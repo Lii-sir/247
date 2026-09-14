@@ -1,0 +1,230 @@
+D:\python_programs\LXD_project\247\.venv\Lib\site-packages\torchvision\transforms\v2\_deprecated.py:42: UserWarning: The transform `ToTensor()` is deprecated and will be removed in a future release. Instead, please use `v2.Compose([v2.ToImage(), v2.ToDtype(torch.float32, scale=True)])`.Output is equivalent up to float precision.
+  warnings.warn(
+运行目录：C:\Users\xinxin\AppData\Local\Temp\efficientad_smoke_hs4dr_ha\outputs\CCD1\20260911_200604_029652
+数据统计：{'train': 6, 'val': 2, 'test': 4, 'test_good': 2, 'test_anomaly': 2, 'test_defect_types': {'defect': 2, 'good': 2}, 'skipped_count': 0, 'skipped_by_reason': {}}
+设备：cuda:0
+首次训练会下载官方教师权重和 ImageNette（完整辅助集约 1.5 GB）；已有缓存会复用。
+
+Calculate teacher channel mean & std:   0%|          | 0/6 [00:00<?, ?it/s]
+Calculate teacher channel mean & std:  17%|█▋        | 1/6 [00:00<00:01,  2.70it/s]
+Calculate teacher channel mean & std: 100%|██████████| 6/6 [00:00<00:00, 14.96it/s]
+
+训练 CCD1:   0%|          | 0/2 [00:00<?, ?it/s]
+训练 CCD1:  50%|█████     | 1/2 [00:03<00:03,  3.58s/it]
+训练 CCD1:  50%|█████     | 1/2 [00:03<00:03,  3.58s/it, loss=13.47137]
+训练 CCD1: 100%|██████████| 2/2 [00:03<00:00,  1.60s/it, loss=13.47137]
+训练 CCD1: 100%|██████████| 2/2 [00:03<00:00,  1.94s/it, loss=13.47137]
+
+Calculate Validation Dataset Quantiles:   0%|          | 0/2 [00:00<?, ?it/s]
+Calculate Validation Dataset Quantiles: 100%|██████████| 2/2 [00:00<00:00, 33.41it/s]
+
+测试集推理:   0%|          | 0/4 [00:00<?, ?it/s]
+测试集推理: 100%|██████████| 4/4 [00:00<00:00, 58.19it/s]
+
+保存热力图:   0%|          | 0/1 [00:00<?, ?it/s]
+保存热力图: 100%|██████████| 1/1 [00:00<00:00,  6.27it/s]
+保存热力图: 100%|██████████| 1/1 [00:00<00:00,  6.27it/s]
+{
+  "evaluation_level": "image",
+  "threshold": 0.1380571871995926,
+  "decision_rule": "score > threshold",
+  "counts": {
+    "total": 4,
+    "normal": 2,
+    "anomaly": 2
+  },
+  "confusion_matrix": {
+    "tn": 0,
+    "fp": 2,
+    "fn": 0,
+    "tp": 2
+  },
+  "accuracy": 0.5,
+  "precision": 0.5,
+  "recall": 1.0,
+  "f1": 0.6666666666666666,
+  "false_positive_rate": 1.0,
+  "false_negative_rate": 0.0,
+  "roc_auc": 0.5,
+  "average_precision": 0.5833333333333333,
+  "defect_type_recall": {
+    "defect": {
+      "support": 2,
+      "tp": 2,
+      "fn": 0,
+      "recall": 1.0
+    }
+  },
+  "notes": [
+    "仅计算图像级指标；数据未提供像素标注，因此不计算像素级指标。",
+    "所有分母为零的指标记录为 null；等于阈值的分数判为正常。"
+  ],
+  "calibration": {
+    "method": "held_out_normal_score_quantile",
+    "quantile": 0.99,
+    "quantile_interpolation": "higher",
+    "threshold": 0.1380571871995926,
+    "decision_rule": "score > threshold",
+    "normal_validation_count": 2,
+    "validation_false_positive_count": 0,
+    "display_max": 0.1380571871995926,
+    "map_quantiles": {
+      "qa_st": 1.0997406244277954,
+      "qa_ae": 0.001216368400491774,
+      "qb_st": 1.2477678060531616,
+      "qb_ae": 0.0012610357953235507
+    },
+    "notes": "分数不是概率；该分位数不保证未来数据的误报率。没有使用测试集调阈值。"
+  }
+}
+完成。模型：C:\Users\xinxin\AppData\Local\Temp\efficientad_smoke_hs4dr_ha\outputs\CCD1\20260911_200604_029652\model.pt
+报告：C:\Users\xinxin\AppData\Local\Temp\efficientad_smoke_hs4dr_ha\outputs\CCD1\20260911_200604_029652
+
+测试集推理:   0%|          | 0/4 [00:00<?, ?it/s]
+测试集推理:  25%|██▌       | 1/4 [00:00<00:00,  3.20it/s]
+测试集推理: 100%|██████████| 4/4 [00:00<00:00, 10.80it/s]
+
+保存热力图:   0%|          | 0/4 [00:00<?, ?it/s]
+保存热力图:  25%|██▌       | 1/4 [00:00<00:00,  5.45it/s]
+保存热力图:  50%|█████     | 2/4 [00:00<00:00,  5.57it/s]
+保存热力图:  75%|███████▌  | 3/4 [00:00<00:00,  5.76it/s]
+保存热力图: 100%|██████████| 4/4 [00:00<00:00,  5.78it/s]
+保存热力图: 100%|██████████| 4/4 [00:00<00:00,  5.72it/s]
+{
+  "evaluation_level": "image",
+  "threshold": 0.1380571871995926,
+  "decision_rule": "score > threshold",
+  "counts": {
+    "total": 4,
+    "normal": 2,
+    "anomaly": 2
+  },
+  "confusion_matrix": {
+    "tn": 0,
+    "fp": 2,
+    "fn": 0,
+    "tp": 2
+  },
+  "accuracy": 0.5,
+  "precision": 0.5,
+  "recall": 1.0,
+  "f1": 0.6666666666666666,
+  "false_positive_rate": 1.0,
+  "false_negative_rate": 0.0,
+  "roc_auc": 0.5,
+  "average_precision": 0.5833333333333333,
+  "defect_type_recall": {
+    "defect": {
+      "support": 2,
+      "tp": 2,
+      "fn": 0,
+      "recall": 1.0
+    }
+  },
+  "notes": [
+    "仅计算图像级指标；数据未提供像素标注，因此不计算像素级指标。",
+    "所有分母为零的指标记录为 null；等于阈值的分数判为正常。"
+  ],
+  "calibration": {
+    "method": "held_out_normal_score_quantile",
+    "quantile": 0.99,
+    "quantile_interpolation": "higher",
+    "threshold": 0.1380571871995926,
+    "decision_rule": "score > threshold",
+    "normal_validation_count": 2,
+    "validation_false_positive_count": 0,
+    "display_max": 0.1380571871995926,
+    "map_quantiles": {
+      "qa_st": 1.0997406244277954,
+      "qa_ae": 0.001216368400491774,
+      "qb_st": 1.2477678060531616,
+      "qb_ae": 0.0012610357953235507
+    },
+    "notes": "分数不是概率；该分位数不保证未来数据的误报率。没有使用测试集调阈值。"
+  }
+}
+评估结果：C:\Users\xinxin\AppData\Local\Temp\efficientad_smoke_hs4dr_ha\outputs\evaluation\CCD1\20260911_200617_086250
+{
+  "image": "C:\\Users\\xinxin\\AppData\\Local\\Temp\\efficientad_smoke_hs4dr_ha\\data\\CCD1\\test\\good\\0.png",
+  "score": 0.14898154139518738,
+  "threshold": 0.1380571871995926,
+  "prediction": "NG"
+}
+预测结果：C:\Users\xinxin\AppData\Local\Temp\efficientad_smoke_hs4dr_ha\predictions\CCD1\20260911_200625_812420
+D:\python_programs\LXD_project\247\.venv\Lib\site-packages\torchvision\transforms\v2\_deprecated.py:42: UserWarning: The transform `ToTensor()` is deprecated and will be removed in a future release. Instead, please use `v2.Compose([v2.ToImage(), v2.ToDtype(torch.float32, scale=True)])`.Output is equivalent up to float precision.
+  warnings.warn(
+从第 2 步续训；总步数/分辨率/划分沿用 checkpoint。
+运行目录：C:\Users\xinxin\AppData\Local\Temp\efficientad_smoke_hs4dr_ha\resumed\CCD1\20260911_200633_248274
+数据统计：{'train': 6, 'val': 2, 'test': 4, 'test_good': 2, 'test_anomaly': 2, 'test_defect_types': {'defect': 2, 'good': 2}, 'skipped_count': 0, 'skipped_by_reason': {}}
+设备：cuda:0
+首次训练会下载官方教师权重和 ImageNette（完整辅助集约 1.5 GB）；已有缓存会复用。
+
+训练 CCD1:  67%|██████▋   | 2/3 [00:00<?, ?it/s]
+训练 CCD1: 100%|██████████| 3/3 [00:00<00:00,  1.53it/s]
+训练 CCD1: 100%|██████████| 3/3 [00:00<00:00,  1.52it/s]
+
+Calculate Validation Dataset Quantiles:   0%|          | 0/2 [00:00<?, ?it/s]
+Calculate Validation Dataset Quantiles: 100%|██████████| 2/2 [00:00<00:00, 50.56it/s]
+
+测试集推理:   0%|          | 0/4 [00:00<?, ?it/s]
+测试集推理: 100%|██████████| 4/4 [00:00<00:00, 57.33it/s]
+
+保存热力图: 0it [00:00, ?it/s]
+保存热力图: 0it [00:00, ?it/s]
+{
+  "evaluation_level": "image",
+  "threshold": 0.1379651576280594,
+  "decision_rule": "score > threshold",
+  "counts": {
+    "total": 4,
+    "normal": 2,
+    "anomaly": 2
+  },
+  "confusion_matrix": {
+    "tn": 0,
+    "fp": 2,
+    "fn": 0,
+    "tp": 2
+  },
+  "accuracy": 0.5,
+  "precision": 0.5,
+  "recall": 1.0,
+  "f1": 0.6666666666666666,
+  "false_positive_rate": 1.0,
+  "false_negative_rate": 0.0,
+  "roc_auc": 0.5,
+  "average_precision": 0.5833333333333333,
+  "defect_type_recall": {
+    "defect": {
+      "support": 2,
+      "tp": 2,
+      "fn": 0,
+      "recall": 1.0
+    }
+  },
+  "notes": [
+    "仅计算图像级指标；数据未提供像素标注，因此不计算像素级指标。",
+    "所有分母为零的指标记录为 null；等于阈值的分数判为正常。"
+  ],
+  "calibration": {
+    "method": "held_out_normal_score_quantile",
+    "quantile": 0.99,
+    "quantile_interpolation": "higher",
+    "threshold": 0.1379651576280594,
+    "decision_rule": "score > threshold",
+    "normal_validation_count": 2,
+    "validation_false_positive_count": 0,
+    "display_max": 0.1379651576280594,
+    "map_quantiles": {
+      "qa_st": 1.0997507572174072,
+      "qa_ae": 0.0012110236566513777,
+      "qb_st": 1.247778058052063,
+      "qb_ae": 0.0012555420398712158
+    },
+    "notes": "分数不是概率；该分位数不保证未来数据的误报率。没有使用测试集调阈值。"
+  }
+}
+完成。模型：C:\Users\xinxin\AppData\Local\Temp\efficientad_smoke_hs4dr_ha\resumed\CCD1\20260911_200633_248274\model.pt
+报告：C:\Users\xinxin\AppData\Local\Temp\efficientad_smoke_hs4dr_ha\resumed\CCD1\20260911_200633_248274
+ͨ�����ϳ����ݵ�ѵ����У׼������/���ء�������������ͼ����ͼԤ��Ͷϵ�ָ���
+ע�⣺����֤ʹ�������ʦ������������·���������ж� EfficientAD Ч����

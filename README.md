@@ -1,0 +1,242 @@
+# CCD 数据集 EfficientAD 实验
+
+这个项目提供数据检查、训练、正常样本阈值校准、独立测试和单图预测脚本。代码注释使用中文，环境由 **uv** 管理。网络结构、教师网络和三项训练损失使用 **anomalib 2.2.0 的官方 EfficientAD 实现**；训练循环自行管理，便于固定数据快照、按步调整学习率和断点续训。
+
+## 1. 已适配的数据目录
+
+本机实际找到的路径为：
+
+```text
+D:\datasets\20260909_ccd1-6_ok+v5ng\
+├─ CCD1\
+│  ├─ train\good\*.bmp
+│  └─ test\
+│     ├─ good\*.bmp
+│     └─ defect\*.bmp
+└─ CCD2\ ...
+```
+
+用户最初提供的 `D:\datasets\20260909\_ccd1-6\_ok+v5ng` 当前不存在；脚本默认优先查找上面的实际路径。以后目录变动时，请用 `--data-root` 指定**包含 CCD1 等子目录**的路径。
+
+当前检查到 CCD1 原始目录有 52 张训练良品、10 张测试良品、318 张测试缺陷图，示例 BMP 为 **2000×1500、RGB**。这些是下载过程中的原始计数；实际参与实验的数量以 `inspect` 输出为准，因为损坏文件和尚在写入的文件会被剔除。
+
+`inspect` 会一次扫描并按 SHA256 汇总所有内容完全相同的图片，完整结果写入 `duplicate_report.json`。下载继续进行后计数可能改变。
+
+每个 CCD 独立训练模型，避免不同相机画面分布混在一起。未来 `test` 下可以有多个缺陷目录，除 `good` 外均视为异常。没有像素级 mask，因此只计算图像级指标，热图用于查看异常位置。
+
+## 2. 安装 uv 环境
+
+本机已安装 uv。PowerShell 中执行：
+
+```powershell
+cd D:\python_programs\LXD_project\247
+
+# 将 uv 缓存放入项目目录，避免全局 D:\uv_cache 的权限问题。
+$env:UV_CACHE_DIR = "$PWD\.uv-cache"
+
+# 使用项目锁定的 Python 3.12 和依赖版本。
+uv sync --locked
+
+# 确认当前环境能识别 GPU。
+uv run python -c "import torch; print('Torch:', torch.__version__); print('CUDA:', torch.version.cuda); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else '未识别 GPU')"
+```
+
+项目固定 `anomalib==2.2.0`、`torch==2.7.1`、`torchvision==0.22.1` 和 `lightning==2.5.5`，PyTorch 使用官方 **CUDA 12.6** wheel。这个组合是固定实验基线，不是追踪 anomalib 最新版。本机为 **RTX 3060 12GB**，默认 `--device auto` 会在可用时使用 CUDA。运行预编译 PyTorch wheel 不需要额外安装 CUDA Toolkit；首次同步会下载体积较大的 GPU 依赖。
+
+新开 PowerShell 窗口时可再次设置上面的 `UV_CACHE_DIR`。也可以逐条使用 `uv --cache-dir .uv-cache run ...` / `uv --cache-dir .uv-cache sync --locked`，命令行参数优先于已有全局变量。
+
+## 3. 先检查 CCD1
+
+```powershell
+uv run python efficientad_ccd.py inspect --category CCD1
+
+# 显式指定数据根目录的等价写法。
+uv run python efficientad_ccd.py inspect --data-root "D:\datasets\20260909_ccd1-6_ok+v5ng" --category CCD1
+```
+
+检查会保存 `outputs/inspection/CCD1/<时间>/manifest.json`，其中包含文件清单、原始尺寸、SHA256、跳过原因和最终划分：
+
+- 仅使用 `train/good` 的正常图。固定随机种子 42，默认约 80% 用于训练、20% 留作正常验证。
+- `test/good` 和 `test/defect` 留给最终评估，不用于拟合网络、异常图分位数或判定阈值。
+- 默认跳过最近 **60 秒**写入的文件、临时文件、不能完整解码的图片，以及扫描期间大小/修改时间变化的文件。
+- 每个文件只计算一次 SHA256，再按哈希一次性汇总全部重复组，包括训练集内部、测试集内部、train/test 交叉重复和标签冲突；`inspect` 保存并打印报告，`train` 在保存完整报告后停止，避免数据泄漏。
+- 每个运行使用固定快照。训练过程中出现的新图片不会悄悄加入，快照内图片发生变化会报错。
+
+至少需要 4 张不同内容的训练良品，训练与验证各至少 2 张。这只是程序可运行下限；要判断效果，应准备更多有代表性的正常样本。哈希识别的是字节完全相同的文件，连续拍摄的近似图、同一工件的不同编码副本仍需按工件/批次人工检查隔离。
+
+由于数据还在下载，建议先只运行 CCD1。全目录检查可使用 `--category all`；未完成的相机会明确报错，已完成相机的检查结果仍保留。扫描对原始数据只读，首次完整解码和计算哈希会读取数 GB 数据。
+
+## 4. 训练并自动评估
+
+先用 1,000 步确认效果输出和流程：
+
+```powershell
+uv run python efficientad_ccd.py train --category CCD1 --max-steps 1000 --image-size 256 --heatmaps 32
+```
+
+进行较完整的初步实验：
+
+```powershell
+uv run python efficientad_ccd.py train --category CCD1 --max-steps 10000 --image-size 256
+```
+
+考虑到原图为 2000×1500，细小缺陷缩到 256×256 后可能不明显，可再运行 512 分辨率对照：
+
+```powershell
+uv run python efficientad_ccd.py train --category CCD1 --max-steps 10000 --image-size 512
+```
+
+1,000 步仅用于快速试跑，10,000 步也不保证收敛。需要更长训练时可设 `--max-steps 70000`；在相同数据快照、相同训练参数下比较效果更有意义。默认将整张图缩放为方形，保留整张画面但会改变长宽比；本脚本未实现 ROI 或分块。若小缺陷在缩放后消失，后续应根据实际缺陷位置增加 ROI/分块处理。
+
+训练使用 **batch size=1**、Adam、初始学习率 `1e-4`、权重衰减 `1e-5`；在总步数 95% 处将学习率乘以 0.1。输入只转 RGB、缩放和映射到 `[0,1]`，不能在外部再做 ImageNet Normalize。`--model-size small` 是默认轻量模型，另支持 `medium`。
+
+训练结束后会自动完成：正常验证集异常图校准 → 图像阈值校准 → 测试集推理 → 指标和热图保存。默认每 1,000 步保存 `checkpoints/last.pt`；Ctrl+C 在训练循环中会保存最近完成步数的续训文件。
+
+### 首次训练需要下载的资源
+
+除了 uv 环境，EfficientAD 还需要：
+
+1. 官方预训练教师权重，默认缓存在 `assets/pre_trained/efficientad_pretrained_weights/`。
+2. **ImageNette 辅助图像集**，默认自动下载官方完整归档（约 1.5 GB），用于学生网络的正则项，缓存在 `assets/imagenette/`。它不是你的 CCD 测试集。
+
+下载使用 anomalib 的官方地址和校验信息。有现成文件时可以显式指定：
+
+```powershell
+uv run python efficientad_ccd.py train --category CCD1 --max-steps 10000 --teacher-weights "D:\models\pretrained_teacher_small.pth" --imagenette-dir "D:\datasets\imagenette2\train"
+```
+
+这里的路径是示例，必须改成实际存在的位置。教师权重必须与 `--model-size` 匹配。辅助图片目录需要兼容 `ImageFolder`，例如 `train/n01440764/*.JPEG`。仅有 CCD 图片不足以复现官方带 ImageNette 正则项的配置。**不要预先创建空的 `assets/imagenette` 目录**：官方辅助函数看到目录存在就会尝试读取，空目录应删除或改用新的有效目录后重试。
+
+## 5. 读取效果报告
+
+每次运行单独保存，例如：
+
+```text
+outputs/CCD1/<运行时间>/
+├─ manifest.json          # 当次实际使用的样本及固定划分
+├─ config.json            # 超参数和设备配置
+├─ loss.csv               # 每一步的总损失和三项损失
+├─ checkpoints/last.pt    # 模型、优化器和调度器，可用于续训
+├─ model.pt               # 已校准模型；包含教师参数，可独立推理
+├─ calibration.json       # 正常验证分数、阈值和异常图分位数
+├─ metrics.json           # 图像级指标与混淆矩阵
+├─ inference_speed.json   # 模型+score 与验证端到端的耗时、FPS
+├─ predictions.csv        # 每张图片的标签、分数、预测和是否正确
+├─ score_distribution.png # 正常/异常分数分布
+└─ heatmaps/               # 原图、异常热图、叠加图，按测试子目录/预测结果分类
+   ├─ good/
+   │  ├─ normal/*.png      # test/good 中预测为正常
+   │  └─ anomaly/*.png     # test/good 中被误报为异常
+   ├─ defect1/
+   │  ├─ normal/*.png      # test/defect1 中被漏检
+   │  └─ anomaly/*.png     # test/defect1 中预测为异常
+   └─ defect2/             # 其他 test 子目录同样保留
+```
+
+验证结束后终端会显示平均检测毫秒数和 FPS。`model_and_score` 包含模型前向与 mask 后整图 score，不含图片读取、缩放和热力图保存；`evaluation_total` 还包含测试 DataLoader 读取，但仍不包含报告和热力图保存。同一统计也保存在 `inference_speed.json`，并写入 `metrics.json` 的 `inference_speed` 字段。
+
+重点看 `roc_auc`、`average_precision`、异常召回率 `recall`、正常误报率 `false_positive_rate` 和漏检率 `false_negative_rate`。当前正常测试图只有 10 张，误报 1 张就会改变误报率 10 个百分点；异常图明显更多，单看 accuracy 容易误判。
+
+阈值采用**留出的正常验证图像分数的 99% 分位数**，插值方式为 `higher`；`score > threshold` 判为 NG，否则 OK。分数不是概率，也不一定处于 `[0,1]`。验证图很少时该阈值通常就是正常验证分数的最大值，不能据此保证未来误报率为 1%。后续有独立带标签验证集时，可以再选择符合业务漏检/误报要求的阈值，不要反复使用测试集选阈值。
+
+热图统一使用正常验证集确定的显示色阶，默认优先保存误判图，再保存接近阈值的图。结果按测试集原始子目录和整图预测结果保存：`heatmaps/<test子目录>/normal/` 或 `heatmaps/<test子目录>/anomaly/`。例如 `test/defect1` 的图片会进入 `heatmaps/defect1/normal/` 或 `heatmaps/defect1/anomaly/`；`test/good` 会进入 `heatmaps/good/normal/` 或 `heatmaps/good/anomaly/`。`--heatmaps 32` 是所有子目录合计最多 32 张，`--heatmaps 0` 不保存热图，`--heatmaps -1` 保存全部。子目录在保存对应图片时自动创建。热图不是像素标注或经像素指标验证的分割结果。
+
+## 6. 重跑评估、预测和续训
+
+以下命令中的 `<运行时间>` 必须替换为实际目录名。
+
+```powershell
+# 使用原始测试快照及原阈值重新评估，不需要下载教师或 ImageNette。
+uv run python efficientad_ccd.py evaluate --checkpoint "outputs\CCD1\<运行时间>\model.pt" --heatmaps -1
+
+# 下载完成后先 inspect，生成新快照，再使用固定阈值评估其中的测试图片。
+uv run python efficientad_ccd.py evaluate --checkpoint "outputs\CCD1\<运行时间>\model.pt" --manifest "outputs\inspection\CCD1\<检查时间>\manifest.json"
+
+# 单张新图推理，输出 prediction.json 和 prediction.png。
+uv run python efficientad_ccd.py predict --checkpoint "outputs\CCD1\<运行时间>\model.pt" --image "D:\datasets\新图片.bmp"
+
+# 中断后续训：沿用 checkpoint 内的数据快照、分辨率和总训练步数。
+uv run python efficientad_ccd.py train --resume "outputs\CCD1\<运行时间>\checkpoints\last.pt"
+```
+
+续训结果放入新的运行目录，不覆盖原结果。续训恢复模型、优化器和调度器，但会重新开始随机数据顺序，因此不保证与不中断训练逐位相同。若要改变总步数、分辨率、阈值分位数、加入新下载的训练图片或改用另一份辅助数据，请启动一次新的训练；`--resume` 会沿用原配置，只允许改变运行设备、数据读取进程数、保存频率和热图数量。
+
+新快照评估不会因内容与原训练/校准样本重复而拒绝；相机类别仍必须一致。快照内文件需要保持路径、大小和修改时间不变。
+
+等 CCD1～CCD6 都下载完整并检查通过后，可依次训练：
+
+```powershell
+uv run python efficientad_ccd.py inspect --category all
+uv run python efficientad_ccd.py train --category all --max-steps 10000 --image-size 256
+```
+
+`all` 按目录顺序串行运行，每个相机各有自己的权重和报告。训练遇到未就绪类别会停止并报错；下载阶段请选择已经完整的相机。
+
+## 7. 验证脚本与常见参数
+
+本次交付已完成：真实 CCD1 数据扫描，27 项数据/评估/命令行测试，以及合成数据的训练、校准、保存/加载、评估、热图、单图预测和恢复后继续优化的完整链路验证。完整链路使用本机已有 **Python 3.14 / anomalib 2.3.3 / PyTorch 2.11 CPU** 环境作为补充检查，随机教师权重只用于验证程序。
+
+2026-09-11 后续修复已将 anomalib 间接导入所需的 `requests` 加入项目依赖和锁文件。**项目锁定的 Python 3.12 / anomalib 2.2.0 / PyTorch 2.7.1 CUDA 12.6 环境现已安装完成，并识别 RTX 3060。** 已在该环境通过合成数据的 GPU 训练、校准、保存/加载、评估、热图、单图预测及恢复后继续训练的完整链路测试。合成测试使用随机教师，只验证程序运行；本次没有用官方预训练教师完成 CCD1 的正式训练，因此尚无可信的 CCD1 检测分数。
+
+```powershell
+uv run python -m unittest discover -s tests -v
+
+# 可选：用合成数据和随机教师测试完整链路，不下载模型，不代表实际检测效果。
+uv run python tests/smoke_pipeline.py
+
+uv run python efficientad_ccd.py --help
+uv run python efficientad_ccd.py train --help
+```
+
+- Windows 默认 `--num-workers 0` 便于定位读取问题；稳定后可尝试 `--num-workers 2`。
+- `--device cuda` 要求 CUDA 可用，否则直接报错；`--device cpu` 可用于调试，但 GPU 环境依赖仍会安装。
+- 默认 `--min-age-seconds 60`；确认所有文件已完整下载后可以设 0。
+- 样本不足、图片损坏、重复内容、校准分位数退化或出现 NaN/Inf 会明确报错；重复内容的全部路径保存在运行目录的 `duplicate_report.json`。
+- 只有一种测试类别时 AUROC 无定义，报告记录为 `null`；没有测试图时仍会保存训练完成的模型与校准结果。
+
+```
+uv run python efficientad_ccd.py train `
+  --data-root "D:\datasets\20260909_ccd1-6_ok+v5ng" `
+  --category CCD1 `
+  --model-size small `
+  --image-size 512 `
+  --max-steps 20000 `
+  --device cuda `
+  --num-workers 0 `
+  --save-every 1000 `
+  --heatmaps 32
+
+
+  $env:UV_CACHE_DIR=".uv-cache"
+
+# 无需修改 JSON：打开界面，拖框选择 ROI，检测并保存 mask。
+uv run python circle_mask_gui.py
+
+uv run python generate_circle_mask.py `
+  --input "D:\datasets\20260913_caijian_liugongwei\2lixiaodong\CCD1\good\B20260731_01_CCD1_0003.bmp" `
+  --output-dir "circle_mask_generated_CCD1" `
+  --circle-config "circle_config.json" `
+  --category CCD1
+
+uv run python detect_background_circle.py `
+  --input "D:\datasets\20260913_caijian_liugongwei\2lixiaodong\CCD1\good" `
+  --output-dir "circle_test_bmp_tight" `
+  --roi "0.58,0.33,0.28,0.36" `
+  --circle-target outer `
+  --group-target largest `
+  --min-radius-ratio 0.15 `
+  --max-radius-ratio 0.55 `
+  --param1 100 `
+  --param2 24 `
+  --mask-radius-scale 0.95 `
+  --mask-margin 2
+```
+
+`generate_circle_mask.py` 从一张参考图生成原图尺寸的单通道 `default_mask.png`：圆内为 255、圆外为 0。同时输出检测叠加图、白色填充预览和带检测耗时的 `circle_mask.json`。确认结果后，可将该 PNG 配置为对应型号的 `default_mask`。
+
+## 参考实现
+
+- [EfficientAD 论文与作者实现](https://github.com/nelson1425/EfficientAD)
+- [本项目使用的 anomalib 2.2.0 EfficientAd 模型](https://github.com/open-edge-platform/anomalib/blob/v2.2.0/src/anomalib/models/image/efficient_ad/lightning_model.py)
+- [PyTorch 2.7.1 官方版本配对](https://pytorch.org/get-started/previous-versions/#v271)
+- [uv 官方 PyTorch 集成说明](https://docs.astral.sh/uv/guides/integration/pytorch/)

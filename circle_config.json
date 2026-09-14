@@ -1,0 +1,34 @@
+{
+  "CCD1": {
+    "enabled": true,
+    "require_circle_inside_roi": true,
+    "roi": [0.58, 0.33, 0.28, 0.36],
+    "circle_target": "outer",
+    "group_target": "largest",
+    "min_radius_ratio": 0.15,
+    "max_radius_ratio": 0.55,
+    "dp": 1.2,
+    "min_dist_ratio": 0.12,
+    "param1": 100,
+    "param2": 24,
+    "blur_kernel": 5,
+    "mask_radius_scale": 0.95,
+    "mask_margin": 2
+  },
+  "CCD2": {
+    "enabled": true,
+    "require_circle_inside_roi": true,
+    "roi": [0.05, 0.32, 0.20, 0.38],
+    "circle_target": "outer",
+    "group_target": "largest",
+    "min_radius_ratio": 0.15,
+    "max_radius_ratio": 0.60,
+    "dp": 1.2,
+    "min_dist_ratio": 0.12,
+    "param1": 100,
+    "param2": 24,
+    "blur_kernel": 5,
+    "mask_radius_scale": 0.95,
+    "mask_margin": 2
+  }
+}

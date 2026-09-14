@@ -1,0 +1,35 @@
+[project]
+name = "ccd-efficientad"
+version = "0.1.0"
+description = "使用 EfficientAD 对 CCD 工业图片进行异常检测"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "anomalib==2.2.0",
+    "torch==2.7.1",
+    "torchvision==0.22.1",
+    "lightning==2.5.5",
+    "pytorch-lightning==2.5.5",
+    "torchmetrics==1.8.2",
+    "numpy>=2.0,<2.3",
+    "pandas>=2.2,<3",
+    "pillow>=11.3,<13",
+    "scikit-learn>=1.6,<1.8",
+    "matplotlib>=3.9,<3.11",
+    "tqdm>=4.67,<5",
+    "requests>=2.32.4,<3",
+]
+
+[tool.uv]
+package = false
+# 将缓存放在项目内，避免本机全局 UV_CACHE_DIR 的权限问题。
+cache-dir = ".uv-cache"
+environments = ["sys_platform == 'win32' or sys_platform == 'linux'"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
