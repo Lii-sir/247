@@ -175,6 +175,32 @@ def _find_duplicate_content(
     }
 
 
+def split_threshold_validation(
+    records: list[dict[str, Any]],
+    ratio: float,
+    seed: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """按测试子目录分层抽取阈值验证集，其余记录保留为最终测试集。"""
+    if not math.isfinite(ratio) or not 0 < ratio < 1:
+        raise ValueError("threshold_val_ratio 必须大于 0 且小于 1")
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        # 兼容旧版/手工 manifest：没有 defect_type 时按 label 给出稳定的默认组名。
+        defect_type = record.get("defect_type", "good" if record.get("label", 0) == 0 else "anomaly")
+        groups[defect_type].append(record)
+
+    threshold_val: list[dict[str, Any]] = []
+    test: list[dict[str, Any]] = []
+    for defect_type, group in sorted(groups.items()):
+        shuffled = list(group)
+        random.Random(f"{seed}:{defect_type}").shuffle(shuffled)
+        # 每个至少有两张图片的子目录均在阈值验证和最终测试中保留样本。
+        count = min(len(shuffled) - 1, max(1, round(len(shuffled) * ratio))) if len(shuffled) >= 2 else 0
+        threshold_val.extend(shuffled[:count])
+        test.extend(shuffled[count:])
+    return threshold_val, test
+
+
 def prepare_manifest(
     root: Path,
     category: str,
@@ -182,10 +208,11 @@ def prepare_manifest(
     seed: int = 42,
     min_age_seconds: float = 60.0,
     verify_images: bool = True,
+    threshold_val_ratio: float = 0.2,
 ) -> dict[str, Any]:
-    """生成快照：仅 train/good 参与训练与正常验证，test 只用于最终测试。
+    """生成快照：仅 train/good 参与训练和异常图校准；test 分层划出阈值验证集，余下用于最终测试。
 
-    验证集至少保留两张不同的良品图片，供 EfficientAD 的分位数校准使用；
+    正常验证集至少保留两张不同的良品图片，供 EfficientAD 的异常图分位数校准使用；
     训练集也至少保留两张。SHA256 仅作为记录字段，不据此剔除图片。
     文件年龄和扫描前后状态检查只能降低下载干扰；快照生成后应保留源文件。
     没有提供像素标注时仅记录图像标签，不构造虚假的缺陷 mask。
@@ -194,6 +221,8 @@ def prepare_manifest(
         raise ValueError("val_ratio 必须大于 0 且小于 1")
     if not math.isfinite(min_age_seconds) or min_age_seconds < 0:
         raise ValueError("min_age_seconds 必须是非负有限数")
+    if not math.isfinite(threshold_val_ratio) or not 0 < threshold_val_ratio < 1:
+        raise ValueError("threshold_val_ratio 必须大于 0 且小于 1")
     root = resolve_data_root(root)
     if not category or category in {".", ".."} or Path(category).name != category or "/" in category or "\\" in category:
         raise ValueError("category 必须是数据集根目录下的相机目录名称")
@@ -216,6 +245,7 @@ def prepare_manifest(
                 _skip(skipped, defect_directory, "missing_label_directory", "测试图片必须位于 test/good 或 test/缺陷类别 子目录")
     train, test = _deduplicate(train, test, skipped)
     duplicate_report = _find_duplicate_content(train, test)
+    threshold_val, test = split_threshold_validation(test, threshold_val_ratio, seed)
     if len(train) < 4:
         raise ValueError(
             f"{category} 可用的训练良品只有 {len(train)} 张，至少需要 4 张"
@@ -228,6 +258,10 @@ def prepare_manifest(
     summary = {
         "train": len(train),
         "val": len(val),
+        "threshold_val": len(threshold_val),
+        "threshold_val_good": sum(record["label"] == 0 for record in threshold_val),
+        "threshold_val_anomaly": sum(record["label"] == 1 for record in threshold_val),
+        "threshold_val_defect_types": dict(sorted(Counter(record["defect_type"] for record in threshold_val).items())),
         "test": len(test),
         "test_good": sum(record["label"] == 0 for record in test),
         "test_anomaly": sum(record["label"] == 1 for record in test),
@@ -246,11 +280,13 @@ def prepare_manifest(
         "category": category,
         "seed": seed,
         "val_ratio": val_ratio,
+        "threshold_val_ratio": threshold_val_ratio,
         "min_age_seconds": min_age_seconds,
         "verify_images": verify_images,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "train": train,
         "val": val,
+        "threshold_val": threshold_val,
         "test": test,
         "skipped": skipped,
         "duplicate_report": duplicate_report,

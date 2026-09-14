@@ -135,6 +135,8 @@ outputs/CCD1/<运行时间>/
 
 验证结束后终端会显示平均检测毫秒数和 FPS。`model_and_score` 包含模型前向与 mask 后整图 score，不含图片读取、缩放和热力图保存；`evaluation_total` 还包含测试 DataLoader 读取，但仍不包含报告和热力图保存。同一统计也保存在 `inference_speed.json`，并写入 `metrics.json` 的 `inference_speed` 字段。
 
+整图 `score` 使用有效区域的 21×21 局部平均池化，再取最高 0.1% 位置的均值；`score_max` 仍保存在 `predictions.csv` 中用于对照。原始 `test` 会按 `good/缺陷类别` 分层划出 20% 的 `threshold_val`，使用其中的正常和异常标签选择达到 `target_recall`（默认 99%）的最高阈值，剩余图片才作为最终测试集。可以通过 `--threshold-val-ratio`、`--target-recall`、`--score-pool-kernel` 和 `--score-topk-ratio` 调整。
+
 重点看 `roc_auc`、`average_precision`、异常召回率 `recall`、正常误报率 `false_positive_rate` 和漏检率 `false_negative_rate`。当前正常测试图只有 10 张，误报 1 张就会改变误报率 10 个百分点；异常图明显更多，单看 accuracy 容易误判。
 
 阈值采用**留出的正常验证图像分数的 99% 分位数**，插值方式为 `higher`；`score > threshold` 判为 NG，否则 OK。分数不是概率，也不一定处于 `[0,1]`。验证图很少时该阈值通常就是正常验证分数的最大值，不能据此保证未来误报率为 1%。后续有独立带标签验证集时，可以再选择符合业务漏检/误报要求的阈值，不要反复使用测试集选阈值。
@@ -230,6 +232,15 @@ uv run python detect_background_circle.py `
   --param2 24 `
   --mask-radius-scale 0.95 `
   --mask-margin 2
+
+
+
+CUDA_VISIBLE_DEVICES=1 python efficientad_ccd.py evaluate \
+  --checkpoint "/media/pe/5fe0ba86-cd64-483b-bfc5-dd83088ea652/lxd/outputs/CCD1-v2/<时间目录>/model.pt" \
+  --output-dir "outputs" \
+  --heatmaps -1 \
+  --device cuda \
+  --num-workers 0
 ```
 
 `generate_circle_mask.py` 从一张参考图生成原图尺寸的单通道 `default_mask.png`：圆内为 255、圆外为 0。同时输出检测叠加图、白色填充预览和带检测耗时的 `circle_mask.json`。确认结果后，可将该 PNG 配置为对应型号的 `default_mask`。

@@ -18,9 +18,10 @@ from circle_mask import (
     load_configs,
     mask_from_circle_record,
     mask_score,
+    pooled_topk_score,
     read_rgb,
 )
-from ccd_data import list_categories, prepare_manifest, resolve_data_root
+from ccd_data import list_categories, prepare_manifest, resolve_data_root, split_threshold_validation
 
 PROJECT_DIR = Path(__file__).resolve().parent
 Batch = namedtuple("Batch", ["image", "gt_label", "ignore_mask"])
@@ -277,47 +278,101 @@ def masked_map_quantiles(model, loader, device: str) -> dict:
     }
 
 
-def prediction_score(prediction, batch, device: str) -> float:
-    """由有效异常图计算 score；兼容无 mask 的旧测试/旧模型对象。"""
+def prediction_scores(prediction, batch, config: dict) -> dict[str, float]:
+    """同时计算正式 Top-K 分数和用于对照的旧版最大值分数。"""
     anomaly_map = getattr(prediction, "anomaly_map", None)
     ignore_mask = getattr(batch, "ignore_mask", None)
     if anomaly_map is not None and ignore_mask is not None:
-        return float(mask_score(anomaly_map, _mask_tensor(ignore_mask, device)).flatten()[0])
-    return float(prediction.pred_score.flatten()[0])
+        mask = _mask_tensor(ignore_mask, config["device"])
+        score_max = float(mask_score(anomaly_map, mask).flatten()[0])
+        score_topk = float(
+            pooled_topk_score(
+                anomaly_map,
+                mask,
+                pool_kernel=config.get("score_pool_kernel", 21),
+                topk_ratio=config.get("score_topk_ratio", 0.001),
+            ).flatten()[0]
+        )
+        return {"score": score_topk, "score_topk": score_topk, "score_max": score_max}
+    score = float(prediction.pred_score.flatten()[0])
+    return {"score": score, "score_topk": score, "score_max": score}
+
+
+def prediction_score(prediction, batch, device: str) -> float:
+    """兼容旧调用入口；正式流程使用 prediction_scores。"""
+    return prediction_scores(prediction, batch, {"device": device})["score"]
+
+
+def threshold_for_target_recall(rows: list[dict], target_recall: float) -> tuple[float, dict]:
+    """选择满足目标异常召回率的最高阈值，等于阈值仍判为正常。"""
+    if not 0 < target_recall <= 1:
+        raise ValueError("target_recall 必须位于 (0, 1]。")
+    normal_scores = np.asarray([row["score"] for row in rows if row["label"] == 0], dtype=np.float64)
+    anomaly_scores = np.asarray([row["score"] for row in rows if row["label"] == 1], dtype=np.float64)
+    if not len(normal_scores) or not len(anomaly_scores):
+        raise ValueError("阈值验证集必须同时包含正常图片和异常图片。")
+    required_tp = int(math.ceil(target_recall * len(anomaly_scores)))
+    boundary = float(np.sort(anomaly_scores)[::-1][required_tp - 1])
+    threshold = float(np.nextafter(boundary, -np.inf))
+    predictions_normal = normal_scores > threshold
+    predictions_anomaly = anomaly_scores > threshold
+    stats = {
+        "target_recall": target_recall,
+        "normal_count": int(len(normal_scores)),
+        "anomaly_count": int(len(anomaly_scores)),
+        "true_positive": int(predictions_anomaly.sum()),
+        "false_negative": int((~predictions_anomaly).sum()),
+        "false_positive": int(predictions_normal.sum()),
+        "true_negative": int((~predictions_normal).sum()),
+        "achieved_recall": float(predictions_anomaly.mean()),
+        "false_positive_rate": float(predictions_normal.mean()),
+    }
+    return threshold, stats
 
 
 def calibrate(model, manifest: dict, config: dict, output_dir: Path) -> dict:
-    """仅用留出的正常验证图校准异常图和图像阈值，不接触测试标签。"""
+    """正常验证图校准异常图；独立带标签验证集选择整图阈值。"""
     model.eval()  # 关闭自编码器 dropout 后再估计分位数。
     loader = make_loader(manifest["val"], config)
     with torch.inference_mode():
         quantiles = masked_map_quantiles(model, loader, config["device"])
         check_statistics(quantiles, quantiles=True)
         model.model.quantiles.update(quantiles)
-        scores = []
+        threshold_records = manifest.get("threshold_val", [])
+        if not threshold_records:
+            raise ValueError("没有阈值验证集；请从 test 分层划出 threshold_val 后再校准。")
+        threshold_loader = make_loader(threshold_records, config)
         rows = []
-        for record, batch in zip(manifest["val"], loader, strict=True):
+        for record, batch in zip(threshold_records, threshold_loader, strict=True):
             prediction = model.model(batch.image.to(config["device"]))
-            score = prediction_score(prediction, batch, config["device"])
-            if not math.isfinite(score):
+            score_values = prediction_scores(prediction, batch, config)
+            if not all(math.isfinite(value) for value in score_values.values()):
                 raise ValueError(f"校准分数不是有限数值：{record['path']}")
-            scores.append(score)
-            rows.append({"path": record["path"], "score": score})
-    # 使用上取整分位数；样本很少时通常就是验证正常分数的最大值。
-    threshold = float(np.quantile(scores, config["threshold_quantile"], method="higher"))
+            rows.append({
+                "path": record["path"],
+                "label": record["label"],
+                "defect_type": record.get("defect_type", "good" if record.get("label", 0) == 0 else "anomaly"),
+                **score_values,
+            })
+    threshold, selection = threshold_for_target_recall(rows, config.get("target_recall", 0.99))
+    normal_scores = [row["score"] for row in rows if row["label"] == 0]
     calibration = {
-        "method": "held_out_normal_score_quantile",
-        "quantile": config["threshold_quantile"],
-        "quantile_interpolation": "higher",
+        "method": "labeled_validation_highest_threshold_for_target_recall",
         "threshold": threshold,
         "decision_rule": "score > threshold",
-        "normal_validation_count": len(scores),
-        "validation_false_positive_count": sum(s > threshold for s in scores),
-        "display_max": max(max(scores), threshold, 0.1),
+        "score_method": {
+            "name": "masked_local_average_topk_mean",
+            "pool_kernel": config.get("score_pool_kernel", 21),
+            "topk_ratio": config.get("score_topk_ratio", 0.001),
+        },
+        "threshold_selection": selection,
+        "normal_map_validation_count": len(manifest["val"]),
+        "threshold_validation_count": len(rows),
+        "display_max": max(max(normal_scores), threshold, 0.1),
         "map_quantiles": {key: float(value) for key, value in quantiles.items()},
-        "notes": "分数不是概率；该分位数不保证未来数据的误报率。没有使用测试集调阈值。",
+        "notes": "分数不是概率；threshold_val 从原 test 分层划出，最终 test 未参与阈值选择。",
     }
-    write_json(output_dir / "calibration.json", {**calibration, "validation_scores": rows})
+    write_json(output_dir / "calibration.json", {**calibration, "threshold_validation_scores": rows})
     return calibration
 
 
@@ -346,15 +401,15 @@ def evaluate_records(model, records: list[dict], config: dict, calibration: dict
                 torch.cuda.synchronize()
             inference_started = time.perf_counter()
             prediction = model.model(image)
-            score = prediction_score(prediction, batch, config["device"])
+            score_values = prediction_scores(prediction, batch, config)
             if config["device"].startswith("cuda"):
                 torch.cuda.synchronize()
             inference_seconds += time.perf_counter() - inference_started
-            if not math.isfinite(score):
+            if not all(math.isfinite(value) for value in score_values.values()):
                 raise ValueError(f"测试分数不是有限数值：{record['path']}")
             rows.append({
-                "path": record["path"], "label": record["label"], "score": score,
-                "pred_label": int(score > calibration["threshold"]),
+                "path": record["path"], "label": record["label"], **score_values,
+                "pred_label": int(score_values["score"] > calibration["threshold"]),
                 "defect_type": record["defect_type"],
             })
     evaluation_seconds = time.perf_counter() - evaluation_started
@@ -428,6 +483,7 @@ def snapshot(args, category: str) -> dict:
         resolve_data_root(args.data_root), category=category,
         val_ratio=args.val_ratio, seed=args.seed,
         min_age_seconds=args.min_age_seconds, verify_images=True,
+        threshold_val_ratio=args.threshold_val_ratio,
     )
 
 
@@ -471,7 +527,7 @@ def prepare_circle_records(manifest: dict, config: dict) -> None:
     # 后续被修改后，单图预测与校准时的 mask 规则发生漂移。
     config["circle_params"] = params
     count = 0
-    for split in ("train", "val", "test"):
+    for split in ("train", "val", "threshold_val", "test"):
         for record in manifest.get(split, []):
             image = read_rgb(Path(record["path"]))
             try:
@@ -499,6 +555,18 @@ def train_one(args, category: str) -> None:
             raise ValueError("续训请使用 checkpoints/last.pt；model.pt 是推理用文件。")
         config, manifest = previous["config"].copy(), previous["manifest"]
         config.update(device=choose_device(args.device), num_workers=args.num_workers)
+        config.setdefault("score_pool_kernel", 21)
+        config.setdefault("score_topk_ratio", 0.001)
+        config.setdefault("target_recall", 0.99)
+        config.setdefault("threshold_val_ratio", 0.2)
+        if not manifest.get("threshold_val"):
+            manifest["threshold_val"], manifest["test"] = split_threshold_validation(
+                manifest.get("test", []), config["threshold_val_ratio"], config["seed"]
+            )
+            print(
+                "旧 checkpoint 未包含 threshold_val：已从原 test 分层划出 "
+                f"{len(manifest['threshold_val'])} 张，剩余 test {len(manifest['test'])} 张。"
+            )
         output = new_output(args.output_dir, manifest["category"])
         print(f"从第 {previous['step']} 步续训；总步数/分辨率/划分沿用 checkpoint。")
     else:
@@ -519,6 +587,10 @@ def train_one(args, category: str) -> None:
             "image_size": args.image_size, "model_size": args.model_size,
             "max_steps": args.max_steps, "lr": args.lr, "weight_decay": args.weight_decay,
             "seed": args.seed, "threshold_quantile": args.threshold_quantile,
+            "threshold_val_ratio": args.threshold_val_ratio,
+            "target_recall": args.target_recall,
+            "score_pool_kernel": args.score_pool_kernel,
+            "score_topk_ratio": args.score_topk_ratio,
             "circle_config": str(args.circle_config.resolve()) if args.circle_config else None,
             "assets_dir": str(assets),
             "imagenette_dir": str(args.imagenette_dir.resolve() if args.imagenette_dir else assets / "imagenette"),
@@ -606,6 +678,10 @@ def restore_for_inference(args):
         raise ValueError("此 checkpoint 尚未校准，请使用训练结束生成的 model.pt。")
     config = saved["config"].copy()
     config.update(device=choose_device(args.device), num_workers=args.num_workers)
+    config.setdefault("score_pool_kernel", 21)
+    config.setdefault("score_topk_ratio", 0.001)
+    config.setdefault("target_recall", 0.99)
+    config.setdefault("threshold_val_ratio", 0.2)
     model = new_model(config)
     model.model.load_state_dict(saved["model_state"])
     model.eval()
@@ -628,17 +704,19 @@ def predict(args) -> None:
     batch = next(iter(make_loader([record], config)))
     with torch.inference_mode():
         prediction = model.model(batch.image.to(config["device"]))
-    score = prediction_score(prediction, batch, config["device"])
-    if not math.isfinite(score):
+    score_values = prediction_scores(prediction, batch, config)
+    if not all(math.isfinite(value) for value in score_values.values()):
         raise ValueError("预测分数不是有限数值。")
     calibration = saved["calibration"]
     output = new_output(args.output_dir, saved["manifest"]["category"])
-    result = {"image": str(image_path), "score": score, "threshold": calibration["threshold"],
-              "prediction": "NG" if score > calibration["threshold"] else "OK"}
+    result = {
+        "image": str(image_path), **score_values, "threshold": calibration["threshold"],
+        "prediction": "NG" if score_values["score"] > calibration["threshold"] else "OK",
+    }
     write_json(output / "prediction.json", result)
     ignore_mask = getattr(batch, "ignore_mask", None)
     save_heatmap(image_path, prediction.anomaly_map.squeeze().cpu().numpy(), output / "prediction.png",
-                 display_max=calibration["display_max"], score=score, threshold=calibration["threshold"],
+                 display_max=calibration["display_max"], score=score_values["score"], threshold=calibration["threshold"],
                  ignore_mask=_mask_numpy(ignore_mask))
     print(json.dumps(result, ensure_ascii=False, indent=2))
     print(f"预测结果：{output}")
@@ -655,6 +733,10 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--data-root", type=Path, help="包含 CCD1 等目录的数据根目录")
             command.add_argument("--category", default="CCD1", help="CCD1、CCD2 等；all 表示依次处理全部 CCD")
             command.add_argument("--val-ratio", type=float, default=0.2)
+            command.add_argument(
+                "--threshold-val-ratio", type=float, default=0.2,
+                help="从 test 各子目录分层划出阈值验证集的比例",
+            )
             command.add_argument("--seed", type=int, default=42)
             command.add_argument("--min-age-seconds", type=float, default=60, help="跳过最近写入的文件")
         if name in ("train",):
@@ -673,6 +755,18 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--lr", type=float, default=1e-4)
             command.add_argument("--weight-decay", type=float, default=1e-5)
             command.add_argument("--threshold-quantile", type=float, default=0.99)
+            command.add_argument(
+                "--target-recall", type=float, default=0.99,
+                help="带标签阈值验证集要求达到的异常召回率",
+            )
+            command.add_argument(
+                "--score-pool-kernel", type=int, default=21,
+                help="整图分数的局部平均池化窗口，必须为正奇数",
+            )
+            command.add_argument(
+                "--score-topk-ratio", type=float, default=0.001,
+                help="池化后最高位置的比例，默认 0.1%%",
+            )
             command.add_argument("--save-every", type=int, default=1000)
             command.add_argument("--assets-dir", type=Path, default=PROJECT_DIR / "assets")
             command.add_argument("--imagenette-dir", type=Path, help="已有 ImageNette/ImageNet 图片目录，按 ImageFolder 格式")
@@ -691,6 +785,14 @@ def main() -> None:
         raise ValueError("num-workers 不能为负数。")
     if hasattr(args, "heatmaps") and args.heatmaps < -1:
         raise ValueError("heatmaps 必须是 -1 或非负数。")
+    if hasattr(args, "threshold_val_ratio") and not 0 < args.threshold_val_ratio < 1:
+        raise ValueError("threshold-val-ratio 必须位于 (0, 1) 内。")
+    if hasattr(args, "target_recall") and not 0 < args.target_recall <= 1:
+        raise ValueError("target-recall 必须位于 (0, 1] 内。")
+    if hasattr(args, "score_pool_kernel") and (args.score_pool_kernel < 1 or args.score_pool_kernel % 2 == 0):
+        raise ValueError("score-pool-kernel 必须是正奇数。")
+    if hasattr(args, "score_topk_ratio") and not 0 < args.score_topk_ratio <= 1:
+        raise ValueError("score-topk-ratio 必须位于 (0, 1] 内。")
     if args.command == "inspect":
         root = resolve_data_root(args.data_root)
         categories = list_categories(root) if args.category.lower() == "all" else [args.category]
@@ -732,11 +834,30 @@ def main() -> None:
         if manifest["category"] != saved["manifest"]["category"]:
             raise ValueError("评估快照的 CCD 类别与 checkpoint 不一致。")
         saved_config = saved.get("config", {})
+        threshold_val_missing = not manifest.get("threshold_val")
+        if threshold_val_missing:
+            ratio = float(saved_config.get("threshold_val_ratio", 0.2))
+            threshold_val, test = split_threshold_validation(
+                manifest.get("test", []), ratio, int(saved_config.get("seed", 42))
+            )
+            manifest["threshold_val"], manifest["test"] = threshold_val, test
+            print(
+                "评估快照未包含 threshold_val：已从 test 分层划出 "
+                f"{len(threshold_val)} 张；当前评估仅使用剩余 {len(test)} 张最终测试图。"
+            )
         if saved_config.get("circle_config") and any("circle" not in record for record in manifest["test"]):
             prepare_circle_records(manifest, saved_config)
         output = new_output(args.output_dir / "evaluation", manifest["category"])
         write_json(output / "manifest.json", manifest)
-        evaluate_records(model, manifest["test"], config, saved["calibration"], output, args.heatmaps)
+        calibration = saved["calibration"]
+        score_method = calibration.get("score_method", {}).get("name")
+        current_score_method = "masked_local_average_topk_mean"
+        threshold_labels = {record.get("label") for record in manifest.get("threshold_val", [])}
+        can_recalibrate = threshold_labels == {0, 1}
+        if can_recalibrate and (score_method != current_score_method or threshold_val_missing):
+            print("检测到旧版或不匹配的 score/threshold：正在使用 threshold_val 重新校准。")
+            calibration = calibrate(model, manifest, config, output)
+        evaluate_records(model, manifest["test"], config, calibration, output, args.heatmaps)
         print(f"评估结果：{output}")
     else:
         predict(args)

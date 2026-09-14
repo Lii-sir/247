@@ -34,10 +34,19 @@ def _validated_rows(rows: list[dict]) -> list[dict]:
         if not isinstance(label, Real) or not math.isfinite(float(label)) or label not in (0, 1):
             raise ValueError(f"第 {index + 1} 条结果的 label 必须为 0 或 1，实际为 {label!r}")
         score = _finite_number(row.get("score"), f"第 {index + 1} 条结果的 score")
+        score_topk = _finite_number(row.get("score_topk", score), f"第 {index + 1} 条结果的 score_topk")
+        score_max = _finite_number(row.get("score_max", score), f"第 {index + 1} 条结果的 score_max")
         defect_type = row.get("defect_type", "unspecified")
         if not isinstance(defect_type, str):
             raise ValueError(f"第 {index + 1} 条结果的 defect_type 必须是字符串")
-        validated.append({**row, "label": int(label), "score": score, "defect_type": defect_type or "unspecified"})
+        validated.append({
+            **row,
+            "label": int(label),
+            "score": score,
+            "score_topk": score_topk,
+            "score_max": score_max,
+            "defect_type": defect_type or "unspecified",
+        })
     return validated
 
 
@@ -142,7 +151,10 @@ def write_report(
     (output_dir / "metrics.json").write_text(payload + "\n", encoding="utf-8")
     # UTF-8 BOM 便于 Windows Excel 直接识别中文路径。
     with (output_dir / "predictions.csv").open("w", encoding="utf-8-sig", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=["path", "label", "score", "pred_label", "defect_type", "correct"])
+        writer = csv.DictWriter(
+            stream,
+            fieldnames=["path", "label", "score", "score_topk", "score_max", "pred_label", "defect_type", "correct"],
+        )
         writer.writeheader()
         for row in rows:
             prediction = int(row["score"] > threshold)
@@ -150,6 +162,8 @@ def write_report(
                 "path": str(row.get("path", "")),
                 "label": row["label"],
                 "score": row["score"],
+                "score_topk": row["score_topk"],
+                "score_max": row["score_max"],
                 "pred_label": prediction,
                 "defect_type": row["defect_type"],
                 "correct": int(prediction == row["label"]),

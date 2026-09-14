@@ -140,7 +140,8 @@ class ManifestTests(unittest.TestCase):
         snapshot = self.manifest()
         self.assertEqual(snapshot["summary"]["skipped_by_reason"], {})
         self.assertEqual(snapshot["summary"]["train"] + snapshot["summary"]["val"], 11)
-        self.assertEqual(snapshot["summary"]["test"], 3)
+        self.assertEqual(snapshot["summary"]["threshold_val"] + snapshot["summary"]["test"], 3)
+        self.assertEqual(snapshot["summary"]["threshold_val"], 1)
         report = snapshot["duplicate_report"]
         self.assertEqual(report["group_count"], 3)
         self.assertEqual(report["file_count"], 6)

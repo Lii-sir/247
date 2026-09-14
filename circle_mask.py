@@ -310,6 +310,57 @@ def mask_score(anomaly_map, ignore_mask):
     return anomaly_map.masked_fill(ignore_mask, -torch.inf).amax(dim=(-2, -1))
 
 
+def pooled_topk_score(anomaly_map, ignore_mask, *, pool_kernel: int = 21, topk_ratio: float = 0.001):
+    """有效区域局部均值池化后，计算最高一部分位置的均值。
+
+    使用有效像素计数修正 mask 边界处的池化，避免圆 mask 内的异常值泄漏到
+    外部，也避免简单填零造成边界均值被人为压低。
+    """
+    import torch
+    import torch.nn.functional as F
+
+    pool_kernel = int(pool_kernel)
+    topk_ratio = float(topk_ratio)
+    if pool_kernel < 1 or pool_kernel % 2 == 0:
+        raise ValueError("pool_kernel 必须是正奇数。")
+    if not 0 < topk_ratio <= 1:
+        raise ValueError("topk_ratio 必须位于 (0, 1]。")
+    if not torch.is_tensor(ignore_mask):
+        ignore_mask = torch.as_tensor(ignore_mask, device=anomaly_map.device)
+    else:
+        ignore_mask = ignore_mask.to(anomaly_map.device)
+    ignore_mask = ignore_mask.bool()
+    while ignore_mask.ndim < anomaly_map.ndim:
+        ignore_mask = ignore_mask.unsqueeze(1)
+    ignore_mask = ignore_mask.expand_as(anomaly_map)
+    valid = ~ignore_mask
+    valid_float = valid.to(anomaly_map.dtype)
+    padding = pool_kernel // 2
+    pooled_sum = F.avg_pool2d(
+        anomaly_map * valid_float,
+        kernel_size=pool_kernel,
+        stride=1,
+        padding=padding,
+        divisor_override=1,
+    )
+    pooled_count = F.avg_pool2d(
+        valid_float,
+        kernel_size=pool_kernel,
+        stride=1,
+        padding=padding,
+        divisor_override=1,
+    )
+    smoothed = pooled_sum / pooled_count.clamp_min(1)
+    scores = []
+    for index in range(anomaly_map.shape[0]):
+        values = smoothed[index][valid[index] & (pooled_count[index] > 0)]
+        if values.numel() == 0:
+            raise ValueError("mask 后没有可用于计算整图分数的有效像素。")
+        count = max(1, int(math.ceil(values.numel() * topk_ratio)))
+        scores.append(torch.topk(values, count, largest=True, sorted=False).values.mean())
+    return torch.stack(scores)
+
+
 def overlay_diagnostics(image_rgb: np.ndarray, result: dict, params: dict) -> np.ndarray:
     canvas = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
     for index, candidate in enumerate(result["detection"].get("candidates", [])):
