@@ -279,8 +279,50 @@ def masked_map_quantiles(model, loader, device: str) -> dict:
     }
 
 
-MULTISCALE_SCORE_METHOD = "masked_multiscale_normalized_topk_max"
+TOP_SCORE_METHOD = "masked_pixel_max"
 SINGLE_SCALE_SCORE_METHOD = "masked_local_average_topk_mean"
+MULTISCALE_SCORE_METHOD = "masked_multiscale_normalized_topk_max"
+SCORE_MODE_TOP = "top"
+SCORE_MODE_POOL_TOPK = "pool_topk"
+SCORE_MODE_MULTISCALE = "multiscale_pool"
+SCORE_MODE_CHECKPOINT = "checkpoint"
+
+
+def normalize_score_mode(value: str, *, allow_checkpoint: bool = False) -> str:
+    """规范化命令行 score 模式，同时接受用户常用写法。"""
+    aliases = {
+        "top": SCORE_MODE_TOP,
+        "max": SCORE_MODE_TOP,
+        "pool+top": SCORE_MODE_POOL_TOPK,
+        "pool_topk": SCORE_MODE_POOL_TOPK,
+        "pool-topk": SCORE_MODE_POOL_TOPK,
+        "multiscale_pool": SCORE_MODE_MULTISCALE,
+        "multiscale-pool": SCORE_MODE_MULTISCALE,
+        "multi_pool": SCORE_MODE_MULTISCALE,
+        "multi-pool": SCORE_MODE_MULTISCALE,
+    }
+    if allow_checkpoint:
+        aliases["checkpoint"] = SCORE_MODE_CHECKPOINT
+        aliases["saved"] = SCORE_MODE_CHECKPOINT
+    normalized = aliases.get(str(value).strip().lower())
+    if normalized is None:
+        options = "top、pool+top、multiscale_pool"
+        if allow_checkpoint:
+            options += "、checkpoint"
+        raise ValueError(f"score-mode 必须是 {options} 之一。")
+    return normalized
+
+
+def calibration_score_mode(calibration: dict) -> str:
+    """识别 checkpoint 的 score 方式；无 score_method 的旧模型属于 top 版本。"""
+    method = (calibration.get("score_method") or {}).get("name")
+    if method == MULTISCALE_SCORE_METHOD:
+        return SCORE_MODE_MULTISCALE
+    if method == SINGLE_SCALE_SCORE_METHOD:
+        return SCORE_MODE_POOL_TOPK
+    if method in (None, TOP_SCORE_METHOD):
+        return SCORE_MODE_TOP
+    raise ValueError(f"checkpoint 包含未知的 score_method：{method}")
 
 
 def score_pool_kernels(config: dict) -> tuple[int, ...]:
@@ -308,15 +350,13 @@ def raw_prediction_scores(
     if anomaly_map is not None and ignore_mask is not None:
         mask = _mask_tensor(ignore_mask, config["device"])
         score_max = float(mask_score(anomaly_map, mask).flatten()[0])
+        kernels = score_pool_kernels(config) if pool_kernels is None else tuple(pool_kernels)
         scale_scores = multiscale_topk_scores(
             anomaly_map,
             mask,
-            pool_kernels=pool_kernels or score_pool_kernels(config),
-            topk_ratio=(
-                config.get("score_topk_ratio", 0.001)
-                if topk_ratio is None else topk_ratio
-            ),
-        )
+            pool_kernels=kernels,
+            topk_ratio=(config.get("score_topk_ratio", 0.001) if topk_ratio is None else topk_ratio),
+        ) if kernels else {}
         return {
             "score_max": score_max,
             **{
@@ -328,8 +368,21 @@ def raw_prediction_scores(
     return {"score_max": score}
 
 
-def build_score_method(normal_rows: list[dict], config: dict) -> dict:
-    """用正常验证集的中位数和 Q99 独立校准每个池化尺度。"""
+def build_score_method(
+    normal_rows: list[dict], config: dict, score_mode: str = SCORE_MODE_MULTISCALE
+) -> dict:
+    """建立所选 score 定义；多尺度方式额外校准每个尺度。"""
+    score_mode = normalize_score_mode(score_mode)
+    if score_mode == SCORE_MODE_TOP:
+        return {"name": TOP_SCORE_METHOD, "mode": SCORE_MODE_TOP}
+    if score_mode == SCORE_MODE_POOL_TOPK:
+        return {
+            "name": SINGLE_SCALE_SCORE_METHOD,
+            "mode": SCORE_MODE_POOL_TOPK,
+            "pool_kernel": int(config.get("score_pool_kernel", 21)),
+            "topk_ratio": float(config.get("score_topk_ratio", 0.001)),
+        }
+
     normalization = {}
     for kernel in score_pool_kernels(config):
         field = f"score_kernel_{kernel}"
@@ -352,6 +405,7 @@ def build_score_method(normal_rows: list[dict], config: dict) -> dict:
         }
     return {
         "name": MULTISCALE_SCORE_METHOD,
+        "mode": SCORE_MODE_MULTISCALE,
         "pool_kernels": list(score_pool_kernels(config)),
         "topk_ratio": config.get("score_topk_ratio", 0.001),
         "normalization": normalization,
@@ -379,9 +433,10 @@ def fuse_prediction_scores(raw_scores: dict[str, float], score_method: dict) -> 
 
 
 def prediction_scores(prediction, batch, config: dict, calibration: dict | None = None) -> dict[str, float]:
-    """计算正式整图分数；已校准的新模型使用多尺度归一化融合。"""
+    """按照 calibration 保存的定义计算整图分数。"""
     score_method = (calibration or {}).get("score_method", {})
-    if score_method.get("name") == MULTISCALE_SCORE_METHOD:
+    method_name = score_method.get("name")
+    if method_name == MULTISCALE_SCORE_METHOD:
         return fuse_prediction_scores(
             raw_prediction_scores(
                 prediction,
@@ -393,17 +448,21 @@ def prediction_scores(prediction, batch, config: dict, calibration: dict | None 
             score_method,
         )
 
-    # 兼容旧 checkpoint：其 threshold 对应单尺度分数，预测时不能改变定义。
     anomaly_map = getattr(prediction, "anomaly_map", None)
     ignore_mask = getattr(batch, "ignore_mask", None)
     if anomaly_map is not None and ignore_mask is not None:
         mask = _mask_tensor(ignore_mask, config["device"])
+        score_max = float(mask_score(anomaly_map, mask).flatten()[0])
+        # f647384 及更早 checkpoint 没有 score_method，其 threshold 对应单像素最大值。
+        if method_name in (None, TOP_SCORE_METHOD):
+            return {"score": score_max, "score_topk": score_max, "score_max": score_max}
+        if method_name != SINGLE_SCALE_SCORE_METHOD:
+            raise ValueError(f"calibration 包含未知的 score_method：{method_name}")
         kernel = int(score_method.get("pool_kernel", config.get("score_pool_kernel", 21)))
         score = float(pooled_topk_score(
             anomaly_map, mask, pool_kernel=kernel,
             topk_ratio=score_method.get("topk_ratio", config.get("score_topk_ratio", 0.001)),
         ).flatten()[0])
-        score_max = float(mask_score(anomaly_map, mask).flatten()[0])
         return {"score": score, "score_topk": score, "score_max": score_max}
     score = float(prediction.pred_score.flatten()[0])
     return {"score": score, "score_topk": score, "score_max": score}
@@ -465,21 +524,40 @@ def threshold_for_target_recall(rows: list[dict], target_recall: float) -> tuple
     return threshold, stats
 
 
-def calibrate(model, manifest: dict, config: dict, output_dir: Path) -> dict:
-    """正常验证图校准异常图；独立带标签验证集选择整图阈值。"""
+def calibrate(
+    model,
+    manifest: dict,
+    config: dict,
+    output_dir: Path,
+    score_mode: str | None = None,
+) -> dict:
+    """校准异常图，并为指定 score 方式用独立带标签验证集选择阈值。"""
+    score_mode = normalize_score_mode(score_mode or config.get("score_mode", SCORE_MODE_MULTISCALE))
     model.eval()  # 关闭自编码器 dropout 后再估计分位数。
     loader = make_loader(manifest["val"], config)
     with torch.inference_mode():
         quantiles = masked_map_quantiles(model, loader, config["device"])
         check_statistics(quantiles, quantiles=True)
         model.model.quantiles.update(quantiles)
+        if score_mode == SCORE_MODE_TOP:
+            calibration_kernels: list[int] = []
+        elif score_mode == SCORE_MODE_POOL_TOPK:
+            calibration_kernels = [int(config.get("score_pool_kernel", 21))]
+        else:
+            calibration_kernels = list(score_pool_kernels(config))
         normal_score_rows = []
         normal_loader = make_loader(manifest["val"], config)
         for record, batch in zip(manifest["val"], normal_loader, strict=True):
             prediction = model.model(batch.image.to(config["device"]))
-            raw_scores = raw_prediction_scores(prediction, batch, config)
+            raw_scores = raw_prediction_scores(
+                prediction,
+                batch,
+                config,
+                pool_kernels=calibration_kernels,
+                topk_ratio=config.get("score_topk_ratio", 0.001),
+            )
             normal_score_rows.append({"path": record["path"], "label": 0, **raw_scores})
-        score_method = build_score_method(normal_score_rows, config)
+        score_method = build_score_method(normal_score_rows, config, score_mode)
         threshold_records = manifest.get("threshold_val", [])
         if not threshold_records:
             raise ValueError("没有阈值验证集；请从 test 分层划出 threshold_val 后再校准。")
@@ -487,7 +565,9 @@ def calibrate(model, manifest: dict, config: dict, output_dir: Path) -> dict:
         rows = []
         for record, batch in zip(threshold_records, threshold_loader, strict=True):
             prediction = model.model(batch.image.to(config["device"]))
-            score_values = fuse_prediction_scores(raw_prediction_scores(prediction, batch, config), score_method)
+            score_values = prediction_scores(
+                prediction, batch, config, {"score_method": score_method}
+            )
             if not all(math.isfinite(value) for value in score_values.values()):
                 raise ValueError(f"校准分数不是有限数值：{record['path']}")
             rows.append({
@@ -505,6 +585,7 @@ def calibrate(model, manifest: dict, config: dict, output_dir: Path) -> dict:
     normal_map_maxima = [row["score_max"] for row in normal_score_rows]
     calibration = {
         "method": "labeled_validation_highest_threshold_for_target_recall",
+        "score_mode": score_mode,
         "threshold": threshold,
         "decision_rule": "score > threshold",
         "score_method": score_method,
@@ -514,7 +595,7 @@ def calibrate(model, manifest: dict, config: dict, output_dir: Path) -> dict:
         "display_max": max(float(np.quantile(normal_map_maxima, 0.99)), 0.1),
         "map_quantiles": {key: float(value) for key, value in quantiles.items()},
         "notes": (
-            "最终分数是各尺度基于正常验证集归一化后的最大值，不是概率；"
+            f"本次使用 {score_mode} 整图分数，分数不是概率；"
             "threshold_val 从原 test 分层划出，最终 test 未参与尺度校准或阈值选择。"
         ),
     }
@@ -705,6 +786,7 @@ def train_one(args, category: str) -> None:
             raise ValueError("续训请使用 checkpoints/last.pt；model.pt 是推理用文件。")
         config, manifest = previous["config"].copy(), previous["manifest"]
         config.update(device=choose_device(args.device), num_workers=args.num_workers)
+        config.setdefault("score_mode", SCORE_MODE_MULTISCALE)
         config.setdefault("score_pool_kernels", [1, 7, 21])
         config.setdefault("score_topk_ratio", 0.001)
         config.setdefault("target_recall", 0.99)
@@ -739,6 +821,7 @@ def train_one(args, category: str) -> None:
             "seed": args.seed, "threshold_quantile": args.threshold_quantile,
             "threshold_val_ratio": args.threshold_val_ratio,
             "target_recall": args.target_recall,
+            "score_mode": SCORE_MODE_MULTISCALE,
             "score_pool_kernels": (
                 [args.score_pool_kernel]
                 if args.score_pool_kernel is not None
@@ -832,6 +915,7 @@ def restore_for_inference(args):
         raise ValueError("此 checkpoint 尚未校准，请使用训练结束生成的 model.pt。")
     config = saved["config"].copy()
     config.update(device=choose_device(args.device), num_workers=args.num_workers)
+    config.setdefault("score_mode", calibration_score_mode(saved["calibration"]))
     config.setdefault("score_pool_kernels", [1, 7, 21])
     config.setdefault("score_topk_ratio", 0.001)
     config.setdefault("target_recall", 0.99)
@@ -885,6 +969,14 @@ def parse_pool_kernels(value: str) -> tuple[int, ...]:
     if not kernels or any(kernel < 1 or kernel % 2 == 0 for kernel in kernels):
         raise argparse.ArgumentTypeError("池化核必须全部是正奇数，例如 1,7,21。")
     return kernels
+
+
+def parse_evaluation_score_mode(value: str) -> str:
+    """解析评估 score 模式并将别名转换为稳定的内部名称。"""
+    try:
+        return normalize_score_mode(value, allow_checkpoint=True)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -942,7 +1034,32 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--teacher-weights", type=Path, help="已有 pretrained_teacher_small.pth 或 medium 权重")
             command.add_argument("--resume", type=Path, help="从 checkpoints/last.pt 续训，沿用该次超参数与数据快照")
         elif name == "evaluate":
-            command.add_argument("--manifest", type=Path, help="可选：inspect 生成的新快照；不会重新选择阈值")
+            command.add_argument(
+                "--manifest", type=Path,
+                help=(
+                    "可选评估快照；checkpoint 模式沿用原阈值，"
+                    "显式 score 模式用快照中的 threshold_val 重新校准"
+                ),
+            )
+            command.add_argument(
+                "--score-mode", type=parse_evaluation_score_mode, default=SCORE_MODE_CHECKPOINT,
+                help=(
+                    "整图分数：top=mask 后最大单像素；pool+top=单尺度池化后 Top-K；"
+                    "multiscale_pool=多尺度归一化融合；checkpoint=沿用模型（默认）"
+                ),
+            )
+            command.add_argument(
+                "--score-pool-kernel", type=int,
+                help="pool+top 的池化核，正奇数，默认沿用 checkpoint 或 21",
+            )
+            command.add_argument(
+                "--score-pool-kernels", type=parse_pool_kernels,
+                help="multiscale_pool 的池化核，逗号分隔，默认沿用 checkpoint 或 1,7,21",
+            )
+            command.add_argument(
+                "--score-topk-ratio", type=float,
+                help="pool+top 和 multiscale_pool 的 Top-K 比例，默认沿用 checkpoint 或 0.001",
+            )
         elif name == "predict":
             command.add_argument("--image", type=Path, required=True)
     return parser
@@ -961,7 +1078,8 @@ def main() -> None:
     if (hasattr(args, "score_pool_kernel") and args.score_pool_kernel is not None
             and (args.score_pool_kernel < 1 or args.score_pool_kernel % 2 == 0)):
         raise ValueError("score-pool-kernel 必须是正奇数。")
-    if hasattr(args, "score_topk_ratio") and not 0 < args.score_topk_ratio <= 1:
+    if (hasattr(args, "score_topk_ratio") and args.score_topk_ratio is not None
+            and not 0 < args.score_topk_ratio <= 1):
         raise ValueError("score-topk-ratio 必须位于 (0, 1] 内。")
     if args.command == "inspect":
         root = resolve_data_root(args.data_root)
@@ -1004,8 +1122,46 @@ def main() -> None:
         if manifest["category"] != saved["manifest"]["category"]:
             raise ValueError("评估快照的 CCD 类别与 checkpoint 不一致。")
         saved_config = saved.get("config", {})
-        threshold_val_missing = not manifest.get("threshold_val")
-        if threshold_val_missing:
+        requested_score_mode = args.score_mode
+        explicit_score_mode = requested_score_mode != SCORE_MODE_CHECKPOINT
+        score_overrides = (
+            args.score_pool_kernel, args.score_pool_kernels, args.score_topk_ratio
+        )
+        if not explicit_score_mode and any(value is not None for value in score_overrides):
+            raise ValueError(
+                "score 池化参数不能与 --score-mode checkpoint 合用；"
+                "请显式指定 top、pool+top 或 multiscale_pool。"
+            )
+        if requested_score_mode == SCORE_MODE_TOP and any(
+            value is not None for value in score_overrides
+        ):
+            raise ValueError("top 模式不使用池化核或 Top-K 比例，请移除 score 池化参数。")
+        if (requested_score_mode == SCORE_MODE_POOL_TOPK
+                and args.score_pool_kernels is not None):
+            raise ValueError(
+                "pool+top 是单尺度模式，请使用 --score-pool-kernel，"
+                "不要使用 --score-pool-kernels。"
+            )
+        if (requested_score_mode == SCORE_MODE_MULTISCALE
+                and args.score_pool_kernel is not None):
+            raise ValueError(
+                "multiscale_pool 是多尺度模式，请使用 --score-pool-kernels，"
+                "不要使用 --score-pool-kernel。"
+            )
+        config.setdefault("score_pool_kernel", 21)
+        config.setdefault("score_pool_kernels", [1, 7, 21])
+        config.setdefault("score_topk_ratio", 0.001)
+        if explicit_score_mode:
+            if args.score_pool_kernel is not None:
+                config["score_pool_kernel"] = args.score_pool_kernel
+            if args.score_pool_kernels is not None:
+                config["score_pool_kernels"] = list(args.score_pool_kernels)
+            if args.score_topk_ratio is not None:
+                config["score_topk_ratio"] = args.score_topk_ratio
+
+        # checkpoint 模式必须完整复现保存时的 score 和 threshold。只有显式选择
+        # score 模式时，才允许从 test 划分 threshold_val 并重新选择对应阈值。
+        if explicit_score_mode and not manifest.get("threshold_val"):
             ratio = float(saved_config.get("threshold_val_ratio", 0.2))
             threshold_val, test = split_threshold_validation(
                 manifest.get("test", []), ratio, int(saved_config.get("seed", 42))
@@ -1022,21 +1178,31 @@ def main() -> None:
         ]
         if saved_config.get("circle_config") and any("circle" not in record for record in scored_records):
             prepare_circle_records(manifest, saved_config)
+        if explicit_score_mode:
+            threshold_labels = {int(record.get("label", 0)) for record in manifest.get("threshold_val", [])}
+            if threshold_labels != {0, 1}:
+                raise ValueError(
+                    "显式选择 score-mode 时，threshold_val 必须同时包含 good(label=0) "
+                    "和异常(label=1) 图片；请增大 threshold-val-ratio 或提供完整 manifest。"
+                )
         output = new_output(args.output_dir / "evaluation", manifest["category"])
         write_json(output / "manifest.json", manifest)
-        calibration = saved["calibration"]
-        score_method = calibration.get("score_method", {}).get("name")
-        current_score_method = MULTISCALE_SCORE_METHOD
-        threshold_labels = {record.get("label") for record in manifest.get("threshold_val", [])}
-        can_recalibrate = threshold_labels == {0, 1}
-        if can_recalibrate and (score_method != current_score_method or threshold_val_missing):
-            print("检测到旧版或不匹配的 score/threshold：正在使用 threshold_val 重新校准。")
-            calibration = calibrate(model, manifest, config, output)
+        if explicit_score_mode:
+            config["score_mode"] = requested_score_mode
+            print(f"正在按 {requested_score_mode} 重新计算 score 并选择匹配的 threshold。")
+            calibration = calibrate(model, manifest, config, output, requested_score_mode)
             save_checkpoint(
                 output / "model.pt", model, config, manifest,
                 int(saved.get("step", 0)), calibration=calibration,
             )
-            print(f"已保存采用多尺度 score 的模型：{output / 'model.pt'}")
+            print(f"已保存采用 {requested_score_mode} score 的模型：{output / 'model.pt'}")
+        else:
+            calibration = saved["calibration"]
+            config["score_mode"] = calibration_score_mode(calibration)
+            print(f"沿用 checkpoint 中的 {config['score_mode']} score 和 threshold。")
+        write_json(output / "config.json", config)
+        if not explicit_score_mode:
+            write_json(output / "calibration.json", calibration)
         evaluate_records(model, manifest["test"], config, calibration, output, args.heatmaps)
         print(f"评估结果：{output}")
     else:

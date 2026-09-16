@@ -148,10 +148,19 @@ outputs/CCD1/<运行时间>/
 以下命令中的 `<运行时间>` 必须替换为实际目录名。
 
 ```powershell
-# 使用原始快照重新评估，不需要下载教师或 ImageNette；旧单尺度模型会自动重新校准并另存新 model.pt。
+# 完整复现 checkpoint 保存时的 score 方式和 threshold（默认）。
 uv run python efficientad_ccd.py evaluate --checkpoint "outputs\CCD1\<运行时间>\model.pt" --heatmaps -1
 
-# 下载完成后先 inspect，生成新快照，再使用固定阈值评估其中的测试图片。
+# 单像素最大值（Git 中“单像素最大作为 score”的方式）。
+uv run python efficientad_ccd.py evaluate --checkpoint "outputs\CCD1\<运行时间>\model.pt" --score-mode top --heatmaps -1
+
+# 单尺度局部平均池化 + Top-K 均值。
+uv run python efficientad_ccd.py evaluate --checkpoint "outputs\CCD1\<运行时间>\model.pt" --score-mode "pool+top" --score-pool-kernel 21 --score-topk-ratio 0.001 --heatmaps -1
+
+# 多尺度池化；各尺度用正常验证集归一化后取最大值。
+uv run python efficientad_ccd.py evaluate --checkpoint "outputs\CCD1\<运行时间>\model.pt" --score-mode multiscale_pool --score-pool-kernels 1,7,21 --score-topk-ratio 0.001 --heatmaps -1
+
+# 下载完成后先 inspect，生成新快照，再评估其中的测试图片。
 uv run python efficientad_ccd.py evaluate --checkpoint "outputs\CCD1\<运行时间>\model.pt" --manifest "outputs\inspection\CCD1\<检查时间>\manifest.json"
 
 # 单张新图推理，输出 prediction.json 和 prediction.png。
@@ -160,6 +169,8 @@ uv run python efficientad_ccd.py predict --checkpoint "outputs\CCD1\<运行时�
 # 中断后续训：沿用 checkpoint 内的数据快照、分辨率和总训练步数。
 uv run python efficientad_ccd.py train --resume "outputs\CCD1\<运行时间>\checkpoints\last.pt"
 ```
+
+`checkpoint` 是 `--score-mode` 的默认值，严格沿用模型里保存的分数公式和阈值。显式选择 `top`、`pool+top` 或 `multiscale_pool` 时，程序使用同一份 `threshold_val` 为所选公式重新选择匹配阈值，并在本次 `evaluation` 目录保存 `calibration.json`、`config.json` 和新的 `model.pt`；原 checkpoint 不会被覆盖。若快照没有 `threshold_val`，程序会从 `test` 各子目录分层划出一部分，因此用于最终报告的测试图片会相应减少。
 
 续训结果放入新的运行目录，不覆盖原结果。续训恢复模型、优化器和调度器，但会重新开始随机数据顺序，因此不保证与不中断训练逐位相同。若要改变总步数、分辨率、阈值分位数、加入新下载的训练图片或改用另一份辅助数据，请启动一次新的训练；`--resume` 会沿用原配置，只允许改变运行设备、数据读取进程数、保存频率和热图数量。
 

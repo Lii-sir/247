@@ -68,6 +68,94 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(len(manifests), 1)
         self.assertEqual(json.loads(manifests[0].read_text(encoding="utf-8"))["test"], records)
 
+    def test_explicit_score_mode_recalibrates_and_saves_matching_model(self) -> None:
+        manifest = {
+            "category": "CCD1",
+            "val": [{"path": "val-good.png", "label": 0}],
+            "threshold_val": [
+                {"path": "threshold-good.png", "label": 0},
+                {"path": "threshold-defect.png", "label": 1},
+            ],
+            "test": [{"path": "test-defect.png", "label": 1}],
+        }
+        manifest_path = self.root / "explicit-manifest.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        arguments = [
+            "efficientad_ccd.py", "evaluate", "--checkpoint", "unused.pt",
+            "--manifest", str(manifest_path), "--output-dir", str(self.root / "explicit-results"),
+            "--score-mode", "pool+top", "--score-pool-kernel", "15",
+            "--score-topk-ratio", "0.01",
+        ]
+        recalibrated = {
+            "threshold": 0.25,
+            "display_max": 1.0,
+            "score_method": {"name": cli.SINGLE_SCALE_SCORE_METHOD},
+        }
+        with patch("sys.argv", arguments), patch.object(cli, "load_runtime"), \
+                patch.object(cli, "restore_for_inference", return_value=(object(), {}, self.saved)), \
+                patch.object(cli, "calibrate", return_value=recalibrated) as calibrate, \
+                patch.object(cli, "save_checkpoint") as save_checkpoint, \
+                patch.object(cli, "evaluate_records", return_value={}) as evaluate:
+            cli.main()
+
+        calibration_args = calibrate.call_args.args
+        self.assertEqual(calibration_args[4], cli.SCORE_MODE_POOL_TOPK)
+        self.assertEqual(calibration_args[2]["score_pool_kernel"], 15)
+        self.assertEqual(calibration_args[2]["score_topk_ratio"], 0.01)
+        self.assertIs(evaluate.call_args.args[3], recalibrated)
+        save_checkpoint.assert_called_once()
+
+    def test_checkpoint_mode_does_not_recalibrate(self) -> None:
+        records = [{"path": "new-test.png", "label": 1}]
+        path = self.root / "checkpoint-manifest.json"
+        path.write_text(json.dumps({"category": "CCD1", "test": records}), encoding="utf-8")
+        arguments = [
+            "efficientad_ccd.py", "evaluate", "--checkpoint", "unused.pt",
+            "--manifest", str(path), "--output-dir", str(self.root / "checkpoint-results"),
+        ]
+        with patch("sys.argv", arguments), patch.object(cli, "load_runtime"), \
+                patch.object(cli, "restore_for_inference", return_value=(object(), {}, self.saved)), \
+                patch.object(cli, "calibrate") as calibrate, \
+                patch.object(cli, "evaluate_records", return_value={}) as evaluate:
+            cli.main()
+
+        calibrate.assert_not_called()
+        self.assertEqual(evaluate.call_args.args[1], records)
+        self.assertIs(evaluate.call_args.args[3], self.calibration)
+
+    def test_checkpoint_mode_rejects_pooling_overrides(self) -> None:
+        arguments = [
+            "efficientad_ccd.py", "evaluate", "--checkpoint", "unused.pt",
+            "--score-pool-kernel", "15",
+        ]
+        with patch("sys.argv", arguments), patch.object(cli, "load_runtime"), \
+                patch.object(cli, "restore_for_inference", return_value=(object(), {}, self.saved)), \
+                self.assertRaisesRegex(ValueError, "不能与.*checkpoint"):
+            cli.main()
+
+    def test_explicit_score_modes_reject_irrelevant_pooling_options(self) -> None:
+        cases = [
+            (["--score-mode", "top", "--score-topk-ratio", "0.01"], "top 模式不使用"),
+            (
+                ["--score-mode", "pool+top", "--score-pool-kernels", "1,3"],
+                r"pool\+top 是单尺度",
+            ),
+            (
+                ["--score-mode", "multiscale_pool", "--score-pool-kernel", "3"],
+                "multiscale_pool 是多尺度",
+            ),
+        ]
+        for extra_arguments, message in cases:
+            arguments = [
+                "efficientad_ccd.py", "evaluate", "--checkpoint", "unused.pt",
+                *extra_arguments,
+            ]
+            with self.subTest(arguments=extra_arguments), patch("sys.argv", arguments), \
+                    patch.object(cli, "load_runtime"), \
+                    patch.object(cli, "restore_for_inference", return_value=(object(), {}, self.saved)), \
+                    self.assertRaisesRegex(ValueError, message):
+                cli.main()
+
     def test_inference_rejects_checkpoint_without_calibration(self) -> None:
         args = SimpleNamespace(checkpoint=self.root / "last.pt")
         with patch.object(cli, "read_checkpoint", return_value={"calibration": None}), \

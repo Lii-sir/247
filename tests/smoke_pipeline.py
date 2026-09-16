@@ -77,6 +77,56 @@ def main() -> None:
         evaluated = json.loads(evaluated_path.read_text(encoding="utf-8"))
         assert abs(evaluated["threshold"] - metrics["threshold"]) < 1e-8
         assert evaluated["confusion_matrix"] == metrics["confusion_matrix"]
+
+        # 同一模型显式切换三种整图 score；每种方式都应重新校准、完成评估，
+        # 并将与 threshold 匹配的 score 定义保存到新的 model.pt。
+        score_cases = [
+            ("top", [], "masked_pixel_max"),
+            (
+                "pool+top",
+                ["--score-pool-kernel", "3", "--score-topk-ratio", "0.01"],
+                "masked_local_average_topk_mean",
+            ),
+            (
+                "multiscale_pool",
+                ["--score-pool-kernels", "1,3", "--score-topk-ratio", "0.01"],
+                "masked_multiscale_normalized_topk_max",
+            ),
+        ]
+        known_evaluations = set(output.glob("evaluation/CCD1/*"))
+        for score_mode, extra_arguments, expected_method in score_cases:
+            run(
+                "evaluate", "--checkpoint", str(model_path), "--output-dir", str(output),
+                "--score-mode", score_mode, "--heatmaps", "0", *extra_arguments,
+            )
+            new_evaluations = set(output.glob("evaluation/CCD1/*")) - known_evaluations
+            assert len(new_evaluations) == 1, (score_mode, new_evaluations)
+            score_output = new_evaluations.pop()
+            known_evaluations.add(score_output)
+            for name in ("model.pt", "manifest.json", "config.json", "calibration.json", "metrics.json"):
+                assert (score_output / name).is_file(), (score_mode, name)
+            score_checkpoint = torch.load(
+                score_output / "model.pt", map_location="cpu", weights_only=True
+            )
+            assert score_checkpoint["calibration"]["score_method"]["name"] == expected_method
+            assert score_checkpoint["calibration"]["threshold"] == json.loads(
+                (score_output / "metrics.json").read_text(encoding="utf-8")
+            )["threshold"]
+            switched_prediction_output = root / f"prediction_{score_mode.replace('+', '_')}"
+            run(
+                "predict", "--checkpoint", str(score_output / "model.pt"),
+                "--image", str(data / "CCD1/test/good/0.png"),
+                "--output-dir", str(switched_prediction_output),
+            )
+            switched_predictions = list(
+                switched_prediction_output.glob("CCD1/*/prediction.json")
+            )
+            assert len(switched_predictions) == 1, (score_mode, switched_predictions)
+            switched_result = json.loads(
+                switched_predictions[0].read_text(encoding="utf-8")
+            )
+            assert switched_result["threshold"] == score_checkpoint["calibration"]["threshold"]
+
         run("predict", "--checkpoint", str(model_path), "--image", str(data / "CCD1/test/good/0.png"),
             "--output-dir", str(root / "predictions"))
         assert len(list((root / "predictions").glob("CCD1/*/prediction.png"))) == 1
