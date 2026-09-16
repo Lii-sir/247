@@ -151,9 +151,18 @@ def write_report(
     (output_dir / "metrics.json").write_text(payload + "\n", encoding="utf-8")
     # UTF-8 BOM 便于 Windows Excel 直接识别中文路径。
     with (output_dir / "predictions.csv").open("w", encoding="utf-8-sig", newline="") as stream:
+        scale_fields = sorted({
+            key
+            for row in rows
+            for key in row
+            if key.startswith("score_kernel_") or key.startswith("score_normalized_kernel_")
+        })
         writer = csv.DictWriter(
             stream,
-            fieldnames=["path", "label", "score", "score_topk", "score_max", "pred_label", "defect_type", "correct"],
+            fieldnames=[
+                "path", "label", "score", "score_topk", "score_max",
+                *scale_fields, "pred_label", "defect_type", "correct",
+            ],
         )
         writer.writeheader()
         for row in rows:
@@ -164,6 +173,7 @@ def write_report(
                 "score": row["score"],
                 "score_topk": row["score_topk"],
                 "score_max": row["score_max"],
+                **{field: row.get(field, "") for field in scale_fields},
                 "pred_label": prediction,
                 "defect_type": row["defect_type"],
                 "correct": int(prediction == row["label"]),

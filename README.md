@@ -135,11 +135,11 @@ outputs/CCD1/<运行时间>/
 
 验证结束后终端会显示平均检测毫秒数和 FPS。`model_and_score` 包含模型前向与 mask 后整图 score，不含图片读取、缩放和热力图保存；`evaluation_total` 还包含测试 DataLoader 读取，但仍不包含报告和热力图保存。同一统计也保存在 `inference_speed.json`，并写入 `metrics.json` 的 `inference_speed` 字段。
 
-整图 `score` 使用有效区域的 21×21 局部平均池化，再取最高 0.1% 位置的均值；`score_max` 仍保存在 `predictions.csv` 中用于对照。原始 `test` 会按 `good/缺陷类别` 分层划出 20% 的 `threshold_val`，使用其中的正常和异常标签选择达到 `target_recall`（默认 99%）的最高阈值，剩余图片才作为最终测试集。可以通过 `--threshold-val-ratio`、`--target-recall`、`--score-pool-kernel` 和 `--score-topk-ratio` 调整。
+整图 `score` 默认使用 `1,7,21` 三个尺度：各尺度先在有效区域进行局部平均池化并取最高 0.1% 位置的均值，再使用正常验证集各自的中位数与 Q99 归一化，最终取三个归一化分数的最大值。`predictions.csv` 同时保存各尺度的原始分数、归一化分数和 `score_max`，便于追踪触发异常的尺度。原始 `test` 会按 `good/缺陷类别` 分层划出 20% 的 `threshold_val`，阈值按每种异常子目录分别约束，选择令所有异常类型达到 `target_recall`（默认 99%）的最高值，剩余图片才作为最终测试集。可以通过 `--threshold-val-ratio`、`--target-recall`、`--score-pool-kernels 1,7,21` 和 `--score-topk-ratio` 调整。
 
 重点看 `roc_auc`、`average_precision`、异常召回率 `recall`、正常误报率 `false_positive_rate` 和漏检率 `false_negative_rate`。当前正常测试图只有 10 张，误报 1 张就会改变误报率 10 个百分点；异常图明显更多，单看 accuracy 容易误判。
 
-阈值采用**留出的正常验证图像分数的 99% 分位数**，插值方式为 `higher`；`score > threshold` 判为 NG，否则 OK。分数不是概率，也不一定处于 `[0,1]`。验证图很少时该阈值通常就是正常验证分数的最大值，不能据此保证未来误报率为 1%。后续有独立带标签验证集时，可以再选择符合业务漏检/误报要求的阈值，不要反复使用测试集选阈值。
+尺度归一化只使用训练良品中留出的正常验证集；最终阈值则使用独立的带标签 `threshold_val`。程序先对每种异常子目录求出满足目标召回率的边界，再取其中最低的边界作为统一阈值；`score > threshold` 判为 NG，否则 OK。阈值验证集同时会统计正常误报率。分数不是概率，也不保证位于 `[0,1]`，最终测试集不参与尺度归一化或阈值选择。
 
 热图统一使用正常验证集确定的显示色阶，默认优先保存误判图，再保存接近阈值的图。结果按测试集原始子目录和整图预测结果保存：`heatmaps/<test子目录>/normal/` 或 `heatmaps/<test子目录>/anomaly/`。例如 `test/defect1` 的图片会进入 `heatmaps/defect1/normal/` 或 `heatmaps/defect1/anomaly/`；`test/good` 会进入 `heatmaps/good/normal/` 或 `heatmaps/good/anomaly/`。`--heatmaps 32` 是所有子目录合计最多 32 张，`--heatmaps 0` 不保存热图，`--heatmaps -1` 保存全部。子目录在保存对应图片时自动创建。热图不是像素标注或经像素指标验证的分割结果。
 
@@ -148,7 +148,7 @@ outputs/CCD1/<运行时间>/
 以下命令中的 `<运行时间>` 必须替换为实际目录名。
 
 ```powershell
-# 使用原始测试快照及原阈值重新评估，不需要下载教师或 ImageNette。
+# 使用原始快照重新评估，不需要下载教师或 ImageNette；旧单尺度模型会自动重新校准并另存新 model.pt。
 uv run python efficientad_ccd.py evaluate --checkpoint "outputs\CCD1\<运行时间>\model.pt" --heatmaps -1
 
 # 下载完成后先 inspect，生成新快照，再使用固定阈值评估其中的测试图片。

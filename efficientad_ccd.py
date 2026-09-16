@@ -18,6 +18,7 @@ from circle_mask import (
     load_configs,
     mask_from_circle_record,
     mask_score,
+    multiscale_topk_scores,
     pooled_topk_score,
     read_rgb,
 )
@@ -278,22 +279,132 @@ def masked_map_quantiles(model, loader, device: str) -> dict:
     }
 
 
-def prediction_scores(prediction, batch, config: dict) -> dict[str, float]:
-    """同时计算正式 Top-K 分数和用于对照的旧版最大值分数。"""
+MULTISCALE_SCORE_METHOD = "masked_multiscale_normalized_topk_max"
+SINGLE_SCALE_SCORE_METHOD = "masked_local_average_topk_mean"
+
+
+def score_pool_kernels(config: dict) -> tuple[int, ...]:
+    """读取并规范化多尺度池化核，同时兼容旧版单尺度配置。"""
+    configured = config.get("score_pool_kernels")
+    if configured is None:
+        configured = [config.get("score_pool_kernel", 21)]
+    kernels = tuple(dict.fromkeys(int(kernel) for kernel in configured))
+    if not kernels or any(kernel < 1 or kernel % 2 == 0 for kernel in kernels):
+        raise ValueError("score_pool_kernels 必须包含至少一个正奇数。")
+    return kernels
+
+
+def raw_prediction_scores(
+    prediction,
+    batch,
+    config: dict,
+    *,
+    pool_kernels: tuple[int, ...] | list[int] | None = None,
+    topk_ratio: float | None = None,
+) -> dict[str, float]:
+    """计算每个池化尺度的原始 Top-K 分数和原始最大值。"""
     anomaly_map = getattr(prediction, "anomaly_map", None)
     ignore_mask = getattr(batch, "ignore_mask", None)
     if anomaly_map is not None and ignore_mask is not None:
         mask = _mask_tensor(ignore_mask, config["device"])
         score_max = float(mask_score(anomaly_map, mask).flatten()[0])
-        score_topk = float(
-            pooled_topk_score(
-                anomaly_map,
-                mask,
-                pool_kernel=config.get("score_pool_kernel", 21),
-                topk_ratio=config.get("score_topk_ratio", 0.001),
-            ).flatten()[0]
+        scale_scores = multiscale_topk_scores(
+            anomaly_map,
+            mask,
+            pool_kernels=pool_kernels or score_pool_kernels(config),
+            topk_ratio=(
+                config.get("score_topk_ratio", 0.001)
+                if topk_ratio is None else topk_ratio
+            ),
         )
-        return {"score": score_topk, "score_topk": score_topk, "score_max": score_max}
+        return {
+            "score_max": score_max,
+            **{
+                f"score_kernel_{kernel}": float(value.flatten()[0])
+                for kernel, value in scale_scores.items()
+            },
+        }
+    score = float(prediction.pred_score.flatten()[0])
+    return {"score_max": score}
+
+
+def build_score_method(normal_rows: list[dict], config: dict) -> dict:
+    """用正常验证集的中位数和 Q99 独立校准每个池化尺度。"""
+    normalization = {}
+    for kernel in score_pool_kernels(config):
+        field = f"score_kernel_{kernel}"
+        values = np.asarray([row[field] for row in normal_rows], dtype=np.float64)
+        if not len(values) or not np.isfinite(values).all():
+            raise ValueError(f"尺度 {kernel} 的正常验证分数为空或包含 NaN/Inf。")
+        median = float(np.quantile(values, 0.5))
+        high = float(np.quantile(values, 0.99))
+        denominator = high - median
+        epsilon = max(1.0, abs(median), abs(high)) * 1e-12
+        if denominator <= epsilon:
+            raise ValueError(
+                f"尺度 {kernel} 的正常验证分数退化（median={median}, q99={high}）；"
+                "请增加有代表性的正常验证图片。"
+            )
+        normalization[str(kernel)] = {
+            "median": median,
+            "q99": high,
+            "denominator": denominator,
+        }
+    return {
+        "name": MULTISCALE_SCORE_METHOD,
+        "pool_kernels": list(score_pool_kernels(config)),
+        "topk_ratio": config.get("score_topk_ratio", 0.001),
+        "normalization": normalization,
+        "normalization_formula": "max(0, (raw_score - median) / (q99 - median))",
+        "fusion": "maximum_normalized_scale_score",
+    }
+
+
+def fuse_prediction_scores(raw_scores: dict[str, float], score_method: dict) -> dict[str, float]:
+    """按正常集尺度基准归一化并取最大值作为最终整图 score。"""
+    normalized = {}
+    for kernel in score_method["pool_kernels"]:
+        key = str(kernel)
+        reference = score_method["normalization"][key]
+        raw = raw_scores[f"score_kernel_{kernel}"]
+        value = max(0.0, (raw - reference["median"]) / reference["denominator"])
+        normalized[f"score_normalized_kernel_{kernel}"] = float(value)
+    final_score = max(normalized.values())
+    return {
+        "score": final_score,
+        "score_topk": final_score,
+        **raw_scores,
+        **normalized,
+    }
+
+
+def prediction_scores(prediction, batch, config: dict, calibration: dict | None = None) -> dict[str, float]:
+    """计算正式整图分数；已校准的新模型使用多尺度归一化融合。"""
+    score_method = (calibration or {}).get("score_method", {})
+    if score_method.get("name") == MULTISCALE_SCORE_METHOD:
+        return fuse_prediction_scores(
+            raw_prediction_scores(
+                prediction,
+                batch,
+                config,
+                pool_kernels=score_method["pool_kernels"],
+                topk_ratio=score_method["topk_ratio"],
+            ),
+            score_method,
+        )
+
+    # 兼容旧 checkpoint：其 threshold 对应单尺度分数，预测时不能改变定义。
+    anomaly_map = getattr(prediction, "anomaly_map", None)
+    ignore_mask = getattr(batch, "ignore_mask", None)
+    if anomaly_map is not None and ignore_mask is not None:
+        mask = _mask_tensor(ignore_mask, config["device"])
+        kernel = int(score_method.get("pool_kernel", config.get("score_pool_kernel", 21)))
+        score = float(pooled_topk_score(
+            anomaly_map, mask, pool_kernel=kernel,
+            topk_ratio=score_method.get("topk_ratio", config.get("score_topk_ratio", 0.001)),
+        ).flatten()[0])
+        score_max = float(mask_score(anomaly_map, mask).flatten()[0])
+        return {"score": score, "score_topk": score, "score_max": score_max}
     score = float(prediction.pred_score.flatten()[0])
     return {"score": score, "score_topk": score, "score_max": score}
 
@@ -304,18 +415,39 @@ def prediction_score(prediction, batch, device: str) -> float:
 
 
 def threshold_for_target_recall(rows: list[dict], target_recall: float) -> tuple[float, dict]:
-    """选择满足目标异常召回率的最高阈值，等于阈值仍判为正常。"""
+    """选择满足每种异常类型目标召回率的最高阈值，等于阈值仍判为正常。"""
     if not 0 < target_recall <= 1:
         raise ValueError("target_recall 必须位于 (0, 1]。")
     normal_scores = np.asarray([row["score"] for row in rows if row["label"] == 0], dtype=np.float64)
     anomaly_scores = np.asarray([row["score"] for row in rows if row["label"] == 1], dtype=np.float64)
     if not len(normal_scores) or not len(anomaly_scores):
         raise ValueError("阈值验证集必须同时包含正常图片和异常图片。")
-    required_tp = int(math.ceil(target_recall * len(anomaly_scores)))
-    boundary = float(np.sort(anomaly_scores)[::-1][required_tp - 1])
-    threshold = float(np.nextafter(boundary, -np.inf))
+    anomaly_groups: dict[str, list[float]] = {}
+    for row in rows:
+        if row["label"] == 1:
+            defect_type = row.get("defect_type", "anomaly") or "anomaly"
+            anomaly_groups.setdefault(defect_type, []).append(row["score"])
+    per_defect = {}
+    boundaries = []
+    for defect_type, values in sorted(anomaly_groups.items()):
+        scores = np.asarray(values, dtype=np.float64)
+        required_tp = int(math.ceil(target_recall * len(scores)))
+        boundary = float(np.sort(scores)[::-1][required_tp - 1])
+        boundaries.append(boundary)
+        per_defect[defect_type] = {
+            "count": int(len(scores)),
+            "required_true_positive": required_tp,
+            "boundary": boundary,
+        }
+    limiting_boundary = min(boundaries)
+    threshold = float(np.nextafter(limiting_boundary, -np.inf))
     predictions_normal = normal_scores > threshold
     predictions_anomaly = anomaly_scores > threshold
+    for defect_type, detail in per_defect.items():
+        scores = np.asarray(anomaly_groups[defect_type], dtype=np.float64)
+        detail["true_positive"] = int((scores > threshold).sum())
+        detail["false_negative"] = int((scores <= threshold).sum())
+        detail["achieved_recall"] = float((scores > threshold).mean())
     stats = {
         "target_recall": target_recall,
         "normal_count": int(len(normal_scores)),
@@ -326,6 +458,9 @@ def threshold_for_target_recall(rows: list[dict], target_recall: float) -> tuple
         "true_negative": int((~predictions_normal).sum()),
         "achieved_recall": float(predictions_anomaly.mean()),
         "false_positive_rate": float(predictions_normal.mean()),
+        "limiting_boundary": limiting_boundary,
+        "degenerate_zero_boundary": limiting_boundary <= 0,
+        "per_defect": per_defect,
     }
     return threshold, stats
 
@@ -338,6 +473,13 @@ def calibrate(model, manifest: dict, config: dict, output_dir: Path) -> dict:
         quantiles = masked_map_quantiles(model, loader, config["device"])
         check_statistics(quantiles, quantiles=True)
         model.model.quantiles.update(quantiles)
+        normal_score_rows = []
+        normal_loader = make_loader(manifest["val"], config)
+        for record, batch in zip(manifest["val"], normal_loader, strict=True):
+            prediction = model.model(batch.image.to(config["device"]))
+            raw_scores = raw_prediction_scores(prediction, batch, config)
+            normal_score_rows.append({"path": record["path"], "label": 0, **raw_scores})
+        score_method = build_score_method(normal_score_rows, config)
         threshold_records = manifest.get("threshold_val", [])
         if not threshold_records:
             raise ValueError("没有阈值验证集；请从 test 分层划出 threshold_val 后再校准。")
@@ -345,7 +487,7 @@ def calibrate(model, manifest: dict, config: dict, output_dir: Path) -> dict:
         rows = []
         for record, batch in zip(threshold_records, threshold_loader, strict=True):
             prediction = model.model(batch.image.to(config["device"]))
-            score_values = prediction_scores(prediction, batch, config)
+            score_values = fuse_prediction_scores(raw_prediction_scores(prediction, batch, config), score_method)
             if not all(math.isfinite(value) for value in score_values.values()):
                 raise ValueError(f"校准分数不是有限数值：{record['path']}")
             rows.append({
@@ -355,24 +497,32 @@ def calibrate(model, manifest: dict, config: dict, output_dir: Path) -> dict:
                 **score_values,
             })
     threshold, selection = threshold_for_target_recall(rows, config.get("target_recall", 0.99))
-    normal_scores = [row["score"] for row in rows if row["label"] == 0]
+    if selection["degenerate_zero_boundary"]:
+        print(
+            "警告：至少一种异常类型的目标召回边界为 0；当前 score 无法有效区分该异常，"
+            "为满足召回约束，阈值会低于 0 并可能导致极高误报率。"
+        )
+    normal_map_maxima = [row["score_max"] for row in normal_score_rows]
     calibration = {
         "method": "labeled_validation_highest_threshold_for_target_recall",
         "threshold": threshold,
         "decision_rule": "score > threshold",
-        "score_method": {
-            "name": "masked_local_average_topk_mean",
-            "pool_kernel": config.get("score_pool_kernel", 21),
-            "topk_ratio": config.get("score_topk_ratio", 0.001),
-        },
+        "score_method": score_method,
         "threshold_selection": selection,
         "normal_map_validation_count": len(manifest["val"]),
         "threshold_validation_count": len(rows),
-        "display_max": max(max(normal_scores), threshold, 0.1),
+        "display_max": max(float(np.quantile(normal_map_maxima, 0.99)), 0.1),
         "map_quantiles": {key: float(value) for key, value in quantiles.items()},
-        "notes": "分数不是概率；threshold_val 从原 test 分层划出，最终 test 未参与阈值选择。",
+        "notes": (
+            "最终分数是各尺度基于正常验证集归一化后的最大值，不是概率；"
+            "threshold_val 从原 test 分层划出，最终 test 未参与尺度校准或阈值选择。"
+        ),
     }
-    write_json(output_dir / "calibration.json", {**calibration, "threshold_validation_scores": rows})
+    write_json(output_dir / "calibration.json", {
+        **calibration,
+        "normal_score_validation": normal_score_rows,
+        "threshold_validation_scores": rows,
+    })
     return calibration
 
 
@@ -401,7 +551,7 @@ def evaluate_records(model, records: list[dict], config: dict, calibration: dict
                 torch.cuda.synchronize()
             inference_started = time.perf_counter()
             prediction = model.model(image)
-            score_values = prediction_scores(prediction, batch, config)
+            score_values = prediction_scores(prediction, batch, config, calibration)
             if config["device"].startswith("cuda"):
                 torch.cuda.synchronize()
             inference_seconds += time.perf_counter() - inference_started
@@ -474,7 +624,7 @@ def _safe_output_component(value: str) -> str:
         return "unspecified"
     # defect_type 来自数据集目录名；仍防御路径分隔符和 Windows 保留字符。
     invalid = '<>:/\\|?*"'
-    value = "_".join("_" if char in invalid or ord(char) < 32 else char for char in value)
+    value = "".join("_" if char in invalid or ord(char) < 32 else char for char in value)
     return value.rstrip(" .") or "unspecified"
 
 
@@ -555,7 +705,7 @@ def train_one(args, category: str) -> None:
             raise ValueError("续训请使用 checkpoints/last.pt；model.pt 是推理用文件。")
         config, manifest = previous["config"].copy(), previous["manifest"]
         config.update(device=choose_device(args.device), num_workers=args.num_workers)
-        config.setdefault("score_pool_kernel", 21)
+        config.setdefault("score_pool_kernels", [1, 7, 21])
         config.setdefault("score_topk_ratio", 0.001)
         config.setdefault("target_recall", 0.99)
         config.setdefault("threshold_val_ratio", 0.2)
@@ -589,7 +739,11 @@ def train_one(args, category: str) -> None:
             "seed": args.seed, "threshold_quantile": args.threshold_quantile,
             "threshold_val_ratio": args.threshold_val_ratio,
             "target_recall": args.target_recall,
-            "score_pool_kernel": args.score_pool_kernel,
+            "score_pool_kernels": (
+                [args.score_pool_kernel]
+                if args.score_pool_kernel is not None
+                else list(args.score_pool_kernels)
+            ),
             "score_topk_ratio": args.score_topk_ratio,
             "circle_config": str(args.circle_config.resolve()) if args.circle_config else None,
             "assets_dir": str(assets),
@@ -678,7 +832,7 @@ def restore_for_inference(args):
         raise ValueError("此 checkpoint 尚未校准，请使用训练结束生成的 model.pt。")
     config = saved["config"].copy()
     config.update(device=choose_device(args.device), num_workers=args.num_workers)
-    config.setdefault("score_pool_kernel", 21)
+    config.setdefault("score_pool_kernels", [1, 7, 21])
     config.setdefault("score_topk_ratio", 0.001)
     config.setdefault("target_recall", 0.99)
     config.setdefault("threshold_val_ratio", 0.2)
@@ -704,7 +858,7 @@ def predict(args) -> None:
     batch = next(iter(make_loader([record], config)))
     with torch.inference_mode():
         prediction = model.model(batch.image.to(config["device"]))
-    score_values = prediction_scores(prediction, batch, config)
+    score_values = prediction_scores(prediction, batch, config, saved["calibration"])
     if not all(math.isfinite(value) for value in score_values.values()):
         raise ValueError("预测分数不是有限数值。")
     calibration = saved["calibration"]
@@ -720,6 +874,17 @@ def predict(args) -> None:
                  ignore_mask=_mask_numpy(ignore_mask))
     print(json.dumps(result, ensure_ascii=False, indent=2))
     print(f"预测结果：{output}")
+
+
+def parse_pool_kernels(value: str) -> tuple[int, ...]:
+    """解析 ``1,7,21`` 形式的多尺度池化核。"""
+    try:
+        kernels = tuple(dict.fromkeys(int(item.strip()) for item in value.split(",") if item.strip()))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("池化核必须是逗号分隔的整数，例如 1,7,21。") from error
+    if not kernels or any(kernel < 1 or kernel % 2 == 0 for kernel in kernels):
+        raise argparse.ArgumentTypeError("池化核必须全部是正奇数，例如 1,7,21。")
+    return kernels
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -760,8 +925,12 @@ def build_parser() -> argparse.ArgumentParser:
                 help="带标签阈值验证集要求达到的异常召回率",
             )
             command.add_argument(
-                "--score-pool-kernel", type=int, default=21,
-                help="整图分数的局部平均池化窗口，必须为正奇数",
+                "--score-pool-kernels", type=parse_pool_kernels, default=(1, 7, 21),
+                help="多尺度局部平均池化窗口，逗号分隔，默认 1,7,21",
+            )
+            command.add_argument(
+                "--score-pool-kernel", type=int,
+                help="兼容旧命令：仅使用一个池化尺度；新训练建议使用 --score-pool-kernels",
             )
             command.add_argument(
                 "--score-topk-ratio", type=float, default=0.001,
@@ -789,7 +958,8 @@ def main() -> None:
         raise ValueError("threshold-val-ratio 必须位于 (0, 1) 内。")
     if hasattr(args, "target_recall") and not 0 < args.target_recall <= 1:
         raise ValueError("target-recall 必须位于 (0, 1] 内。")
-    if hasattr(args, "score_pool_kernel") and (args.score_pool_kernel < 1 or args.score_pool_kernel % 2 == 0):
+    if (hasattr(args, "score_pool_kernel") and args.score_pool_kernel is not None
+            and (args.score_pool_kernel < 1 or args.score_pool_kernel % 2 == 0)):
         raise ValueError("score-pool-kernel 必须是正奇数。")
     if hasattr(args, "score_topk_ratio") and not 0 < args.score_topk_ratio <= 1:
         raise ValueError("score-topk-ratio 必须位于 (0, 1] 内。")
@@ -845,18 +1015,28 @@ def main() -> None:
                 "评估快照未包含 threshold_val：已从 test 分层划出 "
                 f"{len(threshold_val)} 张；当前评估仅使用剩余 {len(test)} 张最终测试图。"
             )
-        if saved_config.get("circle_config") and any("circle" not in record for record in manifest["test"]):
+        scored_records = [
+            record
+            for split in ("val", "threshold_val", "test")
+            for record in manifest.get(split, [])
+        ]
+        if saved_config.get("circle_config") and any("circle" not in record for record in scored_records):
             prepare_circle_records(manifest, saved_config)
         output = new_output(args.output_dir / "evaluation", manifest["category"])
         write_json(output / "manifest.json", manifest)
         calibration = saved["calibration"]
         score_method = calibration.get("score_method", {}).get("name")
-        current_score_method = "masked_local_average_topk_mean"
+        current_score_method = MULTISCALE_SCORE_METHOD
         threshold_labels = {record.get("label") for record in manifest.get("threshold_val", [])}
         can_recalibrate = threshold_labels == {0, 1}
         if can_recalibrate and (score_method != current_score_method or threshold_val_missing):
             print("检测到旧版或不匹配的 score/threshold：正在使用 threshold_val 重新校准。")
             calibration = calibrate(model, manifest, config, output)
+            save_checkpoint(
+                output / "model.pt", model, config, manifest,
+                int(saved.get("step", 0)), calibration=calibration,
+            )
+            print(f"已保存采用多尺度 score 的模型：{output / 'model.pt'}")
         evaluate_records(model, manifest["test"], config, calibration, output, args.heatmaps)
         print(f"评估结果：{output}")
     else:

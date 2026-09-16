@@ -145,6 +145,11 @@ class CommandTests(unittest.TestCase):
                     patch.object(cli, "load_runtime"), self.assertRaises(ValueError):
                 cli.main()
 
+    def test_heatmap_directory_component_preserves_normal_names(self) -> None:
+        self.assertEqual(cli._safe_output_component("good"), "good")
+        self.assertEqual(cli._safe_output_component("严重缺陷"), "严重缺陷")
+        self.assertEqual(cli._safe_output_component("bad/type"), "bad_type")
+
     def test_prediction_uses_saved_threshold_with_strict_greater_than(self) -> None:
         image = self.root / "input.png"
         Image.new("RGB", (8, 8), (10, 20, 30)).save(image)

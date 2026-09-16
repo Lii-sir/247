@@ -40,6 +40,12 @@ def main() -> None:
         teacher_path = root / "random_teacher_for_smoke_only.pth"
         torch.save(teacher.model.teacher.state_dict(), teacher_path)
         del teacher
+        default_mask = root / "default_mask.png"
+        Image.new("L", (256, 256), 0).save(default_mask)
+        circle_config = root / "circle_config.json"
+        circle_config.write_text(json.dumps({
+            "CCD1": {"default_mask": str(default_mask)},
+        }), encoding="utf-8")
         output = root / "outputs"
         entry = [sys.executable, str(PROJECT_DIR / "efficientad_ccd.py")]
 
@@ -48,20 +54,26 @@ def main() -> None:
 
         run("train", "--data-root", str(data), "--max-steps", "2", "--min-age-seconds", "0",
             "--teacher-weights", str(teacher_path), "--imagenette-dir", str(auxiliary.parent),
-            "--output-dir", str(output), "--save-every", "1", "--heatmaps", "1")
+            "--circle-config", str(circle_config), "--output-dir", str(output),
+            "--save-every", "1", "--heatmaps", "1")
         model_path = next(output.glob("CCD1/*/model.pt"))
         run_dir = model_path.parent
         for name in ("manifest.json", "config.json", "loss.csv", "calibration.json", "metrics.json",
                      "predictions.csv", "score_distribution.png", "checkpoints/last.pt"):
             assert (run_dir / name).is_file(), name
         metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
-        assert metrics["counts"] == {"total": 4, "normal": 2, "anomaly": 2}
+        # test/good 与 test/defect 各有一张划入 threshold_val，剩余各一张用于最终测试。
+        assert metrics["counts"] == {"total": 2, "normal": 1, "anomaly": 1}
+        assert metrics["calibration"]["score_method"]["pool_kernels"] == [1, 7, 21]
         assert len(list((run_dir / "heatmaps").rglob("*.png"))) == 1
         run("evaluate", "--checkpoint", str(model_path), "--output-dir", str(output), "--heatmaps", "-1")
         evaluated_path = next(output.glob("evaluation/CCD1/*/metrics.json"))
-        # 全部测试图应按真实标签归档，每类两张，误判也不改变存放类别。
+        # 最终测试图应按真实标签和预测结果两级归档。
+        saved_heatmaps = list((evaluated_path.parent / "heatmaps").rglob("*.png"))
+        assert len(saved_heatmaps) == 2, saved_heatmaps
         for label_directory in ("good", "defect"):
-            assert len(list((evaluated_path.parent / "heatmaps" / label_directory).glob("*.png"))) == 2
+            paths = [path for path in saved_heatmaps if path.relative_to(evaluated_path.parent / "heatmaps").parts[0] == label_directory]
+            assert len(paths) == 1, (label_directory, saved_heatmaps)
         evaluated = json.loads(evaluated_path.read_text(encoding="utf-8"))
         assert abs(evaluated["threshold"] - metrics["threshold"]) < 1e-8
         assert evaluated["confusion_matrix"] == metrics["confusion_matrix"]

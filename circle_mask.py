@@ -361,6 +361,27 @@ def pooled_topk_score(anomaly_map, ignore_mask, *, pool_kernel: int = 21, topk_r
     return torch.stack(scores)
 
 
+def multiscale_topk_scores(
+    anomaly_map,
+    ignore_mask,
+    *,
+    pool_kernels: tuple[int, ...] | list[int] = (1, 7, 21),
+    topk_ratio: float = 0.001,
+):
+    """计算多个池化尺度的 Top-K 分数，返回 ``{kernel: tensor}``。"""
+    kernels = tuple(int(kernel) for kernel in pool_kernels)
+    if not kernels:
+        raise ValueError("pool_kernels 不能为空。")
+    if any(kernel < 1 or kernel % 2 == 0 for kernel in kernels):
+        raise ValueError("pool_kernels 必须全部是正奇数。")
+    return {
+        str(kernel): pooled_topk_score(
+            anomaly_map, ignore_mask, pool_kernel=kernel, topk_ratio=topk_ratio
+        )
+        for kernel in kernels
+    }
+
+
 def overlay_diagnostics(image_rgb: np.ndarray, result: dict, params: dict) -> np.ndarray:
     canvas = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
     for index, candidate in enumerate(result["detection"].get("candidates", [])):
