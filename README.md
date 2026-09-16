@@ -141,7 +141,13 @@ outputs/CCD1/<运行时间>/
 
 尺度归一化只使用训练良品中留出的正常验证集；最终阈值则使用独立的带标签 `threshold_val`。程序先对每种异常子目录求出满足目标召回率的边界，再取其中最低的边界作为统一阈值；`score > threshold` 判为 NG，否则 OK。阈值验证集同时会统计正常误报率。分数不是概率，也不保证位于 `[0,1]`，最终测试集不参与尺度归一化或阈值选择。
 
-热图统一使用正常验证集确定的显示色阶，默认优先保存误判图，再保存接近阈值的图。结果按测试集原始子目录和整图预测结果保存：`heatmaps/<test子目录>/normal/` 或 `heatmaps/<test子目录>/anomaly/`。例如 `test/defect1` 的图片会进入 `heatmaps/defect1/normal/` 或 `heatmaps/defect1/anomaly/`；`test/good` 会进入 `heatmaps/good/normal/` 或 `heatmaps/good/anomaly/`。`--heatmaps 32` 是所有子目录合计最多 32 张，`--heatmaps 0` 不保存热图，`--heatmaps -1` 保存全部。子目录在保存对应图片时自动创建。热图不是像素标注或经像素指标验证的分割结果。
+热图统一使用正常验证集确定的显示色阶，默认优先保存误判图，再保存接近阈值的图。主可视化采用 2×3：上排为原图、原始异常热力图、原始 Overlay；下排为当前 Score 对应的定位响应、阈值二值图、定位 Overlay 与异常框。`top` 使用原始异常图，`pool+top` 使用与 Score 完全相同的 mask-aware 池化图，`multiscale_pool` 只融合整图尺度分数超过阈值的归一化尺度。多尺度模式还会在 `heatmap_scales/` 保存逐尺度池化图与 Overlay 诊断图。
+
+主结果按测试集原始子目录和整图预测结果保存：`heatmaps/<test子目录>/normal/` 或 `heatmaps/<test子目录>/anomaly/`。例如 `test/defect1` 的图片会进入 `heatmaps/defect1/normal/` 或 `heatmaps/defect1/anomaly/`；逐尺度诊断图保持相同层级放在 `heatmap_scales/`。`--heatmaps 32` 是所有子目录合计最多 32 张主图，`--heatmaps 0` 不保存，`--heatmaps -1` 保存全部。预测为正常的图片默认不画框；预测异常但形态学和面积过滤后没有连通域时，会在最强响应位置生成兜底框；响应完全平坦时改用有效区域中心，避免固定落在左上角。热图和异常框均为模型定位的启发式展示，不是像素标注或经过像素指标验证的分割结果。
+
+当校准边界为 0 时，严格大于判定会令整图分类阈值成为一个极小负数。由于异常定位响应通常大于等于 0，三种 Score 模式的画框阶段都会把空间阈值下限限制为 0，避免整幅图被选中；整图分类仍使用 checkpoint 中的原始阈值。该调整会记录在单图 `prediction.json` 的 `threshold_adjusted_for_localization` 字段中。
+
+画框参数在训练、评估和单图预测命令中复用，并保存到 `config.json` 的 `localization` 字段。常用参数是 `--box-min-area-ratio`（最小连通域面积比例）、`--box-morph-kernel`、`--box-open-iterations`、`--box-close-iterations`、`--box-merge-iou`、`--box-merge-distance-ratio` 和 `--box-padding-ratio`。命令行未指定时沿用 checkpoint；旧 checkpoint 自动补齐默认值。
 
 ## 6. 重跑评估、预测和续训
 
@@ -163,7 +169,7 @@ uv run python efficientad_ccd.py evaluate --checkpoint "outputs\CCD1\<运行时�
 # 下载完成后先 inspect，生成新快照，再评估其中的测试图片。
 uv run python efficientad_ccd.py evaluate --checkpoint "outputs\CCD1\<运行时间>\model.pt" --manifest "outputs\inspection\CCD1\<检查时间>\manifest.json"
 
-# 单张新图推理，输出 prediction.json 和 prediction.png。
+# 单张新图推理，输出 prediction.json、2×3 prediction.png；多尺度模型另存 prediction_scales.png。
 uv run python efficientad_ccd.py predict --checkpoint "outputs\CCD1\<运行时间>\model.pt" --image "D:\datasets\新图片.bmp"
 
 # 中断后续训：沿用 checkpoint 内的数据快照、分辨率和总训练步数。
@@ -235,10 +241,15 @@ uv run python detect_background_circle.py `
   --input "D:\datasets\20260913_caijian_liugongwei\2lixiaodong\CCD1\good" `
   --output-dir "circle_test_bmp_tight" `
   --roi "0.58,0.33,0.28,0.36" `
+  --detection-method hybrid `
   --circle-target outer `
-  --group-target largest `
+  --group-target best_score `
   --min-radius-ratio 0.15 `
   --max-radius-ratio 0.55 `
+  --dark-threshold-offset 0 `
+  --morph-kernel 5 `
+  --min-axis-ratio 0.65 `
+  --min-contour-score 0.40 `
   --param1 100 `
   --param2 24 `
   --mask-radius-scale 0.95 `
@@ -255,6 +266,29 @@ CUDA_VISIBLE_DEVICES=1 python efficientad_ccd.py evaluate \
 ```
 
 `generate_circle_mask.py` 从一张参考图生成原图尺寸的单通道 `default_mask.png`：圆内为 255、圆外为 0。同时输出检测叠加图、白色填充预览和带检测耗时的 `circle_mask.json`。确认结果后，可将该 PNG 配置为对应型号的 `default_mask`。
+
+圆检测默认使用 `hybrid`：先对 ROI 内暗区域进行 Otsu 分割、形态学处理、轮廓几何筛选和 RANSAC 圆拟合；没有可信轮廓候选时才回退到 Hough。`param1/param2` 只控制 Hough 路径。若暗区分割范围不合适，优先调整 `dark_threshold_offset`；候选过松或过严则调整 `min_contour_score`。
+
+当目标是“先检测外侧大圆，再利用大小圆之间的黑色环带定位内圆”时，使用
+`detection_method: outer_inner_ring`。该模式只要求内圆完整位于外圆内部，不要求两者
+同心；它综合暗区内轮廓、边缘圆弧和 Hough 候选，并按黑环覆盖率选择最终内圆：
+
+```json
+{
+  "detection_method": "outer_inner_ring",
+  "min_radius_ratio": 0.12,
+  "max_radius_ratio": 0.48,
+  "inner_radius_min_ratio": 0.15,
+  "inner_radius_max_ratio": 0.75,
+  "black_ring_width_ratio": 0.06,
+  "min_black_ring_coverage": 0.45,
+  "min_inner_angular_coverage": 0.35
+}
+```
+
+其中前两个半径比例用于寻找外圆，内圆上下限和黑环宽度均相对于已检测的外圆半径。
+局部反光或工件遮挡可以由覆盖率容忍；若黑环确实只露出较少部分，可适当降低
+`min_black_ring_coverage`，但不建议一开始低于 `0.30`。
 
 ## 参考实现
 

@@ -1,4 +1,4 @@
-"""独立验证圆检测、同心圆选择和白色 mask 的脚本。
+"""独立验证圆检测、偏心内圆选择和白色 mask 的脚本。
 
 示例：
     uv run python detect_background_circle.py --input "图片目录" \
@@ -46,14 +46,31 @@ def parse_roi(value: str) -> list[float]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="验证工件圆检测、同心圆选择和白色 mask")
+    parser = argparse.ArgumentParser(description="验证工件圆检测、偏心内圆选择和白色 mask")
     parser.add_argument("--input", type=Path, required=True, help="单张图片或图片目录")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--circle-config", type=Path, help="按工件类型配置的 JSON 文件")
     parser.add_argument("--category", default="default", help="使用 circle-config 中的类别；默认 default")
     parser.add_argument("--roi", type=parse_roi, help="覆盖配置中的 ROI：x,y,w,h")
+    parser.add_argument(
+        "--detection-method", choices=["outer_inner_ring", "hybrid", "dark_contour", "hough"],
+        help="outer_inner_ring=先找外圆，再按黑环寻找允许偏心的内圆",
+    )
     parser.add_argument("--circle-target", choices=["inner", "outer", "best_contrast"], help="覆盖配置中的目标圆选择规则")
-    parser.add_argument("--group-target", choices=["largest", "strongest"], help="覆盖配置中的目标圆组选择规则")
+    parser.add_argument("--group-target", choices=["best_score", "largest", "strongest"], help="覆盖配置中的目标圆组选择规则")
+    parser.add_argument("--dark-threshold-offset", type=float, help="Otsu 暗区阈值偏移，正数保留更多暗区")
+    parser.add_argument("--morph-kernel", type=int, help="暗区轮廓开闭运算窗口（正奇数）")
+    parser.add_argument("--min-axis-ratio", type=float, help="拟合椭圆最小短轴/长轴比例")
+    parser.add_argument("--min-contour-score", type=float, help="暗区轮廓候选最低综合置信度")
+    parser.add_argument("--ransac-iterations", type=int)
+    parser.add_argument("--ransac-tolerance-ratio", type=float, help="RANSAC 内点距离容差/半径")
+    parser.add_argument("--min-ransac-inlier-ratio", type=float)
+    parser.add_argument("--min-angular-coverage", type=float)
+    parser.add_argument("--inner-radius-min-ratio", type=float, help="内圆半径/外圆半径下限")
+    parser.add_argument("--inner-radius-max-ratio", type=float, help="内圆半径/外圆半径上限")
+    parser.add_argument("--black-ring-width-ratio", type=float, help="黑环采样宽度/外圆半径")
+    parser.add_argument("--min-black-ring-coverage", type=float, help="黑环最低角度覆盖率")
+    parser.add_argument("--min-inner-angular-coverage", type=float, help="内圆最低圆弧覆盖率")
     parser.add_argument("--dp", type=float, help="覆盖 Hough dp")
     parser.add_argument("--param1", type=float, help="覆盖 Canny 高阈值")
     parser.add_argument("--param2", type=float, help="覆盖 Hough 累加器阈值")
@@ -68,8 +85,22 @@ def main() -> int:
     params = category_config(load_configs(args.circle_config), args.category).copy()
     overrides = {
         "roi": args.roi,
+        "detection_method": args.detection_method,
         "circle_target": args.circle_target,
         "group_target": args.group_target,
+        "dark_threshold_offset": args.dark_threshold_offset,
+        "morph_kernel": args.morph_kernel,
+        "min_axis_ratio": args.min_axis_ratio,
+        "min_contour_score": args.min_contour_score,
+        "ransac_iterations": args.ransac_iterations,
+        "ransac_tolerance_ratio": args.ransac_tolerance_ratio,
+        "min_ransac_inlier_ratio": args.min_ransac_inlier_ratio,
+        "min_angular_coverage": args.min_angular_coverage,
+        "inner_radius_min_ratio": args.inner_radius_min_ratio,
+        "inner_radius_max_ratio": args.inner_radius_max_ratio,
+        "black_ring_width_ratio": args.black_ring_width_ratio,
+        "min_black_ring_coverage": args.min_black_ring_coverage,
+        "min_inner_angular_coverage": args.min_inner_angular_coverage,
         "dp": args.dp,
         "param1": args.param1,
         "param2": args.param2,
@@ -106,7 +137,12 @@ def main() -> int:
                 json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
             )
             if selected.get("enabled", True):
-                print(f"[OK] {path.name}: target={selected['circle_target']} center=({selected['center_x']},{selected['center_y']}) r={selected['radius']} candidates={selected['candidate_count']} detection={result['detection_ms']:.2f} ms")
+                print(
+                    f"[OK] {path.name}: detector={result['detection'].get('detector_used')} "
+                    f"target={selected['circle_target']} center=({selected['center_x']},{selected['center_y']}) "
+                    f"r={selected['radius']} confidence={selected.get('candidate_score', 0.0):.3f} "
+                    f"candidates={selected['candidate_count']} detection={result['detection_ms']:.2f} ms"
+                )
             else:
                 print(f"[OK] {path.name}: mask disabled detection={result['detection_ms']:.2f} ms")
         except Exception as exc:

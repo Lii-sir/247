@@ -253,6 +253,11 @@ class CommandTests(unittest.TestCase):
                 ])
                 with patch.object(cli, "restore_for_inference", return_value=(model, {"device": "cpu"}, self.saved)), \
                         patch.object(cli, "make_loader", return_value=[SimpleNamespace(image=MagicMock())]), \
+                        patch.object(cli, "prediction_localization", return_value={
+                            "score_mode": "top", "predicted_anomaly": score > 0.75,
+                            "score": score, "threshold": 0.75, "boxes": [],
+                            "params": {}, "scales": [],
+                        }), \
                         patch.object(cli, "torch", SimpleNamespace(inference_mode=nullcontext), create=True), \
                         patch.dict("sys.modules", {"ccd_report": fake_report}):
                     cli.predict(args)

@@ -66,11 +66,13 @@ def main() -> None:
         assert metrics["counts"] == {"total": 2, "normal": 1, "anomaly": 1}
         assert metrics["calibration"]["score_method"]["pool_kernels"] == [1, 7, 21]
         assert len(list((run_dir / "heatmaps").rglob("*.png"))) == 1
+        assert len(list((run_dir / "heatmap_scales").rglob("*.png"))) == 1
         run("evaluate", "--checkpoint", str(model_path), "--output-dir", str(output), "--heatmaps", "-1")
         evaluated_path = next(output.glob("evaluation/CCD1/*/metrics.json"))
         # 最终测试图应按真实标签和预测结果两级归档。
         saved_heatmaps = list((evaluated_path.parent / "heatmaps").rglob("*.png"))
         assert len(saved_heatmaps) == 2, saved_heatmaps
+        assert len(list((evaluated_path.parent / "heatmap_scales").rglob("*.png"))) == 2
         for label_directory in ("good", "defect"):
             paths = [path for path in saved_heatmaps if path.relative_to(evaluated_path.parent / "heatmaps").parts[0] == label_directory]
             assert len(paths) == 1, (label_directory, saved_heatmaps)
@@ -126,10 +128,15 @@ def main() -> None:
                 switched_predictions[0].read_text(encoding="utf-8")
             )
             assert switched_result["threshold"] == score_checkpoint["calibration"]["threshold"]
+            assert switched_result["localization"]["score_mode"] == score_checkpoint["calibration"]["score_mode"]
+            prediction_folder = switched_predictions[0].parent
+            assert (prediction_folder / "prediction.png").is_file()
+            assert (prediction_folder / "prediction_scales.png").is_file() == (score_mode == "multiscale_pool")
 
         run("predict", "--checkpoint", str(model_path), "--image", str(data / "CCD1/test/good/0.png"),
             "--output-dir", str(root / "predictions"))
         assert len(list((root / "predictions").glob("CCD1/*/prediction.png"))) == 1
+        assert len(list((root / "predictions").glob("CCD1/*/prediction_scales.png"))) == 1
         # 仅在合成验证中将目标步数延长一步，确认恢复后确实执行一次优化。
         resume_payload = torch.load(run_dir / "checkpoints/last.pt", map_location="cpu", weights_only=True)
         resume_payload["config"]["max_steps"] = 3

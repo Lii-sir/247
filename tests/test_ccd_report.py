@@ -107,12 +107,17 @@ class HeatmapTests(unittest.TestCase):
             with patch.object(matplotlib.axes.Axes, "imshow", new=capture):
                 for index, values in enumerate([np.array([[-2.0, 0.2], [0.1, 9.0]]), np.full((2, 2), 0.5)]):
                     save_heatmap(original_path, values, folder / f"heatmap_{index}.png", display_max=2.0, score=0.4, threshold=0.5)
-            self.assertEqual(len(calls), 4)
-            for array, lower, upper in calls:
+            # 每张 2×3 主图包含 4 次连续热图着色和 1 次二值图显示。
+            self.assertEqual(len(calls), 10)
+            color_calls = [call for call in calls if call[2] == 2.0]
+            binary_calls = [call for call in calls if call[2] == 1]
+            self.assertEqual(len(color_calls), 8)
+            self.assertEqual(len(binary_calls), 2)
+            for array, lower, upper in color_calls:
                 self.assertEqual((lower, upper), (0, 2.0))
                 self.assertGreaterEqual(array.min(), 0)
                 self.assertLessEqual(array.max(), 2.0)
-            self.assertTrue(np.allclose(calls[2][0], 0.5))
+            self.assertTrue(any(np.allclose(array, 0.5) for array, _, _ in color_calls))
             with Image.open(folder / "heatmap_0.png") as output:
                 self.assertEqual(output.width, 1500)
 

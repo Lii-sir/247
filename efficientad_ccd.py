@@ -22,6 +22,11 @@ from circle_mask import (
     pooled_topk_score,
     read_rgb,
 )
+from ccd_localization import (
+    build_localization,
+    localization_summary,
+    normalize_localization_params,
+)
 from ccd_data import list_categories, prepare_manifest, resolve_data_root, split_threshold_validation
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -32,6 +37,42 @@ def write_json(path: Path, data: dict) -> None:
     """使用 UTF-8 保存记录，保留中文目录名。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+
+
+LOCALIZATION_ARGUMENT_FIELDS = {
+    "box_min_area_ratio": "min_area_ratio",
+    "box_morph_kernel": "morph_kernel",
+    "box_open_iterations": "open_iterations",
+    "box_close_iterations": "close_iterations",
+    "box_merge_iou": "merge_iou",
+    "box_merge_distance_ratio": "merge_distance_ratio",
+    "box_padding_ratio": "padding_ratio",
+    "box_fallback_size_ratio": "fallback_size_ratio",
+    "box_normalized_display_max": "normalized_display_max",
+}
+
+
+def apply_localization_config(config: dict, args) -> None:
+    """将 checkpoint/默认定位参数与本次命令行覆盖合并到统一配置。"""
+    params = dict(config.get("localization", {}))
+    for argument, field in LOCALIZATION_ARGUMENT_FIELDS.items():
+        value = getattr(args, argument, None)
+        if value is not None:
+            params[field] = value
+    config["localization"] = normalize_localization_params(params)
+
+
+def add_localization_arguments(parser: argparse.ArgumentParser) -> None:
+    """为训练、评估和单图预测添加同一组可复用的画框参数。"""
+    parser.add_argument("--box-min-area-ratio", type=float, help="最小连通域面积/有效图面积，默认 0.00002")
+    parser.add_argument("--box-morph-kernel", type=int, help="开闭运算核，必须为正奇数，默认 3")
+    parser.add_argument("--box-open-iterations", type=int, help="形态学开运算次数，默认 1")
+    parser.add_argument("--box-close-iterations", type=int, help="形态学闭运算次数，默认 1")
+    parser.add_argument("--box-merge-iou", type=float, help="框重叠合并 IoU，默认 0.15")
+    parser.add_argument("--box-merge-distance-ratio", type=float, help="临近框合并距离/图像对角线，默认 0.005")
+    parser.add_argument("--box-padding-ratio", type=float, help="框外扩像素/最大边长，默认 0.003")
+    parser.add_argument("--box-fallback-size-ratio", type=float, help="异常但无连通域时兜底框尺寸比例，默认 0.02")
+    parser.add_argument("--box-normalized-display-max", type=float, help="多尺度归一化融合图固定色阶下限，默认 3.0")
 
 
 def load_runtime() -> None:
@@ -323,6 +364,26 @@ def calibration_score_mode(calibration: dict) -> str:
     if method in (None, TOP_SCORE_METHOD):
         return SCORE_MODE_TOP
     raise ValueError(f"checkpoint 包含未知的 score_method：{method}")
+
+
+def prediction_localization(
+    prediction,
+    batch,
+    config: dict,
+    calibration: dict,
+    score_values: dict,
+) -> dict:
+    """使用与当前整图 Score 相同的响应定义生成画框数据。"""
+    return build_localization(
+        prediction.anomaly_map,
+        getattr(batch, "ignore_mask", None),
+        score_mode=calibration_score_mode(calibration),
+        score_method=calibration.get("score_method") or {},
+        score_values=score_values,
+        threshold=calibration["threshold"],
+        raw_display_max=calibration["display_max"],
+        params=config.get("localization"),
+    )
 
 
 def score_pool_kernels(config: dict) -> tuple[int, ...]:
@@ -683,16 +744,26 @@ def evaluate_records(model, records: list[dict], config: dict, calibration: dict
         for rank, index in enumerate(tqdm(indices, desc="保存热力图")):
             record, row = records[index], rows[index]
             batch = next(iter(make_loader([record], {**config, "num_workers": 0})))
-            anomaly_map = model.model(batch.image.to(config["device"])).anomaly_map.squeeze().cpu().numpy()
+            prediction = model.model(batch.image.to(config["device"]))
+            anomaly_map = prediction.anomaly_map.squeeze().cpu().numpy()
+            localization = prediction_localization(
+                prediction, batch, config, calibration, row
+            )
             # 第一级保持 test 下的真实子目录（good、defect1、defect2 ...），
             # 第二级按整图预测结果区分 normal / anomaly。
             source_directory = _safe_output_component(record.get("defect_type", "unspecified"))
             prediction_directory = "anomaly" if row["pred_label"] else "normal"
+            filename = f"{rank:04d}_{Path(record['path']).stem}.png"
             save_heatmap(
                 Path(record["path"]), anomaly_map,
-                output_dir / "heatmaps" / source_directory / prediction_directory / f"{rank:04d}_{Path(record['path']).stem}.png",
+                output_dir / "heatmaps" / source_directory / prediction_directory / filename,
                 display_max=calibration["display_max"], score=row["score"], threshold=calibration["threshold"],
                 ignore_mask=_mask_numpy(getattr(batch, "ignore_mask", None)),
+                localization=localization,
+                multiscale_output_path=(
+                    output_dir / "heatmap_scales" / source_directory
+                    / prediction_directory / filename
+                ),
             )
     print(json.dumps(metrics, ensure_ascii=False, indent=2, allow_nan=False))
     return metrics
@@ -791,6 +862,7 @@ def train_one(args, category: str) -> None:
         config.setdefault("score_topk_ratio", 0.001)
         config.setdefault("target_recall", 0.99)
         config.setdefault("threshold_val_ratio", 0.2)
+        apply_localization_config(config, args)
         if not manifest.get("threshold_val"):
             manifest["threshold_val"], manifest["test"] = split_threshold_validation(
                 manifest.get("test", []), config["threshold_val_ratio"], config["seed"]
@@ -833,6 +905,7 @@ def train_one(args, category: str) -> None:
             "imagenette_dir": str(args.imagenette_dir.resolve() if args.imagenette_dir else assets / "imagenette"),
             "teacher_weights": str(args.teacher_weights.resolve()) if args.teacher_weights else None,
         }
+        apply_localization_config(config, args)
         prepare_circle_records(manifest, config)
     seed_everything(config["seed"])
     write_json(output / "manifest.json", manifest)
@@ -920,6 +993,7 @@ def restore_for_inference(args):
     config.setdefault("score_topk_ratio", 0.001)
     config.setdefault("target_recall", 0.99)
     config.setdefault("threshold_val_ratio", 0.2)
+    apply_localization_config(config, args)
     model = new_model(config)
     model.model.load_state_dict(saved["model_state"])
     model.eval()
@@ -947,16 +1021,27 @@ def predict(args) -> None:
         raise ValueError("预测分数不是有限数值。")
     calibration = saved["calibration"]
     output = new_output(args.output_dir, saved["manifest"]["category"])
+    localization = prediction_localization(
+        prediction, batch, config, calibration, score_values
+    )
     result = {
         "image": str(image_path), **score_values, "threshold": calibration["threshold"],
         "prediction": "NG" if score_values["score"] > calibration["threshold"] else "OK",
+        "localization": localization_summary(localization),
     }
     write_json(output / "prediction.json", result)
     ignore_mask = getattr(batch, "ignore_mask", None)
     save_heatmap(image_path, prediction.anomaly_map.squeeze().cpu().numpy(), output / "prediction.png",
                  display_max=calibration["display_max"], score=score_values["score"], threshold=calibration["threshold"],
-                 ignore_mask=_mask_numpy(ignore_mask))
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+                 ignore_mask=_mask_numpy(ignore_mask), localization=localization,
+                 multiscale_output_path=output / "prediction_scales.png")
+    print(json.dumps({
+        **{key: value for key, value in result.items() if key != "localization"},
+        "box_count": len(localization["boxes"]),
+        "active_scales": [
+            scale["kernel"] for scale in localization.get("scales", []) if scale["active"]
+        ],
+    }, ensure_ascii=False, indent=2))
     print(f"预测结果：{output}")
 
 
@@ -1001,6 +1086,7 @@ def build_parser() -> argparse.ArgumentParser:
         if name != "inspect":
             command.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
             command.add_argument("--num-workers", type=int, default=0, help="Windows 首次建议用 0")
+            add_localization_arguments(command)
         if name in ("train", "evaluate"):
             command.add_argument("--heatmaps", type=int, default=32, help="热图数量；0 不保存，-1 保存全部")
         if name in ("evaluate", "predict"):

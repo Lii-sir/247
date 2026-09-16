@@ -201,6 +201,96 @@ def write_report(
     return metrics
 
 
+def _resized_map(values: np.ndarray, size: tuple[int, int], *, binary: bool = False) -> np.ndarray:
+    """将模型空间响应映射回展示尺寸；二值图必须使用最近邻插值。"""
+    mode = Image.Resampling.NEAREST if binary else Image.Resampling.BILINEAR
+    if binary:
+        source = Image.fromarray(np.asarray(values, dtype=np.uint8) * 255)
+        return np.asarray(source.resize(size, mode)) > 0
+    return np.asarray(Image.fromarray(np.asarray(values, dtype=np.float32)).resize(size, mode))
+
+
+def _draw_boxes(axis, boxes: list[dict], map_shape: tuple[int, int], display_size: tuple[int, int]) -> None:
+    """把异常图坐标的半开区间外接框映射到原图展示坐标。"""
+    from matplotlib.patches import Rectangle
+
+    map_height, map_width = map_shape
+    display_width, display_height = display_size
+    scale_x, scale_y = display_width / map_width, display_height / map_height
+    for index, box in enumerate(boxes, start=1):
+        x = box["x0"] * scale_x
+        y = box["y0"] * scale_y
+        width = (box["x1"] - box["x0"]) * scale_x
+        height = (box["y1"] - box["y0"]) * scale_y
+        axis.add_patch(Rectangle(
+            (x, y), width, height, fill=False, edgecolor="#ff2020", linewidth=2.2
+        ))
+        axis.text(
+            x, max(0, y - 3), str(index), color="white", fontsize=8,
+            bbox={"facecolor": "#d00000", "edgecolor": "none", "pad": 1.5},
+        )
+
+
+def _save_multiscale_diagnostic(
+    original: Image.Image,
+    localization: dict,
+    output_path: Path,
+    *,
+    raw_display_max: float,
+) -> None:
+    """保存逐尺度池化图与 Overlay；默认 3 个尺度时为 2×3。"""
+    scales = localization.get("scales", [])
+    if localization.get("score_mode") != "multiscale_pool" or not scales:
+        return
+    plt = _pyplot()
+    column_count = len(scales)
+    image_ratio = original.height / original.width
+    fig_height = min(14.0, max(6.0, 5.0 * image_ratio * 2 + 1.7))
+    fig, axes = plt.subplots(
+        2, column_count, figsize=(5 * column_count, fig_height), dpi=100, squeeze=False
+    )
+    colored = None
+    try:
+        for column, scale in enumerate(scales):
+            pooled = np.clip(scale["map"], 0, raw_display_max)
+            shown = _resized_map(pooled, original.size)
+            title = (
+                f"kernel={scale['kernel']} | raw_topk={scale['raw_score']:.5g}\n"
+                f"normalized={scale['normalized_score']:.5g} | active={scale['active']}"
+            )
+            colored = axes[0, column].imshow(
+                shown, cmap="turbo", vmin=0, vmax=raw_display_max
+            )
+            axes[0, column].set_title(f"P{scale['kernel']} pooled map\n{title}", fontsize=9)
+            axes[1, column].imshow(original)
+            axes[1, column].imshow(
+                shown, cmap="turbo", vmin=0, vmax=raw_display_max, alpha=0.45
+            )
+            _draw_boxes(axes[1, column], scale["boxes"], scale["map"].shape, original.size)
+            axes[1, column].set_title(
+                f"Scale overlay | boxes={len(scale['boxes'])}", fontsize=9
+            )
+            axes[0, column].set_axis_off()
+            axes[1, column].set_axis_off()
+        fig.suptitle("Multiscale pooling diagnostics (shared raw anomaly scale)", fontsize=13)
+        # 为水平色条及其标签预留独立空间，避免保存长宽比较大的 CCD 图时被裁切。
+        fig.subplots_adjust(
+            left=0.015, right=0.985, bottom=0.17, top=0.88,
+            wspace=0.05, hspace=0.18,
+        )
+        if colored is not None:
+            color_axis = fig.add_axes((0.35, 0.075, 0.30, 0.022))
+            fig.colorbar(
+                colored, cax=color_axis, orientation="horizontal",
+                label="Raw pooled anomaly value (fixed validation scale)",
+            )
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path)
+    finally:
+        plt.close(fig)
+
+
 def save_heatmap(
     image_path: Path,
     anomaly_map: np.ndarray,
@@ -210,53 +300,138 @@ def save_heatmap(
     score: float,
     threshold: float,
     ignore_mask: np.ndarray | None = None,
+    localization: dict | None = None,
+    multiscale_output_path: Path | None = None,
 ) -> None:
-    """保存原图、热图和叠加图；色阶上限由调用方用正常验证集统一估计。"""
+    """保存 2×3 主可视化，并可选保存多尺度逐尺度诊断图。"""
     display_max = _finite_number(display_max, "display_max")
     score = _finite_number(score, "score")
     threshold = _finite_number(threshold, "threshold")
     if display_max <= 0:
         raise ValueError("display_max 必须大于 0，且应由正常验证集统一估计。")
-    values = np.asarray(anomaly_map)
-    if values.ndim > 2:
-        values = np.squeeze(values)
-    if values.ndim != 2 or not values.size:
+    raw_values = np.asarray(anomaly_map)
+    if raw_values.ndim > 2:
+        raw_values = np.squeeze(raw_values)
+    if raw_values.ndim != 2 or not raw_values.size:
         raise ValueError("anomaly_map 必须是非空二维数组。")
-    if not np.issubdtype(values.dtype, np.number) or np.iscomplexobj(values) or not np.isfinite(values).all():
+    if (not np.issubdtype(raw_values.dtype, np.number)
+            or np.iscomplexobj(raw_values) or not np.isfinite(raw_values).all()):
         raise ValueError("anomaly_map 必须包含有限实数，不能有 NaN 或 Inf。")
+    raw_values = raw_values.astype(np.float32, copy=True)
     if ignore_mask is not None:
         ignore_mask = np.asarray(ignore_mask).squeeze().astype(bool)
-        if ignore_mask.shape != values.shape:
+        if ignore_mask.shape != raw_values.shape:
             raise ValueError("ignore_mask 必须与 anomaly_map 具有相同的二维形状。")
-        values = values.copy()
-        values[ignore_mask] = 0
+        raw_values[ignore_mask] = 0
+    if localization is None:
+        localization = {
+            "score_mode": "top",
+            "response_map": raw_values,
+            "response_threshold": threshold,
+            "response_title": "Raw response M",
+            "response_display_max": display_max,
+            "binary_map": raw_values > threshold if score > threshold else np.zeros_like(raw_values, dtype=bool),
+            "boxes": [],
+            "scales": [],
+        }
+    response = np.asarray(localization["response_map"], dtype=np.float32)
+    binary = np.asarray(localization["binary_map"], dtype=bool)
+    if response.shape != raw_values.shape or binary.shape != raw_values.shape:
+        raise ValueError("定位响应图、二值图必须与 anomaly_map 形状一致。")
+    if not np.isfinite(response).all():
+        raise ValueError("定位响应图不能包含 NaN 或 Inf。")
+    response_display_max = _finite_number(
+        localization["response_display_max"], "response_display_max"
+    )
+    if response_display_max <= 0:
+        raise ValueError("response_display_max 必须大于 0。")
     with Image.open(image_path) as source:
         original = ImageOps.exif_transpose(source).convert("RGB")
     # 限制输出尺寸，同时保留原图长宽比，避免展示超大 CCD 图时占用过多内存。
     original.thumbnail((460, 900), Image.Resampling.LANCZOS)
-    values = np.clip(values, 0, display_max).astype(np.float32)
-    heatmap = np.asarray(Image.fromarray(values).resize(original.size, Image.Resampling.BILINEAR))
-    height = min(11.0, max(3.4, 5.0 * original.height / original.width + 1.4))
+    raw_heatmap = _resized_map(np.clip(raw_values, 0, display_max), original.size)
+    response_heatmap = _resized_map(
+        np.clip(response, 0, response_display_max), original.size
+    )
+    binary_heatmap = _resized_map(binary, original.size, binary=True)
+    height = min(18.0, max(7.0, 10.0 * original.height / original.width + 2.0))
     plt = _pyplot()
-    fig, axes = plt.subplots(1, 3, figsize=(15, height), dpi=100)
+    fig, axes = plt.subplots(2, 3, figsize=(15, height), dpi=100, squeeze=False)
     try:
-        axes[0].imshow(original)
-        axes[0].set_title("Original")
-        colored = axes[1].imshow(heatmap, cmap="turbo", vmin=0, vmax=display_max)
-        axes[1].set_title("Anomaly heatmap")
-        axes[2].imshow(original)
-        axes[2].imshow(heatmap, cmap="turbo", vmin=0, vmax=display_max, alpha=0.45)
-        axes[2].set_title("Overlay")
-        for axis in axes:
+        axes[0, 0].imshow(original)
+        axes[0, 0].set_title("Original")
+        raw_colored = axes[0, 1].imshow(
+            raw_heatmap, cmap="turbo", vmin=0, vmax=display_max
+        )
+        axes[0, 1].set_title("Raw anomaly heatmap M")
+        axes[0, 2].imshow(original)
+        axes[0, 2].imshow(
+            raw_heatmap, cmap="turbo", vmin=0, vmax=display_max, alpha=0.45
+        )
+        axes[0, 2].set_title("Raw anomaly overlay")
+
+        response_colored = axes[1, 0].imshow(
+            response_heatmap, cmap="turbo", vmin=0, vmax=response_display_max
+        )
+        if localization.get("score_mode") == "pool_topk" and localization.get("scales"):
+            scale = localization["scales"][0]
+            response_detail = (
+                f"pooled_max={scale['pooled_max']:.5g} | topk_mean={scale['raw_score']:.5g}"
+            )
+        elif localization.get("score_mode") == "multiscale_pool":
+            active = [str(scale["kernel"]) for scale in localization.get("scales", []) if scale["active"]]
+            response_detail = f"active kernels={','.join(active) if active else 'none'}"
+        else:
+            response_detail = f"max={float(response.max()):.5g}"
+        axes[1, 0].set_title(f"{localization['response_title']}\n{response_detail}", fontsize=10)
+        axes[1, 1].imshow(binary_heatmap, cmap="gray", vmin=0, vmax=1)
+        axes[1, 1].set_title(
+            f"Threshold mask | response > {localization['response_threshold']:.5g}"
+        )
+        axes[1, 2].imshow(original)
+        axes[1, 2].imshow(
+            response_heatmap, cmap="turbo", vmin=0,
+            vmax=response_display_max, alpha=0.45,
+        )
+        _draw_boxes(
+            axes[1, 2], localization.get("boxes", []), response.shape, original.size
+        )
+        axes[1, 2].set_title(
+            f"Localization overlay | boxes={len(localization.get('boxes', []))}"
+        )
+        for axis in axes.flat:
             axis.set_axis_off()
         prediction = "Anomaly" if score > threshold else "Normal"
-        fig.suptitle(f"{prediction} | score={score:.5g} | threshold={threshold:.5g}", fontsize=13)
-        fig.subplots_adjust(left=0.015, right=0.985, bottom=0.18, top=0.85, wspace=0.06)
-        color_axis = fig.add_axes((0.35, 0.105, 0.30, 0.025))
-        fig.colorbar(colored, cax=color_axis, orientation="horizontal", label="Anomaly value (fixed validation scale)")
-        fig.text(0.5, 0.02, "Model heatmap, not pixel annotations. Values clipped to the shared display range.", ha="center", fontsize=9)
+        fig.suptitle(
+            f"{prediction} | mode={localization.get('score_mode', 'unknown')} | "
+            f"score={score:.5g} | threshold={threshold:.5g}", fontsize=13,
+        )
+        fig.subplots_adjust(
+            left=0.015, right=0.985, bottom=0.17, top=0.90,
+            wspace=0.06, hspace=0.20,
+        )
+        raw_color_axis = fig.add_axes((0.12, 0.075, 0.30, 0.018))
+        fig.colorbar(
+            raw_colored, cax=raw_color_axis, orientation="horizontal",
+            label="Raw anomaly value (fixed validation scale)",
+        )
+        response_color_axis = fig.add_axes((0.58, 0.075, 0.30, 0.018))
+        fig.colorbar(
+            response_colored, cax=response_color_axis, orientation="horizontal",
+            label="Localization response (fixed scale)",
+        )
+        fig.text(
+            0.5, 0.015,
+            "Model localization heuristic; boxes are not pixel-ground-truth annotations.",
+            ha="center", fontsize=8,
+        )
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(output_path)
     finally:
         plt.close(fig)
+    if multiscale_output_path is not None:
+        _save_multiscale_diagnostic(
+            original, localization, multiscale_output_path,
+            raw_display_max=display_max,
+        )

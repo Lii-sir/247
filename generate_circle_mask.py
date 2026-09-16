@@ -61,8 +61,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--category", default="default", help="使用配置中的型号，例如 CCD1")
     parser.add_argument("--mask-name", default="default_mask.png", help="二值 mask 文件名，必须为 PNG")
     parser.add_argument("--roi", type=parse_roi, help="覆盖配置中的归一化 ROI：x,y,w,h")
+    parser.add_argument(
+        "--detection-method",
+        choices=["outer_inner_ring", "hybrid", "dark_contour", "hough"],
+    )
     parser.add_argument("--circle-target", choices=["inner", "outer", "best_contrast"])
-    parser.add_argument("--group-target", choices=["largest", "strongest"])
+    parser.add_argument("--group-target", choices=["best_score", "largest", "strongest"])
+    parser.add_argument("--dark-threshold-offset", type=float)
+    parser.add_argument("--morph-kernel", type=int)
+    parser.add_argument("--min-axis-ratio", type=float)
+    parser.add_argument("--min-contour-score", type=float)
+    parser.add_argument("--ransac-iterations", type=int)
+    parser.add_argument("--ransac-tolerance-ratio", type=float)
+    parser.add_argument("--min-ransac-inlier-ratio", type=float)
+    parser.add_argument("--min-angular-coverage", type=float)
+    parser.add_argument("--inner-radius-min-ratio", type=float)
+    parser.add_argument("--inner-radius-max-ratio", type=float)
+    parser.add_argument("--black-ring-width-ratio", type=float)
+    parser.add_argument("--min-black-ring-coverage", type=float)
+    parser.add_argument("--min-inner-angular-coverage", type=float)
     parser.add_argument("--dp", type=float)
     parser.add_argument("--param1", type=float)
     parser.add_argument("--param2", type=float)
@@ -90,8 +107,22 @@ def main() -> int:
     params = category_config(configs, args.category).copy()
     overrides = {
         "roi": args.roi,
+        "detection_method": args.detection_method,
         "circle_target": args.circle_target,
         "group_target": args.group_target,
+        "dark_threshold_offset": args.dark_threshold_offset,
+        "morph_kernel": args.morph_kernel,
+        "min_axis_ratio": args.min_axis_ratio,
+        "min_contour_score": args.min_contour_score,
+        "ransac_iterations": args.ransac_iterations,
+        "ransac_tolerance_ratio": args.ransac_tolerance_ratio,
+        "min_ransac_inlier_ratio": args.min_ransac_inlier_ratio,
+        "min_angular_coverage": args.min_angular_coverage,
+        "inner_radius_min_ratio": args.inner_radius_min_ratio,
+        "inner_radius_max_ratio": args.inner_radius_max_ratio,
+        "black_ring_width_ratio": args.black_ring_width_ratio,
+        "min_black_ring_coverage": args.min_black_ring_coverage,
+        "min_inner_angular_coverage": args.min_inner_angular_coverage,
         "dp": args.dp,
         "param1": args.param1,
         "param2": args.param2,
