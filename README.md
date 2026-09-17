@@ -147,7 +147,7 @@ outputs/CCD1/<运行时间>/
 
 当校准边界为 0 时，严格大于判定会令整图分类阈值成为一个极小负数。由于异常定位响应通常大于等于 0，三种 Score 模式的画框阶段都会把空间阈值下限限制为 0，避免整幅图被选中；整图分类仍使用 checkpoint 中的原始阈值。该调整会记录在单图 `prediction.json` 的 `threshold_adjusted_for_localization` 字段中。
 
-画框参数在训练、评估和单图预测命令中复用，并保存到 `config.json` 的 `localization` 字段。常用参数是 `--box-min-area-ratio`（最小连通域面积比例）、`--box-morph-kernel`、`--box-open-iterations`、`--box-close-iterations`、`--box-merge-iou`、`--box-merge-distance-ratio` 和 `--box-padding-ratio`。命令行未指定时沿用 checkpoint；旧 checkpoint 自动补齐默认值。
+画框参数在训练、评估和单图预测命令中复用，并保存到 `config.json` 的 `localization` 字段。常用参数是 `--box-min-area-ratio`（最小连通域面积比例）、`--box-morph-kernel`、`--box-open-iterations`、`--box-close-iterations`、`--box-merge-iou`、`--box-merge-containment`（小尺度框被大尺度框覆盖时的合并比例）、`--box-merge-distance-ratio` 和 `--box-padding-ratio`。命令行未指定时沿用 checkpoint；旧 checkpoint 自动补齐默认值。
 
 ## 6. 重跑评估、预测和续训
 
@@ -230,6 +230,7 @@ uv run python efficientad_ccd.py train `
 
 # 无需修改 JSON：打开界面，拖框选择 ROI，检测并保存 mask。
 uv run python circle_mask_gui.py
+# 也可打开整个图片文件夹，选定统一 ROI 后批量检测，再用按钮或左右方向键逐张查看。
 
 uv run python generate_circle_mask.py `
   --input "D:\datasets\20260913_caijian_liugongwei\2lixiaodong\CCD1\good\B20260731_01_CCD1_0003.bmp" `
@@ -265,13 +266,14 @@ CUDA_VISIBLE_DEVICES=1 python efficientad_ccd.py evaluate \
   --num-workers 0
 ```
 
+目录输入会递归检测，并在输出目录中保留输入图片的相对子目录，避免不同缺陷目录中的同名图片互相覆盖。输出目录可以放在输入目录下，脚本会排除该目录；但输入目录与输出目录不能完全相同。
+
 `generate_circle_mask.py` 从一张参考图生成原图尺寸的单通道 `default_mask.png`：圆内为 255、圆外为 0。同时输出检测叠加图、白色填充预览和带检测耗时的 `circle_mask.json`。确认结果后，可将该 PNG 配置为对应型号的 `default_mask`。
 
-圆检测默认使用 `hybrid`：先对 ROI 内暗区域进行 Otsu 分割、形态学处理、轮廓几何筛选和 RANSAC 圆拟合；没有可信轮廓候选时才回退到 Hough。`param1/param2` 只控制 Hough 路径。若暗区分割范围不合适，优先调整 `dark_threshold_offset`；候选过松或过严则调整 `min_contour_score`。
-
-当目标是“先检测外侧大圆，再利用大小圆之间的黑色环带定位内圆”时，使用
-`detection_method: outer_inner_ring`。该模式只要求内圆完整位于外圆内部，不要求两者
-同心；它综合暗区内轮廓、边缘圆弧和 Hough 候选，并按黑环覆盖率选择最终内圆：
+圆检测界面固定使用 `outer_inner_ring`：先检测外侧大圆，再利用大小圆之间的黑色环带定位内圆。该模式只要求内圆完整位于外圆内部，不要求两者
+同心。程序先用最大暗色圆形外轮廓直接拟合外圆，再保留外圆内部与外侧环带相连的
+黑色区域，从该黑区的内侧边缘点一次性稳健拟合内圆，不会再对内圆运行另一套 Hough
+候选搜索：
 
 ```json
 {

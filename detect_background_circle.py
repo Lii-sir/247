@@ -30,12 +30,26 @@ def write_image(path: Path, image_rgb: np.ndarray) -> None:
     encoded.tofile(path)
 
 
-def iter_images(path: Path) -> list[Path]:
+def iter_images(path: Path, *, exclude: Path | None = None) -> list[Path]:
+    """列出输入图片；输出目录位于输入树中时明确排除，避免重复处理。"""
     if path.is_file():
         return [path]
     if path.is_dir():
-        return sorted(p for p in path.rglob("*") if p.suffix.lower() in IMAGE_SUFFIXES)
+        excluded = exclude.resolve() if exclude is not None else None
+        return sorted(
+            candidate
+            for candidate in path.rglob("*")
+            if candidate.is_file()
+            and candidate.suffix.lower() in IMAGE_SUFFIXES
+            and not (excluded is not None and candidate.resolve().is_relative_to(excluded))
+        )
     raise FileNotFoundError(f"输入路径不存在：{path}")
+
+
+def output_stem(input_path: Path, source: Path, output_dir: Path) -> Path:
+    """在输出目录中保留递归输入的相对层级，避免同名文件覆盖。"""
+    relative_parent = source.relative_to(input_path).parent if input_path.is_dir() else Path()
+    return output_dir / relative_parent / source.stem
 
 
 def parse_roi(value: str) -> list[float]:
@@ -61,6 +75,7 @@ def main() -> int:
     parser.add_argument("--dark-threshold-offset", type=float, help="Otsu 暗区阈值偏移，正数保留更多暗区")
     parser.add_argument("--morph-kernel", type=int, help="暗区轮廓开闭运算窗口（正奇数）")
     parser.add_argument("--min-axis-ratio", type=float, help="拟合椭圆最小短轴/长轴比例")
+    parser.add_argument("--outer-min-axis-ratio", type=float, help="外圆拟合椭圆最小短轴/长轴比例")
     parser.add_argument("--min-contour-score", type=float, help="暗区轮廓候选最低综合置信度")
     parser.add_argument("--ransac-iterations", type=int)
     parser.add_argument("--ransac-tolerance-ratio", type=float, help="RANSAC 内点距离容差/半径")
@@ -91,6 +106,7 @@ def main() -> int:
         "dark_threshold_offset": args.dark_threshold_offset,
         "morph_kernel": args.morph_kernel,
         "min_axis_ratio": args.min_axis_ratio,
+        "outer_min_axis_ratio": args.outer_min_axis_ratio,
         "min_contour_score": args.min_contour_score,
         "ransac_iterations": args.ransac_iterations,
         "ransac_tolerance_ratio": args.ransac_tolerance_ratio,
@@ -114,8 +130,14 @@ def main() -> int:
     params.update({key: value for key, value in overrides.items() if value is not None})
     params.setdefault("enabled", True)
 
-    images = iter_images(args.input.resolve())
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    input_path = args.input.resolve()
+    output_dir = args.output_dir.resolve()
+    if input_path.is_dir() and output_dir == input_path:
+        raise ValueError("输入目录和输出目录不能相同；请为检测结果指定单独的输出目录。")
+    images = iter_images(input_path, exclude=output_dir)
+    if not images:
+        raise ValueError(f"输入路径中没有受支持的图片：{input_path}")
+    output_dir.mkdir(parents=True, exist_ok=True)
     failed = 0
     timings = []
     for path in images:
@@ -128,12 +150,17 @@ def main() -> int:
             masked = image.copy()
             masked[mask > 0] = 255
             overlay = overlay_diagnostics(image, result, params)
-            stem = path.stem
-            write_image(args.output_dir / f"{stem}_overlay.jpg", overlay)
-            write_image(args.output_dir / f"{stem}_masked.jpg", masked)
-            write_image(args.output_dir / f"{stem}_mask.png", np.repeat(mask[:, :, None], 3, axis=2))
+            destination = output_stem(input_path, path, output_dir)
+            write_image(destination.with_name(f"{destination.name}_overlay.jpg"), overlay)
+            write_image(destination.with_name(f"{destination.name}_masked.jpg"), masked)
+            write_image(
+                destination.with_name(f"{destination.name}_mask.png"),
+                np.repeat(mask[:, :, None], 3, axis=2),
+            )
             metadata = {"image": str(path), "params": params, **result}
-            (args.output_dir / f"{stem}_circle.json").write_text(
+            metadata_path = destination.with_name(f"{destination.name}_circle.json")
+            metadata_path.parent.mkdir(parents=True, exist_ok=True)
+            metadata_path.write_text(
                 json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
             )
             if selected.get("enabled", True):

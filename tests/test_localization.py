@@ -26,6 +26,7 @@ TEST_PARAMS = {
     "open_iterations": 0,
     "close_iterations": 0,
     "merge_iou": 0.15,
+    "merge_containment": 0.80,
     "merge_distance_ratio": 0.0,
     "padding_ratio": 0.0,
     "fallback_size_ratio": 0.1,
@@ -166,6 +167,31 @@ class LocalizationTests(unittest.TestCase):
             only_first["response_map"], only_first["scales"][0]["normalized_map"]
         ))
 
+    def test_nested_multiscale_boxes_merge_by_containment(self) -> None:
+        anomaly = torch.zeros((1, 1, 31, 31))
+        anomaly[0, 0, 14:17, 14:17] = 8.0
+        method = {
+            "pool_kernels": [1, 15], "topk_ratio": 0.001,
+            "normalization": {
+                "1": {"median": 0.0, "q99": 1.0, "denominator": 1.0},
+                "15": {"median": 0.0, "q99": 0.01, "denominator": 0.01},
+            },
+        }
+        result = build_localization(
+            anomaly, torch.zeros_like(anomaly, dtype=torch.bool),
+            score_mode="multiscale_pool", score_method=method,
+            score_values={
+                "score": 2.0,
+                "score_kernel_1": 8.0, "score_normalized_kernel_1": 8.0,
+                "score_kernel_15": 0.2, "score_normalized_kernel_15": 2.0,
+            },
+            threshold=1.0, raw_display_max=8.0, params=TEST_PARAMS,
+        )
+        self.assertEqual(len(result["scales"][0]["boxes"]), 1)
+        self.assertEqual(len(result["scales"][1]["boxes"]), 1)
+        self.assertEqual(len(result["boxes"]), 1)
+        self.assertEqual(result["boxes"][0]["source_scales"], [1, 15])
+
     def test_multiscale_visualization_saves_main_and_scale_diagnostic(self) -> None:
         anomaly = torch.zeros((1, 1, 12, 12))
         anomaly[0, 0, 4:8, 4:8] = 4.0
@@ -235,7 +261,8 @@ class LocalizationTests(unittest.TestCase):
     def test_localization_parameter_validation(self) -> None:
         for invalid in (
             {"morph_kernel": 2}, {"open_iterations": -1},
-            {"min_area_ratio": -0.1}, {"normalized_display_max": 0},
+            {"min_area_ratio": -0.1}, {"merge_containment": 1.1},
+            {"normalized_display_max": 0},
         ):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 normalize_localization_params(invalid)

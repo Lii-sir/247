@@ -45,6 +45,7 @@ LOCALIZATION_ARGUMENT_FIELDS = {
     "box_open_iterations": "open_iterations",
     "box_close_iterations": "close_iterations",
     "box_merge_iou": "merge_iou",
+    "box_merge_containment": "merge_containment",
     "box_merge_distance_ratio": "merge_distance_ratio",
     "box_padding_ratio": "padding_ratio",
     "box_fallback_size_ratio": "fallback_size_ratio",
@@ -69,6 +70,10 @@ def add_localization_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--box-open-iterations", type=int, help="形态学开运算次数，默认 1")
     parser.add_argument("--box-close-iterations", type=int, help="形态学闭运算次数，默认 1")
     parser.add_argument("--box-merge-iou", type=float, help="框重叠合并 IoU，默认 0.15")
+    parser.add_argument(
+        "--box-merge-containment", type=float,
+        help="小框被大框覆盖到该比例时合并，默认 0.80",
+    )
     parser.add_argument("--box-merge-distance-ratio", type=float, help="临近框合并距离/图像对角线，默认 0.005")
     parser.add_argument("--box-padding-ratio", type=float, help="框外扩像素/最大边长，默认 0.003")
     parser.add_argument("--box-fallback-size-ratio", type=float, help="异常但无连通域时兜底框尺寸比例，默认 0.02")

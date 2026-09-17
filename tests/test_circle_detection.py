@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import cv2
 import numpy as np
 
 import circle_mask
+import detect_background_circle as detector_cli
+from detect_background_circle import iter_images, output_stem
 
 
 class RobustCircleDetectionTests(unittest.TestCase):
@@ -117,6 +121,41 @@ class RobustCircleDetectionTests(unittest.TestCase):
         self.assertLessEqual(abs(selected["radius"] - 43), 4)
         self.assertGreater(selected["black_ring_coverage"], 0.70)
         self.assertEqual(selected["circle_target"], "inner_black_ring")
+
+    def test_recursive_input_preserves_subdirectories_and_excludes_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            input_dir = root / "input"
+            output_dir = input_dir / "results"
+            first = input_dir / "defect1" / "same.bmp"
+            second = input_dir / "defect2" / "same.bmp"
+            old_output = output_dir / "same_overlay.jpg"
+            for path in (first, second, old_output):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"placeholder")
+
+            images = iter_images(input_dir, exclude=output_dir)
+            self.assertEqual(images, [first, second])
+            self.assertEqual(
+                output_stem(input_dir, first, output_dir),
+                output_dir / "defect1" / "same",
+            )
+            self.assertEqual(
+                output_stem(input_dir, second, output_dir),
+                output_dir / "defect2" / "same",
+            )
+
+    def test_detector_rejects_same_input_and_output_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            arguments = [
+                "detect_background_circle.py", "--input", str(folder),
+                "--output-dir", str(folder),
+            ]
+            with patch("sys.argv", arguments), self.assertRaisesRegex(
+                ValueError, "输入目录和输出目录不能相同"
+            ):
+                detector_cli.main()
 
 
 if __name__ == "__main__":

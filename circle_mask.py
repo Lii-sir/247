@@ -12,6 +12,42 @@ import numpy as np
 from PIL import Image, ImageOps
 
 
+# Public defaults shared by the detector and its frontends. Ratio values use
+# the backend representation (0..1), not display percentages.
+CIRCLE_DETECTION_DEFAULTS = {
+    "enabled": True,
+    "detection_method": "outer_inner_ring",
+    "require_circle_inside_roi": True,
+    "roi": [0.45, 0.05, 0.50, 0.90],
+    "circle_target": "outer",
+    "group_target": "largest",
+    "min_radius_ratio": 0.05,
+    "max_radius_ratio": 0.80,
+    "dark_threshold_offset": 0.0,
+    "morph_kernel": 5,
+    "min_axis_ratio": 0.65,
+    "outer_min_axis_ratio": 0.60,
+    "min_contour_score": 0.40,
+    "inner_radius_min_ratio": 0.15,
+    "inner_radius_max_ratio": 0.75,
+    "black_ring_width_ratio": 0.06,
+    "min_black_ring_coverage": 0.45,
+    "min_inner_angular_coverage": 0.35,
+    "dp": 1.2,
+    "min_dist_ratio": 0.12,
+    "param1": 60.0,
+    "param2": 22.0,
+    "blur_kernel": 5,
+    "mask_radius_scale": 1.0,
+    "mask_margin": 2,
+}
+
+
+def resolve_circle_params(params: dict | None = None) -> dict:
+    """Return detector settings with all public defaults filled in."""
+    return {**CIRCLE_DETECTION_DEFAULTS, **(params or {})}
+
+
 def read_rgb(path: Path) -> np.ndarray:
     """读取并处理 EXIF 方向，返回 RGB uint8 数组。"""
     with Image.open(path) as source:
@@ -221,8 +257,13 @@ def _group_candidates(candidates: list[dict]) -> list[list[dict]]:
 
 def _dark_binary(gray: np.ndarray, params: dict) -> tuple[np.ndarray, dict]:
     """生成暗区域二值图及其可序列化参数记录。"""
-    offset = _finite(params.get("dark_threshold_offset", 0.0), "dark_threshold_offset")
-    morph_kernel = max(1, int(params.get("morph_kernel", 5)) | 1)
+    offset = _finite(
+        params.get("dark_threshold_offset", CIRCLE_DETECTION_DEFAULTS["dark_threshold_offset"]),
+        "dark_threshold_offset",
+    )
+    morph_kernel = max(
+        1, int(params.get("morph_kernel", CIRCLE_DETECTION_DEFAULTS["morph_kernel"])) | 1
+    )
     otsu_value, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
     threshold_value = int(np.clip(otsu_value + offset, 0, 255))
     _, binary = cv2.threshold(gray, threshold_value, 255, cv2.THRESH_BINARY_INV)
@@ -240,11 +281,12 @@ def dark_region_mask(image_rgb: np.ndarray, params: dict) -> np.ndarray:
     """返回与实际轮廓检测一致的原图尺寸暗区诊断 mask。"""
     if image_rgb.ndim != 3 or image_rgb.shape[2] != 3:
         raise ValueError("输入图片必须是 RGB 三通道数组。")
+    params = resolve_circle_params(params)
     x0, y0, x1, y1 = _roi_pixels(
-        image_rgb.shape[:2], params.get("roi", [0.45, 0.05, 0.50, 0.90])
+        image_rgb.shape[:2], params["roi"]
     )
     crop = cv2.cvtColor(image_rgb[y0:y1, x0:x1], cv2.COLOR_RGB2GRAY)
-    gray = cv2.medianBlur(crop, int(params.get("blur_kernel", 5)) | 1)
+    gray = cv2.medianBlur(crop, int(params["blur_kernel"]) | 1)
     binary, _ = _dark_binary(gray, params)
     result = np.zeros(image_rgb.shape[:2], dtype=np.uint8)
     result[y0:y1, x0:x1] = binary
@@ -263,8 +305,14 @@ def _dark_contour_candidates(
     contours = sorted(contours, key=cv2.contourArea, reverse=True)[:max(1, int(params.get("max_contours", 40)))]
     candidates = []
     rejected = {"too_small": 0, "shape": 0, "ransac": 0, "outside_roi": 0, "score": 0}
-    min_axis_ratio = _finite(params.get("min_axis_ratio", 0.65), "min_axis_ratio")
-    min_candidate_score = _finite(params.get("min_contour_score", 0.40), "min_contour_score")
+    min_axis_ratio = _finite(
+        params.get("min_axis_ratio", CIRCLE_DETECTION_DEFAULTS["min_axis_ratio"]),
+        "min_axis_ratio",
+    )
+    min_candidate_score = _finite(
+        params.get("min_contour_score", CIRCLE_DETECTION_DEFAULTS["min_contour_score"]),
+        "min_contour_score",
+    )
     min_inlier_ratio = _finite(
         params.get("min_ransac_inlier_ratio", 0.45), "min_ransac_inlier_ratio"
     )
@@ -301,7 +349,10 @@ def _dark_contour_candidates(
             rejected["ransac"] += 1
             continue
         center_x, center_y, radius = fitted["center_x"], fitted["center_y"], fitted["radius"]
-        if params.get("require_circle_inside_roi", True) and not (
+        if params.get(
+            "require_circle_inside_roi",
+            CIRCLE_DETECTION_DEFAULTS["require_circle_inside_roi"],
+        ) and not (
             center_x - radius >= 0
             and center_y - radius >= 0
             and center_x + radius < gray.shape[1]
@@ -360,10 +411,14 @@ def _hough_candidates(
     circles = cv2.HoughCircles(
         gray,
         cv2.HOUGH_GRADIENT,
-        dp=float(params.get("dp", 1.2)),
-        minDist=max(10.0, float(params.get("min_dist_ratio", 0.12)) * min(gray.shape[:2])),
-        param1=float(params.get("param1", 100.0)),
-        param2=float(params.get("param2", 22.0)),
+        dp=float(params.get("dp", CIRCLE_DETECTION_DEFAULTS["dp"])),
+        minDist=max(
+            10.0,
+            float(params.get("min_dist_ratio", CIRCLE_DETECTION_DEFAULTS["min_dist_ratio"]))
+            * min(gray.shape[:2]),
+        ),
+        param1=float(params.get("param1", CIRCLE_DETECTION_DEFAULTS["param1"])),
+        param2=float(params.get("param2", CIRCLE_DETECTION_DEFAULTS["param2"])),
         minRadius=min_radius,
         maxRadius=max_radius,
     )
@@ -372,7 +427,10 @@ def _hough_candidates(
         for center_x, center_y, radius in np.rint(circles[0]).astype(np.int32):
             if radius <= 0:
                 continue
-            if params.get("require_circle_inside_roi", True) and not (
+            if params.get(
+                "require_circle_inside_roi",
+                CIRCLE_DETECTION_DEFAULTS["require_circle_inside_roi"],
+            ) and not (
                 center_x - radius >= 0
                 and center_y - radius >= 0
                 and center_x + radius < gray.shape[1]
@@ -423,7 +481,10 @@ def _black_ring_metrics(
     outer_radius = float(outer["radius"])
     samples = max(72, int(params.get("radial_samples", 360)))
     angles = np.linspace(0.0, 2.0 * np.pi, samples, endpoint=False, dtype=np.float32)
-    width_ratio = _finite(params.get("black_ring_width_ratio", 0.06), "black_ring_width_ratio")
+    width_ratio = _finite(
+        params.get("black_ring_width_ratio", CIRCLE_DETECTION_DEFAULTS["black_ring_width_ratio"]),
+        "black_ring_width_ratio",
+    )
     if not 0 < width_ratio < 1:
         raise ValueError("black_ring_width_ratio 必须位于 (0, 1)。")
     ring_width = max(3.0, width_ratio * outer_radius)
@@ -493,24 +554,187 @@ def _black_ring_metrics(
     }
 
 
-def _deduplicate_circles(candidates: list[dict]) -> list[dict]:
-    """合并不同候选生成器产生的近似重复圆。"""
-    unique: list[dict] = []
-    for candidate in sorted(candidates, key=lambda item: item.get("candidate_score", 0.0), reverse=True):
-        duplicate = False
-        for kept in unique:
-            radius_scale = max(4.0, float(candidate["radius"]), float(kept["radius"]))
-            center_distance = math.hypot(
-                float(candidate["center_x"]) - float(kept["center_x"]),
-                float(candidate["center_y"]) - float(kept["center_y"]),
-            )
-            radius_distance = abs(float(candidate["radius"]) - float(kept["radius"]))
-            if center_distance <= 0.08 * radius_scale and radius_distance <= 0.12 * radius_scale:
-                duplicate = True
-                break
-        if not duplicate:
-            unique.append(candidate)
-    return unique
+def _simple_outer_circle(
+    gray: np.ndarray,
+    binary: np.ndarray,
+    min_radius: int,
+    max_radius: int,
+    params: dict,
+) -> tuple[dict, int]:
+    """从暗区最大圆形外轮廓直接拟合外圆。"""
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    candidates: list[tuple[float, dict]] = []
+    minimum_axis_ratio = float(
+        params.get("outer_min_axis_ratio", CIRCLE_DETECTION_DEFAULTS["outer_min_axis_ratio"])
+    )
+    for contour in contours:
+        if len(contour) < 6:
+            continue
+        area = float(abs(cv2.contourArea(contour)))
+        perimeter = float(cv2.arcLength(contour, True))
+        if area <= 0 or perimeter <= 0:
+            continue
+        (center_x, center_y), (diameter_a, diameter_b), angle = cv2.fitEllipse(contour)
+        major, minor = max(diameter_a, diameter_b), min(diameter_a, diameter_b)
+        if major <= 0 or minor / major < minimum_axis_ratio:
+            continue
+        radius = 0.25 * (major + minor)
+        if not min_radius <= radius <= max_radius:
+            continue
+        if params.get(
+            "require_circle_inside_roi",
+            CIRCLE_DETECTION_DEFAULTS["require_circle_inside_roi"],
+        ) and not (
+            center_x - radius >= 0
+            and center_y - radius >= 0
+            and center_x + radius < gray.shape[1]
+            and center_y + radius < gray.shape[0]
+        ):
+            continue
+        circularity = float(np.clip(4.0 * math.pi * area / (perimeter * perimeter), 0.0, 1.0))
+        axis_ratio = float(minor / major)
+        # 外圆在这里仅用于限定内侧搜索区域，面积优先即可。
+        objective = area * (0.5 + 0.25 * axis_ratio + 0.25 * circularity)
+        candidates.append((objective, {
+            "center_x": int(round(center_x)),
+            "center_y": int(round(center_y)),
+            "radius": int(round(radius)),
+            "edge_score": _edge_score(gray, center_x, center_y, radius),
+            "candidate_score": 0.5 * axis_ratio + 0.5 * circularity,
+            "axis_ratio": axis_ratio,
+            "circularity": circularity,
+            "fitted_ellipse": {
+                "diameter_major": float(major),
+                "diameter_minor": float(minor),
+                "angle": float(angle),
+            },
+            "detector": "largest_dark_outer_contour",
+            "role": "outer_search_boundary",
+        }))
+    if not candidates:
+        raise ValueError("ROI 内没有找到可拟合外圆的暗色外轮廓。")
+    return max(candidates, key=lambda item: item[0])[1], len(candidates)
+
+
+def _connected_black_region(binary: np.ndarray, outer: dict) -> np.ndarray:
+    """保留外圆中与外侧黑环采样带重合最多的暗色连通区域。"""
+    height, width = binary.shape
+    center = (int(outer["center_x"]), int(outer["center_y"]))
+    radius = int(outer["radius"])
+    outer_disk = np.zeros((height, width), dtype=np.uint8)
+    seed_band = np.zeros((height, width), dtype=np.uint8)
+    cv2.circle(outer_disk, center, max(1, int(round(0.96 * radius))), 255, thickness=-1)
+    cv2.circle(seed_band, center, max(1, int(round(0.90 * radius))), 255, thickness=-1)
+    cv2.circle(seed_band, center, max(1, int(round(0.62 * radius))), 0, thickness=-1)
+    dark_inside = cv2.bitwise_and(binary, outer_disk)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(dark_inside, connectivity=8)
+    if count <= 1:
+        raise ValueError("已找到外圆，但外圆内部没有可用的黑色区域。")
+    best_label = max(
+        range(1, count),
+        key=lambda label: (
+            int(np.count_nonzero((labels == label) & (seed_band > 0))),
+            int(stats[label, cv2.CC_STAT_AREA]),
+        ),
+    )
+    if not np.any((labels == best_label) & (seed_band > 0)):
+        raise ValueError("外圆内部的暗区没有与外侧黑环相连。")
+    return np.where(labels == best_label, 255, 0).astype(np.uint8)
+
+
+def _fit_inner_circle_from_black_edge(
+    gray: np.ndarray,
+    black_region: np.ndarray,
+    outer: dict,
+    min_radius: int,
+    max_radius: int,
+    params: dict,
+) -> tuple[dict, dict]:
+    """提取黑区内侧边缘点，并对点云执行一次 RANSAC 圆拟合。"""
+    high = float(params.get("param1", CIRCLE_DETECTION_DEFAULTS["param1"]))
+    image_edges = cv2.Canny(gray, max(1.0, 0.45 * high), high)
+    # 黑区形态边缘用于补足低对比度圆弧，灰度边缘用于处理黑区与孔洞粘连的情况。
+    eroded = cv2.erode(
+        black_region, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    )
+    region_edge = cv2.subtract(black_region, eroded)
+    near_black = cv2.dilate(
+        black_region, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    )
+    edge_mask = cv2.bitwise_or(region_edge, cv2.bitwise_and(image_edges, near_black))
+
+    yy, xx = np.indices(gray.shape)
+    distance_to_outer_center = np.hypot(
+        xx - float(outer["center_x"]), yy - float(outer["center_y"])
+    )
+    # 去掉外圆本身的边缘，只留下外圆内部向内遇到的黑区边缘。
+    inner_search = distance_to_outer_center <= 0.88 * float(outer["radius"])
+    points_y, points_x = np.nonzero((edge_mask > 0) & inner_search)
+    points = np.column_stack((points_x, points_y)).astype(np.float64)
+    if len(points) < 12:
+        raise ValueError("黑色区域的内侧边缘点不足，无法拟合内圆。")
+
+    maximum_points = max(200, int(params.get("inner_edge_max_points", 2400)))
+    rng = np.random.default_rng(int(params.get("ransac_seed", 2026)) + 20000)
+    if len(points) > maximum_points:
+        points = points[rng.choice(len(points), maximum_points, replace=False)]
+    iterations = max(100, int(params.get("inner_ransac_iterations", 800)))
+    tolerance_ratio = float(params.get("inner_ransac_tolerance_ratio", 0.04))
+    margin = max(0.0, float(params.get("inner_containment_margin_ratio", 0.01))) * float(outer["radius"])
+    best: tuple[float, tuple[float, float, float], np.ndarray, float] | None = None
+    for _ in range(iterations):
+        model = _circle_from_three_points(points[rng.choice(len(points), 3, replace=False)])
+        if model is None:
+            continue
+        center_x, center_y, radius = model
+        if not min_radius <= radius <= max_radius:
+            continue
+        if math.hypot(center_x - outer["center_x"], center_y - outer["center_y"]) + radius + margin >= outer["radius"]:
+            continue
+        tolerance = max(1.5, tolerance_ratio * radius)
+        inliers, _, coverage = _circle_support(points, center_x, center_y, radius, tolerance)
+        inlier_count = int(np.count_nonzero(inliers))
+        objective = inlier_count * (0.25 + 0.75 * coverage)
+        if best is None or objective > best[0]:
+            best = (objective, model, inliers, coverage)
+    if best is None:
+        raise ValueError("已提取黑区内侧边缘，但无法拟合出满足尺寸范围的内圆。")
+    refined = _refine_circle(points[best[2]]) or best[1]
+    center_x, center_y, radius = refined
+    if not min_radius <= radius <= max_radius:
+        raise ValueError("内圆精修后的半径超出设定范围。")
+    if math.hypot(center_x - outer["center_x"], center_y - outer["center_y"]) + radius + margin >= outer["radius"]:
+        raise ValueError("内圆精修后超出外圆边界。")
+    tolerance = max(1.5, tolerance_ratio * radius)
+    inliers, inlier_ratio, coverage = _circle_support(
+        points, center_x, center_y, radius, tolerance
+    )
+    minimum_coverage = float(
+        params.get(
+            "min_inner_angular_coverage",
+            CIRCLE_DETECTION_DEFAULTS["min_inner_angular_coverage"],
+        )
+    )
+    if not 0 <= minimum_coverage <= 1:
+        raise ValueError("min_inner_angular_coverage 必须位于 [0, 1]。")
+    if coverage < minimum_coverage:
+        raise ValueError(
+            "内圆弧覆盖率不足（对应界面“最小内圆弧覆盖率”）："
+            f"{coverage:.3f} < {minimum_coverage:.3f}。"
+        )
+    return {
+        "center_x": int(round(center_x)),
+        "center_y": int(round(center_y)),
+        "radius": int(round(radius)),
+        "ransac_inlier_ratio": inlier_ratio,
+        "ransac_inlier_count": int(np.count_nonzero(inliers)),
+        "angular_coverage": coverage,
+        "edge_score": _edge_score(gray, center_x, center_y, radius),
+        "detector": "black_region_inner_edge_fit",
+    }, {
+        "inner_edge_point_count": int(len(points)),
+        "inner_edge_inlier_count": int(np.count_nonzero(inliers)),
+    }
 
 
 def _outer_inner_ring_candidates(
@@ -519,124 +743,56 @@ def _outer_inner_ring_candidates(
     max_radius: int,
     params: dict,
 ) -> tuple[list[dict], dict]:
-    """先找外圆，再依靠黑色环带寻找允许大幅偏心的内圆。"""
-    outer_params = {
-        **params,
-        "min_contour_score": float(params.get("outer_min_contour_score", 0.30)),
-        "min_ransac_inlier_ratio": float(params.get("outer_min_ransac_inlier_ratio", 0.35)),
-        "min_angular_coverage": float(params.get("outer_min_angular_coverage", 0.45)),
-    }
-    outer_contours, contour_details = _dark_contour_candidates(
-        gray, min_radius, max_radius, outer_params
+    """最大暗轮廓拟合外圆，再从连通黑区的内侧边缘拟合内圆。"""
+    binary, binary_details = _dark_binary(gray, params)
+    outer, outer_candidate_count = _simple_outer_circle(
+        gray, binary, min_radius, max_radius, params
     )
-    outer_hough, discarded = _hough_candidates(gray, min_radius, max_radius, params)
-    outer_pool = _deduplicate_circles(outer_contours + outer_hough)
-    if not outer_pool:
-        raise ValueError("ROI 内未检测到外侧大圆。")
-    largest_outer_radius = max(float(item["radius"]) for item in outer_pool)
-    outer = max(
-        outer_pool,
-        key=lambda item: (
-            float(item.get("candidate_score", 0.0))
-            + 0.35 * float(item["radius"]) / largest_outer_radius
-        ),
-    ).copy()
-    outer["role"] = "outer_search_boundary"
 
     inner_min_ratio = _finite(
-        params.get("inner_radius_min_ratio", 0.15), "inner_radius_min_ratio"
+        params.get(
+            "inner_radius_min_ratio", CIRCLE_DETECTION_DEFAULTS["inner_radius_min_ratio"]
+        ),
+        "inner_radius_min_ratio",
     )
     inner_max_ratio = _finite(
-        params.get("inner_radius_max_ratio", 0.75), "inner_radius_max_ratio"
+        params.get(
+            "inner_radius_max_ratio", CIRCLE_DETECTION_DEFAULTS["inner_radius_max_ratio"]
+        ),
+        "inner_radius_max_ratio",
     )
     if not 0 < inner_min_ratio < inner_max_ratio < 1:
         raise ValueError("内圆半径比例必须满足 0 < min < max < 1。")
     inner_min = max(2, int(round(inner_min_ratio * float(outer["radius"]))))
     inner_max = max(inner_min + 1, int(round(inner_max_ratio * float(outer["radius"]))))
 
-    binary, binary_details = _dark_binary(gray, params)
-    inner_params = {
-        **params,
-        "min_ransac_inlier_ratio": float(params.get("min_inner_ransac_inlier_ratio", 0.25)),
-        "min_angular_coverage": float(params.get("min_inner_angular_coverage", 0.35)),
-        "ransac_tolerance_ratio": float(params.get("inner_ransac_tolerance_ratio", 0.04)),
-    }
-    contour_sets: list[tuple[str, list[np.ndarray]]] = []
-    dark_contours, _ = cv2.findContours(binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
-    contour_sets.append(("dark_inner_boundary", dark_contours))
-    high = float(params.get("param1", 100.0))
-    edges = cv2.Canny(gray, max(1.0, high * 0.45), high)
-    edge_contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
-    contour_sets.append(("edge_arc", edge_contours))
-
-    raw_candidates: list[dict] = []
-    max_contours = max(10, int(params.get("max_inner_contours", 80)))
-    seed = int(params.get("ransac_seed", 2026)) + 10000
-    for source, contours in contour_sets:
-        for index, contour in enumerate(
-            sorted(contours, key=lambda item: cv2.arcLength(item, True), reverse=True)[:max_contours]
-        ):
-            if len(contour) < 6:
-                continue
-            fitted = _ransac_circle(
-                contour, inner_min, inner_max, inner_params, seed + index
-            )
-            if fitted is None:
-                continue
-            raw_candidates.append({
-                **fitted,
-                "center_x": int(round(fitted["center_x"])),
-                "center_y": int(round(fitted["center_y"])),
-                "radius": int(round(fitted["radius"])),
-                "detector": source,
-            })
-        seed += max_contours
-    hough_candidates, _ = _hough_candidates(
-        gray, inner_min, inner_max, {**params, "require_circle_inside_roi": False}
+    black_region = _connected_black_region(binary, outer)
+    candidate, edge_details = _fit_inner_circle_from_black_edge(
+        gray, black_region, outer, inner_min, inner_max, params
     )
-    raw_candidates.extend(hough_candidates)
-
-    accepted: list[dict] = []
-    rejected = {"outside_outer": 0, "black_ring": 0, "arc_coverage": 0}
-    containment_margin = max(0.0, float(params.get("inner_containment_margin_ratio", 0.01))) * float(outer["radius"])
+    metrics = _black_ring_metrics(gray, black_region, candidate, outer, params)
+    candidate = {**candidate, **metrics, "role": "inner_mask_circle"}
     min_black_coverage = _finite(
-        params.get("min_black_ring_coverage", 0.45), "min_black_ring_coverage"
+        params.get(
+            "min_black_ring_coverage", CIRCLE_DETECTION_DEFAULTS["min_black_ring_coverage"]
+        ),
+        "min_black_ring_coverage",
     )
-    min_arc_coverage = _finite(
-        params.get("min_inner_angular_coverage", 0.35), "min_inner_angular_coverage"
-    )
-    if not 0 <= min_black_coverage <= 1 or not 0 <= min_arc_coverage <= 1:
-        raise ValueError("黑环覆盖率和内圆圆弧覆盖率必须位于 [0, 1]。")
-    for candidate in raw_candidates:
-        center_distance = math.hypot(
-            float(candidate["center_x"]) - float(outer["center_x"]),
-            float(candidate["center_y"]) - float(outer["center_y"]),
+    if not 0 <= min_black_coverage <= 1:
+        raise ValueError("min_black_ring_coverage 必须位于 [0, 1]。")
+    if candidate["black_ring_coverage"] < min_black_coverage:
+        raise ValueError(
+            "黑环覆盖率不足（对应界面“最小黑环覆盖率”）："
+            f"{candidate['black_ring_coverage']:.3f} "
+            f"< {min_black_coverage:.3f}。"
         )
-        if center_distance + float(candidate["radius"]) + containment_margin >= float(outer["radius"]):
-            rejected["outside_outer"] += 1
-            continue
-        metrics = _black_ring_metrics(gray, binary, candidate, outer, params)
-        candidate = {**candidate, **metrics, "role": "inner_mask_circle"}
-        if candidate["black_ring_coverage"] < min_black_coverage:
-            rejected["black_ring"] += 1
-            continue
-        if max(candidate.get("angular_coverage", 0.0), candidate["edge_coverage"]) < min_arc_coverage:
-            rejected["arc_coverage"] += 1
-            continue
-        accepted.append(candidate)
-    accepted = _deduplicate_circles(accepted)
-    accepted.sort(key=lambda item: item["candidate_score"], reverse=True)
-    if not accepted:
-        raise ValueError("已检测到外圆，但没有找到具有足够黑色环带支持的内圆。")
-    return accepted, {
+    return [candidate], {
         **binary_details,
+        **edge_details,
         "outer_circle": outer,
-        "outer_candidate_count": len(outer_pool),
-        "inner_raw_candidate_count": len(raw_candidates),
-        "inner_rejected": rejected,
+        "outer_candidate_count": outer_candidate_count,
         "inner_radius_range": [inner_min, inner_max],
-        "discarded_outside_roi": discarded,
-        "outer_contour_details": contour_details,
+        "black_region_pixel_count": int(np.count_nonzero(black_region)),
     }
 
 
@@ -644,16 +800,17 @@ def detect_candidates(image_rgb: np.ndarray, params: dict) -> dict:
     """返回 ROI 和候选圆；坐标均为原图坐标。"""
     if image_rgb.ndim != 3 or image_rgb.shape[2] != 3:
         raise ValueError("输入图片必须是 RGB 三通道数组。")
-    if params.get("enabled", True) is False:
+    params = resolve_circle_params(params)
+    if params["enabled"] is False:
         return {"enabled": False, "candidates": [], "groups": [], "roi": None}
-    roi = params.get("roi", [0.45, 0.05, 0.50, 0.90])
+    roi = params["roi"]
     x0, y0, x1, y1 = _roi_pixels(image_rgb.shape[:2], roi)
     crop = cv2.cvtColor(image_rgb[y0:y1, x0:x1], cv2.COLOR_RGB2GRAY)
-    gray = cv2.medianBlur(crop, int(params.get("blur_kernel", 5)) | 1)
+    gray = cv2.medianBlur(crop, int(params["blur_kernel"]) | 1)
     min_dim = min(gray.shape[:2])
-    min_radius = max(2, int(round(float(params.get("min_radius_ratio", 0.05)) * min_dim)))
-    max_radius = max(min_radius + 1, int(round(float(params.get("max_radius_ratio", 0.80)) * min_dim)))
-    method = str(params.get("detection_method", "hybrid")).strip().lower()
+    min_radius = max(2, int(round(float(params["min_radius_ratio"]) * min_dim)))
+    max_radius = max(min_radius + 1, int(round(float(params["max_radius_ratio"]) * min_dim)))
+    method = str(params["detection_method"]).strip().lower()
     if method not in {"hybrid", "dark_contour", "hough", "outer_inner_ring"}:
         raise ValueError(
             "detection_method 只能是 hybrid、dark_contour、hough 或 outer_inner_ring。"
@@ -726,7 +883,7 @@ def select_circle(detection: dict, params: dict) -> dict:
             "candidate_count": len(detection.get("candidates", [])),
             "roi": detection["roi"],
         }
-    group_mode = params.get("group_target", "largest")
+    group_mode = params.get("group_target", CIRCLE_DETECTION_DEFAULTS["group_target"])
     if group_mode == "largest":
         group = max(groups, key=lambda items: max(item["radius"] for item in items))
     elif group_mode == "strongest":
@@ -735,7 +892,7 @@ def select_circle(detection: dict, params: dict) -> dict:
         group = max(groups, key=lambda items: max(item.get("candidate_score", 0.0) for item in items))
     else:
         raise ValueError("group_target 只能是 largest、strongest 或 best_score。")
-    target = params.get("circle_target", "outer")
+    target = params.get("circle_target", CIRCLE_DETECTION_DEFAULTS["circle_target"])
     if target == "inner":
         chosen = min(group, key=lambda item: (item["radius"], -item["edge_score"]))
     elif target == "outer":
@@ -756,6 +913,7 @@ def select_circle(detection: dict, params: dict) -> dict:
 
 def detect_circle(image_rgb: np.ndarray, params: dict) -> dict:
     started = time.perf_counter()
+    params = resolve_circle_params(params)
     detection = detect_candidates(image_rgb, params)
     selected = select_circle(detection, params) if detection.get("enabled", True) else {"enabled": False}
     elapsed_ms = (time.perf_counter() - started) * 1000.0
@@ -857,7 +1015,11 @@ def default_mask_record(image_rgb: np.ndarray, params: dict, *, base_dir: Path |
 
 
 def effective_mask_radius(selected: dict, params: dict) -> int:
-    return max(1, int(round(selected["radius"] * float(params.get("mask_radius_scale", 1.0)))) + int(params.get("mask_margin", 2)))
+    scale = float(
+        params.get("mask_radius_scale", CIRCLE_DETECTION_DEFAULTS["mask_radius_scale"])
+    )
+    margin = int(params.get("mask_margin", CIRCLE_DETECTION_DEFAULTS["mask_margin"]))
+    return max(1, int(round(selected["radius"] * scale)) + margin)
 
 
 def preprocess_record(path: Path, params: dict, image_size: int) -> tuple[np.ndarray, np.ndarray, dict]:
@@ -1016,6 +1178,19 @@ def overlay_diagnostics(image_rgb: np.ndarray, result: dict, params: dict) -> np
                 10,
                 1,
             )
+            cv2.putText(
+                canvas,
+                f"outer r={outer['radius']}",
+                (
+                    max(5, outer["center_x"] - outer["radius"]),
+                    max(20, outer["center_y"] - outer["radius"] - 8),
+                ),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
         mask = make_mask(image_rgb.shape[:2], selected, params)
         mask_radius = effective_mask_radius(selected, params)
         cv2.circle(canvas, (selected["center_x"], selected["center_y"]), selected["radius"], (0, 255, 0), 2)
@@ -1023,7 +1198,12 @@ def overlay_diagnostics(image_rgb: np.ndarray, result: dict, params: dict) -> np
         cv2.drawMarker(canvas, (selected["center_x"], selected["center_y"]), (255, 0, 0), cv2.MARKER_CROSS, 14, 2)
         x, y, w, h = result["detection"]["roi"]
         cv2.rectangle(canvas, (x, y), (x + w, y + h), (255, 128, 0), 2)
-        cv2.putText(canvas, f"target={selected['circle_target']} r={selected['radius']} mask_r={mask_radius}",
+        label = (
+            f"inner r={selected['radius']} mask_r={mask_radius}"
+            if outer is not None
+            else f"target={selected['circle_target']} r={selected['radius']} mask_r={mask_radius}"
+        )
+        cv2.putText(canvas, label,
                     (max(5, selected["center_x"] - selected["radius"]), max(20, selected["center_y"] - selected["radius"] - 8)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2, cv2.LINE_AA)
         if "black_ring_coverage" in selected:

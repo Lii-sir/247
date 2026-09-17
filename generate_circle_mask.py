@@ -70,6 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dark-threshold-offset", type=float)
     parser.add_argument("--morph-kernel", type=int)
     parser.add_argument("--min-axis-ratio", type=float)
+    parser.add_argument("--outer-min-axis-ratio", type=float)
     parser.add_argument("--min-contour-score", type=float)
     parser.add_argument("--ransac-iterations", type=int)
     parser.add_argument("--ransac-tolerance-ratio", type=float)
@@ -113,6 +114,7 @@ def main() -> int:
         "dark_threshold_offset": args.dark_threshold_offset,
         "morph_kernel": args.morph_kernel,
         "min_axis_ratio": args.min_axis_ratio,
+        "outer_min_axis_ratio": args.outer_min_axis_ratio,
         "min_contour_score": args.min_contour_score,
         "ransac_iterations": args.ransac_iterations,
         "ransac_tolerance_ratio": args.ransac_tolerance_ratio,

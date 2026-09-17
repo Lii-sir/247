@@ -17,6 +17,8 @@ DEFAULT_LOCALIZATION_PARAMS = {
     "open_iterations": 1,
     "close_iterations": 1,
     "merge_iou": 0.15,
+    # 小尺度框被大尺度框包含时，IoU 可能很低；用较小框的覆盖率识别同一缺陷。
+    "merge_containment": 0.80,
     "merge_distance_ratio": 0.005,
     "padding_ratio": 0.003,
     "fallback_size_ratio": 0.02,
@@ -31,6 +33,7 @@ def normalize_localization_params(overrides: dict | None = None) -> dict:
     float_ranges = {
         "min_area_ratio": (0.0, 1.0, True),
         "merge_iou": (0.0, 1.0, True),
+        "merge_containment": (0.0, 1.0, True),
         "merge_distance_ratio": (0.0, 1.0, True),
         "padding_ratio": (0.0, 0.5, True),
         "fallback_size_ratio": (0.0, 1.0, False),
@@ -139,14 +142,14 @@ def _component_boxes(
     return boxes
 
 
-def _intersection_over_union(first: dict, second: dict) -> float:
+def _intersection_and_areas(first: dict, second: dict) -> tuple[int, int, int]:
+    """返回交集面积及两个框面积，供 IoU 和包含率复用。"""
     x0, y0 = max(first["x0"], second["x0"]), max(first["y0"], second["y0"])
     x1, y1 = min(first["x1"], second["x1"]), min(first["y1"], second["y1"])
     intersection = max(0, x1 - x0) * max(0, y1 - y0)
     first_area = (first["x1"] - first["x0"]) * (first["y1"] - first["y0"])
     second_area = (second["x1"] - second["x0"]) * (second["y1"] - second["y0"])
-    union = first_area + second_area - intersection
-    return intersection / union if union else 0.0
+    return intersection, first_area, second_area
 
 
 def _box_gap(first: dict, second: dict) -> float:
@@ -181,12 +184,22 @@ def merge_boxes(boxes: list[dict], shape: tuple[int, int], params: dict) -> list
         for first_index in range(len(merged)):
             for second_index in range(first_index + 1, len(merged)):
                 first, second = merged[first_index], merged[second_index]
-                overlap = _intersection_over_union(first, second)
+                intersection, first_area, second_area = _intersection_and_areas(first, second)
+                union = first_area + second_area - intersection
+                overlap = intersection / union if union else 0.0
+                containment = (
+                    intersection / min(first_area, second_area)
+                    if min(first_area, second_area) > 0 else 0.0
+                )
                 overlap_match = params["merge_iou"] > 0 and overlap >= params["merge_iou"]
+                containment_match = (
+                    params["merge_containment"] > 0
+                    and containment >= params["merge_containment"]
+                )
                 # 距离规则只负责没有面积重叠的临近/接触框；低 IoU 重叠框仍由
-                # merge_iou 控制，避免距离条件令 IoU 参数失效。
+                # IoU/包含率控制，避免距离条件令重叠参数失效。
                 distance_match = overlap == 0 and _box_gap(first, second) <= max_gap
-                if overlap_match or distance_match:
+                if overlap_match or containment_match or distance_match:
                     merged[first_index] = _merge_two_boxes(first, second)
                     merged.pop(second_index)
                     changed = True
