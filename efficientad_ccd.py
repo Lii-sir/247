@@ -85,7 +85,7 @@ def load_runtime() -> None:
     global torch, np, EfficientAd, DataLoader, Image, TF, tqdm
     import numpy as np
     import torch
-    from anomalib.models import EfficientAd
+    from self_efficientad import EfficientAd
     from PIL import Image
     from torch.utils.data import DataLoader
     from torchvision.transforms import functional as TF
@@ -136,11 +136,24 @@ def collate_batch(samples: list) -> Batch:
     return Batch(torch.stack(images), torch.tensor(labels, dtype=torch.int64), torch.stack(masks).bool())
 
 
-def make_loader(records: list[dict], config: dict, *, shuffle: bool = False):
+def make_loader(records: list[dict], config: dict, *, shuffle: bool = False, training: bool = False):
+    """Create a loader with explicit training/evaluation batch semantics.
+
+    Training uses the configured full batch and drops the final incomplete batch
+    so the normal-image/ImageNette ratio stays fixed. All evaluation paths keep
+    one image per batch because their reporting and heatmap code is per-image.
+    """
+    batch_size = config.get("batch_size", 1) if training else 1
+    if training and len(records) < batch_size:
+        raise ValueError(
+            "训练图片数量必须不少于 batch-size，"
+            f"当前为 {len(records)} < {batch_size}；请减小 batch-size 或增加训练图片。"
+        )
     return DataLoader(
         SnapshotDataset(records, config["image_size"]),
-        batch_size=1,  # 官方 EfficientAD 的训练批量固定为 1。
+        batch_size=batch_size,
         shuffle=shuffle,
+        drop_last=training,
         num_workers=config["num_workers"],
         collate_fn=collate_batch,
         pin_memory=config["device"].startswith("cuda"),
@@ -165,12 +178,14 @@ def seed_everything(seed: int) -> None:
 
 
 def new_model(config: dict):
-    # 直接调用官方模型与辅助函数，训练循环由本脚本控制，学习率按 step 更新。
+    # 使用项目内副本；训练循环由本脚本控制，学习率按 step 更新。
     return EfficientAd(
         imagenet_dir=config["imagenette_dir"],
         model_size=config["model_size"],
         lr=config["lr"],
         weight_decay=config["weight_decay"],
+        batch_size=config.get("batch_size", 1),
+        hard_loss_mode=config.get("hard_loss_mode", "global"),
         pre_processor=False,
         post_processor=False,
         evaluator=False,
@@ -181,7 +196,7 @@ def new_model(config: dict):
 def prepare_assets(model, config: dict, *, load_teacher: bool) -> None:
     """复用官方带 SHA256 校验的下载器，也支持手工提供辅助数据。"""
     from anomalib.data.utils import download_and_extract
-    from anomalib.models.image.efficient_ad.lightning_model import WEIGHTS_DOWNLOAD_INFO
+    from self_efficientad.lightning_model import WEIGHTS_DOWNLOAD_INFO
 
     if load_teacher:
         teacher_path = config.get("teacher_weights")
@@ -203,7 +218,10 @@ def prepare_assets(model, config: dict, *, load_teacher: bool) -> None:
     imagenette = Path(config["imagenette_dir"])
     # 仅建立父目录，空的叶目录会让官方函数误判为已经下载完成。
     imagenette.parent.mkdir(parents=True, exist_ok=True)
-    model.prepare_imagenette_data((config["image_size"], config["image_size"]))
+    model.prepare_imagenette_data(
+        (config["image_size"], config["image_size"]),
+        num_workers=config["num_workers"],
+    )
     if len(model.imagenet_loader.dataset) == 0:
         raise ValueError(f"ImageNette 辅助数据为空：{imagenette}")
 
@@ -862,6 +880,16 @@ def train_one(args, category: str) -> None:
             raise ValueError("续训请使用 checkpoints/last.pt；model.pt 是推理用文件。")
         config, manifest = previous["config"].copy(), previous["manifest"]
         config.update(device=choose_device(args.device), num_workers=args.num_workers)
+        # Old checkpoints predate batched training and must retain their exact
+        # original loss semantics when resumed.
+        config.setdefault("batch_size", 1)
+        config.setdefault("hard_loss_mode", "global")
+        config.setdefault("batch_training_version", 0)
+        config.setdefault("training_budget_mode", "optimizer_steps")
+        config.setdefault("max_images_requested", None)
+        # Keep the derived budget consistent with the actual resume target,
+        # including checkpoints whose metadata was edited to extend training.
+        config["max_images"] = config.get("max_steps", 1) * config["batch_size"]
         config.setdefault("score_mode", SCORE_MODE_MULTISCALE)
         config.setdefault("score_pool_kernels", [1, 7, 21])
         config.setdefault("score_topk_ratio", 0.001)
@@ -891,10 +919,26 @@ def train_one(args, category: str) -> None:
                 f"请处理后重试；完整报告：{duplicate_report_path}"
             )
         assets = args.assets_dir.resolve()
+        batch_size = args.batch_size
+        hard_loss_mode = "per_image" if batch_size > 1 else "global"
+        if args.max_images is not None:
+            max_steps = math.ceil(args.max_images / batch_size)
+            max_images_requested = args.max_images
+            budget_mode = "images"
+        else:
+            max_steps = args.max_steps
+            max_images_requested = None
+            budget_mode = "optimizer_steps"
+        max_images = max_steps * batch_size
         config = {
             "device": choose_device(args.device), "num_workers": args.num_workers,
             "image_size": args.image_size, "model_size": args.model_size,
-            "max_steps": args.max_steps, "lr": args.lr, "weight_decay": args.weight_decay,
+            "batch_size": batch_size, "hard_loss_mode": hard_loss_mode,
+            "batch_training_version": 1 if batch_size > 1 else 0,
+            "max_steps": max_steps, "max_images": max_images,
+            "max_images_requested": max_images_requested,
+            "training_budget_mode": budget_mode,
+            "lr": args.lr, "weight_decay": args.weight_decay,
             "seed": args.seed, "threshold_quantile": args.threshold_quantile,
             "threshold_val_ratio": args.threshold_val_ratio,
             "target_recall": args.target_recall,
@@ -902,7 +946,7 @@ def train_one(args, category: str) -> None:
             "score_pool_kernels": (
                 [args.score_pool_kernel]
                 if args.score_pool_kernel is not None
-                else list(args.score_pool_kernels)
+                else list(args.score_pool_kernels or (1, 7, 21))
             ),
             "score_topk_ratio": args.score_topk_ratio,
             "circle_config": str(args.circle_config.resolve()) if args.circle_config else None,
@@ -916,15 +960,22 @@ def train_one(args, category: str) -> None:
     write_json(output / "manifest.json", manifest)
     write_json(output / "config.json", config)
     print(f"运行目录：{output}\n数据统计：{manifest['summary']}\n设备：{config['device']}")
+    print(
+        f"训练 batch-size={config['batch_size']}，hard-loss={config['hard_loss_mode']}，"
+        f"optimizer steps={config['max_steps']}，有效图片预算={config['max_images']}"
+    )
     print("首次训练会下载官方教师权重和 ImageNette（完整辅助集约 1.5 GB）；已有缓存会复用。")
     model = new_model(config)
     if previous:
         model.model.load_state_dict(previous["model_state"])
     prepare_assets(model, config, load_teacher=previous is None)
-    loader = make_loader(manifest["train"], config, shuffle=True)
+    loader = make_loader(manifest["train"], config, shuffle=True, training=True)
     if previous is None:
         model.eval()
-        statistics = model.teacher_channel_mean_std(loader)
+        # Statistics must include every training image, including a final
+        # incomplete batch that is intentionally omitted during optimization.
+        statistics_loader = make_loader(manifest["train"], config, shuffle=False, training=False)
+        statistics = model.teacher_channel_mean_std(statistics_loader)
         check_statistics(statistics)
         model.model.mean_std.update(statistics)
     optimizer = torch.optim.Adam(
@@ -1098,6 +1149,14 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--checkpoint", type=Path, required=True, help="本脚本生成的 model.pt")
         if name == "train":
             command.add_argument("--max-steps", type=int, default=10000, help="快速试跑可设为 1000，正式对照可设为 70000")
+            command.add_argument(
+                "--max-images", type=int,
+                help="训练总图片预算；与 batch-size 一起向上换算 optimizer steps，优先于 --max-steps",
+            )
+            command.add_argument(
+                "--batch-size", type=int, default=1,
+                help="训练 batch 大小，默认 1；大于 1 时启用逐图片 hard loss。评估始终使用 1",
+            )
             command.add_argument("--image-size", type=int, choices=[256, 384, 512, 768], default=256)
             command.add_argument("--model-size", choices=["small", "medium"], default="small")
             command.add_argument("--lr", type=float, default=1e-4)
@@ -1108,7 +1167,7 @@ def build_parser() -> argparse.ArgumentParser:
                 help="带标签阈值验证集要求达到的异常召回率",
             )
             command.add_argument(
-                "--score-pool-kernels", type=parse_pool_kernels, default=(1, 7, 21),
+                "--score-pool-kernels", type=parse_pool_kernels,
                 help="多尺度局部平均池化窗口，逗号分隔，默认 1,7,21",
             )
             command.add_argument(
@@ -1166,6 +1225,10 @@ def main() -> None:
         raise ValueError("threshold-val-ratio 必须位于 (0, 1) 内。")
     if hasattr(args, "target_recall") and not 0 < args.target_recall <= 1:
         raise ValueError("target-recall 必须位于 (0, 1] 内。")
+    if hasattr(args, "batch_size") and args.batch_size < 1:
+        raise ValueError("batch-size 必须为正整数。")
+    if hasattr(args, "max_images") and args.max_images is not None and args.max_images < 1:
+        raise ValueError("max-images 必须为正整数。")
     if (hasattr(args, "score_pool_kernel") and args.score_pool_kernel is not None
             and (args.score_pool_kernel < 1 or args.score_pool_kernel % 2 == 0)):
         raise ValueError("score-pool-kernel 必须是正奇数。")
@@ -1195,11 +1258,17 @@ def main() -> None:
         return
     load_runtime()
     if args.command == "train":
-        if (args.max_steps < 1 or args.save_every < 1 or not math.isfinite(args.lr) or args.lr <= 0
+        if ((args.max_steps < 1 and args.max_images is None) or args.save_every < 1
+                or not math.isfinite(args.lr) or args.lr <= 0
                 or not math.isfinite(args.weight_decay) or args.weight_decay < 0):
-            raise ValueError("max-steps、save-every 和 lr 必须为正数，weight-decay 不能为负数。")
+            raise ValueError("未指定 max-images 时 max-steps 必须为正数；save-every 和 lr 必须为正数，weight-decay 不能为负数。")
         if not 0 < args.threshold_quantile <= 1:
             raise ValueError("threshold-quantile 必须在 (0, 1] 内。")
+        if args.score_pool_kernel is not None and args.score_pool_kernels is not None:
+            raise ValueError(
+                "训练时 --score-pool-kernel 与 --score-pool-kernels 不能同时使用；"
+                "前者是单尺度，后者是多尺度。"
+            )
         if args.resume and args.category.lower() == "all":
             raise ValueError("resume 一次只能恢复一个模型，不能与 category all 合用。")
         categories = list_categories(resolve_data_root(args.data_root)) if args.category.lower() == "all" else [args.category]

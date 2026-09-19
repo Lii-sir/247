@@ -1,6 +1,6 @@
 # CCD 数据集 EfficientAD 实验
 
-这个项目提供数据检查、训练、正常样本阈值校准、独立测试和单图预测脚本。代码注释使用中文，环境由 **uv** 管理。网络结构、教师网络和三项训练损失使用 **anomalib 2.2.0 的官方 EfficientAD 实现**；训练循环自行管理，便于固定数据快照、按步调整学习率和断点续训。
+这个项目提供数据检查、训练、正常样本阈值校准、独立测试和单图预测脚本。代码注释使用中文，环境由 **uv** 管理。网络结构、教师网络和三项训练损失基于 **anomalib 2.2.0 的 EfficientAD 实现**；训练循环自行管理，便于固定数据快照、按步调整学习率和断点续训。
 
 ## 1. 已适配的数据目录
 
@@ -88,7 +88,17 @@ uv run python efficientad_ccd.py train --category CCD1 --max-steps 10000 --image
 
 1,000 步仅用于快速试跑，10,000 步也不保证收敛。需要更长训练时可设 `--max-steps 70000`；在相同数据快照、相同训练参数下比较效果更有意义。默认将整张图缩放为方形，保留整张画面但会改变长宽比；本脚本未实现 ROI 或分块。若小缺陷在缩放后消失，后续应根据实际缺陷位置增加 ROI/分块处理。
 
-训练使用 **batch size=1**、Adam、初始学习率 `1e-4`、权重衰减 `1e-5`；在总步数 95% 处将学习率乘以 0.1。输入只转 RGB、缩放和映射到 `[0,1]`，不能在外部再做 ImageNet Normalize。`--model-size small` 是默认轻量模型，另支持 `medium`。
+训练默认使用 **batch size=1**、Adam、初始学习率 `1e-4`、权重衰减 `1e-5`；在总步数 95% 处将学习率乘以 0.1。输入只转 RGB、缩放和映射到 `[0,1]`，不能在外部再做 ImageNet Normalize。`--model-size small` 是默认轻量模型，另支持 `medium`。
+
+当前也支持显式批量训练。例如：
+
+```powershell
+uv run python efficientad_ccd.py train --category CCD1 --batch-size 4 --max-images 70000
+```
+
+`batch-size` 只作用于训练，正常样本统计、异常图校准、测试和热图仍使用单张图片。`batch-size` 大于 1 时，程序启用逐图片 Q99.9 hard loss，并让 ImageNette 辅助 loader 使用相同 batch size；训练 loader 和辅助 loader 都丢弃最后一个不完整 batch。`--max-images` 表示目标图片预算，程序会按 batch 向上换算 optimizer steps，实际预算写入运行目录的 `config.json`。默认 `batch-size=1` 保留原始全局 hard loss 和旧 checkpoint 语义。
+
+`--max-images` 不能被 batch 整除时，实际图片预算会向上取整到完整 batch；例如 `--batch-size 4 --max-images 101` 会执行 26 步、实际预算 104 张。`--device auto` 会优先使用 `cuda:0`，也可以明确指定 `--device cuda` 或 `--device cpu`；`--num-workers` 同时用于训练、评估、统计和 ImageNette 辅助 loader。默认 score 选取方式是多尺度池化 `multiscale_pool`，使用 `1,7,21` 三个窗口和 `0.001` 的 Top-K 比例。训练时 `--score-pool-kernel`（单尺度）与 `--score-pool-kernels`（多尺度）只能二选一。
 
 训练结束后会自动完成：正常验证集异常图校准 → 图像阈值校准 → 测试集推理 → 指标和热图保存。默认每 1,000 步保存 `checkpoints/last.pt`；Ctrl+C 在训练循环中会保存最近完成步数的续训文件。
 

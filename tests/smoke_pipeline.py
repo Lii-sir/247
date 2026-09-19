@@ -33,7 +33,10 @@ def main() -> None:
                 Image.fromarray(pixels).save(destination / f"{index}.png")
         auxiliary = root / "auxiliary" / "dummy_class"
         auxiliary.mkdir(parents=True)
-        Image.fromarray(rng.integers(0, 256, (256, 256, 3), dtype=np.uint8)).save(auxiliary / "0.png")
+        for index in range(2):
+            Image.fromarray(
+                rng.integers(0, 256, (256, 256, 3), dtype=np.uint8)
+            ).save(auxiliary / f"{index}.png")
         config = {"imagenette_dir": str(auxiliary.parent), "model_size": "small", "lr": 1e-4,
                   "weight_decay": 1e-5, "device": "cpu"}
         teacher = new_model(config)
@@ -52,7 +55,8 @@ def main() -> None:
         def run(*arguments: str) -> None:
             subprocess.run(entry + list(arguments), cwd=PROJECT_DIR, check=True)
 
-        run("train", "--data-root", str(data), "--max-steps", "2", "--min-age-seconds", "0",
+        run("train", "--data-root", str(data), "--batch-size", "2", "--max-images", "4",
+            "--min-age-seconds", "0",
             "--teacher-weights", str(teacher_path), "--imagenette-dir", str(auxiliary.parent),
             "--circle-config", str(circle_config), "--output-dir", str(output),
             "--save-every", "1", "--heatmaps", "1")

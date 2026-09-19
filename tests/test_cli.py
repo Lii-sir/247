@@ -268,6 +268,23 @@ class CommandTests(unittest.TestCase):
                 self.assertEqual(result["threshold"], 0.75)
                 fake_report.save_heatmap.assert_called_once()
 
+    def test_training_parser_accepts_image_budget_and_batch_size(self) -> None:
+        args = cli.build_parser().parse_args([
+            "train", "--batch-size", "4", "--max-images", "101",
+        ])
+        self.assertEqual(args.batch_size, 4)
+        self.assertEqual(args.max_images, 101)
+
+    def test_training_loader_rejects_incomplete_first_batch(self) -> None:
+        config = {
+            "image_size": 256,
+            "batch_size": 4,
+            "num_workers": 0,
+            "device": "cpu",
+        }
+        with self.assertRaisesRegex(ValueError, "不少于 batch-size"):
+            cli.make_loader([{"path": "unused"}] * 3, config, training=True)
+
 
 if __name__ == "__main__":
     unittest.main()
