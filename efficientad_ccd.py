@@ -1180,7 +1180,11 @@ def build_parser() -> argparse.ArgumentParser:
             )
             command.add_argument("--save-every", type=int, default=1000)
             command.add_argument("--assets-dir", type=Path, default=PROJECT_DIR / "assets")
-            command.add_argument("--imagenette-dir", type=Path, help="已有 ImageNette/ImageNet 图片目录，按 ImageFolder 格式")
+            command.add_argument(
+                "--imagenette-dir",
+                type=Path,
+                help="辅助图片目录（兼容旧参数名），按 ImageFolder 格式；可使用 ImageNette 或 VisA",
+            )
             command.add_argument("--teacher-weights", type=Path, help="已有 pretrained_teacher_small.pth 或 medium 权重")
             command.add_argument("--resume", type=Path, help="从 checkpoints/last.pt 续训，沿用该次超参数与数据快照")
         elif name == "evaluate":

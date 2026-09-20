@@ -117,6 +117,37 @@ uv run python efficientad_ccd.py train --category CCD1 --max-steps 10000 --teach
 
 这里的路径是示例，必须改成实际存在的位置。教师权重必须与 `--model-size` 匹配。辅助图片目录需要兼容 `ImageFolder`，例如 `train/n01440764/*.JPEG`。仅有 CCD 图片不足以复现官方带 ImageNette 正则项的配置。**不要预先创建空的 `assets/imagenette` 目录**：官方辅助函数看到目录存在就会尝试读取，空目录应删除或改用新的有效目录后重试。
 
+### 使用 VisA 作为工业辅助数据集
+
+如果不使用 ImageNette，也可以下载 VisA 的训练正常图片作为辅助数据。项目中的 `download_visa_aux.py` 会读取官方 `VisA_20220922.tar`，只保留 `train` 且标签为 `normal/good` 的图片，并整理为当前 `ImageFolder` 需要的格式：
+
+```text
+D:\datasets\visa_aux\
+├─ candle\*.JPG
+├─ capsules\*.JPG
+└─ ...
+```
+
+PowerShell 下载并整理命令如下；归档路径放在输出目录之外：
+
+```powershell
+uv run python download_visa_aux.py `
+  --output "D:\datasets\visa_aux" `
+  --archive "D:\datasets\VisA_20220922.tar"
+```
+
+脚本默认使用 VisA 官方地址，并在输出目录写入 `manifest.json`。它不会把 VisA 的异常测试图放入辅助集；`--exclude-class candle` 可以排除某个类别，`--max-per-class 500` 可以限制每类图片数量。下载失败时，也可以手动取得 `.tar` 文件后重新执行同一命令，脚本会通过 `--archive` 直接读取本地归档。
+
+整理完成后，把输出目录传给现有的兼容参数 `--imagenette-dir` 即可；参数名沿用旧版，但底层只要求 `ImageFolder` 目录：
+
+```powershell
+uv run python efficientad_ccd.py train `
+  --data-root "D:\datasets\20260909_ccd1-6_ok+v5ng" `
+  --category CCD1 `
+  --imagenette-dir "D:\datasets\visa_aux" `
+  --circle-config "D:\python_programs\LXD_project\247\circle_config.json"
+```
+
 ## 5. 读取效果报告
 
 每次运行单独保存，例如：
