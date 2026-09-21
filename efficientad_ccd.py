@@ -179,9 +179,11 @@ def seed_everything(seed: int) -> None:
 
 def new_model(config: dict):
     # 使用项目内副本；训练循环由本脚本控制，学习率按 step 更新。
+    backbone = config.get("backbone") or f"pdn_{config['model_size']}"
     return EfficientAd(
         imagenet_dir=config["imagenette_dir"],
         model_size=config["model_size"],
+        backbone=backbone,
         lr=config["lr"],
         weight_decay=config["weight_decay"],
         batch_size=config.get("batch_size", 1),
@@ -200,21 +202,30 @@ def prepare_assets(model, config: dict, *, load_teacher: bool) -> None:
 
     if load_teacher:
         teacher_path = config.get("teacher_weights")
+        backbone = config.get("backbone", f"pdn_{config['model_size']}")
         if teacher_path:
             teacher_path = Path(teacher_path)
             if not teacher_path.is_file():
                 raise FileNotFoundError(f"找不到教师权重：{teacher_path}")
-        else:
+            model.model.teacher.load_state_dict(
+                torch.load(teacher_path, map_location=config["device"], weights_only=True)
+            )
+        elif backbone.startswith("pdn_"):
             cache = Path(config["assets_dir"]) / "pre_trained"
+            teacher_size = "medium" if backbone == "pdn_medium" else "small"
             teacher_path = cache / "efficientad_pretrained_weights" / (
-                f"pretrained_teacher_{config['model_size']}.pth"
+                f"pretrained_teacher_{teacher_size}.pth"
             )
             if not teacher_path.is_file():
                 cache.mkdir(parents=True, exist_ok=True)
                 download_and_extract(cache, WEIGHTS_DOWNLOAD_INFO)
-        model.model.teacher.load_state_dict(
-            torch.load(teacher_path, map_location=config["device"], weights_only=True)
-        )
+            model.model.teacher.load_state_dict(
+                torch.load(teacher_path, map_location=config["device"], weights_only=True)
+            )
+        else:
+            from self_efficientad.backbones import load_default_teacher_weights
+
+            load_default_teacher_weights(backbone, model.model.teacher)
     imagenette = Path(config["imagenette_dir"])
     # 仅建立父目录，空的叶目录会让官方函数误判为已经下载完成。
     imagenette.parent.mkdir(parents=True, exist_ok=True)
@@ -879,11 +890,22 @@ def train_one(args, category: str) -> None:
         if "optimizer_state" not in previous:
             raise ValueError("续训请使用 checkpoints/last.pt；model.pt 是推理用文件。")
         config, manifest = previous["config"].copy(), previous["manifest"]
+        saved_backbone = config.get("backbone") or f"pdn_{config.get('model_size', 'small')}"
+        requested_backbone = args.backbone
+        if args.model_size is not None:
+            requested_backbone = f"pdn_{args.model_size}"
+        if requested_backbone is not None and requested_backbone != saved_backbone:
+            raise ValueError(
+                f"续训不能更改 backbone：checkpoint={saved_backbone}，请求={requested_backbone}；"
+                "请移除 --resume 启动新训练。"
+            )
         config.update(device=choose_device(args.device), num_workers=args.num_workers)
         # Old checkpoints predate batched training and must retain their exact
         # original loss semantics when resumed.
         config.setdefault("batch_size", 1)
         config.setdefault("hard_loss_mode", "global")
+        config.setdefault("model_size", "small")
+        config.setdefault("backbone", f"pdn_{config['model_size']}")
         config.setdefault("batch_training_version", 0)
         config.setdefault("training_budget_mode", "optimizer_steps")
         config.setdefault("max_images_requested", None)
@@ -932,7 +954,11 @@ def train_one(args, category: str) -> None:
         max_images = max_steps * batch_size
         config = {
             "device": choose_device(args.device), "num_workers": args.num_workers,
-            "image_size": args.image_size, "model_size": args.model_size,
+            "image_size": args.image_size,
+            "model_size": (args.backbone.removeprefix("pdn_")
+                           if args.backbone and args.backbone.startswith("pdn_")
+                           else args.model_size or "small"),
+            "backbone": args.backbone or f"pdn_{args.model_size or 'small'}",
             "batch_size": batch_size, "hard_loss_mode": hard_loss_mode,
             "batch_training_version": 1 if batch_size > 1 else 0,
             "max_steps": max_steps, "max_images": max_images,
@@ -964,7 +990,7 @@ def train_one(args, category: str) -> None:
         f"训练 batch-size={config['batch_size']}，hard-loss={config['hard_loss_mode']}，"
         f"optimizer steps={config['max_steps']}，有效图片预算={config['max_images']}"
     )
-    print("首次训练会下载官方教师权重和 ImageNette（完整辅助集约 1.5 GB）；已有缓存会复用。")
+    print(f"backbone={config['backbone']}；辅助数据：{config['imagenette_dir']}；缺失的默认资源将自动下载。")
     model = new_model(config)
     if previous:
         model.model.load_state_dict(previous["model_state"])
@@ -1043,6 +1069,8 @@ def restore_for_inference(args):
     if not saved.get("calibration"):
         raise ValueError("此 checkpoint 尚未校准，请使用训练结束生成的 model.pt。")
     config = saved["config"].copy()
+    config.setdefault("model_size", "small")
+    config.setdefault("backbone", f"pdn_{config['model_size']}")
     config.update(device=choose_device(args.device), num_workers=args.num_workers)
     config.setdefault("score_mode", calibration_score_mode(saved["calibration"]))
     config.setdefault("score_pool_kernels", [1, 7, 21])
@@ -1158,7 +1186,14 @@ def build_parser() -> argparse.ArgumentParser:
                 help="训练 batch 大小，默认 1；大于 1 时启用逐图片 hard loss。评估始终使用 1",
             )
             command.add_argument("--image-size", type=int, choices=[256, 384, 512, 768], default=256)
-            command.add_argument("--model-size", choices=["small", "medium"], default="small")
+            backbone_group = command.add_mutually_exclusive_group()
+            backbone_group.add_argument("--model-size", choices=["small", "medium"], default=None,
+                                        help="旧版 PDN 大小选项；新训练未指定架构时默认 small")
+            backbone_group.add_argument(
+                "--backbone",
+                choices=["pdn_small", "pdn_medium", "resnet18_layer2"],
+                help="特征提取器；默认随 --model-size 选择 pdn_small 或 pdn_medium",
+            )
             command.add_argument("--lr", type=float, default=1e-4)
             command.add_argument("--weight-decay", type=float, default=1e-5)
             command.add_argument("--threshold-quantile", type=float, default=0.99)
@@ -1185,7 +1220,10 @@ def build_parser() -> argparse.ArgumentParser:
                 type=Path,
                 help="辅助图片目录（兼容旧参数名），按 ImageFolder 格式；可使用 ImageNette 或 VisA",
             )
-            command.add_argument("--teacher-weights", type=Path, help="已有 pretrained_teacher_small.pth 或 medium 权重")
+            command.add_argument(
+                "--teacher-weights", type=Path,
+                help="与所选 backbone 匹配的教师权重；ResNet 可省略并自动使用 torchvision ImageNet 权重",
+            )
             command.add_argument("--resume", type=Path, help="从 checkpoints/last.pt 续训，沿用该次超参数与数据快照")
         elif name == "evaluate":
             command.add_argument(

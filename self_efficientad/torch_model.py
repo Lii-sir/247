@@ -7,7 +7,7 @@ This module contains the PyTorch implementation of the student, teacher and
 autoencoder networks used in EfficientAd for fast and accurate anomaly detection.
 
 The model consists of:
-    - A pre-trained EfficientNet teacher network
+    - A frozen PDN or ResNet teacher network (weights loaded before training)
     - A lightweight student network
     - Knowledge distillation training
     - Anomaly detection via feature comparison
@@ -482,9 +482,9 @@ class EfficientAdModel(nn.Module):
     network is trained to match the teacher's outputs.
 
     Args:
-        teacher_out_channels (int): Number of convolution output channels of the
-            pre-trained teacher model.
-            Defaults to ``384``.
+        teacher_out_channels (int | None): Number of convolution output channels of the
+            teacher model. ``None`` selects 384 for PDN or 128 for ResNet.
+            Defaults to ``None``.
         model_size (EfficientAdModelSize): Size of student and teacher model.
             Defaults to ``EfficientAdModelSize.S``.
         padding (bool): Whether to use padding in convolutional layers.
@@ -492,6 +492,10 @@ class EfficientAdModel(nn.Module):
         pad_maps (bool): Whether to pad output anomaly maps when ``padding=False``
             to match size of padded case. Only relevant if ``padding=False``.
             Defaults to ``True``.
+        backbone (str | None): Keyword-only architecture override. Defaults to
+            the PDN selected by ``model_size``.
+        teacher_pretrained (bool): Load ImageNet teacher weights at construction
+            for ResNet only. PDN weights must be loaded separately.
 
     Example:
         >>> from anomalib.models.image.efficient_ad.torch_model import (
@@ -514,35 +518,35 @@ class EfficientAdModel(nn.Module):
 
     def __init__(
         self,
-        teacher_out_channels: int = 384,
+        teacher_out_channels: int | None = None,
         model_size: EfficientAdModelSize = EfficientAdModelSize.S,
         padding: bool = False,
         pad_maps: bool = True,
         hard_loss_mode: str = "global",
+        *,
+        backbone: str | None = None,
+        teacher_pretrained: bool = False,
     ) -> None:
         super().__init__()
 
-        self.pad_maps = pad_maps
         if hard_loss_mode not in {"global", "per_image"}:
             raise ValueError("hard_loss_mode must be 'global' or 'per_image'")
         self.hard_loss_mode = hard_loss_mode
-        self.teacher: MediumPatchDescriptionNetwork | SmallPatchDescriptionNetwork
-        self.student: MediumPatchDescriptionNetwork | SmallPatchDescriptionNetwork
+        model_size = EfficientAdModelSize(model_size)
+        if backbone is None:
+            backbone = "pdn_medium" if model_size == EfficientAdModelSize.M else "pdn_small"
+        from .backbones import build_backbone_pair
 
-        if model_size == EfficientAdModelSize.M:
-            self.teacher = MediumPatchDescriptionNetwork(out_channels=teacher_out_channels, padding=padding).eval()
-            self.student = MediumPatchDescriptionNetwork(out_channels=teacher_out_channels * 2, padding=padding)
-
-        elif model_size == EfficientAdModelSize.S:
-            self.teacher = SmallPatchDescriptionNetwork(out_channels=teacher_out_channels, padding=padding).eval()
-            self.student = SmallPatchDescriptionNetwork(out_channels=teacher_out_channels * 2, padding=padding)
-
-        else:
-            msg = f"Unknown model size {model_size}"
-            raise ValueError(msg)
-
-        self.ae: AutoEncoder = AutoEncoder(out_channels=teacher_out_channels, padding=padding)
-        self.teacher_out_channels: int = teacher_out_channels
+        self.backbone = backbone
+        self.teacher, self.student, self.teacher_out_channels = build_backbone_pair(
+            backbone,
+            teacher_out_channels=teacher_out_channels,
+            padding=padding,
+            teacher_pretrained=teacher_pretrained,
+        )
+        self.teacher.requires_grad_(False)
+        self.pad_maps = pad_maps if backbone.startswith("pdn_") else False
+        self.ae: AutoEncoder = AutoEncoder(out_channels=self.teacher_out_channels, padding=padding)
 
         self.mean_std: nn.ParameterDict = nn.ParameterDict(
             {
@@ -559,6 +563,13 @@ class EfficientAdModel(nn.Module):
                 "qb_ae": torch.tensor(0.0),
             },
         )
+
+    def train(self, mode: bool = True):
+        """Keep the frozen teacher, including BatchNorm, in evaluation mode."""
+
+        super().train(mode)
+        self.teacher.eval()
+        return self
 
     @staticmethod
     def is_set(p_dic: nn.ParameterDict) -> bool:
@@ -697,12 +708,13 @@ class EfficientAdModel(nn.Module):
             batch,
             per_image=self.hard_loss_mode == "per_image",
         )
-        ae_output_aug = self.ae(aug_img, batch.shape[-2:])
-
         with torch.no_grad():
             teacher_output_aug = self.teacher(aug_img)
             if self.is_set(self.mean_std):
                 teacher_output_aug = (teacher_output_aug - self.mean_std["mean"]) / self.mean_std["std"]
+
+        ae_output_aug = self.ae(aug_img, batch.shape[-2:])
+        ae_output_aug = F.interpolate(ae_output_aug, size=teacher_output_aug.shape[-2:], mode="bilinear")
 
         student_output_ae_aug = self.student(aug_img)[:, self.teacher_out_channels :, :, :]
 
@@ -738,6 +750,7 @@ class EfficientAdModel(nn.Module):
         # Eval mode.
         with torch.no_grad():
             ae_output = self.ae(batch, image_size)
+            ae_output = F.interpolate(ae_output, size=student_output.shape[-2:], mode="bilinear")
 
             map_st = torch.mean(distance_st, dim=1, keepdim=True)
             map_stae = torch.mean(

@@ -5,11 +5,11 @@
 
 This module implements the EfficientAd model for fast and accurate anomaly
 detection. EfficientAd uses a student-teacher architecture with a pre-trained
-EfficientNet backbone to achieve state-of-the-art performance with
+PDN backbone (with an experimental ResNet alternative) for
 millisecond-level inference times.
 
 The model consists of:
-    - A pre-trained EfficientNet teacher network
+    - A frozen PDN or ResNet teacher network
     - A lightweight student network
     - Knowledge distillation training
     - Anomaly detection via feature comparison
@@ -78,13 +78,14 @@ class EfficientAd(AnomalibModule):
     """PL Lightning Module for the EfficientAd algorithm.
 
     The EfficientAd model uses a student-teacher architecture with a pretrained
-    EfficientNet backbone for fast and accurate anomaly detection.
+    PDN or experimental ResNet backbone for anomaly detection.
 
     Args:
         imagenet_dir (Path | str): Directory path for the Imagenet dataset.
             Defaults to ``"./datasets/imagenette"``.
-        teacher_out_channels (int): Number of convolution output channels.
-            Defaults to ``384``.
+        teacher_out_channels (int | None): Number of convolution output channels.
+            ``None`` selects 384 for PDN or 128 for ResNet.
+            Defaults to ``None``.
         model_size (EfficientAdModelSize | str): Size of student and teacher model.
             Defaults to ``EfficientAdModelSize.S``.
         lr (float): Learning rate.
@@ -121,7 +122,7 @@ class EfficientAd(AnomalibModule):
     def __init__(
         self,
         imagenet_dir: Path | str = "./datasets/imagenette",
-        teacher_out_channels: int = 384,
+        teacher_out_channels: int | None = None,
         model_size: EfficientAdModelSize | str = EfficientAdModelSize.S,
         lr: float = 0.0001,
         weight_decay: float = 0.00001,
@@ -133,6 +134,9 @@ class EfficientAd(AnomalibModule):
         post_processor: PostProcessor | bool = True,
         evaluator: Evaluator | bool = True,
         visualizer: Visualizer | bool = True,
+        *,
+        backbone: str | None = None,
+        teacher_pretrained: bool = False,
     ) -> None:
         super().__init__(
             pre_processor=pre_processor,
@@ -145,6 +149,9 @@ class EfficientAd(AnomalibModule):
         if not isinstance(model_size, EfficientAdModelSize):
             model_size = EfficientAdModelSize(model_size)
         self.model_size: EfficientAdModelSize = model_size
+        self.backbone = backbone or ("pdn_medium" if model_size == EfficientAdModelSize.M else "pdn_small")
+        if self.backbone.startswith("pdn_"):
+            self.model_size = EfficientAdModelSize(self.backbone.removeprefix("pdn_"))
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
         if batch_size > 1 and hard_loss_mode != "per_image":
@@ -155,6 +162,8 @@ class EfficientAd(AnomalibModule):
         self.model: EfficientAdModel = EfficientAdModel(
             teacher_out_channels=teacher_out_channels,
             model_size=model_size,
+            backbone=self.backbone,
+            teacher_pretrained=teacher_pretrained,
             padding=padding,
             pad_maps=pad_maps,
             hard_loss_mode=hard_loss_mode,
@@ -163,6 +172,23 @@ class EfficientAd(AnomalibModule):
         self.hard_loss_mode: str = hard_loss_mode
         self.lr: float = lr
         self.weight_decay: float = weight_decay
+        self._teacher_loaded_from_checkpoint = False
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        """Preserve the teacher restored by Lightning instead of loading defaults."""
+        super().on_load_checkpoint(checkpoint)
+        self._teacher_loaded_from_checkpoint = True
+
+    @classmethod
+    def load_from_checkpoint(cls, *args: Any, **kwargs: Any) -> "EfficientAd":
+        """Restore embedded teacher weights without fetching initialization weights.
+
+        Lightning constructs the model before calling ``on_load_checkpoint``.
+        Override the saved bootstrap flag before construction, including for older
+        checkpoints that saved ``teacher_pretrained=True``.
+        """
+        kwargs["teacher_pretrained"] = False
+        return super().load_from_checkpoint(*args, **kwargs)
 
     def prepare_pretrained_model(self) -> None:
         """Prepare the pretrained teacher model.
@@ -170,10 +196,16 @@ class EfficientAd(AnomalibModule):
         Downloads and loads pretrained weights for the teacher model if not already
         present.
         """
+        if not self.backbone.startswith("pdn_"):
+            from .backbones import load_default_teacher_weights
+
+            load_default_teacher_weights(self.backbone, self.model.teacher)
+            return
+
         pretrained_models_dir = Path("./pre_trained/")
         if not (pretrained_models_dir / "efficientad_pretrained_weights").is_dir():
             download_and_extract(pretrained_models_dir, WEIGHTS_DOWNLOAD_INFO)
-        model_size_str = self.model_size.value if isinstance(self.model_size, EfficientAdModelSize) else self.model_size
+        model_size_str = self.backbone.removeprefix("pdn_")
         teacher_path = (
             pretrained_models_dir / "efficientad_pretrained_weights" / f"pretrained_teacher_{model_size_str}.pth"
         )
@@ -274,11 +306,15 @@ class EfficientAd(AnomalibModule):
 
         for batch in tqdm.tqdm(dataloader, desc="Calculate teacher channel mean & std", position=0, leave=True):
             y = self.model.teacher(batch.image.to(self.device))
+            if self.backbone == "resnet18_layer2":
+                # ResNet 的稀疏 ReLU 特征可含恒定通道；低方差统计使用双精度。
+                y = y.double()
             if not arrays_defined:
                 _, num_channels, _, _ = y.shape
                 n = torch.zeros((num_channels,), dtype=torch.int64, device=y.device)
-                chanel_sum = torch.zeros((num_channels,), dtype=torch.float32, device=y.device)
-                chanel_sum_sqr = torch.zeros((num_channels,), dtype=torch.float32, device=y.device)
+                stats_dtype = torch.float64 if self.backbone == "resnet18_layer2" else torch.float32
+                chanel_sum = torch.zeros((num_channels,), dtype=stats_dtype, device=y.device)
+                chanel_sum_sqr = torch.zeros((num_channels,), dtype=stats_dtype, device=y.device)
                 arrays_defined = True
 
             n += y[:, 0].numel()
@@ -291,7 +327,17 @@ class EfficientAd(AnomalibModule):
 
         channel_mean = chanel_sum / n
 
-        channel_std = (torch.sqrt((chanel_sum_sqr / n) - (channel_mean**2))).float()[None, :, None, None]
+        variance = (chanel_sum_sqr / n) - (channel_mean**2)
+        if self.backbone == "resnet18_layer2":
+            variance = variance.clamp_min(0)
+            inactive = variance == 0
+            if inactive.all():
+                raise ValueError("教师特征全部为恒定值，请增加有代表性的正常图片。")
+            if inactive.any():
+                logger.warning("ResNet 教师有 %d 个恒定通道，使用单位标准差归一化。", inactive.sum().item())
+            # 恒定特征只减均值，不用极小 epsilon 放大未见过的激活。
+            variance = torch.where(inactive, torch.ones_like(variance), variance)
+        channel_std = torch.sqrt(variance).float()[None, :, None, None]
         channel_mean = channel_mean.float()[None, :, None, None]
 
         return {"mean": channel_mean, "std": channel_std}
@@ -366,7 +412,7 @@ class EfficientAd(AnomalibModule):
         transform = Compose([Resize(image_size, antialias=True)])
         return PreProcessor(transform=transform)
 
-    def configure_optimizers(self) -> torch.optim.Optimizer:
+    def configure_optimizers(self) -> dict[str, Any]:
         """Configure optimizers for training.
 
         Sets up Adam optimizer with learning rate scheduler that decays LR by 0.1
@@ -409,7 +455,10 @@ class EfficientAd(AnomalibModule):
             step_size=max(1, int(0.95 * num_steps)),
             gamma=0.1,
         )
-        return {"optimizer": optimizer, "lr_scheduler": scheduler}
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1},
+        }
 
     def on_train_start(self) -> None:
         """Set up model before training begins.
@@ -444,7 +493,8 @@ class EfficientAd(AnomalibModule):
 
         sample = next(iter(self.trainer.train_dataloader))
         image_size = sample.image.shape[-2:]
-        self.prepare_pretrained_model()
+        if not self._teacher_loaded_from_checkpoint:
+            self.prepare_pretrained_model()
         self.prepare_imagenette_data(image_size, num_workers=datamodule.num_workers)
         if not self.model.is_set(self.model.mean_std):
             channel_mean_std = self.teacher_channel_mean_std(self._teacher_statistics_dataloader())

@@ -1,7 +1,8 @@
-"""用合成图和随机教师权重验证程序链路，不代表真实数据上的检测效果。"""
+"""用合成图验证不同 backbone 的程序链路，不代表真实数据上的检测效果。"""
 
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 import sys
@@ -20,7 +21,11 @@ from efficientad_ccd import load_runtime, new_model
 
 def main() -> None:
     """通过真正的命令行验证训练、恢复、评估和预测，不访问外网。"""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--backbone", choices=("pdn_small", "pdn_medium", "resnet18_layer2"), default="pdn_small")
+    args = parser.parse_args()
     load_runtime()
+    torch.manual_seed(2026)
     rng = np.random.default_rng(2026)
     with TemporaryDirectory(prefix="efficientad_smoke_") as temporary:
         root = Path(temporary)
@@ -38,9 +43,17 @@ def main() -> None:
                 rng.integers(0, 256, (256, 256, 3), dtype=np.uint8)
             ).save(auxiliary / f"{index}.png")
         config = {"imagenette_dir": str(auxiliary.parent), "model_size": "small", "lr": 1e-4,
-                  "weight_decay": 1e-5, "device": "cpu"}
+                  "weight_decay": 1e-5, "device": "cpu", "backbone": args.backbone}
         teacher = new_model(config)
-        teacher_path = root / "random_teacher_for_smoke_only.pth"
+        if args.backbone == "resnet18_layer2":
+            from torchvision.models import ResNet18_Weights
+            from self_efficientad.backbones import load_default_teacher_weights
+
+            cached = Path(torch.hub.get_dir()) / "checkpoints" / ResNet18_Weights.DEFAULT.url.rsplit("/", 1)[-1]
+            if not cached.is_file():
+                raise FileNotFoundError(f"ResNet smoke 需要已缓存的 torchvision 教师权重：{cached}")
+            load_default_teacher_weights(args.backbone, teacher.model.teacher)
+        teacher_path = root / "teacher_for_smoke_only.pth"
         torch.save(teacher.model.teacher.state_dict(), teacher_path)
         del teacher
         default_mask = root / "default_mask.png"
@@ -55,13 +68,14 @@ def main() -> None:
         def run(*arguments: str) -> None:
             subprocess.run(entry + list(arguments), cwd=PROJECT_DIR, check=True)
 
-        run("train", "--data-root", str(data), "--batch-size", "2", "--max-images", "4",
+        run("train", "--backbone", args.backbone, "--data-root", str(data), "--batch-size", "2", "--max-images", "4",
             "--min-age-seconds", "0",
             "--teacher-weights", str(teacher_path), "--imagenette-dir", str(auxiliary.parent),
             "--circle-config", str(circle_config), "--output-dir", str(output),
             "--save-every", "1", "--heatmaps", "1")
         model_path = next(output.glob("CCD1/*/model.pt"))
         run_dir = model_path.parent
+        assert json.loads((run_dir / "config.json").read_text(encoding="utf-8"))["backbone"] == args.backbone
         for name in ("manifest.json", "config.json", "loss.csv", "calibration.json", "metrics.json",
                      "predictions.csv", "score_distribution.png", "checkpoints/last.pt"):
             assert (run_dir / name).is_file(), name
@@ -149,9 +163,11 @@ def main() -> None:
         run("train", "--resume", str(resume_path),
             "--output-dir", str(root / "resumed"), "--heatmaps", "0")
         resumed_path = next((root / "resumed").glob("CCD1/*/model.pt"))
-        assert torch.load(resumed_path, map_location="cpu", weights_only=True)["step"] == 3
-        print("通过：合成数据的训练、校准、保存/加载、独立评估、热图、单图预测和断点恢复。")
-        print("注意：该验证使用随机教师，仅检查程序链路，不用于判断 EfficientAD 效果。")
+        resumed = torch.load(resumed_path, map_location="cpu", weights_only=True)
+        assert resumed["step"] == 3
+        assert resumed["config"]["backbone"] == args.backbone
+        print(f"通过：{args.backbone} 合成数据的训练、校准、保存/加载、独立评估、热图、单图预测和断点恢复。")
+        print("注意：该验证仅检查程序链路，不用于判断真实数据上的检测效果。")
 
 
 if __name__ == "__main__":
