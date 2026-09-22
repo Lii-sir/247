@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -23,6 +24,9 @@ def main() -> None:
     """通过真正的命令行验证训练、恢复、评估和预测，不访问外网。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backbone", choices=("pdn_small", "pdn_medium", "resnet18_layer2"), default="pdn_small")
+    parser.add_argument("--ddp-test-device", choices=("cpu", "cuda:0"),
+                        help="测试专用：在同一设备启动两个真实 DDP 进程，不代表两张物理卡的性能")
+    parser.add_argument("--num-workers", type=int, default=0)
     args = parser.parse_args()
     load_runtime()
     torch.manual_seed(2026)
@@ -38,7 +42,7 @@ def main() -> None:
                 Image.fromarray(pixels).save(destination / f"{index}.png")
         auxiliary = root / "auxiliary" / "dummy_class"
         auxiliary.mkdir(parents=True)
-        for index in range(2):
+        for index in range(4 if args.ddp_test_device else 2):
             Image.fromarray(
                 rng.integers(0, 256, (256, 256, 3), dtype=np.uint8)
             ).save(auxiliary / f"{index}.png")
@@ -64,11 +68,18 @@ def main() -> None:
         }), encoding="utf-8")
         output = root / "outputs"
         entry = [sys.executable, str(PROJECT_DIR / "efficientad_ccd.py")]
+        environment = os.environ.copy()
+        environment["PYTHONUTF8"] = "1"
+        if args.ddp_test_device:
+            entry = [sys.executable, str(PROJECT_DIR / "tests/distributed_cli_entry.py")]
+            environment["CCD_DDP_TEST_DEVICE"] = args.ddp_test_device
 
         def run(*arguments: str) -> None:
-            subprocess.run(entry + list(arguments), cwd=PROJECT_DIR, check=True)
+            subprocess.run(entry + list(arguments), cwd=PROJECT_DIR, check=True, env=environment)
 
-        run("train", "--backbone", args.backbone, "--data-root", str(data), "--batch-size", "2", "--max-images", "4",
+        run("train", "--backbone", args.backbone, "--data-root", str(data), "--batch-size", "2",
+            "--max-images", "8" if args.ddp_test_device else "4",
+            "--num-workers", str(args.num_workers),
             "--min-age-seconds", "0",
             "--teacher-weights", str(teacher_path), "--imagenette-dir", str(auxiliary.parent),
             "--circle-config", str(circle_config), "--output-dir", str(output),
@@ -76,6 +87,10 @@ def main() -> None:
         model_path = next(output.glob("CCD1/*/model.pt"))
         run_dir = model_path.parent
         assert json.loads((run_dir / "config.json").read_text(encoding="utf-8"))["backbone"] == args.backbone
+        training_config = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+        assert training_config["world_size"] == (2 if args.ddp_test_device else 1)
+        assert training_config["global_batch_size"] == (4 if args.ddp_test_device else 2)
+        assert training_config["max_steps"] == 2
         for name in ("manifest.json", "config.json", "loss.csv", "calibration.json", "metrics.json",
                      "predictions.csv", "score_distribution.png", "checkpoints/last.pt"):
             assert (run_dir / name).is_file(), name
@@ -161,6 +176,7 @@ def main() -> None:
         resume_path = root / "resume_for_smoke_only.pt"
         torch.save(resume_payload, resume_path)
         run("train", "--resume", str(resume_path),
+            "--num-workers", str(args.num_workers),
             "--output-dir", str(root / "resumed"), "--heatmaps", "0")
         resumed_path = next((root / "resumed").glob("CCD1/*/model.pt"))
         resumed = torch.load(resumed_path, map_location="cpu", weights_only=True)

@@ -113,9 +113,32 @@ ResNet 通道统计使用双精度累积；若部分 ReLU 通道在训练集上�
 uv run python efficientad_ccd.py train --category CCD1 --batch-size 4 --max-images 70000
 ```
 
-`batch-size` 只作用于训练，正常样本统计、异常图校准、测试和热图仍使用单张图片。`batch-size` 大于 1 时，程序启用逐图片 Q99.9 hard loss，并让 ImageNette 辅助 loader 使用相同 batch size；训练 loader 和辅助 loader 都丢弃最后一个不完整 batch。`--max-images` 表示目标图片预算，程序会按 batch 向上换算 optimizer steps，实际预算写入运行目录的 `config.json`。默认 `batch-size=1` 保留原始全局 hard loss 和旧 checkpoint 语义。
+`batch-size` 是**每张卡**的训练 batch，正常样本统计、异常图校准、测试和热图仍使用单张图片。每卡 `batch-size` 大于 1 或使用多卡时，程序启用逐图片 Q99.9 hard loss，并让辅助 loader 使用相同的每卡 batch。单卡 `batch-size=1` 保留原始全局 hard loss 和旧 checkpoint 语义。
 
 `--max-images` 不能被 batch 整除时，实际图片预算会向上取整到完整 batch；例如 `--batch-size 4 --max-images 101` 会执行 26 步、实际预算 104 张。`--device auto` 会优先使用 `cuda:0`，也可以明确指定 `--device cuda` 或 `--device cpu`；`--num-workers` 同时用于训练、评估、统计和 ImageNette 辅助 loader。默认 score 选取方式是多尺度池化 `multiscale_pool`，使用 `1,7,21` 三个窗口和 `0.001` 的 Top-K 比例。训练时 `--score-pool-kernel`（单尺度）与 `--score-pool-kernels`（多尺度）只能二选一。
+
+### 单机多卡训练
+
+```powershell
+uv run python efficientad_ccd.py train `
+  --category CCD1 `
+  --device 0 1 `
+  --batch-size 4 `
+  --backbone resnet18_layer2 `
+  --max-images 70000 `
+  --imagenette-dir "assets\visa_aux" `
+  --circle-config "circle_config.json"
+```
+
+此命令由两张卡共同训练一个模型：每卡 4 张，全局 batch 为 8，执行 8,750 个 optimizer steps。`--max-images` 是所有卡合计的图片预算，向上取整到完整全局 batch；例如两卡、每卡 4 张、预算 101 张，实际执行 13 步、104 张。`--max-steps` 则始终是同步优化步数。学习率保持 `--lr` 指定值，不自动按卡数放大。
+
+`--device 1` 只使用编号 1 的 GPU；`auto`/`cuda` 仍只选第一张可见 GPU，`cpu` 为单进程。编号相对于 `CUDA_VISIBLE_DEVICES` 筛选后的可见设备，重复、越界或混合 CPU/GPU 会报错。独立评估和预测只接受一个设备，例如 `--device 0`。
+
+多卡通过 DDP 一卡一进程训练，训练集和辅助集分别分片，不补重复图片，每轮丢弃不完整的全局 batch；两套数据各自必须至少包含一个全局 batch。`--num-workers` 是每个进程中每个 loader 的 worker 数，Windows 建议先用 0。教师统计在启动前统一计算；训练结束后只在主进程进行完整校准、评估与报告保存。ResNet 学生使用每卡本地 BatchNorm，DDP 在每次前向前同步 rank 0 的缓冲区，最终保存 rank 0 状态；未启用 SyncBatchNorm，因此它与同全局 batch 的单卡训练不保证数值等价。
+
+续训必须保持原来的卡数，每卡 batch、优化器和总步数沿用 checkpoint，允许换用其他 GPU 编号。旧 checkpoint 视为单卡；已训练的多卡 `model.pt` 可在单 GPU 或 CPU 推理。多卡中断时保留最近一次成功写入的 `checkpoints/last.pt`，保存间隔由 `--save-every` 控制。多卡恢复会分别恢复训练集和辅助集的 sampler epoch，并跳过本轮已处理的 batch；因此样本顺序可以接续，但随机增强和 Dropout 的 RNG 状态未保存，仍不保证与不中断训练逐位一致。
+
+优先使用 NCCL（通常是 Linux CUDA），不可用时使用 Gloo。本功能针对 `efficientad_ccd.py` 单机训练；未扩展为多机训练，也不代表独立 Lightning/Engine 入口已完成 DDP 适配。
 
 训练结束后会自动完成：正常验证集异常图校准 → 图像阈值校准 → 测试集推理 → 指标和热图保存。默认每 1,000 步保存 `checkpoints/last.pt`；Ctrl+C 在训练循环中会保存最近完成步数的续训文件。
 
@@ -240,7 +263,7 @@ uv run python efficientad_ccd.py train --resume "outputs\CCD1\<运行时间>\che
 
 `checkpoint` 是 `--score-mode` 的默认值，严格沿用模型里保存的分数公式和阈值。显式选择 `top`、`pool+top` 或 `multiscale_pool` 时，程序使用同一份 `threshold_val` 为所选公式重新选择匹配阈值，并在本次 `evaluation` 目录保存 `calibration.json`、`config.json` 和新的 `model.pt`；原 checkpoint 不会被覆盖。若快照没有 `threshold_val`，程序会从 `test` 各子目录分层划出一部分，因此用于最终报告的测试图片会相应减少。
 
-续训结果放入新的运行目录，不覆盖原结果。续训恢复模型、优化器和调度器，但会重新开始随机数据顺序，因此不保证与不中断训练逐位相同。若要改变总步数、分辨率、阈值分位数、加入新下载的训练图片或改用另一份辅助数据，请启动一次新的训练；`--resume` 会沿用原配置，只允许改变运行设备、数据读取进程数、保存频率和热图数量。
+续训结果放入新的运行目录，不覆盖原结果。续训恢复模型、优化器和调度器；单卡会重新开始随机数据顺序，多卡会接续两套数据的分片顺序。随机增强和 Dropout 的 RNG 状态未保存，因此不保证与不中断训练逐位相同。若要改变总步数、分辨率、阈值分位数、加入新下载的训练图片或改用另一份辅助数据，请启动一次新的训练；`--resume` 会沿用原配置，只允许改变运行设备（卡数保持一致）、数据读取进程数、保存频率和热图数量。
 
 新快照评估不会因内容与原训练/校准样本重复而拒绝；相机类别仍必须一致。快照内文件需要保持路径、大小和修改时间不变。
 
@@ -267,6 +290,13 @@ uv run python tests/smoke_pipeline.py
 
 # ResNet 完整链路：需要本机已缓存 torchvision ImageNet 预训练教师权重。
 uv run python tests/smoke_pipeline.py --backbone resnet18_layer2
+
+# 测试专用：在 CPU 上运行两个真实 DDP 进程，验证完整流程。
+uv run python tests/smoke_pipeline.py --ddp-test-device cpu
+
+# 测试专用：同一张 GPU 上运行两个进程，验证 Windows Gloo/CUDA 和 DataLoader。
+# 不代表两张物理 GPU 的性能验证；正式训练禁止重复选择同一 GPU。
+uv run python tests/smoke_pipeline.py --ddp-test-device cuda:0 --num-workers 1
 
 uv run python efficientad_ccd.py --help
 uv run python efficientad_ccd.py train --help

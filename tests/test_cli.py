@@ -195,7 +195,7 @@ class CommandTests(unittest.TestCase):
             }],
         }
         manifest = {"category": "CCD1", "duplicate_report": report, "summary": {}}
-        args = SimpleNamespace(resume=None, output_dir=self.root / "training")
+        args = SimpleNamespace(resume=None, output_dir=self.root / "training", device="cpu")
         with patch.object(cli, "snapshot", return_value=manifest), \
                 self.assertRaisesRegex(ValueError, "训练未启动"):
             cli.train_one(args, "CCD1")

@@ -219,6 +219,7 @@ class EfficientAd(AnomalibModule):
         image_size: tuple[int, int] | torch.Size,
         *,
         num_workers: int = 0,
+        start_iterator: bool = True,
     ) -> None:
         """Prepare ImageNette dataset transformations.
 
@@ -229,6 +230,8 @@ class EfficientAd(AnomalibModule):
                 transforms.
             num_workers (int): Number of workers for the auxiliary ImageNette
                 loader. Defaults to ``0``.
+            start_iterator (bool): Start loading immediately. DDP defers this
+                until a distributed sampler is installed. Defaults to ``True``.
         """
         self.data_transforms_imagenet = Compose(
             [
@@ -256,7 +259,7 @@ class EfficientAd(AnomalibModule):
             num_workers=num_workers,
             persistent_workers=num_workers > 0,
         )
-        self.imagenet_iterator = iter(self.imagenet_loader)
+        self.imagenet_iterator = iter(self.imagenet_loader) if start_iterator else None
 
     def _teacher_statistics_dataloader(self) -> DataLoader:
         """Build a non-dropping single-image loader for teacher statistics."""

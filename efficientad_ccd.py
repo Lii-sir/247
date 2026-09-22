@@ -161,12 +161,30 @@ def make_loader(records: list[dict], config: dict, *, shuffle: bool = False, tra
     )
 
 
-def choose_device(requested: str) -> str:
-    if requested == "auto":
-        return "cuda:0" if torch.cuda.is_available() else "cpu"
-    if requested == "cuda" and not torch.cuda.is_available():
+def choose_devices(requested: str | list[str]) -> list[str]:
+    values = [requested] if isinstance(requested, str) else requested
+    if values == ["cpu"] or (values == ["auto"] and not torch.cuda.is_available()):
+        return ["cpu"]
+    if values in (["auto"], ["cuda"]):
+        values = ["0"]
+    if not values or any(not value.isdecimal() for value in values):
+        raise ValueError("device 应为 auto、cuda、cpu 或 GPU 编号列表，例如 --device 0 1。")
+    indices = [int(value) for value in values]
+    if len(set(indices)) != len(indices):
+        raise ValueError("device 中不能重复指定同一张 GPU。")
+    if not torch.cuda.is_available():
         raise RuntimeError("当前 PyTorch 无法使用 CUDA，请运行 README 中的 GPU 检查命令。")
-    return "cuda:0" if requested == "cuda" else "cpu"
+    count = torch.cuda.device_count()
+    if any(index >= count for index in indices):
+        raise ValueError(f"GPU 编号越界：当前可见 {count} 张卡，请使用 0 到 {count - 1}。")
+    return [f"cuda:{index}" for index in indices]
+
+
+def choose_device(requested: str | list[str]) -> str:
+    devices = choose_devices(requested)
+    if len(devices) != 1:
+        raise ValueError("评估和预测仅支持单个设备；多卡列表用于 train。")
+    return devices[0]
 
 
 def seed_everything(seed: int) -> None:
@@ -232,6 +250,7 @@ def prepare_assets(model, config: dict, *, load_teacher: bool) -> None:
     model.prepare_imagenette_data(
         (config["image_size"], config["image_size"]),
         num_workers=config["num_workers"],
+        start_iterator=config.get("world_size", 1) == 1,
     )
     if len(model.imagenet_loader.dataset) == 0:
         raise ValueError(f"ImageNette 辅助数据为空：{imagenette}")
@@ -885,6 +904,9 @@ def new_output(base: Path, category: str) -> Path:
 
 
 def train_one(args, category: str) -> None:
+    from ccd_distributed import configure_training_world, optimize, train_distributed
+
+    devices = choose_devices(args.device)
     if args.resume:
         previous = read_checkpoint(args.resume)
         if "optimizer_state" not in previous:
@@ -899,7 +921,7 @@ def train_one(args, category: str) -> None:
                 f"续训不能更改 backbone：checkpoint={saved_backbone}，请求={requested_backbone}；"
                 "请移除 --resume 启动新训练。"
             )
-        config.update(device=choose_device(args.device), num_workers=args.num_workers)
+        config.update(device=devices[0], num_workers=args.num_workers)
         # Old checkpoints predate batched training and must retain their exact
         # original loss semantics when resumed.
         config.setdefault("batch_size", 1)
@@ -911,7 +933,7 @@ def train_one(args, category: str) -> None:
         config.setdefault("max_images_requested", None)
         # Keep the derived budget consistent with the actual resume target,
         # including checkpoints whose metadata was edited to extend training.
-        config["max_images"] = config.get("max_steps", 1) * config["batch_size"]
+        configure_training_world(config, devices, resume=True)
         config.setdefault("score_mode", SCORE_MODE_MULTISCALE)
         config.setdefault("score_pool_kernels", [1, 7, 21])
         config.setdefault("score_topk_ratio", 0.001)
@@ -953,7 +975,7 @@ def train_one(args, category: str) -> None:
             budget_mode = "optimizer_steps"
         max_images = max_steps * batch_size
         config = {
-            "device": choose_device(args.device), "num_workers": args.num_workers,
+            "device": devices[0], "num_workers": args.num_workers,
             "image_size": args.image_size,
             "model_size": (args.backbone.removeprefix("pdn_")
                            if args.backbone and args.backbone.startswith("pdn_")
@@ -980,6 +1002,7 @@ def train_one(args, category: str) -> None:
             "imagenette_dir": str(args.imagenette_dir.resolve() if args.imagenette_dir else assets / "imagenette"),
             "teacher_weights": str(args.teacher_weights.resolve()) if args.teacher_weights else None,
         }
+        configure_training_world(config, devices, resume=False)
         apply_localization_config(config, args)
         prepare_circle_records(manifest, config)
     seed_everything(config["seed"])
@@ -987,7 +1010,8 @@ def train_one(args, category: str) -> None:
     write_json(output / "config.json", config)
     print(f"运行目录：{output}\n数据统计：{manifest['summary']}\n设备：{config['device']}")
     print(
-        f"训练 batch-size={config['batch_size']}，hard-loss={config['hard_loss_mode']}，"
+        f"每卡 batch-size={config['batch_size']}，全局 batch={config['global_batch_size']}，"
+        f"hard-loss={config['hard_loss_mode']}，"
         f"optimizer steps={config['max_steps']}，有效图片预算={config['max_images']}"
     )
     print(f"backbone={config['backbone']}；辅助数据：{config['imagenette_dir']}；缺失的默认资源将自动下载。")
@@ -995,7 +1019,6 @@ def train_one(args, category: str) -> None:
     if previous:
         model.model.load_state_dict(previous["model_state"])
     prepare_assets(model, config, load_teacher=previous is None)
-    loader = make_loader(manifest["train"], config, shuffle=True, training=True)
     if previous is None:
         model.eval()
         # Statistics must include every training image, including a final
@@ -1004,60 +1027,8 @@ def train_one(args, category: str) -> None:
         statistics = model.teacher_channel_mean_std(statistics_loader)
         check_statistics(statistics)
         model.model.mean_std.update(statistics)
-    optimizer = torch.optim.Adam(
-        list(model.model.student.parameters()) + list(model.model.ae.parameters()),
-        lr=config["lr"], weight_decay=config["weight_decay"],
-    )
-    scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer, step_size=max(1, int(0.95 * config["max_steps"])), gamma=0.1,
-    )
-    step = previous["step"] if previous else 0
-    if previous:
-        optimizer.load_state_dict(previous["optimizer_state"])
-        scheduler.load_state_dict(previous["scheduler_state"])
-    model.train()
-    iterator = iter(loader)
-    log_path = output / "loss.csv"
-    with log_path.open("w", encoding="utf-8", newline="") as log:
-        log.write("step,loss,loss_st,loss_ae,loss_stae,lr\n")
-        progress = tqdm(total=config["max_steps"], initial=step, desc=f"训练 {manifest['category']}")
-        try:
-            while step < config["max_steps"]:
-                try:
-                    batch = next(iterator)
-                except StopIteration:
-                    iterator = iter(loader)
-                    batch = next(iterator)
-                try:
-                    auxiliary = next(model.imagenet_iterator)[0]
-                except StopIteration:
-                    model.imagenet_iterator = iter(model.imagenet_loader)
-                    auxiliary = next(model.imagenet_iterator)[0]
-                optimizer.zero_grad(set_to_none=True)
-                losses = model.model(batch=batch.image.to(config["device"]),
-                                     batch_imagenet=auxiliary.to(config["device"]))
-                loss = sum(losses)
-                if not torch.isfinite(loss):
-                    raise RuntimeError(f"第 {step + 1} 步损失不是有限数值，训练停止。")
-                loss.backward()
-                optimizer.step()
-                scheduler.step()  # 每步调度，在总步数的 95% 处将学习率降为原来的 0.1。
-                step += 1
-                numbers = [float(loss.detach())] + [float(x.detach()) for x in losses]
-                log.write(f"{step}," + ",".join(str(x) for x in numbers) + f",{scheduler.get_last_lr()[0]}\n")
-                progress.update(1)
-                if step % 20 == 0 or step == 1:
-                    progress.set_postfix(loss=f"{numbers[0]:.5f}")
-                    log.flush()
-                if step % args.save_every == 0:
-                    save_checkpoint(output / "checkpoints" / "last.pt", model, config, manifest, step, optimizer, scheduler)
-        except KeyboardInterrupt:
-            save_checkpoint(output / "checkpoints" / "last.pt", model, config, manifest, step, optimizer, scheduler)
-            print(f"\n已中断并保存续训文件：{output / 'checkpoints' / 'last.pt'}")
-            raise
-        finally:
-            progress.close()
-    save_checkpoint(output / "checkpoints" / "last.pt", model, config, manifest, step, optimizer, scheduler)
+    train = train_distributed if len(devices) > 1 else optimize
+    step = train(model, config, manifest, output, previous, args.save_every)
     calibration = calibrate(model, manifest, config, output)
     save_checkpoint(output / "model.pt", model, config, manifest, step, calibration=calibration)
     evaluate_records(model, manifest["test"], config, calibration, output, args.heatmaps)
@@ -1168,7 +1139,8 @@ def build_parser() -> argparse.ArgumentParser:
         if name in ("train",):
             command.add_argument("--circle-config", type=Path, help="按工件类型配置圆检测与 mask 的 JSON 文件")
         if name != "inspect":
-            command.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
+            command.add_argument("--device", nargs="+", default="auto",
+                                 help="auto/cuda/cpu 或 GPU 编号；train 支持 --device 0 1，评估/预测只接受一张卡")
             command.add_argument("--num-workers", type=int, default=0, help="Windows 首次建议用 0")
             add_localization_arguments(command)
         if name in ("train", "evaluate"):
@@ -1179,11 +1151,11 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--max-steps", type=int, default=10000, help="快速试跑可设为 1000，正式对照可设为 70000")
             command.add_argument(
                 "--max-images", type=int,
-                help="训练总图片预算；与 batch-size 一起向上换算 optimizer steps，优先于 --max-steps",
+                help="全局训练图片预算；按 batch-size × 卡数向上换算 optimizer steps，优先于 --max-steps",
             )
             command.add_argument(
                 "--batch-size", type=int, default=1,
-                help="训练 batch 大小，默认 1；大于 1 时启用逐图片 hard loss。评估始终使用 1",
+                help="每张卡的训练 batch，默认 1；多卡或大于 1 时启用逐图片 hard loss。评估始终使用 1",
             )
             command.add_argument("--image-size", type=int, choices=[256, 384, 512, 768], default=256)
             backbone_group = command.add_mutually_exclusive_group()
