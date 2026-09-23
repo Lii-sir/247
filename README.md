@@ -88,7 +88,7 @@ uv run python efficientad_ccd.py train --category CCD1 --max-steps 10000 --image
 
 1,000 步仅用于快速试跑，10,000 步也不保证收敛。需要更长训练时可设 `--max-steps 70000`；在相同数据快照、相同训练参数下比较效果更有意义。默认将整张图缩放为方形，保留整张画面但会改变长宽比；本脚本未实现 ROI 或分块。若小缺陷在缩放后消失，后续应根据实际缺陷位置增加 ROI/分块处理。
 
-训练默认使用 **batch size=1**、Adam、初始学习率 `1e-4`、权重衰减 `1e-5`；在总步数 95% 处将学习率乘以 0.1。输入只转 RGB、缩放和映射到 `[0,1]`，不能在外部再做 ImageNet Normalize。默认 backbone 是 `pdn_small`，也支持 `pdn_medium` 和 `resnet18_layer2`。后两者必须使用各自的教师权重；`resnet18_layer2` 默认使用 torchvision 的 ImageNet 预训练 ResNet-18 layer2 特征，第一次运行会下载对应权重。
+训练默认使用 **batch size=1**、Adam、初始学习率 `1e-4`、权重衰减 `1e-5`；在总步数 95% 处将学习率乘以 0.1。输入只转 RGB、缩放和映射到 `[0,1]`，不能在外部再做 ImageNet Normalize。默认 backbone 是 `pdn_small`，也支持 `pdn_medium`、`resnet18_layer2` 和 `resnet18_layer3`。PDN 使用对应的预训练教师权重；两个 ResNet 选项默认使用 torchvision 的 ImageNet 预训练 ResNet-18 主干，第一次运行会下载对应权重。
 
 可以用同一份数据快照比较不同 backbone：
 
@@ -104,6 +104,8 @@ uv run python efficientad_ccd.py train `
 `--backbone` 与旧版 `--model-size` 互斥，不能同时传入；未指定 `--backbone` 时，`small/medium` 分别映射到 `pdn_small/pdn_medium`。续训默认沿用 checkpoint 的结构，显式指定不同 backbone 会报错；切换结构必须重新训练并重新校准阈值。
 
 `resnet18_layer2` 同时替换教师和学生：教师使用冻结的 ImageNet 预训练特征（128 通道、步长 8），学生随机初始化并输出 256 通道，分别用于教师与自编码器两项匹配。自编码器输出会插值到对应特征尺寸，异常图不使用 PDN 的边缘补偿。这是实验性 EfficientAD 变体，并非原论文的等价替换；它含 BatchNorm，且特征分辨率低于 PDN，需要在相同数据划分下对照缺陷召回、误报、耗时和显存，不能仅凭流程测试判断更好。
+
+`resnet18_layer3` 使用更深的特征：教师保留 ImageNet 预训练 ResNet-18 截至 layer3 的原生 256 通道输出并冻结；学生从同样的主干结构随机初始化，末端增加可训练的 `3×3 Conv(256, 512, padding=1)`，前后各 256 通道分别匹配教师和 AE。输入 256×256 时特征图为 16×16（步长 16）。教师没有随机新增的输出卷积，保证蒸馏目标来自预训练特征。此结构仍是实验性变体，空间分辨率低于 `layer2`，小缺陷可能更难定位，且学生的 BatchNorm 使用每卡局部统计。旧 `resnet18_layer2` checkpoint 保持原结构；切换到 `layer3` 必须重新训练和校准。
 
 ResNet 通道统计使用双精度累积；若部分 ReLU 通道在训练集上恒定，则只减均值、使用单位标准差并给出警告，避免除零。全部通道恒定仍会报错。PDN 保留原有统计行为。
 
@@ -155,7 +157,7 @@ uv run python efficientad_ccd.py train `
 uv run python efficientad_ccd.py train --category CCD1 --max-steps 10000 --teacher-weights "D:\models\pretrained_teacher_small.pth" --imagenette-dir "D:\datasets\imagenette2\train"
 ```
 
-这里的路径是示例，必须改成实际存在的位置。教师权重必须与所选 `--backbone` 匹配；`pdn_small/pdn_medium` 使用官方对应权重，`resnet18_layer2` 可以省略该参数并自动使用 torchvision 的 ImageNet 权重。辅助图片目录需要兼容 `ImageFolder`，例如 `train/n01440764/*.JPEG`。仅有 CCD 图片不足以复现官方带 ImageNette 正则项的配置。**不要预先创建空的 `assets/imagenette` 目录**：官方辅助函数看到目录存在就会尝试读取，空目录应删除或改用新的有效目录后重试。
+这里的路径是示例，必须改成实际存在的位置。教师权重必须与所选 `--backbone` 匹配；`pdn_small/pdn_medium` 使用官方对应权重，`resnet18_layer2/resnet18_layer3` 可以省略该参数并自动使用 torchvision 的 ImageNet 权重。辅助图片目录需要兼容 `ImageFolder`，例如 `train/n01440764/*.JPEG`。仅有 CCD 图片不足以复现官方带 ImageNette 正则项的配置。**不要预先创建空的 `assets/imagenette` 目录**：官方辅助函数看到目录存在就会尝试读取，空目录应删除或改用新的有效目录后重试。
 
 ResNet 自定义 `--teacher-weights` 应保存本项目适配器的 `model.teacher.state_dict()`（Lightning 包装实例为 `model.model.teacher.state_dict()`）；完整 torchvision ResNet 的原始 state dict 键名与其不同，不能直接传入。已训练的 `model.pt` 包含教师参数，推理和 CLI 续训不需要重新下载教师。
 

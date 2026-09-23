@@ -196,6 +196,66 @@ class BackboneTests(unittest.TestCase):
         self.assertEqual(prediction.anomaly_map.shape, (1, 1, 256, 256))
         self.assertTrue(torch.isfinite(prediction.anomaly_map).all())
 
+    def test_resnet18_layer3_training_preserves_frozen_teacher_and_updates_student_head(self) -> None:
+        model = EfficientAdModel(backbone="resnet18_layer3", hard_loss_mode="per_image")
+        image = torch.rand(2, 3, 256, 256)
+        self.assertEqual(tuple(model.teacher(image).shape), (2, 256, 16, 16))
+        self.assertEqual(tuple(model.student(image).shape), (2, 512, 16, 16))
+        self.assertIsInstance(model.teacher.head, torch.nn.Identity)
+        self.assertEqual(tuple(model.student.head.weight.shape), (512, 256, 3, 3))
+        self.assertTrue(all(not parameter.requires_grad for parameter in model.teacher.parameters()))
+        teacher_before = {name: value.clone() for name, value in model.teacher.state_dict().items()}
+        student_head_before = model.student.head.weight.detach().clone()
+        model.train()
+        self.assertFalse(model.teacher.training)
+        losses = model(image, torch.rand_like(image))
+        self.assertEqual(len(losses), 3)
+        self.assertTrue(all(torch.isfinite(loss) for loss in losses))
+        sum(losses).backward()
+        self.assertIsNotNone(model.student.head.weight.grad)
+        self.assertTrue(torch.isfinite(model.student.head.weight.grad).all())
+        self.assertGreater(model.student.head.weight.grad[:256].abs().sum().item(), 0)
+        self.assertGreater(model.student.head.weight.grad[256:].abs().sum().item(), 0)
+        self.assertTrue(all(p.grad is None for p in model.teacher.parameters()))
+        torch.optim.SGD(model.student.parameters(), lr=0.01).step()
+        self.assertFalse(torch.equal(model.student.head.weight, student_head_before))
+        for name, before in teacher_before.items():
+            torch.testing.assert_close(model.teacher.state_dict()[name], before, rtol=0, atol=0)
+        model.eval()
+        self.assertEqual(tuple(model(image).anomaly_map.shape), (2, 1, 256, 256))
+
+    def test_resnet18_layer3_teacher_loads_pretrained_features_without_random_head(self) -> None:
+        from torchvision.models import resnet18
+        from self_efficientad.backbones import load_default_teacher_weights
+
+        model = EfficientAdModel(backbone="resnet18_layer3")
+        pretrained = resnet18(weights=None).state_dict()
+        pretrained["conv1.weight"].fill_(0.125)
+        with patch("torchvision.models.resnet.ResNet18_Weights.get_state_dict", return_value=pretrained):
+            load_default_teacher_weights("resnet18_layer3", model.teacher)
+        self.assertTrue(torch.equal(model.teacher.features[0].weight, pretrained["conv1.weight"]))
+        self.assertIsInstance(model.teacher.head, torch.nn.Identity)
+
+    def test_resnet18_layer3_cli_and_checkpoint_roundtrip(self) -> None:
+        cli.load_runtime()
+        args = cli.build_parser().parse_args(["train", "--backbone", "resnet18_layer3"])
+        self.assertEqual(args.backbone, "resnet18_layer3")
+        config = {"imagenette_dir": "unused", "model_size": "small",
+                  "backbone": "resnet18_layer3", "lr": 1e-4,
+                  "weight_decay": 1e-5, "device": "cpu"}
+        original = cli.new_model(config).eval()
+        image = torch.rand(1, 3, 256, 256)
+        with torch.inference_mode():
+            expected = original.model(image).anomaly_map
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "model.pt"
+            torch.save(original.model.state_dict(), path)
+            restored = cli.new_model(config).eval()
+            restored.model.load_state_dict(torch.load(path, weights_only=True))
+            with torch.inference_mode():
+                actual = restored.model(image).anomaly_map
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     def test_explicit_pdn_medium_loads_medium_teacher(self) -> None:
         cli.load_runtime()
         model = cli.new_model({

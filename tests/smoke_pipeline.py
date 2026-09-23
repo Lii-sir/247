@@ -23,7 +23,7 @@ from efficientad_ccd import load_runtime, new_model
 def main() -> None:
     """通过真正的命令行验证训练、恢复、评估和预测，不访问外网。"""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backbone", choices=("pdn_small", "pdn_medium", "resnet18_layer2"), default="pdn_small")
+    parser.add_argument("--backbone", choices=("pdn_small", "pdn_medium", "resnet18_layer2", "resnet18_layer3"), default="pdn_small")
     parser.add_argument("--ddp-test-device", choices=("cpu", "cuda:0"),
                         help="测试专用：在同一设备启动两个真实 DDP 进程，不代表两张物理卡的性能")
     parser.add_argument("--num-workers", type=int, default=0)
@@ -49,7 +49,7 @@ def main() -> None:
         config = {"imagenette_dir": str(auxiliary.parent), "model_size": "small", "lr": 1e-4,
                   "weight_decay": 1e-5, "device": "cpu", "backbone": args.backbone}
         teacher = new_model(config)
-        if args.backbone == "resnet18_layer2":
+        if args.backbone.startswith("resnet18_"):
             from torchvision.models import ResNet18_Weights
             from self_efficientad.backbones import load_default_teacher_weights
 

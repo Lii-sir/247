@@ -309,13 +309,13 @@ class EfficientAd(AnomalibModule):
 
         for batch in tqdm.tqdm(dataloader, desc="Calculate teacher channel mean & std", position=0, leave=True):
             y = self.model.teacher(batch.image.to(self.device))
-            if self.backbone == "resnet18_layer2":
+            if self.backbone.startswith("resnet18_"):
                 # ResNet 的稀疏 ReLU 特征可含恒定通道；低方差统计使用双精度。
                 y = y.double()
             if not arrays_defined:
                 _, num_channels, _, _ = y.shape
                 n = torch.zeros((num_channels,), dtype=torch.int64, device=y.device)
-                stats_dtype = torch.float64 if self.backbone == "resnet18_layer2" else torch.float32
+                stats_dtype = torch.float64 if self.backbone.startswith("resnet18_") else torch.float32
                 chanel_sum = torch.zeros((num_channels,), dtype=stats_dtype, device=y.device)
                 chanel_sum_sqr = torch.zeros((num_channels,), dtype=stats_dtype, device=y.device)
                 arrays_defined = True
@@ -331,7 +331,7 @@ class EfficientAd(AnomalibModule):
         channel_mean = chanel_sum / n
 
         variance = (chanel_sum_sqr / n) - (channel_mean**2)
-        if self.backbone == "resnet18_layer2":
+        if self.backbone.startswith("resnet18_"):
             variance = variance.clamp_min(0)
             inactive = variance == 0
             if inactive.all():
