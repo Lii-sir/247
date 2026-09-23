@@ -179,6 +179,18 @@ class DistributedConfigurationTests(unittest.TestCase):
             self.assertIsNone(model.imagenet_iterator)
             self.assertIsNone(model.imagenet_loader._iterator)
 
+    def test_checkpoint_read_loads_runtime_when_torch_is_not_bound(self):
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "checkpoint.pt"
+            torch.save({"format_version": 1, "model_state": {}}, path)
+            saved_torch = cli.__dict__.pop("torch", None)
+            try:
+                payload = cli.read_checkpoint(path)
+            finally:
+                if saved_torch is not None:
+                    cli.__dict__["torch"] = saved_torch
+            self.assertEqual(payload["format_version"], 1)
+
 
 class DistributedOptimizationTests(unittest.TestCase):
     def test_mid_epoch_resume_matches_uninterrupted_optimization(self):

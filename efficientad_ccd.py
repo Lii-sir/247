@@ -259,6 +259,8 @@ def prepare_assets(model, config: dict, *, load_teacher: bool) -> None:
 def save_checkpoint(path: Path, model, config: dict, manifest: dict, step: int,
                     optimizer=None, scheduler=None, calibration: dict | None = None) -> None:
     """先写临时文件再替换，减少中断时留下半个 checkpoint 的可能性。"""
+    if "torch" not in globals():
+        load_runtime()
     payload = {
         "format_version": 1,
         "model_state": model.model.state_dict(),
@@ -278,6 +280,8 @@ def save_checkpoint(path: Path, model, config: dict, manifest: dict, step: int,
 
 def read_checkpoint(path: Path) -> dict:
     # checkpoint 只包含张量和普通 Python 数据，使用 weights_only 限制反序列化。
+    if "torch" not in globals():
+        load_runtime()
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if payload.get("format_version") != 1:
         raise ValueError("不是本脚本生成的 checkpoint，或格式版本不匹配。")
