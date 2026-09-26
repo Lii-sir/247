@@ -484,7 +484,8 @@ class EfficientAdModel(nn.Module):
     Args:
         teacher_out_channels (int | None): Number of convolution output channels of the
             teacher model. ``None`` selects 384 for PDN, 128 for ResNet-18
-            layer2, 256 for ResNet-18 layer3, or 1024 for ResNet-50 layer3.
+            layer2, 256 for ResNet-18 layer3, or 256/512/1024 for ResNet-50
+            layer1/layer2/layer3 respectively.
             Defaults to ``None``.
         model_size (EfficientAdModelSize): Size of student and teacher model.
             Defaults to ``EfficientAdModelSize.S``.

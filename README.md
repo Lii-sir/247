@@ -88,7 +88,7 @@ uv run python efficientad_ccd.py train --category CCD1 --max-steps 10000 --image
 
 1,000 步仅用于快速试跑，10,000 步也不保证收敛。需要更长训练时可设 `--max-steps 70000`；在相同数据快照、相同训练参数下比较效果更有意义。默认将整张图缩放为方形，保留整张画面但会改变长宽比；本脚本未实现 ROI 或分块。若小缺陷在缩放后消失，后续应根据实际缺陷位置增加 ROI/分块处理。
 
-训练默认使用 **batch size=1**、Adam、初始学习率 `1e-4`、权重衰减 `1e-5`；在总步数 95% 处将学习率乘以 0.1。输入只转 RGB、缩放和映射到 `[0,1]`，不能在外部再做 ImageNet Normalize。默认 backbone 是 `pdn_small`，也支持 `pdn_medium`、`resnet18_layer2`、`resnet18_layer3` 和 `resnet50_layer3`。PDN 使用对应的预训练教师权重；ResNet 默认使用 torchvision 的 ImageNet 预训练主干（ResNet-18 V1、ResNet-50 V2），第一次运行会下载对应权重。
+训练默认使用 **batch size=1**、Adam、初始学习率 `1e-4`、权重衰减 `1e-5`；在总步数 95% 处将学习率乘以 0.1。输入只转 RGB、缩放和映射到 `[0,1]`，不能在外部再做 ImageNet Normalize。默认 backbone 是 `pdn_small`，也支持 `pdn_medium`、`resnet18_layer2`、`resnet18_layer3`、`resnet50_layer1`、`resnet50_layer2` 和 `resnet50_layer3`。PDN 使用对应的预训练教师权重；ResNet 默认使用 torchvision 的 ImageNet 预训练主干（ResNet-18 V1、ResNet-50 V2），第一次运行会下载对应权重。
 
 可以用同一份数据快照比较不同 backbone：
 
@@ -103,9 +103,19 @@ uv run python efficientad_ccd.py train `
 
 `--backbone` 与旧版 `--model-size` 互斥，不能同时传入；未指定 `--backbone` 时，`small/medium` 分别映射到 `pdn_small/pdn_medium`。续训默认沿用 checkpoint 的结构，显式指定不同 backbone 会报错；切换结构必须重新训练并重新校准阈值。
 
-ResNet 新训练默认采用架构版本 2：teacher 保留原生预训练特征并冻结；student 的 stem 和所有保留的残差 stage 通道整体扩大 2 倍，末尾使用无激活的 `3×3` 输出卷积；AE 保留卷积编码、插值解码和 Dropout 的形式，中间容量按 teacher 通道数扩展，直接输出 teacher 的空间尺寸。Teacher / student / AE 的通道分别为：layer2 的 128/256/128、ResNet-18 layer3 的 256/512/256、ResNet-50 layer3 的 1024/2048/1024。256×256 输入对应 32×32、16×16、16×16 特征图。详见 [ResNet 容量升级说明](docs/resnet_capacity_upgrade.md)。
+ResNet 新训练默认采用架构版本 2：teacher 保留原生预训练特征并冻结；student 的 stem 和所有保留的残差 stage 通道整体扩大 2 倍，末尾使用无激活的 `3×3` 输出卷积；AE 保留卷积编码、插值解码和 Dropout 的形式，中间容量按 teacher 通道数扩展，直接输出 teacher 的空间尺寸。256×256 输入时：
 
-这是实验性 EfficientAD 变体。Student 的 BatchNorm 使用每卡局部统计；layer3 空间分辨率较低，整体扩宽不能保证提高小缺陷召回。ResNet-50 student 约 7184 万参数，需要更多显存。旧 checkpoint 缺少 `resnet_architecture_version` 时自动按版本 1 原结构加载，可继续旧训练；要使用新结构，应启动新训练并重新校准，不能把旧权重直接装进版本 2。
+| Backbone | Teacher / student / AE 通道 | 特征图 | AE hidden |
+|---|---|---|---:|
+| resnet18_layer2 | 128 / 256 / 128 | 32×32 | 64 |
+| resnet18_layer3 | 256 / 512 / 256 | 16×16 | 128 |
+| resnet50_layer1 | 256 / 512 / 256 | 64×64 | 128 |
+| resnet50_layer2 | 512 / 1024 / 512 | 32×32 | 256 |
+| resnet50_layer3 | 1024 / 2048 / 1024 | 16×16 | 256 |
+
+ResNet-50 layer1/layer2 分别只保留 3 个、3+4 个 Bottleneck；student 的块内通道和残差支路同步扩宽，不包含后续 stage。AE 按实际特征尺寸解码，无额外 PDN 边界补零。详见 [ResNet 容量升级说明](docs/resnet_capacity_upgrade.md)。
+
+这是实验性 EfficientAD 变体。Student 的 BatchNorm 使用每卡局部统计；layer3 空间分辨率较低，整体扩宽不能保证提高小缺陷召回。ResNet-50 layer3 student 约 7184 万参数；layer1/layer2 参数更少，但特征图更大，仍需实测显存。旧 checkpoint 缺少 `resnet_architecture_version` 时自动按版本 1 原结构加载，可继续旧训练；要使用新结构，应启动新训练并重新校准，不能把旧权重直接装进版本 2。
 
 ResNet 通道统计使用双精度累积；若部分 ReLU 通道在训练集上恒定，则只减均值、使用单位标准差并给出警告，避免除零。全部通道恒定仍会报错。PDN 保留原有统计行为。
 
@@ -293,6 +303,8 @@ uv run python tests/smoke_pipeline.py
 # ResNet 完整链路：需要本机已缓存 torchvision ImageNet 预训练教师权重。
 uv run python tests/smoke_pipeline.py --backbone resnet18_layer2
 uv run python tests/smoke_pipeline.py --backbone resnet50_layer3
+uv run python tests/smoke_pipeline.py --backbone resnet50_layer1
+uv run python tests/smoke_pipeline.py --backbone resnet50_layer2
 
 # 测试专用：在 CPU 上运行两个真实 DDP 进程，验证完整流程。
 uv run python tests/smoke_pipeline.py --ddp-test-device cpu

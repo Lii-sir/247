@@ -1174,7 +1174,8 @@ def build_parser() -> argparse.ArgumentParser:
                                         help="旧版 PDN 大小选项；新训练未指定架构时默认 small")
             backbone_group.add_argument(
                 "--backbone",
-                choices=["pdn_small", "pdn_medium", "resnet18_layer2", "resnet18_layer3", "resnet50_layer3"],
+                choices=["pdn_small", "pdn_medium", "resnet18_layer2", "resnet18_layer3",
+                         "resnet50_layer1", "resnet50_layer2", "resnet50_layer3"],
                 help="特征提取器；默认随 --model-size 选择 pdn_small 或 pdn_medium",
             )
             command.add_argument("--lr", type=float, default=1e-4)

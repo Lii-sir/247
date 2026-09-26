@@ -1,12 +1,13 @@
 # ResNet student 与 AE 容量升级说明
 
 日期：2026-09-25
+更新：2026-09-26，补充 ResNet-50 layer1/layer2。
 
 ## 1. 实现范围
 
 新训练默认使用 ResNet 架构版本 2，完成以下三项：
 
-1. 新增 `resnet50_layer3`，使用原生 ImageNet 预训练 teacher。
+1. 支持 `resnet50_layer1`、`resnet50_layer2` 和 `resnet50_layer3`，使用原生 ImageNet 预训练 teacher。
 2. Student 的 stem 和所有保留的残差 stage 通道整体扩大 2 倍，随机初始化。
 3. AE 参考 EfficientAD 原有卷积编码/解码形式，中间通道随 teacher 通道数变化，直接生成与 teacher 对齐的特征图。
 
@@ -22,6 +23,8 @@ PDN small/medium 保持原结构和原 AE。本次未加入缺陷 mask 辅助损
 |---|---:|---:|---:|---|---:|
 | resnet18_layer2 | 128 | 256 | 128 | 32×32 | 8 |
 | resnet18_layer3 | 256 | 512 | 256 | 16×16 | 16 |
+| resnet50_layer1 | 256 | 512 | 256 | 64×64 | 4 |
+| resnet50_layer2 | 512 | 1024 | 512 | 32×32 | 8 |
 | resnet50_layer3 | 1024 | 2048 | 1024 | 16×16 | 16 |
 
 Teacher 保留 torchvision ResNet 原生 stem 和 stage；无新增随机输出投影。
@@ -47,6 +50,7 @@ Teacher 全部参数禁用梯度，模型调用 `train()` 后仍保持 teacher �
 | layer3 | 256 | 512 | 1024 | 2048 |
 
 `resnet18_layer2` 截止 layer2，不构建 layer3。
+`resnet50_layer1` 仅保留 layer1；`resnet50_layer2` 保留 layer1/layer2，不构建后续 stage。
 ResNet-18 使用 BasicBlock，各保留 stage 为 2 个块；ResNet-50 使用 Bottleneck，各 stage 为 3、4、6 个块。
 保持原阶段的步长；Bottleneck 内部通道和残差下采样支路一起扩宽。
 没有构建 layer4、分类池化或全连接分类层。
@@ -80,9 +84,11 @@ small = hidden // 2
 |---|---:|---:|---:|
 | resnet18_layer2 | 32 | 64 | 128 |
 | resnet18_layer3 | 64 | 128 | 256 |
+| resnet50_layer1 | 64 | 128 | 256 |
+| resnet50_layer2 | 128 | 256 | 512 |
 | resnet50_layer3 | 128 | 256 | 1024 |
 
-hidden 的上限 256 是本版本明确的容量选择：ResNet-50 AE 没有将全部隐藏层扩大到 512。
+hidden 的上限 256 是本版本明确的容量选择：ResNet-50 layer2/layer3 的 hidden 均为 256，layer3 未继续扩大到 512。
 它仍比原来的 64 通道 AE 更宽。这不是官方规定，也不是已验证的最优值；
 若后续修改上限，需要相应升级架构版本并重新训练。
 
@@ -110,6 +116,9 @@ ceil(Hf/4) → ceil(Hf/2) → Hf → Hf → Hf → Hf
 宽度同理，每个维度至少为 2；4×4、padding=2 的卷积会增加一个像素，
 因此每层卷积前先插值到计划尺寸减 1。最后两层 3×3 保持尺寸。
 16×16 目标对应 4→8→16→16→16→16，最终直接输出 C×16×16。
+ResNet-50 layer1 的 64×64 目标对应 16→32→64→64→64→64；
+layer2 的 32×32 目标对应 8→16→32→32→32→32。
+因此 layer1 与 ResNet-18 layer3 虽然同为 256 通道，空间解码路径仍按各自 teacher 的实际尺寸区分。
 训练和推理都走这一条路径，不先生成 PDN 的 56×56 特征再缩小。
 
 ## 5. 损失与多卡语义
@@ -149,6 +158,8 @@ Teacher 的 BatchNorm 保持冻结推理状态。
 因此旧 ResNet 模型仍可评估和沿旧结构续训；它们不会因为软件升级而自动扩宽。
 若要采用新结构，需要启动新训练并重新统计、校准。
 已有 checkpoint 的 teacher 权重内嵌其中，恢复不需要重新下载。
+新增 layer1/layer2 也使用版本 2；现有 layer3 的 state dict 键和形状保持一致。
+layer1、layer2、layer3 的完整模型 checkpoint 不能互换，切换 stage 必须新训练并重新校准。
 直接保存裸 state dict 的 API 使用者需要自行保存 backbone 和架构版本。
 
 ## 7. 参数量与资源
@@ -159,14 +170,20 @@ Teacher 的 BatchNorm 保持冻结推理状态。
 |---|---:|---:|---:|
 | resnet18_layer2 | 683,072 | 3,299,712 | 948,608 |
 | resnet18_layer3 | 2,782,784 | 13,463,168 | 3,789,568 |
+| resnet50_layer1 | 225,344 | 3,236,480 | 3,789,568 |
+| resnet50_layer2 | 1,444,928 | 15,178,880 | 15,148,544 |
 | resnet50_layer3 | 8,543,296 | 71,843,968 | 16,328,704 |
 
-ResNet-50 的 2048→2048 密集 3×3 输出卷积本身就约有 3775 万参数。
+ResNet-50 layer3 的 2048→2048 密集 3×3 输出卷积本身就约有 3775 万参数。
 这里保留已确认的空间卷积设计；不应将本变体宣传为原版 EfficientAD 的毫秒级轻量网络。
 实际显存还包含激活、梯度、Adam 状态和 DDP 通信缓冲，不能仅按权重大小估算 batch。
+layer1/layer2 的特征图更大，AE 也在更大网格解码；参数更少不意味着任意输入尺寸和 batch 都能更省显存。
 
 更宽的网络未提高 layer3 的空间分辨率；它仍然是 stride 16。
 检测效果尤其是小缺陷召回，需要在真实数据上做相同划分和图片预算的对照。
+layer1/layer2 提供更细的特征网格，但 teacher/student 的推理感受野也更小。
+AE 在 256×256 输入下仍压缩到 1×1 瓶颈，再重建 64×64 或 32×32 网格；
+增加解码分辨率不会取消该瓶颈，也不保证小缺陷或全局结构异常的检测效果更好。
 
 ## 8. 使用命令
 
@@ -187,6 +204,7 @@ CUDA_VISIBLE_DEVICES=0,1 python efficientad_ccd.py train \
 
 此例每卡 batch=1，全局 batch=2；脚本自行启动 DDP，无需另用 torchrun。
 将 backbone 改成 `resnet18_layer3` 即使用新版整体扩宽的 ResNet-18 与 AE。
+改为 `resnet50_layer1` 或 `resnet50_layer2` 即选择对应的 ResNet-50 浅层特征、整体扩宽 student 和匹配 AE。
 首轮可先用较小图片预算核实显存。
 
 恢复同一架构：
@@ -204,6 +222,8 @@ python efficientad_ccd.py evaluate \
 ```
 
 ## 9. 验证记录
+
+### 初始容量升级（2026-09-25）
 
 环境：Windows、Python 3.12、PyTorch 2.7.1+cu126、torchvision 0.22.1，
 单张 RTX 3060 12 GiB。测试使用现有虚拟环境，未修改依赖版本。
@@ -260,6 +280,61 @@ float64 被重置为 float32，再修正为同时继承设备、dtype 和原 cor
 第二轮完整测试集 113 项通过，独立代码复核未发现其他需要修正的损失或恢复问题。
 另重跑 ResNet-50 layer3 单卡 batch=2 全流程，训练、校准、评分切换、预测与实际续训均通过，退出码 0。
 
+### ResNet-50 layer1/layer2 扩展（2026-09-26）
+
+新增 `tests/test_resnet50_stages.py`，共 8 项测试，覆盖：
+
+- CLI 选项、原生通道及 stride，拒绝错误 teacher 通道和旧架构版本。
+- 所有保留 Bottleneck 的三层卷积、残差下采样支路均扩宽 2 倍，且未构建后续 stage。
+- 256×256 与 257×289 输入下 teacher/student/AE 对齐，异常图恢复输入尺寸，输出允许负值。
+- 384、512、768 输入下 AE 直接匹配实际 teacher 的大尺寸特征网格。
+- 原生预训练权重前缀加载，不额外增加随机 teacher 投影；原 layer3 的键和形状保持兼容。
+- batch=2 的真实三损失反传，student 两半输出和 AE 都有有限梯度并实际更新，teacher 参数和 BN 缓冲不变。
+- CLI 与 Lightning checkpoint 保存/恢复的输出一致，恢复不下载初始化权重。
+
+复现命令：
+
+```bash
+python -m unittest discover -s tests -p "test*.py" -q
+python tests/smoke_pipeline.py --backbone resnet50_layer1
+python tests/smoke_pipeline.py --backbone resnet50_layer2 --ddp-test-device cuda:0 --batch-size 2
+```
+
+| 检查 | 实测结果 |
+|---|---|
+| 当前工作区完整 unittest discovery | 124 项通过，122.953 秒，退出码 0 |
+| layer1 单卡 batch=2 完整 CLI 流程 | 通过，退出码 0 |
+| layer2 两个 DDP rank、每 rank batch=2 完整 CLI 流程 | 通过，退出码 0 |
+| 独立结构/兼容性代码复核 | 未发现需要修正的问题 |
+| git diff --check | 通过，仅 Windows 行尾提示 |
+
+两个 CLI 流程均使用缓存的真实 ResNet-50 V2 teacher 权重和合成图片，
+覆盖训练、校准、评分切换、评估、预测及从第 2 步恢复后完成第 3 步优化。
+DDP 实测使用同一 RTX 3060 上的两个进程、Gloo 后端；尚未实测 Linux 双物理卡 NCCL。
+这些结果验证程序和梯度链路，不能替代真实缺陷数据上的效果评估。
+完整测试第一次遇到工作区并行新增分支导出测试的导入失败；其配套模块出现后重跑全部通过，
+本次未修改该模块或对应测试。
+
+### 扩展后的再次复核（2026-09-26）
+
+本轮没有发现需要修改的网络或训练逻辑错误，新增一项损失语义测试（专项测试现共 9 项）：
+对 layer1/layer2 分别使用 batch=1/global 与 batch=2/per_image，启用非零 teacher 均值和非单位标准差。
+保留真实增强、BN 和 Dropout，从各次前向输出独立重算 hard loss、辅助惩罚、AE 重建及 student–AE 损失，
+结果与模型返回值一致；逐损失求梯度也验证了 student 两半输出、共享主干及 AE 的更新范围。
+
+另外从本次修改前的 Git HEAD 加载原 backbone 实现，在相同随机种子下对比 layer3：
+teacher/student 的所有 state dict 键、张量值、严格加载和前向输出均完全一致。
+
+| 本轮检查 | 结果 |
+|---|---|
+| 完整 unittest discovery | 125 项通过，155.206 秒，退出码 0 |
+| layer1 DDP 两进程、每进程 batch=1 全流程 | 通过，退出码 0；包含恢复后第 3 步优化 |
+| layer3 与修改前实现的数值兼容检查 | 完全一致，rtol=0、atol=0 |
+| 独立代码复核 | 未发现新的结构或损失逻辑问题 |
+
+DDP 仍使用同一 GPU 的两个 rank 与 Gloo，不等同于双物理卡 NCCL 测试。
+本轮仅补充测试与说明，保留现有结构和训练损失。
+
 ## 10. 代码位置
 
 - `self_efficientad/backbones.py`：teacher、整体扩宽 student、架构版本选择。
@@ -269,4 +344,5 @@ float64 被重置为 float32，再修正为同时继承设备、dtype 和原 cor
 - `efficientad_ccd.py`：CLI 选项及 checkpoint 版本读写。
 - `ccd_distributed.py`：DDP 启动文件保留实际架构版本。
 - `tests/test_resnet_capacity.py`、`tests/test_backbones.py`：结构、梯度与兼容测试。
+- `tests/test_resnet50_stages.py`：ResNet-50 layer1/layer2 的结构、梯度、多尺寸和恢复测试。
 - `tests/smoke_pipeline.py`：CLI 全流程测试。

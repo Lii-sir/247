@@ -20,6 +20,8 @@ BACKBONE_SPECS = {
     "pdn_medium": BackboneSpec("pdn_medium", 384, 4),
     "resnet18_layer2": BackboneSpec("resnet18_layer2", 128, 8),
     "resnet18_layer3": BackboneSpec("resnet18_layer3", 256, 16),
+    "resnet50_layer1": BackboneSpec("resnet50_layer1", 256, 4),
+    "resnet50_layer2": BackboneSpec("resnet50_layer2", 512, 8),
     "resnet50_layer3": BackboneSpec("resnet50_layer3", 1024, 16),
 }
 
@@ -86,24 +88,33 @@ class ResNet18Layer3(nn.Module):
         return self.head(self.features((x - mean) / std))
 
 
-class ResNet50Layer3(nn.Module):
-    """Native ImageNet feature space; no randomly initialized teacher head."""
+class ResNet50Features(nn.Module):
+    """Native ImageNet features through the requested stage, without a new head."""
 
-    def __init__(self, *, pretrained: bool = False) -> None:
+    def __init__(self, *, layer: int, pretrained: bool = False) -> None:
         super().__init__()
         from torchvision.models import ResNet50_Weights, resnet50
 
+        if type(layer) is not int or layer not in (1, 2, 3):
+            raise ValueError("ResNet-50 feature layer must be 1, 2 or 3.")
         source = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2 if pretrained else None)
         self.features = nn.Sequential(
             source.conv1, source.bn1, source.relu, source.maxpool,
-            source.layer1, source.layer2, source.layer3,
+            *(getattr(source, f"layer{index}") for index in range(1, layer + 1)),
         )
-        self.output_channels = 1024
+        self.output_channels = 256 * 2 ** (layer - 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         mean = x.new_tensor((0.485, 0.456, 0.406))[None, :, None, None]
         std = x.new_tensor((0.229, 0.224, 0.225))[None, :, None, None]
         return self.features((x - mean) / std)
+
+
+class ResNet50Layer3(ResNet50Features):
+    """Compatibility constructor; parameter names and shapes remain unchanged."""
+
+    def __init__(self, *, pretrained: bool = False) -> None:
+        super().__init__(layer=3, pretrained=pretrained)
 
 
 class WideResNetStudent(nn.Module):
@@ -118,9 +129,11 @@ class WideResNetStudent(nn.Module):
         from torchvision.models.resnet import BasicBlock, Bottleneck
 
         spec = get_backbone_spec(backbone)
-        block = Bottleneck if backbone == "resnet50_layer3" else BasicBlock
+        if not backbone.startswith("resnet"):
+            raise ValueError("WideResNetStudent requires a ResNet backbone.")
+        block = Bottleneck if backbone.startswith("resnet50_") else BasicBlock
         depths = (3, 4, 6) if block is Bottleneck else (2, 2, 2)
-        stage_count = 2 if backbone == "resnet18_layer2" else 3
+        stage_count = int(backbone.rsplit("_layer", 1)[1])
         modules = [
             nn.Conv2d(3, 128, kernel_size=7, stride=2, padding=3, bias=False),
             nn.BatchNorm2d(128), nn.ReLU(inplace=True),
@@ -209,10 +222,12 @@ def build_backbone_pair(
                 f"{name} 的 teacher_out_channels 固定为 {spec.out_channels}，"
                 f"收到 {teacher_out_channels}。"
             )
-        if name == "resnet50_layer3":
+        if name.startswith("resnet50_"):
             if resnet_architecture_version == 1:
-                raise ValueError("resnet50_layer3 只支持 resnet_architecture_version=2。")
-            teacher = ResNet50Layer3(pretrained=teacher_pretrained).eval()
+                raise ValueError(f"{name} 只支持 resnet_architecture_version=2。")
+            teacher = (ResNet50Layer3(pretrained=teacher_pretrained) if name == "resnet50_layer3"
+                       else ResNet50Features(layer=int(name.rsplit("_layer", 1)[1]),
+                                             pretrained=teacher_pretrained)).eval()
         elif name == "resnet18_layer2":
             teacher = ResNet18Layer2(output_channels=128, pretrained=teacher_pretrained).eval()
         else:
@@ -231,8 +246,8 @@ def build_backbone_pair(
 def load_default_teacher_weights(name: str, teacher: nn.Module) -> None:
     """Load the framework-provided pretrained teacher for a non-PDN backbone."""
 
-    if name == "resnet50_layer3":
-        pretrained = ResNet50Layer3(pretrained=True)
+    if name in BACKBONE_SPECS and name.startswith("resnet50_"):
+        pretrained = ResNet50Features(layer=int(name.rsplit("_layer", 1)[1]), pretrained=True)
         teacher.load_state_dict(pretrained.state_dict())
         return
     if name == "resnet18_layer3":
