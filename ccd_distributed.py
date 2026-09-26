@@ -192,6 +192,12 @@ def train_distributed(model, config: dict, manifest: dict, output: Path,
     """Prepare once, spawn workers, then restore rank-zero weights for calibration."""
     import efficientad_ccd as cli
 
+    # API callers can omit the version while constructing a new default model.
+    # Persist its actual architecture before workers interpret missing versions
+    # as legacy checkpoints.
+    config = dict(config)
+    if hasattr(model.model, "resnet_architecture_version"):
+        config["resnet_architecture_version"] = model.model.resnet_architecture_version
     devices = config["devices"]
     for name, count in (("训练集", len(manifest["train"])),
                         ("辅助集", len(model.imagenet_loader.dataset))):

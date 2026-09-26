@@ -312,14 +312,14 @@ class Encoder(nn.Module):
         the last one.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, small_channels: int = 32, hidden_channels: int = 64) -> None:
         super().__init__()
-        self.enconv1 = nn.Conv2d(3, 32, kernel_size=4, stride=2, padding=1)
-        self.enconv2 = nn.Conv2d(32, 32, kernel_size=4, stride=2, padding=1)
-        self.enconv3 = nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1)
-        self.enconv4 = nn.Conv2d(64, 64, kernel_size=4, stride=2, padding=1)
-        self.enconv5 = nn.Conv2d(64, 64, kernel_size=4, stride=2, padding=1)
-        self.enconv6 = nn.Conv2d(64, 64, kernel_size=8, stride=1, padding=0)
+        self.enconv1 = nn.Conv2d(3, small_channels, kernel_size=4, stride=2, padding=1)
+        self.enconv2 = nn.Conv2d(small_channels, small_channels, kernel_size=4, stride=2, padding=1)
+        self.enconv3 = nn.Conv2d(small_channels, hidden_channels, kernel_size=4, stride=2, padding=1)
+        self.enconv4 = nn.Conv2d(hidden_channels, hidden_channels, kernel_size=4, stride=2, padding=1)
+        self.enconv5 = nn.Conv2d(hidden_channels, hidden_channels, kernel_size=4, stride=2, padding=1)
+        self.enconv6 = nn.Conv2d(hidden_channels, hidden_channels, kernel_size=8, stride=1, padding=0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through the encoder network.
@@ -483,8 +483,8 @@ class EfficientAdModel(nn.Module):
 
     Args:
         teacher_out_channels (int | None): Number of convolution output channels of the
-            teacher model. ``None`` selects 384 for PDN, 128 for ResNet
-            layer2, or 256 for ResNet layer3.
+            teacher model. ``None`` selects 384 for PDN, 128 for ResNet-18
+            layer2, 256 for ResNet-18 layer3, or 1024 for ResNet-50 layer3.
             Defaults to ``None``.
         model_size (EfficientAdModelSize): Size of student and teacher model.
             Defaults to ``EfficientAdModelSize.S``.
@@ -497,6 +497,8 @@ class EfficientAdModel(nn.Module):
             the PDN selected by ``model_size``.
         teacher_pretrained (bool): Load ImageNet teacher weights at construction
             for ResNet only. PDN weights must be loaded separately.
+        resnet_architecture_version (int): 2 selects a fully widened student and
+            a feature-sized AE. 1 restores the legacy ResNet-18 architecture.
 
     Example:
         >>> from anomalib.models.image.efficient_ad.torch_model import (
@@ -527,6 +529,7 @@ class EfficientAdModel(nn.Module):
         *,
         backbone: str | None = None,
         teacher_pretrained: bool = False,
+        resnet_architecture_version: int = 2,
     ) -> None:
         super().__init__()
 
@@ -539,15 +542,22 @@ class EfficientAdModel(nn.Module):
         from .backbones import build_backbone_pair
 
         self.backbone = backbone
+        self.resnet_architecture_version = resnet_architecture_version
         self.teacher, self.student, self.teacher_out_channels = build_backbone_pair(
             backbone,
             teacher_out_channels=teacher_out_channels,
             padding=padding,
             teacher_pretrained=teacher_pretrained,
+            resnet_architecture_version=resnet_architecture_version,
         )
         self.teacher.requires_grad_(False)
         self.pad_maps = pad_maps if backbone.startswith("pdn_") else False
-        self.ae: AutoEncoder = AutoEncoder(out_channels=self.teacher_out_channels, padding=padding)
+        self.use_feature_ae = backbone.startswith("resnet") and resnet_architecture_version == 2
+        if self.use_feature_ae:
+            from .resnet_autoencoder import ResNetFeatureAutoEncoder
+            self.ae = ResNetFeatureAutoEncoder(self.teacher_out_channels)
+        else:
+            self.ae = AutoEncoder(out_channels=self.teacher_out_channels, padding=padding)
 
         self.mean_std: nn.ParameterDict = nn.ParameterDict(
             {
@@ -714,8 +724,7 @@ class EfficientAdModel(nn.Module):
             if self.is_set(self.mean_std):
                 teacher_output_aug = (teacher_output_aug - self.mean_std["mean"]) / self.mean_std["std"]
 
-        ae_output_aug = self.ae(aug_img, batch.shape[-2:])
-        ae_output_aug = F.interpolate(ae_output_aug, size=teacher_output_aug.shape[-2:], mode="bilinear")
+        ae_output_aug = self.autoencoder_features(aug_img, teacher_output_aug.shape[-2:])
 
         student_output_ae_aug = self.student(aug_img)[:, self.teacher_out_channels :, :, :]
 
@@ -725,6 +734,13 @@ class EfficientAdModel(nn.Module):
         loss_ae = torch.mean(distance_ae)
         loss_stae = torch.mean(distance_stae)
         return (loss_st, loss_ae, loss_stae)
+
+    def autoencoder_features(self, image: torch.Tensor, feature_size: tuple[int, int] | torch.Size) -> torch.Tensor:
+        """Produce teacher-aligned features, preserving the legacy AE path."""
+        if self.use_feature_ae:
+            return self.ae(image, feature_size)
+        output = self.ae(image, image.shape[-2:])
+        return F.interpolate(output, size=feature_size, mode="bilinear")
 
     def compute_maps(
         self,
@@ -750,8 +766,7 @@ class EfficientAdModel(nn.Module):
         image_size = batch.shape[-2:]
         # Eval mode.
         with torch.no_grad():
-            ae_output = self.ae(batch, image_size)
-            ae_output = F.interpolate(ae_output, size=student_output.shape[-2:], mode="bilinear")
+            ae_output = self.autoencoder_features(batch, student_output.shape[-2:])
 
             map_st = torch.mean(distance_st, dim=1, keepdim=True)
             map_stae = torch.mean(

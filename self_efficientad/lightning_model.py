@@ -137,6 +137,7 @@ class EfficientAd(AnomalibModule):
         *,
         backbone: str | None = None,
         teacher_pretrained: bool = False,
+        resnet_architecture_version: int = 2,
     ) -> None:
         super().__init__(
             pre_processor=pre_processor,
@@ -164,6 +165,7 @@ class EfficientAd(AnomalibModule):
             model_size=model_size,
             backbone=self.backbone,
             teacher_pretrained=teacher_pretrained,
+            resnet_architecture_version=resnet_architecture_version,
             padding=padding,
             pad_maps=pad_maps,
             hard_loss_mode=hard_loss_mode,
@@ -177,6 +179,21 @@ class EfficientAd(AnomalibModule):
     def on_load_checkpoint(self, checkpoint: dict) -> None:
         """Preserve the teacher restored by Lightning instead of loading defaults."""
         super().on_load_checkpoint(checkpoint)
+        saved_version = checkpoint.get("hyper_parameters", {}).get("resnet_architecture_version", 1)
+        if self.backbone.startswith("resnet") and saved_version != self.model.resnet_architecture_version:
+            # Older Lightning checkpoints predate architecture versioning.
+            # Rebuild before Lightning applies the state dict; never fetch weights.
+            was_training = self.model.training
+            self.model = EfficientAdModel(
+                teacher_out_channels=self.model.teacher_out_channels,
+                model_size=self.model_size, backbone=self.backbone,
+                padding=self.hparams.get("padding", False),
+                pad_maps=self.hparams.get("pad_maps", True),
+                hard_loss_mode=self.hard_loss_mode,
+                resnet_architecture_version=saved_version,
+            ).to(device=self.device, dtype=self.dtype)
+            self.model.train(was_training)
+            self.hparams["resnet_architecture_version"] = saved_version
         self._teacher_loaded_from_checkpoint = True
 
     @classmethod
@@ -309,13 +326,13 @@ class EfficientAd(AnomalibModule):
 
         for batch in tqdm.tqdm(dataloader, desc="Calculate teacher channel mean & std", position=0, leave=True):
             y = self.model.teacher(batch.image.to(self.device))
-            if self.backbone.startswith("resnet18_"):
+            if self.backbone.startswith("resnet"):
                 # ResNet 的稀疏 ReLU 特征可含恒定通道；低方差统计使用双精度。
                 y = y.double()
             if not arrays_defined:
                 _, num_channels, _, _ = y.shape
                 n = torch.zeros((num_channels,), dtype=torch.int64, device=y.device)
-                stats_dtype = torch.float64 if self.backbone.startswith("resnet18_") else torch.float32
+                stats_dtype = torch.float64 if self.backbone.startswith("resnet") else torch.float32
                 chanel_sum = torch.zeros((num_channels,), dtype=stats_dtype, device=y.device)
                 chanel_sum_sqr = torch.zeros((num_channels,), dtype=stats_dtype, device=y.device)
                 arrays_defined = True
@@ -331,7 +348,7 @@ class EfficientAd(AnomalibModule):
         channel_mean = chanel_sum / n
 
         variance = (chanel_sum_sqr / n) - (channel_mean**2)
-        if self.backbone.startswith("resnet18_"):
+        if self.backbone.startswith("resnet"):
             variance = variance.clamp_min(0)
             inactive = variance == 0
             if inactive.all():

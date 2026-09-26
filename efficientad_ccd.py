@@ -202,6 +202,7 @@ def new_model(config: dict):
         imagenet_dir=config["imagenette_dir"],
         model_size=config["model_size"],
         backbone=backbone,
+        resnet_architecture_version=config.get("resnet_architecture_version", 2),
         lr=config["lr"],
         weight_decay=config["weight_decay"],
         batch_size=config.get("batch_size", 1),
@@ -261,10 +262,13 @@ def save_checkpoint(path: Path, model, config: dict, manifest: dict, step: int,
     """先写临时文件再替换，减少中断时留下半个 checkpoint 的可能性。"""
     if "torch" not in globals():
         load_runtime()
+    saved_config = dict(config)
+    if hasattr(model.model, "resnet_architecture_version"):
+        saved_config["resnet_architecture_version"] = model.model.resnet_architecture_version
     payload = {
         "format_version": 1,
         "model_state": model.model.state_dict(),
-        "config": config,
+        "config": saved_config,
         "manifest": manifest,
         "step": step,
         "calibration": calibration,
@@ -285,6 +289,8 @@ def read_checkpoint(path: Path) -> dict:
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if payload.get("format_version") != 1:
         raise ValueError("不是本脚本生成的 checkpoint，或格式版本不匹配。")
+    if "config" in payload:
+        payload["config"].setdefault("resnet_architecture_version", 1)
     return payload
 
 
@@ -985,6 +991,7 @@ def train_one(args, category: str) -> None:
                            if args.backbone and args.backbone.startswith("pdn_")
                            else args.model_size or "small"),
             "backbone": args.backbone or f"pdn_{args.model_size or 'small'}",
+            "resnet_architecture_version": 2,
             "batch_size": batch_size, "hard_loss_mode": hard_loss_mode,
             "batch_training_version": 1 if batch_size > 1 else 0,
             "max_steps": max_steps, "max_images": max_images,
@@ -1167,7 +1174,7 @@ def build_parser() -> argparse.ArgumentParser:
                                         help="旧版 PDN 大小选项；新训练未指定架构时默认 small")
             backbone_group.add_argument(
                 "--backbone",
-                choices=["pdn_small", "pdn_medium", "resnet18_layer2", "resnet18_layer3"],
+                choices=["pdn_small", "pdn_medium", "resnet18_layer2", "resnet18_layer3", "resnet50_layer3"],
                 help="特征提取器；默认随 --model-size 选择 pdn_small 或 pdn_medium",
             )
             command.add_argument("--lr", type=float, default=1e-4)

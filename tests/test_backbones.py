@@ -130,7 +130,8 @@ class BackboneTests(unittest.TestCase):
                     train_dataloader=[SimpleNamespace(image=torch.zeros(1, 3, 256, 256))],
                 )
                 if restored:
-                    model.on_load_checkpoint({"state_dict": model.state_dict()})
+                    model.on_load_checkpoint({"state_dict": model.state_dict(),
+                                              "hyper_parameters": dict(model.hparams)})
                 with patch.object(model, "prepare_pretrained_model") as load_teacher, \
                         patch.object(model, "prepare_imagenette_data"):
                     model.on_train_start()
@@ -202,7 +203,7 @@ class BackboneTests(unittest.TestCase):
         self.assertEqual(tuple(model.teacher(image).shape), (2, 256, 16, 16))
         self.assertEqual(tuple(model.student(image).shape), (2, 512, 16, 16))
         self.assertIsInstance(model.teacher.head, torch.nn.Identity)
-        self.assertEqual(tuple(model.student.head.weight.shape), (512, 256, 3, 3))
+        self.assertEqual(tuple(model.student.head.weight.shape), (512, 512, 3, 3))
         self.assertTrue(all(not parameter.requires_grad for parameter in model.teacher.parameters()))
         teacher_before = {name: value.clone() for name, value in model.teacher.state_dict().items()}
         student_head_before = model.student.head.weight.detach().clone()

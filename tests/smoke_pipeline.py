@@ -23,10 +23,12 @@ from efficientad_ccd import load_runtime, new_model
 def main() -> None:
     """通过真正的命令行验证训练、恢复、评估和预测，不访问外网。"""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backbone", choices=("pdn_small", "pdn_medium", "resnet18_layer2", "resnet18_layer3"), default="pdn_small")
+    parser.add_argument("--backbone", choices=("pdn_small", "pdn_medium", "resnet18_layer2", "resnet18_layer3", "resnet50_layer3"), default="pdn_small")
     parser.add_argument("--ddp-test-device", choices=("cpu", "cuda:0"),
                         help="测试专用：在同一设备启动两个真实 DDP 进程，不代表两张物理卡的性能")
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, choices=(1, 2), default=2,
+                        help="每个 rank 的合成测试 batch；大模型 DDP 可用 1 降低显存占用")
     args = parser.parse_args()
     load_runtime()
     torch.manual_seed(2026)
@@ -47,13 +49,16 @@ def main() -> None:
                 rng.integers(0, 256, (256, 256, 3), dtype=np.uint8)
             ).save(auxiliary / f"{index}.png")
         config = {"imagenette_dir": str(auxiliary.parent), "model_size": "small", "lr": 1e-4,
-                  "weight_decay": 1e-5, "device": "cpu", "backbone": args.backbone}
+                  "weight_decay": 1e-5, "device": "cpu", "backbone": args.backbone,
+                  "resnet_architecture_version": 2}
         teacher = new_model(config)
-        if args.backbone.startswith("resnet18_"):
-            from torchvision.models import ResNet18_Weights
+        if args.backbone.startswith("resnet"):
+            from torchvision.models import ResNet18_Weights, ResNet50_Weights
             from self_efficientad.backbones import load_default_teacher_weights
 
-            cached = Path(torch.hub.get_dir()) / "checkpoints" / ResNet18_Weights.DEFAULT.url.rsplit("/", 1)[-1]
+            weights = (ResNet50_Weights.IMAGENET1K_V2 if args.backbone == "resnet50_layer3"
+                       else ResNet18_Weights.IMAGENET1K_V1)
+            cached = Path(torch.hub.get_dir()) / "checkpoints" / weights.url.rsplit("/", 1)[-1]
             if not cached.is_file():
                 raise FileNotFoundError(f"ResNet smoke 需要已缓存的 torchvision 教师权重：{cached}")
             load_default_teacher_weights(args.backbone, teacher.model.teacher)
@@ -77,8 +82,9 @@ def main() -> None:
         def run(*arguments: str) -> None:
             subprocess.run(entry + list(arguments), cwd=PROJECT_DIR, check=True, env=environment)
 
-        run("train", "--backbone", args.backbone, "--data-root", str(data), "--batch-size", "2",
-            "--max-images", "8" if args.ddp_test_device else "4",
+        global_batch_size = args.batch_size * (2 if args.ddp_test_device else 1)
+        run("train", "--backbone", args.backbone, "--data-root", str(data), "--batch-size", str(args.batch_size),
+            "--max-images", str(2 * global_batch_size),
             "--num-workers", str(args.num_workers),
             "--min-age-seconds", "0",
             "--teacher-weights", str(teacher_path), "--imagenette-dir", str(auxiliary.parent),
@@ -89,8 +95,9 @@ def main() -> None:
         assert json.loads((run_dir / "config.json").read_text(encoding="utf-8"))["backbone"] == args.backbone
         training_config = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
         assert training_config["world_size"] == (2 if args.ddp_test_device else 1)
-        assert training_config["global_batch_size"] == (4 if args.ddp_test_device else 2)
+        assert training_config["global_batch_size"] == global_batch_size
         assert training_config["max_steps"] == 2
+        assert training_config["resnet_architecture_version"] == 2
         for name in ("manifest.json", "config.json", "loss.csv", "calibration.json", "metrics.json",
                      "predictions.csv", "score_distribution.png", "checkpoints/last.pt"):
             assert (run_dir / name).is_file(), name
@@ -182,6 +189,7 @@ def main() -> None:
         resumed = torch.load(resumed_path, map_location="cpu", weights_only=True)
         assert resumed["step"] == 3
         assert resumed["config"]["backbone"] == args.backbone
+        assert resumed["config"]["resnet_architecture_version"] == 2
         print(f"通过：{args.backbone} 合成数据的训练、校准、保存/加载、独立评估、热图、单图预测和断点恢复。")
         print("注意：该验证仅检查程序链路，不用于判断真实数据上的检测效果。")
 
