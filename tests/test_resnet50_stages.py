@@ -32,6 +32,36 @@ class ResNet50StageTests(unittest.TestCase):
                 args = cli.build_parser().parse_args(["train", "--backbone", name])
                 self.assertEqual(args.backbone, name)
 
+    def test_layer1v2_uses_standard_layer1_and_expands_only_output_head(self):
+        name = "resnet50_layer1v2"
+        self.assertIn(name, BACKBONE_SPECS)
+        spec = BACKBONE_SPECS[name]
+        self.assertEqual((spec.out_channels, spec.feature_stride), (256, 4))
+        args = cli.build_parser().parse_args(["train", "--backbone", name])
+        self.assertEqual(args.backbone, name)
+        model = EfficientAdModel(backbone=name).eval()
+        self.assertEqual(model.student.features[0].out_channels, 64)
+        self.assertEqual(len(model.student.features), 5)
+        teacher_stage = model.teacher.features[4]
+        student_stage = model.student.features[4]
+        self.assertEqual(len(student_stage), len(teacher_stage))
+        for teacher_block, student_block in zip(teacher_stage, student_stage, strict=True):
+            for conv_name in ("conv1", "conv2", "conv3"):
+                teacher_conv = getattr(teacher_block, conv_name)
+                student_conv = getattr(student_block, conv_name)
+                self.assertEqual(student_conv.in_channels, teacher_conv.in_channels)
+                self.assertEqual(student_conv.out_channels, teacher_conv.out_channels)
+                self.assertEqual(student_conv.stride, teacher_conv.stride)
+        self.assertEqual(tuple(model.student.head.weight.shape), (512, 256, 3, 3))
+        self.assertFalse(model.pad_maps)
+        with torch.no_grad():
+            image = torch.rand(1, 3, 256, 256)
+            self.assertEqual(tuple(model.teacher(image).shape), (1, 256, 64, 64))
+            self.assertEqual(tuple(model.student(image).shape), (1, 512, 64, 64))
+            self.assertEqual(tuple(model.autoencoder_features(image, (64, 64)).shape),
+                             (1, 256, 64, 64))
+        del model
+
     def test_stages_use_bottlenecks_with_all_internal_and_residual_widths_doubled(self):
         for stage in (1, 2):
             name = f"resnet50_layer{stage}"
@@ -100,8 +130,8 @@ class ResNet50StageTests(unittest.TestCase):
         image = torch.rand(1, 3, 256, 256)
         normalized = (image - image.new_tensor([.485, .456, .406])[None, :, None, None]) / image.new_tensor(
             [.229, .224, .225])[None, :, None, None]
-        for stage in (1, 2, 3):
-            name = f"resnet50_layer{stage}"
+        for name, stage in (("resnet50_layer1", 1), ("resnet50_layer1v2", 1),
+                            ("resnet50_layer2", 2), ("resnet50_layer3", 3)):
             with self.subTest(backbone=name):
                 self.assertIn(name, BACKBONE_SPECS)
                 model = EfficientAdModel(backbone=name).eval()
@@ -248,8 +278,7 @@ class ResNet50StageTests(unittest.TestCase):
                     del model, losses, outputs, parameters
 
     def test_new_stages_reject_legacy_version_and_wrong_teacher_width(self):
-        for stage in (1, 2):
-            name = f"resnet50_layer{stage}"
+        for name in ("resnet50_layer1", "resnet50_layer1v2", "resnet50_layer2"):
             with self.subTest(backbone=name):
                 self.assertIn(name, BACKBONE_SPECS)
                 with self.assertRaisesRegex(ValueError, "resnet_architecture_version=2"):

@@ -7,8 +7,8 @@
 
 新训练默认使用 ResNet 架构版本 2，完成以下三项：
 
-1. 支持 `resnet50_layer1`、`resnet50_layer2` 和 `resnet50_layer3`，使用原生 ImageNet 预训练 teacher。
-2. Student 的 stem 和所有保留的残差 stage 通道整体扩大 2 倍，随机初始化。
+1. 支持 `resnet50_layer1`、`resnet50_layer1v2`、`resnet50_layer2` 和 `resnet50_layer3`，使用原生 ImageNet 预训练 teacher。
+2. `resnet50_layer1`、`resnet50_layer2` 和 `resnet50_layer3` 的 student stem 与保留 stage 通道整体扩大 2 倍；`resnet50_layer1v2` 保持标准主干，仅扩展末端输出头。
 3. AE 参考 EfficientAD 原有卷积编码/解码形式，中间通道随 teacher 通道数变化，直接生成与 teacher 对齐的特征图。
 
 PDN small/medium 保持原结构和原 AE。本次未加入缺陷 mask 辅助损失，也未改变数据划分、评分方式或阈值算法。
@@ -24,6 +24,7 @@ PDN small/medium 保持原结构和原 AE。本次未加入缺陷 mask 辅助损
 | resnet18_layer2 | 128 | 256 | 128 | 32×32 | 8 |
 | resnet18_layer3 | 256 | 512 | 256 | 16×16 | 16 |
 | resnet50_layer1 | 256 | 512 | 256 | 64×64 | 4 |
+| resnet50_layer1v2 | 256 | 512 | 256 | 64×64 | 4 |
 | resnet50_layer2 | 512 | 1024 | 512 | 32×32 | 8 |
 | resnet50_layer3 | 1024 | 2048 | 1024 | 16×16 | 16 |
 
@@ -50,12 +51,12 @@ Teacher 全部参数禁用梯度，模型调用 `train()` 后仍保持 teacher �
 | layer3 | 256 | 512 | 1024 | 2048 |
 
 `resnet18_layer2` 截止 layer2，不构建 layer3。
-`resnet50_layer1` 仅保留 layer1；`resnet50_layer2` 保留 layer1/layer2，不构建后续 stage。
+`resnet50_layer1` 和 `resnet50_layer1v2` 仅保留 layer1；`resnet50_layer2` 保留 layer1/layer2，不构建后续 stage。
 ResNet-18 使用 BasicBlock，各保留 stage 为 2 个块；ResNet-50 使用 Bottleneck，各 stage 为 3、4、6 个块。
-保持原阶段的步长；Bottleneck 内部通道和残差下采样支路一起扩宽。
+整体扩宽版本保持原阶段步长，并将 Bottleneck 内部通道和残差下采样支路一起扩宽；`resnet50_layer1v2` 保持这些通道与标准 ResNet 一致。
 没有构建 layer4、分类池化或全连接分类层。
 
-整个 student 从随机权重训练。所有保留 stage 后增加一个 stride=1、padding=1、
+整体扩宽版本的 student 从随机权重训练。所有保留 stage 后增加一个 stride=1、padding=1、
 输入输出均为 2C 的密集 3×3 卷积，不使用末尾 ReLU 或 BatchNorm：
 
 ```text
@@ -67,6 +68,10 @@ RGB → 扩宽 stem → 扩宽 stage → 3×3 Conv(2C, 2C)
 保留线性输出是必要的：经过每通道标准化的 teacher 特征可以为负，
 不能直接将末尾 ReLU 后的非负 ResNet 特征当作最终 student 预测。
 两个输出切片有各自的卷积滤波器，但共享上游主干。
+
+`resnet50_layer1v2` 是容量更保守的对照结构：使用标准 ResNet-50 stem 和 layer1，
+不扩宽残差块，只增加 `Conv2d(256, 512, kernel_size=3, padding=1)` 输出头，
+再按 `256+256` 切分为 teacher 分支和 AE 分支。它与 PDN 的“主干保持、末端输出扩展”方式一致。
 
 这与 torchvision 的 `wide_resnet50_2` 不是同一种配置：本项目扩宽 stem、
 stage 输出和 Bottleneck 内部通道，不能直接加载那个模型的 student 权重。
@@ -171,6 +176,7 @@ layer1、layer2、layer3 的完整模型 checkpoint 不能互换，切换 stage 
 | resnet18_layer2 | 683,072 | 3,299,712 | 948,608 |
 | resnet18_layer3 | 2,782,784 | 13,463,168 | 3,789,568 |
 | resnet50_layer1 | 225,344 | 3,236,480 | 3,789,568 |
+| resnet50_layer1v2 | 225,344 | 1,405,504 | 3,789,568 |
 | resnet50_layer2 | 1,444,928 | 15,178,880 | 15,148,544 |
 | resnet50_layer3 | 8,543,296 | 71,843,968 | 16,328,704 |
 
@@ -204,7 +210,8 @@ CUDA_VISIBLE_DEVICES=0,1 python efficientad_ccd.py train \
 
 此例每卡 batch=1，全局 batch=2；脚本自行启动 DDP，无需另用 torchrun。
 将 backbone 改成 `resnet18_layer3` 即使用新版整体扩宽的 ResNet-18 与 AE。
-改为 `resnet50_layer1` 或 `resnet50_layer2` 即选择对应的 ResNet-50 浅层特征、整体扩宽 student 和匹配 AE。
+改为 `resnet50_layer1` 或 `resnet50_layer2` 即选择对应的整体扩宽 student；改为
+`resnet50_layer1v2` 则使用标准 layer1 主干和末端 `3×3` 双分支输出头。三者都使用匹配的 ResNet AE。
 首轮可先用较小图片预算核实显存。
 
 恢复同一架构：

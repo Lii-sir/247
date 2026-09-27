@@ -165,7 +165,7 @@ class CommandTests(unittest.TestCase):
         constructor.assert_not_called()
 
     def test_resume_rejects_inference_only_model(self) -> None:
-        args = cli.build_parser().parse_args(["train", "--resume", "model.pt"])
+        args = cli.build_parser().parse_args(["train", "--resume", "model.pt", "--device", "cpu"])
         with patch.object(cli, "read_checkpoint", return_value={"calibration": self.calibration}), \
                 patch.object(cli, "new_output") as output:
             with self.assertRaisesRegex(ValueError, "last.pt"):
@@ -237,6 +237,72 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(cli._safe_output_component("good"), "good")
         self.assertEqual(cli._safe_output_component("严重缺陷"), "严重缺陷")
         self.assertEqual(cli._safe_output_component("bad/type"), "bad_type")
+
+    def test_training_score_modes_use_separate_requested_heatmap_directories(self) -> None:
+        output = self.root / "training"
+        output.mkdir()
+        calibration = {"threshold": 0.5, "display_max": 1.0,
+                       "score_method": {"name": cli.MULTISCALE_SCORE_METHOD}}
+        with patch.object(cli, "calibrate", return_value=calibration) as calibrate, \
+                patch.object(cli, "evaluate_records", return_value={}) as evaluate:
+            cli.evaluate_training_score_modes(
+                object(), [{"path": "test.png", "label": 1}],
+                {"val": [], "threshold_val": []},
+                {"device": "cpu", "score_pool_kernels": [1, 7, 21]},
+                output, calibration, 1,
+            )
+
+        self.assertEqual(calibrate.call_count, 2)
+        self.assertEqual([call.args[4] for call in calibrate.call_args_list],
+                         ["top", "pool_topk"])
+        self.assertEqual([call.args[4] for call in evaluate.call_args_list],
+                         [output / "score_reports/top", output / "score_reports/pool+top",
+                          output / "score_reports/multipool"])
+        self.assertEqual([call.args[5] for call in evaluate.call_args_list], [1, 1, 1])
+        pool_config = json.loads((output / "score_reports/pool+top/config.json").read_text(encoding="utf-8"))
+        self.assertEqual(pool_config["score_mode"], "pool_topk")
+        self.assertEqual(pool_config["score_pool_kernel"], 21)
+        multi_config = json.loads((output / "score_reports/multipool/config.json").read_text(encoding="utf-8"))
+        self.assertEqual(multi_config["score_mode"], "multiscale_pool")
+        heatmap_dirs = [call.kwargs["heatmap_dir"] for call in evaluate.call_args_list]
+        self.assertEqual([path.name for path in heatmap_dirs],
+                         ["heatmaps-top", "heatmaps-pool+top", "heatmaps-multipool"])
+        self.assertEqual([call.kwargs["heatmap_scales_dir"].name for call in evaluate.call_args_list],
+                         ["heatmap_scales-top", "heatmap_scales-pool+top",
+                          "heatmap_scales-multipool"])
+
+    def test_training_score_modes_keep_matching_calibrations_and_legacy_default(self) -> None:
+        output = self.root / "legacy_training"
+        config = {"device": "cpu", "score_mode": "top",
+                  "score_pool_kernel": 7, "score_pool_kernels": [1, 7, 21],
+                  "score_topk_ratio": 0.01}
+        pool_calibration = {"threshold": 0.2, "display_max": 1.0,
+                            "score_method": {"name": cli.SINGLE_SCALE_SCORE_METHOD}}
+        multi_calibration = {"threshold": 2.0, "display_max": 1.0,
+                             "score_method": {"name": cli.MULTISCALE_SCORE_METHOD}}
+        cli.write_json(output / "score_reports/top/calibration.json", self.calibration)
+        with (
+            patch.object(cli, "calibrate", side_effect=[pool_calibration, multi_calibration]) as calibrate,
+            patch.object(cli, "evaluate_records", return_value={}) as evaluate,
+        ):
+            cli.evaluate_training_score_modes(
+                object(), [], {"val": [], "threshold_val": []},
+                config, output, self.calibration, 0,
+            )
+        self.assertEqual([call.args[4] for call in calibrate.call_args_list],
+                         ["pool_topk", "multiscale_pool"])
+        self.assertEqual([call.args[3] for call in evaluate.call_args_list],
+                         [self.calibration, pool_calibration, multi_calibration])
+        self.assertEqual([call.args[4] for call in evaluate.call_args_list],
+                         [output / "score_reports/top", output / "score_reports/pool+top",
+                          output / "score_reports/multipool"])
+        self.assertEqual([call.args[5] for call in evaluate.call_args_list], [0, 0, 0])
+        self.assertEqual(json.loads((output / "score_reports/top/calibration.json").read_text(encoding="utf-8")),
+                         self.calibration)
+        pool_config = json.loads((output / "score_reports/pool+top/config.json").read_text(encoding="utf-8"))
+        self.assertEqual(pool_config["score_pool_kernel"], 7)
+        self.assertEqual(pool_config["score_topk_ratio"], 0.01)
+        self.assertEqual(config["score_mode"], "top")
 
     def test_prediction_uses_saved_threshold_with_strict_greater_than(self) -> None:
         image = self.root / "input.png"

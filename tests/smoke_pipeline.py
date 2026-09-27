@@ -24,10 +24,12 @@ def main() -> None:
     """通过真正的命令行验证训练、恢复、评估和预测，不访问外网。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backbone", choices=("pdn_small", "pdn_medium", "resnet18_layer2", "resnet18_layer3",
-                                               "resnet50_layer1", "resnet50_layer2", "resnet50_layer3"), default="pdn_small")
+                                               "resnet50_layer1", "resnet50_layer1v2", "resnet50_layer2", "resnet50_layer3"), default="pdn_small")
     parser.add_argument("--ddp-test-device", choices=("cpu", "cuda:0"),
                         help="测试专用：在同一设备启动两个真实 DDP 进程，不代表两张物理卡的性能")
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--score-pool-kernel", type=int,
+                        help="同时检查训练后 pool+top 与旧版单尺度参数的传递")
     parser.add_argument("--batch-size", type=int, choices=(1, 2), default=2,
                         help="每个 rank 的合成测试 batch；大模型 DDP 可用 1 降低显存占用")
     args = parser.parse_args()
@@ -90,7 +92,9 @@ def main() -> None:
             "--min-age-seconds", "0",
             "--teacher-weights", str(teacher_path), "--imagenette-dir", str(auxiliary.parent),
             "--circle-config", str(circle_config), "--output-dir", str(output),
-            "--save-every", "1", "--heatmaps", "1")
+            "--save-every", "1", "--heatmaps", "1",
+            *(["--score-pool-kernel", str(args.score_pool_kernel)]
+              if args.score_pool_kernel is not None else []))
         model_path = next(output.glob("CCD1/*/model.pt"))
         run_dir = model_path.parent
         assert json.loads((run_dir / "config.json").read_text(encoding="utf-8"))["backbone"] == args.backbone
@@ -99,15 +103,43 @@ def main() -> None:
         assert training_config["global_batch_size"] == global_batch_size
         assert training_config["max_steps"] == 2
         assert training_config["resnet_architecture_version"] == 2
-        for name in ("manifest.json", "config.json", "loss.csv", "calibration.json", "metrics.json",
-                     "predictions.csv", "score_distribution.png", "checkpoints/last.pt"):
+        for name in ("manifest.json", "config.json", "loss.csv", "checkpoints/last.pt"):
             assert (run_dir / name).is_file(), name
-        metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+        metrics = json.loads((run_dir / "score_reports/multipool/metrics.json").read_text(encoding="utf-8"))
         # test/good 与 test/defect 各有一张划入 threshold_val，剩余各一张用于最终测试。
         assert metrics["counts"] == {"total": 2, "normal": 1, "anomaly": 1}
-        assert metrics["calibration"]["score_method"]["pool_kernels"] == [1, 7, 21]
-        assert len(list((run_dir / "heatmaps").rglob("*.png"))) == 1
-        assert len(list((run_dir / "heatmap_scales").rglob("*.png"))) == 1
+        expected_kernels = [args.score_pool_kernel] if args.score_pool_kernel is not None else [1, 7, 21]
+        assert metrics["calibration"]["score_method"]["pool_kernels"] == expected_kernels
+        for label, expected_method in (
+            ("top", "masked_pixel_max"),
+            ("pool+top", "masked_local_average_topk_mean"),
+            ("multipool", "masked_multiscale_normalized_topk_max"),
+        ):
+            report_dir = run_dir / "score_reports" / label
+            for name in ("calibration.json", "config.json", "metrics.json", "predictions.csv",
+                         "inference_speed.json", "score_distribution.png"):
+                assert (report_dir / name).is_file(), (label, name)
+            mode_metrics = json.loads((report_dir / "metrics.json").read_text(encoding="utf-8"))
+            mode_calibration = json.loads((report_dir / "calibration.json").read_text(encoding="utf-8"))
+            assert mode_metrics["counts"] == {"total": 2, "normal": 1, "anomaly": 1}
+            assert mode_metrics["calibration"]["score_method"]["name"] == expected_method
+            assert mode_metrics["threshold"] == mode_calibration["threshold"]
+            assert mode_metrics["calibration"]["score_method"] == mode_calibration["score_method"]
+            assert len(mode_calibration["normal_score_validation"]) == 2
+            assert len(mode_calibration["threshold_validation_scores"]) == 2
+            if label == "pool+top":
+                assert mode_calibration["score_method"]["pool_kernel"] == (args.score_pool_kernel or 21)
+            images = list((run_dir / f"heatmaps-{label}").rglob("*.png"))
+            assert len(images) == 1, (label, images)
+            assert images[0].parent.name in {"normal", "anomaly"}
+            assert images[0].parent.parent.name in {"good", "defect"}
+            diagnostics = list((run_dir / f"heatmap_scales-{label}").rglob("*.png"))
+            assert len(diagnostics) == (1 if label == "multipool" else 0), (label, diagnostics)
+        assert not (run_dir / "heatmaps").exists()
+        assert not (run_dir / "heatmap_scales").exists()
+        for name in ("calibration.json", "metrics.json", "predictions.csv",
+                     "inference_speed.json", "score_distribution.png"):
+            assert not (run_dir / name).exists(), name
         run("evaluate", "--checkpoint", str(model_path), "--output-dir", str(output), "--heatmaps", "-1")
         evaluated_path = next(output.glob("evaluation/CCD1/*/metrics.json"))
         # 最终测试图应按真实标签和预测结果两级归档。
@@ -191,6 +223,11 @@ def main() -> None:
         assert resumed["step"] == 3
         assert resumed["config"]["backbone"] == args.backbone
         assert resumed["config"]["resnet_architecture_version"] == 2
+        for label in ("top", "pool+top", "multipool"):
+            report_dir = resumed_path.parent / "score_reports" / label
+            assert (report_dir / "metrics.json").is_file(), label
+            assert not (resumed_path.parent / f"heatmaps-{label}").exists(), label
+            assert not (resumed_path.parent / f"heatmap_scales-{label}").exists(), label
         print(f"通过：{args.backbone} 合成数据的训练、校准、保存/加载、独立评估、热图、单图预测和断点恢复。")
         print("注意：该验证仅检查程序链路，不用于判断真实数据上的检测效果。")
 

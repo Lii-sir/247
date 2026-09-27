@@ -88,7 +88,7 @@ uv run python efficientad_ccd.py train --category CCD1 --max-steps 10000 --image
 
 1,000 步仅用于快速试跑，10,000 步也不保证收敛。需要更长训练时可设 `--max-steps 70000`；在相同数据快照、相同训练参数下比较效果更有意义。默认将整张图缩放为方形，保留整张画面但会改变长宽比；本脚本未实现 ROI 或分块。若小缺陷在缩放后消失，后续应根据实际缺陷位置增加 ROI/分块处理。
 
-训练默认使用 **batch size=1**、Adam、初始学习率 `1e-4`、权重衰减 `1e-5`；在总步数 95% 处将学习率乘以 0.1。输入只转 RGB、缩放和映射到 `[0,1]`，不能在外部再做 ImageNet Normalize。默认 backbone 是 `pdn_small`，也支持 `pdn_medium`、`resnet18_layer2`、`resnet18_layer3`、`resnet50_layer1`、`resnet50_layer2` 和 `resnet50_layer3`。PDN 使用对应的预训练教师权重；ResNet 默认使用 torchvision 的 ImageNet 预训练主干（ResNet-18 V1、ResNet-50 V2），第一次运行会下载对应权重。
+训练默认使用 **batch size=1**、Adam、初始学习率 `1e-4`、权重衰减 `1e-5`；在总步数 95% 处将学习率乘以 0.1。输入只转 RGB、缩放和映射到 `[0,1]`，不能在外部再做 ImageNet Normalize。默认 backbone 是 `pdn_small`，也支持 `pdn_medium`、`resnet18_layer2`、`resnet18_layer3`、`resnet50_layer1`、`resnet50_layer1v2`、`resnet50_layer2` 和 `resnet50_layer3`。PDN 使用对应的预训练教师权重；ResNet 默认使用 torchvision 的 ImageNet 预训练主干（ResNet-18 V1、ResNet-50 V2），第一次运行会下载对应权重。
 
 可以用同一份数据快照比较不同 backbone：
 
@@ -110,10 +110,11 @@ ResNet 新训练默认采用架构版本 2：teacher 保留原生预训练特征
 | resnet18_layer2 | 128 / 256 / 128 | 32×32 | 64 |
 | resnet18_layer3 | 256 / 512 / 256 | 16×16 | 128 |
 | resnet50_layer1 | 256 / 512 / 256 | 64×64 | 128 |
+| resnet50_layer1v2 | 256 / 512 / 256 | 64×64 | 128 |
 | resnet50_layer2 | 512 / 1024 / 512 | 32×32 | 256 |
 | resnet50_layer3 | 1024 / 2048 / 1024 | 16×16 | 256 |
 
-ResNet-50 layer1/layer2 分别只保留 3 个、3+4 个 Bottleneck；student 的块内通道和残差支路同步扩宽，不包含后续 stage。AE 按实际特征尺寸解码，无额外 PDN 边界补零。详见 [ResNet 容量升级说明](docs/resnet_capacity_upgrade.md)。
+ResNet-50 layer1/layer2 分别只保留 3 个、3+4 个 Bottleneck；`resnet50_layer1` 的 student 整体扩宽，`resnet50_layer1v2` 保持标准 stem/layer1 宽度，只在末端使用 `3×3 Conv(256→512)` 扩展双分支输出；`resnet50_layer2` 的 student 仍整体扩宽。AE 按实际特征尺寸解码，无额外 PDN 边界补零。详见 [ResNet 容量升级说明](docs/resnet_capacity_upgrade.md)。
 
 这是实验性 EfficientAD 变体。Student 的 BatchNorm 使用每卡局部统计；layer3 空间分辨率较低，整体扩宽不能保证提高小缺陷召回。ResNet-50 layer3 student 约 7184 万参数；layer1/layer2 参数更少，但特征图更大，仍需实测显存。旧 checkpoint 缺少 `resnet_architecture_version` 时自动按版本 1 原结构加载，可继续旧训练；要使用新结构，应启动新训练并重新校准，不能把旧权重直接装进版本 2。
 
@@ -206,7 +207,7 @@ uv run python efficientad_ccd.py train `
 
 ## 5. 读取效果报告
 
-每次运行单独保存，例如：
+每次训练完成后，使用同一模型分别校准并评估 top、pool+top、multipool 三种整图分数，保存到本次运行目录：
 
 ```text
 outputs/CCD1/<运行时间>/
@@ -215,12 +216,20 @@ outputs/CCD1/<运行时间>/
 ├─ loss.csv               # 每一步的总损失和三项损失
 ├─ checkpoints/last.pt    # 模型、优化器和调度器，可用于续训
 ├─ model.pt               # 已校准模型；包含教师参数，可独立推理
-├─ calibration.json       # 正常验证分数、阈值和异常图分位数
-├─ metrics.json           # 图像级指标与混淆矩阵
-├─ inference_speed.json   # 模型+score 与验证端到端的耗时、FPS
-├─ predictions.csv        # 每张图片的标签、分数、预测和是否正确
-├─ score_distribution.png # 正常/异常分数分布
-└─ heatmaps/               # 原图、异常热图、叠加图，按测试子目录/预测结果分类
+├─ score_reports/
+│  ├─ top/                # top 的独立 calibration、metrics、predictions、速度和分布图
+│  ├─ pool+top/           # pool+top 的独立报告
+│  └─ multipool/          # multipool 的独立报告；三种目录都包含以下文件
+│     ├─ config.json             # 本 score 模式的配置
+│     ├─ calibration.json        # 正常验证分数、阈值和异常图分位数
+│     ├─ metrics.json            # 图像级指标与混淆矩阵
+│     ├─ predictions.csv         # 每张图片的标签、分数和预测结果
+│     ├─ inference_speed.json    # 模型+score 与端到端耗时、FPS
+│     └─ score_distribution.png  # 正常/异常分数分布
+├─ heatmaps-top/          # top 分数、对应阈值与定位结果
+├─ heatmaps-pool+top/     # 单尺度池化 + Top-K 的结果
+├─ heatmap_scales-multipool/ # multipool 的逐尺度诊断图
+└─ heatmaps-multipool/    # 多尺度融合结果；三套主热图均采用以下子目录结构
    ├─ good/
    │  ├─ normal/*.png      # test/good 中预测为正常
    │  └─ anomaly/*.png     # test/good 中被误报为异常
@@ -238,9 +247,11 @@ outputs/CCD1/<运行时间>/
 
 尺度归一化只使用训练良品中留出的正常验证集；最终阈值则使用独立的带标签 `threshold_val`。程序先对每种异常子目录求出满足目标召回率的边界，再取其中最低的边界作为统一阈值；`score > threshold` 判为 NG，否则 OK。阈值验证集同时会统计正常误报率。分数不是概率，也不保证位于 `[0,1]`，最终测试集不参与尺度归一化或阈值选择。
 
-热图统一使用正常验证集确定的显示色阶，默认优先保存误判图，再保存接近阈值的图。主可视化采用 2×3：上排为原图、原始异常热力图、原始 Overlay；下排为当前 Score 对应的定位响应、阈值二值图、定位 Overlay 与异常框。`top` 使用原始异常图，`pool+top` 使用与 Score 完全相同的 mask-aware 池化图，`multiscale_pool` 只融合整图尺度分数超过阈值的归一化尺度。多尺度模式还会在 `heatmap_scales/` 保存逐尺度池化图与 Overlay 诊断图。
+训练后三种方式分别从同一正常验证集和独立的带标签阈值验证集校准，分别生成阈值、测试指标与热图；测试集不参与校准。三种报告统一保存在 score_reports/top、score_reports/pool+top、score_reports/multipool。默认模式 multipool 复用已完成的校准，其报告与根目录 model.pt 保存的校准参数及后续默认推理保持对应。续训旧模型时，model.pt 仍沿用 checkpoint 原本的 score 模式，三种报告也都保存在各自子目录。pool+top 默认窗口为 21，Top-K 比例沿用训练配置（默认 0.1%）；指定旧参数 --score-pool-kernel K 时，pool+top 使用 K，multipool 也保持旧版的单尺度 [K] 行为。--score-pool-kernels 则只调整 multipool 的尺度列表。三种方式增加的是训练后的校准、评估和出图耗时，不增加训练步数。
 
-主结果按测试集原始子目录和整图预测结果保存：`heatmaps/<test子目录>/normal/` 或 `heatmaps/<test子目录>/anomaly/`。例如 `test/defect1` 的图片会进入 `heatmaps/defect1/normal/` 或 `heatmaps/defect1/anomaly/`；逐尺度诊断图保持相同层级放在 `heatmap_scales/`。`--heatmaps 32` 是所有子目录合计最多 32 张主图，`--heatmaps 0` 不保存，`--heatmaps -1` 保存全部。预测为正常的图片默认不画框；预测异常但形态学和面积过滤后没有连通域时，会在最强响应位置生成兜底框；响应完全平坦时改用有效区域中心，避免固定落在左上角。热图和异常框均为模型定位的启发式展示，不是像素标注或经过像素指标验证的分割结果。
+热图统一使用正常验证集确定的显示色阶。每种方式优先输出预测异常的图，再补充预测正常的图，各组内优先误判和接近阈值的图。主可视化采用 2×3：上排为原图、原始异常热力图、原始 Overlay；下排为当前 Score 对应的定位响应、阈值二值图、定位 Overlay 与异常框。top 使用原始异常图，pool+top 使用与 Score 完全相同的 mask-aware 池化图，multipool（内部名称 multiscale_pool）只融合整图尺度分数超过阈值的归一化尺度。多尺度诊断图在训练后放入 heatmap_scales-multipool；top 和 pool+top 不另外生成逐尺度诊断图。
+
+训练主结果按 heatmaps-top、heatmaps-pool+top、heatmaps-multipool 三个目录分别保存，目录内仍为“测试集原始子目录/normal 或 anomaly/图片.png”。--heatmaps 32 表示每种 score 最多保存 32 张主图（三种最多 96 张），各模式按自身结果挑选，样本可能不同；--heatmaps 0 仍生成三套评估报告，但不保存热图；--heatmaps -1 为三种方式都保存全部测试图片，便于逐图比较。单独 evaluate 命令仍只输出所选 score，沿用 heatmaps 和 heatmap_scales 目录。预测为正常的图片默认不画框；预测异常但形态学和面积过滤后没有连通域时，会在最强响应位置生成兜底框；响应完全平坦时改用有效区域中心，避免固定落在左上角。热图和异常框均为模型定位的启发式展示，不是像素标注或经过像素指标验证的分割结果。
 
 当校准边界为 0 时，严格大于判定会令整图分类阈值成为一个极小负数。由于异常定位响应通常大于等于 0，三种 Score 模式的画框阶段都会把空间阈值下限限制为 0，避免整幅图被选中；整图分类仍使用 checkpoint 中的原始阈值。该调整会记录在单图 `prediction.json` 的 `threshold_adjusted_for_localization` 字段中。
 

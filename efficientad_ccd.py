@@ -390,6 +390,11 @@ SCORE_MODE_TOP = "top"
 SCORE_MODE_POOL_TOPK = "pool_topk"
 SCORE_MODE_MULTISCALE = "multiscale_pool"
 SCORE_MODE_CHECKPOINT = "checkpoint"
+TRAINING_SCORE_DIRECTORIES = {
+    SCORE_MODE_TOP: "top",
+    SCORE_MODE_POOL_TOPK: "pool+top",
+    SCORE_MODE_MULTISCALE: "multipool",
+}
 
 
 def normalize_score_mode(value: str, *, allow_checkpoint: bool = False) -> str:
@@ -732,9 +737,15 @@ def calibrate(
 
 
 def evaluate_records(model, records: list[dict], config: dict, calibration: dict,
-                     output_dir: Path, heatmaps: int) -> dict:
+                     output_dir: Path, heatmaps: int, *,
+                     heatmap_dir: Path | None = None,
+                     heatmap_scales_dir: Path | None = None) -> dict:
     from ccd_report import save_heatmap, write_report
 
+    heatmap_dir = output_dir / "heatmaps" if heatmap_dir is None else heatmap_dir
+    heatmap_scales_dir = (
+        output_dir / "heatmap_scales" if heatmap_scales_dir is None else heatmap_scales_dir
+    )
     if not records:
         print("当前快照没有测试图片，已保存模型和校准结果，跳过测试。")
         return {}
@@ -819,17 +830,43 @@ def evaluate_records(model, records: list[dict], config: dict, calibration: dict
             filename = f"{rank:04d}_{Path(record['path']).stem}.png"
             save_heatmap(
                 Path(record["path"]), anomaly_map,
-                output_dir / "heatmaps" / source_directory / prediction_directory / filename,
+                heatmap_dir / source_directory / prediction_directory / filename,
                 display_max=calibration["display_max"], score=row["score"], threshold=calibration["threshold"],
                 ignore_mask=_mask_numpy(getattr(batch, "ignore_mask", None)),
                 localization=localization,
                 multiscale_output_path=(
-                    output_dir / "heatmap_scales" / source_directory
+                    heatmap_scales_dir / source_directory
                     / prediction_directory / filename
                 ),
             )
     print(json.dumps(metrics, ensure_ascii=False, indent=2, allow_nan=False))
     return metrics
+
+
+def evaluate_training_score_modes(
+    model, records: list[dict], manifest: dict, config: dict,
+    output_dir: Path, default_calibration: dict, heatmaps: int,
+) -> dict[str, dict]:
+    """同一训练模型分别校准、评估三种 score，并保存到独立热图目录。"""
+    default_mode = calibration_score_mode(default_calibration)
+    results = {}
+    for score_mode, directory_name in TRAINING_SCORE_DIRECTORIES.items():
+        mode_config = {**config, "score_mode": score_mode}
+        mode_config.setdefault("score_pool_kernel", 21)
+        report_dir = output_dir / "score_reports" / directory_name
+        print(f"训练后评估 score={directory_name}；报告：{report_dir}")
+        if score_mode == default_mode:
+            # train_one 已在该目录保存包含验证分数明细的完整校准报告。
+            calibration = default_calibration
+        else:
+            calibration = calibrate(model, manifest, mode_config, report_dir, score_mode)
+        write_json(report_dir / "config.json", mode_config)
+        results[directory_name] = evaluate_records(
+            model, records, mode_config, calibration, report_dir, heatmaps,
+            heatmap_dir=output_dir / f"heatmaps-{directory_name}",
+            heatmap_scales_dir=output_dir / f"heatmap_scales-{directory_name}",
+        )
+    return results
 
 
 def _safe_output_component(value: str) -> str:
@@ -1002,6 +1039,7 @@ def train_one(args, category: str) -> None:
             "threshold_val_ratio": args.threshold_val_ratio,
             "target_recall": args.target_recall,
             "score_mode": SCORE_MODE_MULTISCALE,
+            "score_pool_kernel": args.score_pool_kernel if args.score_pool_kernel is not None else 21,
             "score_pool_kernels": (
                 [args.score_pool_kernel]
                 if args.score_pool_kernel is not None
@@ -1040,9 +1078,13 @@ def train_one(args, category: str) -> None:
         model.model.mean_std.update(statistics)
     train = train_distributed if len(devices) > 1 else optimize
     step = train(model, config, manifest, output, previous, args.save_every)
-    calibration = calibrate(model, manifest, config, output)
+    default_score_mode = normalize_score_mode(config.get("score_mode", SCORE_MODE_MULTISCALE))
+    calibration_dir = output / "score_reports" / TRAINING_SCORE_DIRECTORIES[default_score_mode]
+    calibration = calibrate(model, manifest, config, calibration_dir, default_score_mode)
     save_checkpoint(output / "model.pt", model, config, manifest, step, calibration=calibration)
-    evaluate_records(model, manifest["test"], config, calibration, output, args.heatmaps)
+    evaluate_training_score_modes(
+        model, manifest["test"], manifest, config, output, calibration, args.heatmaps,
+    )
     print(f"完成。模型：{output / 'model.pt'}\n报告：{output}")
 
 
@@ -1155,7 +1197,11 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--num-workers", type=int, default=0, help="Windows 首次建议用 0")
             add_localization_arguments(command)
         if name in ("train", "evaluate"):
-            command.add_argument("--heatmaps", type=int, default=32, help="热图数量；0 不保存，-1 保存全部")
+            command.add_argument(
+                "--heatmaps", type=int, default=32,
+                help=("每种 score 的热图数量（三种方式分别保存）；0 不保存，-1 保存全部"
+                      if name == "train" else "热图数量；0 不保存，-1 保存全部"),
+            )
         if name in ("evaluate", "predict"):
             command.add_argument("--checkpoint", type=Path, required=True, help="本脚本生成的 model.pt")
         if name == "train":
@@ -1175,7 +1221,7 @@ def build_parser() -> argparse.ArgumentParser:
             backbone_group.add_argument(
                 "--backbone",
                 choices=["pdn_small", "pdn_medium", "resnet18_layer2", "resnet18_layer3",
-                         "resnet50_layer1", "resnet50_layer2", "resnet50_layer3"],
+                         "resnet50_layer1", "resnet50_layer1v2", "resnet50_layer2", "resnet50_layer3"],
                 help="特征提取器；默认随 --model-size 选择 pdn_small 或 pdn_medium",
             )
             command.add_argument("--lr", type=float, default=1e-4)
@@ -1191,7 +1237,7 @@ def build_parser() -> argparse.ArgumentParser:
             )
             command.add_argument(
                 "--score-pool-kernel", type=int,
-                help="兼容旧命令：仅使用一个池化尺度；新训练建议使用 --score-pool-kernels",
+                help="pool+top 的池化核；兼容旧命令，同时将 multipool 设为该单一尺度",
             )
             command.add_argument(
                 "--score-topk-ratio", type=float, default=0.001,

@@ -1,4 +1,4 @@
-"""Export unpooled EfficientAD branch errors from a CLI checkpoint and one image.
+"""Export unpooled EfficientAD branch errors from a checkpoint and image(s).
 
 No mask is applied: inspecting ignored regions is intentional. Raw errors still
 use the checkpoint's channel-standardized teacher. Calibrated errors additionally
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from tempfile import mkdtemp
 
@@ -18,6 +19,29 @@ import torch
 from PIL import Image, ImageOps
 from torch.nn import functional as F
 from torchvision.transforms.functional import to_tensor
+
+
+def collect_images(root: Path, output_root: Path) -> list[Path]:
+    """Snapshot supported inputs, excluding the output subtree and symlinks."""
+    root, output_root = root.resolve(), output_root.resolve()
+    if not root.is_dir():
+        raise ValueError(f"Image directory does not exist: {root}")
+    if root.is_relative_to(output_root):
+        raise ValueError("The output directory must not equal or contain the input directory.")
+    extensions = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+    images = []
+    for directory, folders, files in os.walk(root):
+        current = Path(directory)
+        folders[:] = sorted(folder for folder in folders
+                            if not (current / folder).is_symlink()
+                            and not (current / folder).resolve().is_relative_to(output_root))
+        for name in sorted(files):
+            path = current / name
+            if path.suffix.lower() in extensions and path.is_file() and not path.is_symlink():
+                images.append(path)
+    if not images:
+        raise ValueError(f"No supported images found in {root}")
+    return sorted(images)
 
 
 @torch.inference_mode()
@@ -29,15 +53,24 @@ def extract_maps(model, image: torch.Tensor) -> dict[str, np.ndarray]:
         raise ValueError("Expected one image with shape [1, 3, H, W].")
     student, distance = model.compute_student_teacher_distance(image)
     ae = model.autoencoder_features(image, student.shape[-2:])
+    # The existing ``stae`` branch measures AE-versus-student agreement.  Keep a
+    # separate teacher-versus-AE diagnostic so AE underfitting is observable.
+    with torch.no_grad():
+        teacher = model.teacher(image)
+        if model.is_set(model.mean_std):
+            teacher = (teacher - model.mean_std["mean"]) / model.mean_std["std"]
     st = distance.mean(dim=1, keepdim=True)
     stae = (ae - student[:, model.teacher_out_channels:]).square().mean(dim=1, keepdim=True)
-    tensors = {"st_native": st, "stae_native": stae}
+    teacher_ae = (teacher - ae).square().mean(dim=1, keepdim=True)
+    tensors = {"st_native": st, "stae_native": stae,
+               "teacher_ae_native": teacher_ae}
     # Match EfficientAdModel.compute_maps, including the PDN border convention.
     if model.pad_maps:
-        st, stae = (F.pad(value, (4, 4, 4, 4)) for value in (st, stae))
-    st, stae = (F.interpolate(value, size=image.shape[-2:], mode="bilinear", align_corners=False)
-                for value in (st, stae))
-    tensors.update(st_raw=st, stae_raw=stae)
+        st, stae, teacher_ae = (F.pad(value, (4, 4, 4, 4))
+                                for value in (st, stae, teacher_ae))
+    st, stae, teacher_ae = (F.interpolate(value, size=image.shape[-2:], mode="bilinear", align_corners=False)
+                            for value in (st, stae, teacher_ae))
+    tensors.update(st_raw=st, stae_raw=stae, teacher_ae_raw=teacher_ae)
     if model.is_set(model.quantiles):
         q = model.quantiles
         if not all(torch.isfinite(v).all().item() for v in q.values()):
@@ -61,7 +94,7 @@ def save_figures(image: Image.Image, maps: dict[str, np.ndarray], output: Path,
     import matplotlib.pyplot as plt
 
     scales = {}
-    groups = [("raw", ["st_raw", "stae_raw"])]
+    groups = [("raw", ["st_raw", "stae_raw", "teacher_ae_raw"])]
     if "fused_calibrated" in maps:
         groups.append(("calibrated", ["st_calibrated", "stae_calibrated", "fused_calibrated"]))
     for group, keys in groups:
@@ -95,39 +128,21 @@ def save_figures(image: Image.Image, maps: dict[str, np.ndarray], output: Path,
     return scales
 
 
-def main(argv: list[str] | None = None) -> Path:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", type=Path, required=True, help="CLI model.pt or checkpoints/last.pt")
-    parser.add_argument("--image", type=Path, required=True, help="Original source image, not a heatmap montage")
-    parser.add_argument("--device", default="auto", help="auto, cpu, cuda or visible GPU index (e.g. 0)")
-    parser.add_argument("--output-dir", type=Path, default=Path(__file__).resolve().parent / "outputs/branch_maps")
-    parser.add_argument("--vmax", type=float, help="Optional fixed positive PNG upper limit; does not alter NPZ")
-    args = parser.parse_args(argv)
-    if args.vmax is not None and (not np.isfinite(args.vmax) or args.vmax <= 0):
-        parser.error("--vmax must be finite and positive")
-
-    import efficientad_ccd as cli
-    cli.load_runtime()
-    saved = cli.read_checkpoint(args.checkpoint)
-    config = dict(saved["config"])
-    config["device"] = cli.choose_device(args.device)
-    config.setdefault("model_size", "small")
-    model = cli.new_model(config).eval()
-    model.model.load_state_dict(saved["model_state"], strict=True)
-    with Image.open(args.image) as source:
+def export_image(model, config: dict, checkpoint: Path, image_path: Path,
+                 output: Path, vmax: float | None) -> None:
+    with Image.open(image_path) as source:
         original = ImageOps.exif_transpose(source).convert("RGB")
     size = int(config["image_size"])
     resized = original.resize((size, size), Image.Resampling.BILINEAR)
     tensor = to_tensor(resized).unsqueeze(0).to(config["device"])
     maps = extract_maps(model.model, tensor)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    output = Path(mkdtemp(prefix="branches_", dir=args.output_dir.resolve()))
+    output.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(output / "maps.npz", **maps)
     # Rendering can be bounded independently of inference resolution.
     original.thumbnail((800, 800), Image.Resampling.LANCZOS)
-    scales = save_figures(original, maps, output, args.vmax)
+    scales = save_figures(original, maps, output, vmax)
     metadata = {
-        "checkpoint": str(args.checkpoint.resolve()), "image": str(args.image.resolve()),
+        "checkpoint": str(checkpoint.resolve()), "image": str(image_path.resolve()),
         "backbone": model.model.backbone, "input_size": size,
         "mask_applied": False, "pooling_applied": False,
         "teacher_channel_standardization_applied": bool(model.model.is_set(model.model.mean_std)),
@@ -135,6 +150,7 @@ def main(argv: list[str] | None = None) -> Path:
         "definitions": {
             "st": "mean_C((standardized_teacher - student[:C])**2)",
             "stae": "mean_C((autoencoder - student[C:])**2); NOT teacher-autoencoder error",
+            "teacher_ae": "mean_C((standardized_teacher - autoencoder)**2); diagnostic only, not calibrated/fused",
             "native": "Original feature grid before PDN border padding and image-size interpolation",
             "raw": "Input-sized error before anomaly-map quantile normalization",
             "calibrated": "Stored checkpoint quantile normalization, signed and unclipped in NPZ",
@@ -146,6 +162,51 @@ def main(argv: list[str] | None = None) -> Path:
     }
     (output / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2,
                                                      allow_nan=False), encoding="utf-8")
+
+def main(argv: list[str] | None = None) -> Path:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--checkpoint", type=Path, required=True, help="CLI model.pt or checkpoints/last.pt")
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--image", type=Path, help="Original source image, not a heatmap montage")
+    inputs.add_argument("--image-dir", type=Path, help="Recursively export a directory of original images")
+    parser.add_argument("--device", default="auto", help="auto, cpu, cuda or visible GPU index (e.g. 0)")
+    parser.add_argument("--output-dir", type=Path, default=Path(__file__).resolve().parent / "outputs/branch_maps")
+    parser.add_argument("--vmax", type=float, help="Fixed positive PNG upper limit across images; does not alter NPZ")
+    args = parser.parse_args(argv)
+    if args.vmax is not None and (not np.isfinite(args.vmax) or args.vmax <= 0):
+        parser.error("--vmax must be finite and positive")
+    if args.image_dir:
+        try:
+            images = collect_images(args.image_dir, args.output_dir)
+        except ValueError as error:
+            parser.error(str(error))
+    else:
+        if not args.image.is_file():
+            parser.error(f"Image does not exist: {args.image}")
+        images = [args.image.resolve()]
+
+    import efficientad_ccd as cli
+    cli.load_runtime()
+    saved = cli.read_checkpoint(args.checkpoint)
+    config = dict(saved["config"])
+    config["device"] = cli.choose_device(args.device)
+    config.setdefault("model_size", "small")
+    model = cli.new_model(config).eval()
+    model.model.load_state_dict(saved["model_state"], strict=True)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    output = Path(mkdtemp(prefix="branches_", dir=args.output_dir.resolve()))
+    for index, image_path in enumerate(images, 1):
+        # Keep the full filename (including extension) as a directory name,
+        # so a.png, a.bmp and nested/a.png all have different destinations.
+        destination = output / image_path.relative_to(args.image_dir.resolve()) if args.image_dir else output
+        print(f"[{index}/{len(images)}] {image_path}", flush=True)
+        export_image(model, config, args.checkpoint, image_path, destination, args.vmax)
+    (output / "summary.json").write_text(json.dumps({
+        "image_count": len(images), "images": [str(path) for path in images],
+        "input_directory": str(args.image_dir.resolve()) if args.image_dir else None,
+        "checkpoint": str(args.checkpoint.resolve()),
+        "fixed_vmax": args.vmax,
+    }, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
     print(f"Branch diagnostics: {output}")
     return output
 

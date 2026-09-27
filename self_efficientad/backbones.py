@@ -21,6 +21,7 @@ BACKBONE_SPECS = {
     "resnet18_layer2": BackboneSpec("resnet18_layer2", 128, 8),
     "resnet18_layer3": BackboneSpec("resnet18_layer3", 256, 16),
     "resnet50_layer1": BackboneSpec("resnet50_layer1", 256, 4),
+    "resnet50_layer1v2": BackboneSpec("resnet50_layer1v2", 256, 4),
     "resnet50_layer2": BackboneSpec("resnet50_layer2", 512, 8),
     "resnet50_layer3": BackboneSpec("resnet50_layer3", 1024, 16),
 }
@@ -171,6 +172,31 @@ class WideResNetStudent(nn.Module):
         return self.head(self.features((x - mean) / std))
 
 
+class ResNet50Layer1V2Student(nn.Module):
+    """Standard ResNet-50 layer1 with a two-branch output projection.
+
+    The retained ResNet trunk keeps the native 64-channel stem and 256-channel
+    layer1 widths. Only the final spatial projection expands the output to
+    ``2 * 256`` channels, matching the PDN student convention.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        from torchvision.models import resnet50
+
+        source = resnet50(weights=None)
+        self.features = nn.Sequential(
+            source.conv1, source.bn1, source.relu, source.maxpool, source.layer1,
+        )
+        self.output_channels = 512
+        self.head = nn.Conv2d(256, self.output_channels, kernel_size=3, padding=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        mean = x.new_tensor((0.485, 0.456, 0.406))[None, :, None, None]
+        std = x.new_tensor((0.229, 0.224, 0.225))[None, :, None, None]
+        return self.head(self.features((x - mean) / std))
+
+
 def build_resnet18_layer2_pair(
     *, teacher_pretrained: bool = False, resnet_architecture_version: int = 2,
 ) -> tuple[nn.Module, nn.Module]:
@@ -225,15 +251,18 @@ def build_backbone_pair(
         if name.startswith("resnet50_"):
             if resnet_architecture_version == 1:
                 raise ValueError(f"{name} 只支持 resnet_architecture_version=2。")
-            teacher = (ResNet50Layer3(pretrained=teacher_pretrained) if name == "resnet50_layer3"
-                       else ResNet50Features(layer=int(name.rsplit("_layer", 1)[1]),
-                                             pretrained=teacher_pretrained)).eval()
+            if name == "resnet50_layer3":
+                teacher = ResNet50Layer3(pretrained=teacher_pretrained).eval()
+            else:
+                teacher_layer = 1 if name == "resnet50_layer1v2" else int(name.rsplit("_layer", 1)[1])
+                teacher = ResNet50Features(layer=teacher_layer, pretrained=teacher_pretrained).eval()
         elif name == "resnet18_layer2":
             teacher = ResNet18Layer2(output_channels=128, pretrained=teacher_pretrained).eval()
         else:
             teacher = ResNet18Layer3(output_channels=256, pretrained=teacher_pretrained).eval()
         if resnet_architecture_version == 2:
-            student = WideResNetStudent(name)
+            student = (ResNet50Layer1V2Student() if name == "resnet50_layer1v2"
+                       else WideResNetStudent(name))
         elif name == "resnet18_layer2":
             student = ResNet18Layer2(output_channels=256, pretrained=False)
         else:
@@ -247,7 +276,8 @@ def load_default_teacher_weights(name: str, teacher: nn.Module) -> None:
     """Load the framework-provided pretrained teacher for a non-PDN backbone."""
 
     if name in BACKBONE_SPECS and name.startswith("resnet50_"):
-        pretrained = ResNet50Features(layer=int(name.rsplit("_layer", 1)[1]), pretrained=True)
+        layer = 1 if name == "resnet50_layer1v2" else int(name.rsplit("_layer", 1)[1])
+        pretrained = ResNet50Features(layer=layer, pretrained=True)
         teacher.load_state_dict(pretrained.state_dict())
         return
     if name == "resnet18_layer3":
