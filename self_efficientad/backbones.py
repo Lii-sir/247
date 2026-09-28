@@ -35,6 +35,24 @@ def get_backbone_spec(name: str) -> BackboneSpec:
         raise ValueError(f"未知 backbone {name!r}，可选：{choices}") from error
 
 
+def crop_output_border(module: nn.Module, features: torch.Tensor) -> torch.Tensor:
+    """Align teacher targets to a valid 3x3 student head without changing the trunk."""
+    border = getattr(module, "output_border", 0)
+    if not border:
+        return features
+    if min(features.shape[-2:]) <= 2 * border:
+        raise ValueError("ResNet 最终特征图太小，无法裁剪输出边界；请增大输入尺寸。")
+    return features[..., border:-border, border:-border]
+
+
+def resolve_resnet_feature_mode(mode: str | None, version: int) -> str:
+    if mode is None:
+        return "valid" if version == 2 else "native"
+    if mode not in ("valid", "native"):
+        raise ValueError("resnet_feature_mode 必须为 valid 或 native。")
+    return mode
+
+
 class ResNet18Layer2(nn.Module):
     """ResNet-18 stem through layer2, preserving a spatial feature map."""
 
@@ -62,7 +80,7 @@ class ResNet18Layer2(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         mean = x.new_tensor((0.485, 0.456, 0.406))[None, :, None, None]
         std = x.new_tensor((0.229, 0.224, 0.225))[None, :, None, None]
-        return self.projection(self.features((x - mean) / std))
+        return crop_output_border(self, self.projection(self.features((x - mean) / std)))
 
 
 class ResNet18Layer3(nn.Module):
@@ -86,11 +104,11 @@ class ResNet18Layer3(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         mean = x.new_tensor((0.485, 0.456, 0.406))[None, :, None, None]
         std = x.new_tensor((0.229, 0.224, 0.225))[None, :, None, None]
-        return self.head(self.features((x - mean) / std))
+        return crop_output_border(self, self.head(self.features((x - mean) / std)))
 
 
 class ResNet50Features(nn.Module):
-    """Native ImageNet features through the requested stage, without a new head."""
+    """Native ImageNet trunk; an optional output crop aligns valid student heads."""
 
     def __init__(self, *, layer: int, pretrained: bool = False) -> None:
         super().__init__()
@@ -108,7 +126,7 @@ class ResNet50Features(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         mean = x.new_tensor((0.485, 0.456, 0.406))[None, :, None, None]
         std = x.new_tensor((0.229, 0.224, 0.225))[None, :, None, None]
-        return self.features((x - mean) / std)
+        return crop_output_border(self, self.features((x - mean) / std))
 
 
 class ResNet50Layer3(ResNet50Features):
@@ -225,6 +243,7 @@ def build_backbone_pair(
     padding: bool = False,
     teacher_pretrained: bool = False,
     resnet_architecture_version: int = 2,
+    resnet_feature_mode: str | None = None,
 ) -> tuple[nn.Module, nn.Module, int]:
     """Build frozen-teacher and two-branch student feature extractors."""
 
@@ -233,6 +252,9 @@ def build_backbone_pair(
     spec = get_backbone_spec(name)
     if type(resnet_architecture_version) is not int or resnet_architecture_version not in (1, 2):
         raise ValueError("resnet_architecture_version 必须为 1（旧结构）或 2（整体扩宽）。")
+    mode = resolve_resnet_feature_mode(resnet_feature_mode, resnet_architecture_version)
+    if name.startswith("resnet") and mode == "valid" and resnet_architecture_version == 1:
+        raise ValueError("valid 输出模式需要 resnet_architecture_version=2；旧结构请使用 native。")
     out_channels = spec.out_channels if teacher_out_channels is None else teacher_out_channels
     if not isinstance(out_channels, int) or isinstance(out_channels, bool) or out_channels < 1:
         raise ValueError("teacher_out_channels 必须是正整数。")
@@ -267,6 +289,11 @@ def build_backbone_pair(
             student = ResNet18Layer2(output_channels=256, pretrained=False)
         else:
             student = ResNet18Layer3(output_channels=512, pretrained=False)
+        if mode == "valid":
+            # Keep every pretrained residual block untouched. Only the final
+            # student projection becomes valid; crop the teacher by one cell.
+            student.head.padding = (0, 0)
+            teacher.output_border = 1
     else:  # pragma: no cover - get_backbone_spec gives the public error
         raise ValueError(f"Unsupported backbone: {name}")
     return teacher, student, out_channels

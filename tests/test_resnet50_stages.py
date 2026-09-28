@@ -53,13 +53,14 @@ class ResNet50StageTests(unittest.TestCase):
                 self.assertEqual(student_conv.out_channels, teacher_conv.out_channels)
                 self.assertEqual(student_conv.stride, teacher_conv.stride)
         self.assertEqual(tuple(model.student.head.weight.shape), (512, 256, 3, 3))
-        self.assertFalse(model.pad_maps)
+        self.assertTrue(model.pad_maps)
+        self.assertEqual(model.student.head.padding, (0, 0))
         with torch.no_grad():
             image = torch.rand(1, 3, 256, 256)
-            self.assertEqual(tuple(model.teacher(image).shape), (1, 256, 64, 64))
-            self.assertEqual(tuple(model.student(image).shape), (1, 512, 64, 64))
-            self.assertEqual(tuple(model.autoencoder_features(image, (64, 64)).shape),
-                             (1, 256, 64, 64))
+            self.assertEqual(tuple(model.teacher(image).shape), (1, 256, 62, 62))
+            self.assertEqual(tuple(model.student(image).shape), (1, 512, 62, 62))
+            self.assertEqual(tuple(model.autoencoder_features(image, (62, 62)).shape),
+                             (1, 256, 62, 62))
         del model
 
     def test_stages_use_bottlenecks_with_all_internal_and_residual_widths_doubled(self):
@@ -91,7 +92,7 @@ class ResNet50StageTests(unittest.TestCase):
                                              2 * teacher_block.downsample[0].out_channels)
                 channels = 256 * 2 ** (stage - 1)
                 self.assertEqual(tuple(model.student.head.weight.shape), (2 * channels, 2 * channels, 3, 3))
-                self.assertFalse(model.pad_maps)
+                self.assertTrue(model.pad_maps)
                 del model
 
     def test_teacher_student_and_ae_align_at_native_square_and_odd_rectangular_grids(self):
@@ -105,7 +106,7 @@ class ResNet50StageTests(unittest.TestCase):
                 with torch.no_grad():
                     for h, w in ((256, 256), (257, 289)):
                         image = torch.rand(1, 3, h, w)
-                        grid = ((h + stride - 1) // stride, (w + stride - 1) // stride)
+                        grid = ((h + stride - 1) // stride - 2, (w + stride - 1) // stride - 2)
                         teacher = model.teacher(image)
                         student = model.student(image)
                         ae = model.autoencoder_features(image, teacher.shape[-2:])
@@ -142,7 +143,8 @@ class ResNet50StageTests(unittest.TestCase):
                 self.assertEqual(set(model.teacher.state_dict()),
                                  {f"features.{key}" for key in reference.state_dict()})
                 with torch.no_grad():
-                    torch.testing.assert_close(model.teacher(image), reference(normalized), rtol=0, atol=0)
+                    torch.testing.assert_close(model.teacher(image), reference(normalized)[..., 1:-1, 1:-1],
+                                               rtol=0, atol=0)
                 del model
 
     def test_feature_ae_adapts_to_all_larger_cli_image_sizes(self):
@@ -153,7 +155,7 @@ class ResNet50StageTests(unittest.TestCase):
                     with self.subTest(stage=stage, image_size=size):
                         image = torch.rand(1, 3, size, size)
                         teacher = model.teacher(image)
-                        expected_shape = (1, channels, size // stride, size // stride)
+                        expected_shape = (1, channels, size // stride - 2, size // stride - 2)
                         self.assertEqual(tuple(teacher.shape), expected_shape)
                         ae = model.autoencoder_features(image, teacher.shape[-2:])
                         self.assertEqual(tuple(ae.shape), expected_shape)

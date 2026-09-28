@@ -27,8 +27,8 @@ class ResNetCapacityTests(unittest.TestCase):
         model = EfficientAdModel(backbone=args.backbone).eval()
         with torch.no_grad():
             x = torch.rand(1, 3, 256, 256)
-            self.assertEqual(tuple(model.teacher(x).shape), (1, 1024, 16, 16))
-            self.assertEqual(tuple(model.student(x).shape), (1, 2048, 16, 16))
+            self.assertEqual(tuple(model.teacher(x).shape), (1, 1024, 14, 14))
+            self.assertEqual(tuple(model.student(x).shape), (1, 2048, 14, 14))
 
     def test_public_pair_factories_also_default_to_whole_student_widening(self):
         from self_efficientad.backbones import build_resnet18_layer2_pair, build_resnet18_layer3_pair
@@ -151,7 +151,8 @@ class ResNetCapacityTests(unittest.TestCase):
         normalized = (x - x.new_tensor([.485, .456, .406])[None, :, None, None]) / x.new_tensor(
             [.229, .224, .225])[None, :, None, None]
         with torch.no_grad():
-            torch.testing.assert_close(model.teacher(x), reference(normalized), rtol=0, atol=0)
+            torch.testing.assert_close(model.teacher(x), reference(normalized)[..., 1:-1, 1:-1],
+                                       rtol=0, atol=0)
 
     def test_cli_roundtrip_records_version_and_restores_legacy_without_version(self):
         cli.load_runtime()

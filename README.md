@@ -103,18 +103,20 @@ uv run python efficientad_ccd.py train `
 
 `--backbone` 与旧版 `--model-size` 互斥，不能同时传入；未指定 `--backbone` 时，`small/medium` 分别映射到 `pdn_small/pdn_medium`。续训默认沿用 checkpoint 的结构，显式指定不同 backbone 会报错；切换结构必须重新训练并重新校准阈值。
 
-ResNet 新训练默认采用架构版本 2：teacher 保留原生预训练特征并冻结；student 的 stem 和所有保留的残差 stage 通道整体扩大 2 倍，末尾使用无激活的 `3×3` 输出卷积；AE 保留卷积编码、插值解码和 Dropout 的形式，中间容量按 teacher 通道数扩展，直接输出 teacher 的空间尺寸。256×256 输入时：
+ResNet 新训练默认采用架构版本 2、`resnet_feature_mode="valid"`：**保留主干内部 padding，仅最终输出不补边**。Teacher 保留并冻结原生预训练主干，输出裁掉四周各 1 格；student 末尾无激活的 `3×3` 输出卷积使用 `padding=0`；AE 最后一个 `3×3` 输出卷积同样不补边，三路特征严格对齐。除了 `layer1v2`，student 的 stem 和所有保留 stage 通道整体扩大 2 倍。256×256 输入时：
 
 | Backbone | Teacher / student / AE 通道 | 特征图 | AE hidden |
 |---|---|---|---:|
-| resnet18_layer2 | 128 / 256 / 128 | 32×32 | 64 |
-| resnet18_layer3 | 256 / 512 / 256 | 16×16 | 128 |
-| resnet50_layer1 | 256 / 512 / 256 | 64×64 | 128 |
-| resnet50_layer1v2 | 256 / 512 / 256 | 64×64 | 128 |
-| resnet50_layer2 | 512 / 1024 / 512 | 32×32 | 256 |
-| resnet50_layer3 | 1024 / 2048 / 1024 | 16×16 | 256 |
+| resnet18_layer2 | 128 / 256 / 128 | 30×30 | 64 |
+| resnet18_layer3 | 256 / 512 / 256 | 14×14 | 128 |
+| resnet50_layer1 | 256 / 512 / 256 | 62×62 | 128 |
+| resnet50_layer1v2 | 256 / 512 / 256 | 62×62 | 128 |
+| resnet50_layer2 | 512 / 1024 / 512 | 30×30 | 256 |
+| resnet50_layer3 | 1024 / 2048 / 1024 | 14×14 | 256 |
 
-ResNet-50 layer1/layer2 分别只保留 3 个、3+4 个 Bottleneck；`resnet50_layer1` 的 student 整体扩宽，`resnet50_layer1v2` 保持标准 stem/layer1 宽度，只在末端使用 `3×3 Conv(256→512)` 扩展双分支输出；`resnet50_layer2` 的 student 仍整体扩宽。AE 按实际特征尺寸解码，无额外 PDN 边界补零。详见 [ResNet 容量升级说明](docs/resnet_capacity_upgrade.md)。
+ResNet-50 layer1/layer2 分别只保留 3 个、3+4 个 Bottleneck；`resnet50_layer1v2` 保持标准 stem/layer1 宽度，只在末端使用 `3×3 Conv(256→512)` 扩展双分支输出。**计算异常分数后**，ResNet 的异常图四周各补 1 格零，再双线性插值回输入大小；PDN 仍各补 4 格，未改动。不要将这称为“整个 ResNet 无 padding”，也不代表内部特征完全不受填充值影响。详见 [ResNet 输出边界模式](docs/resnet_output_padding.md)。
+
+CLI 与 Lightning checkpoint 均保存 `resnet_feature_mode`。缺少该字段的历史 checkpoint 自动使用 `native`（旧输出头 padding=1、不额外补异常图边界），保证原始模型的推理/续训语义。API 可显式选择 `resnet_feature_mode="native"`；切换到 `valid` 应重新训练、统计与校准，不要复用旧阈值。
 
 这是实验性 EfficientAD 变体。Student 的 BatchNorm 使用每卡局部统计；layer3 空间分辨率较低，整体扩宽不能保证提高小缺陷召回。ResNet-50 layer3 student 约 7184 万参数；layer1/layer2 参数更少，但特征图更大，仍需实测显存。旧 checkpoint 缺少 `resnet_architecture_version` 时自动按版本 1 原结构加载，可继续旧训练；要使用新结构，应启动新训练并重新校准，不能把旧权重直接装进版本 2。
 

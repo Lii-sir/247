@@ -3,6 +3,8 @@
 日期：2026-09-25
 更新：2026-09-26，补充 ResNet-50 layer1/layer2。
 
+> 2026-09-28：新增默认 `resnet_feature_mode="valid"`，只关闭末端 Student/AE 输出头的 padding，Teacher 输出裁边对齐，异常图随后各补 1 格零。本文以下尺寸和输出头 padding=1 描述保留为 `native` 历史模式记录；当前默认值、尺寸及兼容策略见 [ResNet 输出边界模式](resnet_output_padding.md)。
+
 ## 1. 实现范围
 
 新训练默认使用 ResNet 架构版本 2，完成以下三项：

@@ -314,6 +314,7 @@ class Encoder(nn.Module):
 
     def __init__(self, small_channels: int = 32, hidden_channels: int = 64) -> None:
         super().__init__()
+        self.allow_small_input = False
         self.enconv1 = nn.Conv2d(3, small_channels, kernel_size=4, stride=2, padding=1)
         self.enconv2 = nn.Conv2d(small_channels, small_channels, kernel_size=4, stride=2, padding=1)
         self.enconv3 = nn.Conv2d(small_channels, hidden_channels, kernel_size=4, stride=2, padding=1)
@@ -336,6 +337,12 @@ class Encoder(nn.Module):
         x = F.relu(self.enconv3(x))
         x = F.relu(self.enconv4(x))
         x = F.relu(self.enconv5(x))
+        # Only new ResNet valid-output models opt into 224px AE inputs.
+        # Five stride-2 layers yield 7x7; resize this bottleneck to the fixed
+        # 8x8 kernel minimum without changing PDN or legacy checkpoint behavior.
+        if self.allow_small_input and min(x.shape[-2:]) < 8:
+            x = F.interpolate(x, size=(max(8, x.shape[-2]), max(8, x.shape[-1])),
+                              mode="bilinear", align_corners=False)
         return self.enconv6(x)
 
 
@@ -531,6 +538,7 @@ class EfficientAdModel(nn.Module):
         backbone: str | None = None,
         teacher_pretrained: bool = False,
         resnet_architecture_version: int = 2,
+        resnet_feature_mode: str | None = None,
     ) -> None:
         super().__init__()
 
@@ -540,23 +548,29 @@ class EfficientAdModel(nn.Module):
         model_size = EfficientAdModelSize(model_size)
         if backbone is None:
             backbone = "pdn_medium" if model_size == EfficientAdModelSize.M else "pdn_small"
-        from .backbones import build_backbone_pair
+        from .backbones import build_backbone_pair, get_backbone_spec, resolve_resnet_feature_mode
 
         self.backbone = backbone
         self.resnet_architecture_version = resnet_architecture_version
+        self.resnet_feature_mode = resolve_resnet_feature_mode(resnet_feature_mode, resnet_architecture_version)
+        self.valid_resnet_output = backbone.startswith("resnet") and self.resnet_feature_mode == "valid"
         self.teacher, self.student, self.teacher_out_channels = build_backbone_pair(
             backbone,
             teacher_out_channels=teacher_out_channels,
             padding=padding,
             teacher_pretrained=teacher_pretrained,
             resnet_architecture_version=resnet_architecture_version,
+            resnet_feature_mode=resnet_feature_mode,
         )
         self.teacher.requires_grad_(False)
-        self.pad_maps = pad_maps if backbone.startswith("pdn_") else False
+        # PDN and valid-mode ResNet use a smaller native map. Restore the
+        # missing border only after feature distances have been computed.
+        self.pad_maps = pad_maps if backbone.startswith("pdn_") or self.valid_resnet_output else False
+        self.feature_stride = get_backbone_spec(backbone).feature_stride
         self.use_feature_ae = backbone.startswith("resnet") and resnet_architecture_version == 2
         if self.use_feature_ae:
             from .resnet_autoencoder import ResNetFeatureAutoEncoder
-            self.ae = ResNetFeatureAutoEncoder(self.teacher_out_channels)
+            self.ae = ResNetFeatureAutoEncoder(self.teacher_out_channels, valid_output=self.valid_resnet_output)
         else:
             self.ae = AutoEncoder(out_channels=self.teacher_out_channels, padding=padding)
 
@@ -777,8 +791,8 @@ class EfficientAdModel(nn.Module):
             )
 
         if self.pad_maps:
-            map_st = F.pad(map_st, (4, 4, 4, 4))
-            map_stae = F.pad(map_stae, (4, 4, 4, 4))
+            map_st = self.pad_map_to_feature_grid(map_st, image_size)
+            map_stae = self.pad_map_to_feature_grid(map_stae, image_size)
         map_st = F.interpolate(map_st, size=image_size, mode="bilinear")
         map_stae = F.interpolate(map_stae, size=image_size, mode="bilinear")
 
@@ -786,6 +800,33 @@ class EfficientAdModel(nn.Module):
             map_st = 0.1 * (map_st - self.quantiles["qa_st"]) / (self.quantiles["qb_st"] - self.quantiles["qa_st"])
             map_stae = 0.1 * (map_stae - self.quantiles["qa_ae"]) / (self.quantiles["qb_ae"] - self.quantiles["qa_ae"])
         return map_st, map_stae
+
+    def pad_map_to_feature_grid(
+        self, anomaly_map: torch.Tensor, image_size: tuple[int, int] | torch.Size
+    ) -> torch.Tensor:
+        """PDN restores four cells; valid ResNet output restores one cell per edge."""
+
+        if not self.pad_maps:
+            return anomaly_map
+        if self.backbone.startswith("pdn_"):
+            # Preserve the exact existing PDN behavior, including explicit padding=True.
+            return F.pad(anomaly_map, (4, 4, 4, 4), mode="constant", value=0.0)
+
+        target_h = (int(image_size[0]) + self.feature_stride - 1) // self.feature_stride
+        target_w = (int(image_size[1]) + self.feature_stride - 1) // self.feature_stride
+        pad_h = target_h - anomaly_map.shape[-2]
+        pad_w = target_w - anomaly_map.shape[-1]
+        if (pad_h, pad_w) != (2, 2):
+            raise ValueError(
+                f"ResNet valid 异常图 {tuple(anomaly_map.shape[-2:])} 应比目标网格 "
+                f"{(target_h, target_w)} 的高宽各小 2。"
+            )
+        return F.pad(
+            anomaly_map,
+            (pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2),
+            mode="constant",
+            value=0.0,
+        )
 
     def get_maps(self, batch: torch.Tensor, normalize: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute anomaly maps for a batch of images.

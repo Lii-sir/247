@@ -65,7 +65,7 @@ class BranchMapTests(unittest.TestCase):
         np.testing.assert_allclose(result["teacher_ae_native"],
                                    (teacher - ae).square().mean(1)[0].numpy(), atol=1e-7)
         self.assertEqual(result["st_raw"].shape, (512, 512))
-        self.assertEqual(result["st_native"].shape, (32, 32))
+        self.assertEqual(result["st_native"].shape, (30, 30))
         self.assertTrue((result["st_raw"] >= 0).all())
         self.assertTrue((result["stae_raw"] >= 0).all())
         self.assertTrue((result["teacher_ae_raw"] >= 0).all())
@@ -111,7 +111,7 @@ class BranchMapTests(unittest.TestCase):
             self.assertFalse(metadata["mask_applied"])
             self.assertEqual(metadata["backbone"], "resnet18_layer2")
             with np.load(output / "maps.npz") as maps:
-                self.assertEqual(maps["st_native"].shape, (32, 32))
+                self.assertEqual(maps["st_native"].shape, (30, 30))
                 self.assertIn("teacher_ae_native", maps.files)
                 self.assertIn("teacher_ae_raw", maps.files)
                 np.testing.assert_allclose(maps["fused_calibrated"],

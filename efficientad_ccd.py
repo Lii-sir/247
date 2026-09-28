@@ -203,6 +203,7 @@ def new_model(config: dict):
         model_size=config["model_size"],
         backbone=backbone,
         resnet_architecture_version=config.get("resnet_architecture_version", 2),
+        resnet_feature_mode=config.get("resnet_feature_mode"),
         lr=config["lr"],
         weight_decay=config["weight_decay"],
         batch_size=config.get("batch_size", 1),
@@ -265,6 +266,8 @@ def save_checkpoint(path: Path, model, config: dict, manifest: dict, step: int,
     saved_config = dict(config)
     if hasattr(model.model, "resnet_architecture_version"):
         saved_config["resnet_architecture_version"] = model.model.resnet_architecture_version
+    if hasattr(model.model, "resnet_feature_mode"):
+        saved_config["resnet_feature_mode"] = model.model.resnet_feature_mode
     payload = {
         "format_version": 1,
         "model_state": model.model.state_dict(),
@@ -291,6 +294,9 @@ def read_checkpoint(path: Path) -> dict:
         raise ValueError("不是本脚本生成的 checkpoint，或格式版本不匹配。")
     if "config" in payload:
         payload["config"].setdefault("resnet_architecture_version", 1)
+        # Older checkpoints used padded output heads. Never silently change
+        # their features, calibration or inference geometry when resuming.
+        payload["config"].setdefault("resnet_feature_mode", "native")
     return payload
 
 
@@ -1029,6 +1035,7 @@ def train_one(args, category: str) -> None:
                            else args.model_size or "small"),
             "backbone": args.backbone or f"pdn_{args.model_size or 'small'}",
             "resnet_architecture_version": 2,
+            "resnet_feature_mode": "valid",
             "batch_size": batch_size, "hard_loss_mode": hard_loss_mode,
             "batch_training_version": 1 if batch_size > 1 else 0,
             "max_steps": max_steps, "max_images": max_images,

@@ -64,9 +64,9 @@ def extract_maps(model, image: torch.Tensor) -> dict[str, np.ndarray]:
     teacher_ae = (teacher - ae).square().mean(dim=1, keepdim=True)
     tensors = {"st_native": st, "stae_native": stae,
                "teacher_ae_native": teacher_ae}
-    # Match EfficientAdModel.compute_maps, including the PDN border convention.
+    # Match compute_maps: PDN restores four cells, valid ResNet restores one.
     if model.pad_maps:
-        st, stae, teacher_ae = (F.pad(value, (4, 4, 4, 4))
+        st, stae, teacher_ae = (model.pad_map_to_feature_grid(value, image.shape[-2:])
                                 for value in (st, stae, teacher_ae))
     st, stae, teacher_ae = (F.interpolate(value, size=image.shape[-2:], mode="bilinear", align_corners=False)
                             for value in (st, stae, teacher_ae))

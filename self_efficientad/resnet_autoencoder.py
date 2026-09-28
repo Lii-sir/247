@@ -17,18 +17,20 @@ class ResNetFeatureAutoEncoder(nn.Module):
     PDN-sized feature map merely to downsample it back to the ResNet grid.
     """
 
-    def __init__(self, out_channels: int) -> None:
+    def __init__(self, out_channels: int, *, valid_output: bool = False) -> None:
         super().__init__()
         from .torch_model import Encoder
 
         self.out_channels = out_channels
+        self.valid_output = valid_output
         self.hidden_channels = min(256, max(64, out_channels // 2))
         self.encoder = Encoder(self.hidden_channels // 2, self.hidden_channels)
+        self.encoder.allow_small_input = valid_output
         self.decoder = nn.ModuleList(
             [nn.Conv2d(self.hidden_channels, self.hidden_channels, 4, padding=2)
              for _ in range(6)]
             + [nn.Conv2d(self.hidden_channels, self.hidden_channels, 3, padding=1),
-               nn.Conv2d(self.hidden_channels, out_channels, 3, padding=1)]
+               nn.Conv2d(self.hidden_channels, out_channels, 3, padding=0 if valid_output else 1)]
         )
         self.dropout = nn.Dropout(0.2)
 
@@ -38,6 +40,10 @@ class ResNetFeatureAutoEncoder(nn.Module):
         height, width = feature_size
         if height < 2 or width < 2:
             raise ValueError("ResNet AE feature_size 的高和宽必须至少为 2。")
+        if self.valid_output:
+            # Reconstruct on the full trunk grid, then a valid final 3x3
+            # produces the same one-cell interior as the teacher/student.
+            height, width = height + 2, width + 2
         x = self.encoder(imagenet_norm_batch(x))
         sizes = [
             (max(2, math.ceil(height / 4)), max(2, math.ceil(width / 4))),

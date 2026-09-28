@@ -183,8 +183,8 @@ class BackboneTests(unittest.TestCase):
         image = torch.rand(1, 3, 256, 256)
         teacher = model.teacher(image)
         student = model.student(image)
-        self.assertEqual(teacher.shape, (1, 128, 32, 32))
-        self.assertEqual(student.shape, (1, 256, 32, 32))
+        self.assertEqual(teacher.shape, (1, 128, 30, 30))
+        self.assertEqual(student.shape, (1, 256, 30, 30))
 
         model.train()
         losses = model(image, torch.rand_like(image))
@@ -200,8 +200,8 @@ class BackboneTests(unittest.TestCase):
     def test_resnet18_layer3_training_preserves_frozen_teacher_and_updates_student_head(self) -> None:
         model = EfficientAdModel(backbone="resnet18_layer3", hard_loss_mode="per_image")
         image = torch.rand(2, 3, 256, 256)
-        self.assertEqual(tuple(model.teacher(image).shape), (2, 256, 16, 16))
-        self.assertEqual(tuple(model.student(image).shape), (2, 512, 16, 16))
+        self.assertEqual(tuple(model.teacher(image).shape), (2, 256, 14, 14))
+        self.assertEqual(tuple(model.student(image).shape), (2, 512, 14, 14))
         self.assertIsInstance(model.teacher.head, torch.nn.Identity)
         self.assertEqual(tuple(model.student.head.weight.shape), (512, 512, 3, 3))
         self.assertTrue(all(not parameter.requires_grad for parameter in model.teacher.parameters()))
