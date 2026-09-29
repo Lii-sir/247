@@ -12,7 +12,8 @@ layer1/layer1v2/layer2/layer3。PDN 及架构版本 1 的既有流程保持不�
 
 ## 处理流程
 
-1. Teacher 和 Student 的 stem、池化、残差块保留原有 padding；不修改残差 forward。
+1. Teacher 和 Student 的 stem、池化、残差块保留原有 padding；裁边本身不修改残差 forward。
+   layer1v2 Teacher 的独立激活选项见 [最终激活说明](resnet_teacher_activation.md)。
 2. Student 最后 `3×3, stride=1` 输出头设置 `padding=0`，网格高宽各减少 2。
 3. Teacher 不增加随机投影，只把原生输出四周各裁 1 格，与 Student 窗口中心对齐。
    预训练参数键、形状不变；教师统计也使用裁剪后的输出。

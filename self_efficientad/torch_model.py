@@ -539,6 +539,7 @@ class EfficientAdModel(nn.Module):
         teacher_pretrained: bool = False,
         resnet_architecture_version: int = 2,
         resnet_feature_mode: str | None = None,
+        resnet_teacher_output_activation: str | None = None,
     ) -> None:
         super().__init__()
 
@@ -548,11 +549,14 @@ class EfficientAdModel(nn.Module):
         model_size = EfficientAdModelSize(model_size)
         if backbone is None:
             backbone = "pdn_medium" if model_size == EfficientAdModelSize.M else "pdn_small"
-        from .backbones import build_backbone_pair, get_backbone_spec, resolve_resnet_feature_mode
+        from .backbones import (build_backbone_pair, get_backbone_spec,
+                                resolve_resnet_feature_mode, resolve_teacher_output_activation)
 
         self.backbone = backbone
         self.resnet_architecture_version = resnet_architecture_version
         self.resnet_feature_mode = resolve_resnet_feature_mode(resnet_feature_mode, resnet_architecture_version)
+        self.resnet_teacher_output_activation = resolve_teacher_output_activation(
+            backbone, resnet_teacher_output_activation)
         self.valid_resnet_output = backbone.startswith("resnet") and self.resnet_feature_mode == "valid"
         self.teacher, self.student, self.teacher_out_channels = build_backbone_pair(
             backbone,
@@ -561,6 +565,7 @@ class EfficientAdModel(nn.Module):
             teacher_pretrained=teacher_pretrained,
             resnet_architecture_version=resnet_architecture_version,
             resnet_feature_mode=resnet_feature_mode,
+            resnet_teacher_output_activation=self.resnet_teacher_output_activation,
         )
         self.teacher.requires_grad_(False)
         # PDN and valid-mode ResNet use a smaller native map. Restore the

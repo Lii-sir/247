@@ -139,6 +139,7 @@ class EfficientAd(AnomalibModule):
         teacher_pretrained: bool = False,
         resnet_architecture_version: int = 2,
         resnet_feature_mode: str | None = None,
+        resnet_teacher_output_activation: str | None = None,
     ) -> None:
         super().__init__(
             pre_processor=pre_processor,
@@ -168,11 +169,13 @@ class EfficientAd(AnomalibModule):
             teacher_pretrained=teacher_pretrained,
             resnet_architecture_version=resnet_architecture_version,
             resnet_feature_mode=resnet_feature_mode,
+            resnet_teacher_output_activation=resnet_teacher_output_activation,
             padding=padding,
             pad_maps=pad_maps,
             hard_loss_mode=hard_loss_mode,
         )
         self.hparams["resnet_feature_mode"] = self.model.resnet_feature_mode
+        self.hparams["resnet_teacher_output_activation"] = self.model.resnet_teacher_output_activation
         self.batch_size: int = batch_size
         self.hard_loss_mode: str = hard_loss_mode
         self.lr: float = lr
@@ -184,9 +187,11 @@ class EfficientAd(AnomalibModule):
         super().on_load_checkpoint(checkpoint)
         saved_version = checkpoint.get("hyper_parameters", {}).get("resnet_architecture_version", 1)
         saved_mode = checkpoint.get("hyper_parameters", {}).get("resnet_feature_mode", "native")
+        saved_activation = checkpoint.get("hyper_parameters", {}).get("resnet_teacher_output_activation", "relu")
         if self.backbone.startswith("resnet") and (
             saved_version != self.model.resnet_architecture_version
             or saved_mode != self.model.resnet_feature_mode
+            or saved_activation != self.model.resnet_teacher_output_activation
         ):
             # Older Lightning checkpoints predate architecture versioning.
             # Rebuild before Lightning applies the state dict; never fetch weights.
@@ -199,10 +204,12 @@ class EfficientAd(AnomalibModule):
                 hard_loss_mode=self.hard_loss_mode,
                 resnet_architecture_version=saved_version,
                 resnet_feature_mode=saved_mode,
+                resnet_teacher_output_activation=saved_activation,
             ).to(device=self.device, dtype=self.dtype)
             self.model.train(was_training)
             self.hparams["resnet_architecture_version"] = saved_version
             self.hparams["resnet_feature_mode"] = saved_mode
+            self.hparams["resnet_teacher_output_activation"] = saved_activation
         self._teacher_loaded_from_checkpoint = True
 
     @classmethod

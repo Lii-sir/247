@@ -204,6 +204,7 @@ def new_model(config: dict):
         backbone=backbone,
         resnet_architecture_version=config.get("resnet_architecture_version", 2),
         resnet_feature_mode=config.get("resnet_feature_mode"),
+        resnet_teacher_output_activation=config.get("resnet_teacher_output_activation"),
         lr=config["lr"],
         weight_decay=config["weight_decay"],
         batch_size=config.get("batch_size", 1),
@@ -268,6 +269,8 @@ def save_checkpoint(path: Path, model, config: dict, manifest: dict, step: int,
         saved_config["resnet_architecture_version"] = model.model.resnet_architecture_version
     if hasattr(model.model, "resnet_feature_mode"):
         saved_config["resnet_feature_mode"] = model.model.resnet_feature_mode
+    if hasattr(model.model, "resnet_teacher_output_activation"):
+        saved_config["resnet_teacher_output_activation"] = model.model.resnet_teacher_output_activation
     payload = {
         "format_version": 1,
         "model_state": model.model.state_dict(),
@@ -297,6 +300,8 @@ def read_checkpoint(path: Path) -> dict:
         # Older checkpoints used padded output heads. Never silently change
         # their features, calibration or inference geometry when resuming.
         payload["config"].setdefault("resnet_feature_mode", "native")
+        # ReLU has no weights: state_dict cannot identify this behavioral change.
+        payload["config"].setdefault("resnet_teacher_output_activation", "relu")
     return payload
 
 
@@ -858,7 +863,7 @@ def evaluate_training_score_modes(
     results = {}
     for score_mode, directory_name in TRAINING_SCORE_DIRECTORIES.items():
         mode_config = {**config, "score_mode": score_mode}
-        mode_config.setdefault("score_pool_kernel", 21)
+        mode_config.setdefault("score_pool_kernel", 7)
         report_dir = output_dir / "score_reports" / directory_name
         print(f"训练后评估 score={directory_name}；报告：{report_dir}")
         if score_mode == default_mode:
@@ -975,6 +980,9 @@ def train_one(args, category: str) -> None:
                 "请移除 --resume 启动新训练。"
             )
         config.update(device=devices[0], num_workers=args.num_workers)
+        requested_activation = args.resnet_teacher_output_activation
+        if requested_activation is not None and requested_activation != config["resnet_teacher_output_activation"]:
+            raise ValueError("续训不能更改 Teacher 输出激活；请移除 --resume 启动新训练并重新校准。")
         # Old checkpoints predate batched training and must retain their exact
         # original loss semantics when resumed.
         config.setdefault("batch_size", 1)
@@ -1036,6 +1044,11 @@ def train_one(args, category: str) -> None:
             "backbone": args.backbone or f"pdn_{args.model_size or 'small'}",
             "resnet_architecture_version": 2,
             "resnet_feature_mode": "valid",
+            "resnet_teacher_output_activation": (
+                args.resnet_teacher_output_activation
+                if args.resnet_teacher_output_activation is not None
+                else "none" if args.backbone == "resnet50_layer1v2" else "relu"
+            ),
             "batch_size": batch_size, "hard_loss_mode": hard_loss_mode,
             "batch_training_version": 1 if batch_size > 1 else 0,
             "max_steps": max_steps, "max_images": max_images,
@@ -1046,7 +1059,7 @@ def train_one(args, category: str) -> None:
             "threshold_val_ratio": args.threshold_val_ratio,
             "target_recall": args.target_recall,
             "score_mode": SCORE_MODE_MULTISCALE,
-            "score_pool_kernel": args.score_pool_kernel if args.score_pool_kernel is not None else 21,
+            "score_pool_kernel": args.score_pool_kernel if args.score_pool_kernel is not None else 7,
             "score_pool_kernels": (
                 [args.score_pool_kernel]
                 if args.score_pool_kernel is not None
@@ -1232,6 +1245,10 @@ def build_parser() -> argparse.ArgumentParser:
                 help="特征提取器；默认随 --model-size 选择 pdn_small 或 pdn_medium",
             )
             command.add_argument("--lr", type=float, default=1e-4)
+            command.add_argument(
+                "--resnet-teacher-output-activation", choices=["relu", "none"],
+                help="Teacher 阶段最终激活；新 layer1v2 默认 none，其他架构保持原样；续训沿用 checkpoint",
+            )
             command.add_argument("--weight-decay", type=float, default=1e-5)
             command.add_argument("--threshold-quantile", type=float, default=0.99)
             command.add_argument(

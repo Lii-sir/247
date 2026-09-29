@@ -103,6 +103,10 @@ def main() -> None:
         assert training_config["global_batch_size"] == global_batch_size
         assert training_config["max_steps"] == 2
         assert training_config["resnet_architecture_version"] == 2
+        expected_activation = "none" if args.backbone == "resnet50_layer1v2" else "relu"
+        assert training_config["resnet_teacher_output_activation"] == expected_activation
+        checkpoint_config = torch.load(model_path, map_location="cpu", weights_only=True)["config"]
+        assert checkpoint_config["resnet_teacher_output_activation"] == expected_activation
         for name in ("manifest.json", "config.json", "loss.csv", "checkpoints/last.pt"):
             assert (run_dir / name).is_file(), name
         metrics = json.loads((run_dir / "score_reports/multipool/metrics.json").read_text(encoding="utf-8"))
@@ -128,7 +132,7 @@ def main() -> None:
             assert len(mode_calibration["normal_score_validation"]) == 2
             assert len(mode_calibration["threshold_validation_scores"]) == 2
             if label == "pool+top":
-                assert mode_calibration["score_method"]["pool_kernel"] == (args.score_pool_kernel or 21)
+                assert mode_calibration["score_method"]["pool_kernel"] == (args.score_pool_kernel or 7)
             images = list((run_dir / f"heatmaps-{label}").rglob("*.png"))
             assert len(images) == 1, (label, images)
             assert images[0].parent.name in {"normal", "anomaly"}
@@ -212,6 +216,7 @@ def main() -> None:
         assert len(list((root / "predictions").glob("CCD1/*/prediction_scales.png"))) == 1
         # 仅在合成验证中将目标步数延长一步，确认恢复后确实执行一次优化。
         resume_payload = torch.load(run_dir / "checkpoints/last.pt", map_location="cpu", weights_only=True)
+        assert resume_payload["config"]["resnet_teacher_output_activation"] == expected_activation
         resume_payload["config"]["max_steps"] = 3
         resume_path = root / "resume_for_smoke_only.pt"
         torch.save(resume_payload, resume_path)
@@ -223,6 +228,7 @@ def main() -> None:
         assert resumed["step"] == 3
         assert resumed["config"]["backbone"] == args.backbone
         assert resumed["config"]["resnet_architecture_version"] == 2
+        assert resumed["config"]["resnet_teacher_output_activation"] == expected_activation
         for label in ("top", "pool+top", "multipool"):
             report_dir = resumed_path.parent / "score_reports" / label
             assert (report_dir / "metrics.json").is_file(), label

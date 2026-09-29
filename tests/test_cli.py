@@ -261,7 +261,7 @@ class CommandTests(unittest.TestCase):
         self.assertEqual([call.args[5] for call in evaluate.call_args_list], [1, 1, 1])
         pool_config = json.loads((output / "score_reports/pool+top/config.json").read_text(encoding="utf-8"))
         self.assertEqual(pool_config["score_mode"], "pool_topk")
-        self.assertEqual(pool_config["score_pool_kernel"], 21)
+        self.assertEqual(pool_config["score_pool_kernel"], 7)
         multi_config = json.loads((output / "score_reports/multipool/config.json").read_text(encoding="utf-8"))
         self.assertEqual(multi_config["score_mode"], "multiscale_pool")
         heatmap_dirs = [call.kwargs["heatmap_dir"] for call in evaluate.call_args_list]

@@ -143,8 +143,16 @@ class ResNet50StageTests(unittest.TestCase):
                 self.assertEqual(set(model.teacher.state_dict()),
                                  {f"features.{key}" for key in reference.state_dict()})
                 with torch.no_grad():
-                    torch.testing.assert_close(model.teacher(image), reference(normalized)[..., 1:-1, 1:-1],
-                                               rtol=0, atol=0)
+                    if name == "resnet50_layer1v2":
+                        standard_output = reference(normalized)
+                        output_without_relu = model.teacher.forward_features(normalized)
+                        torch.testing.assert_close(output_without_relu.clamp_min(0),
+                                                   standard_output, rtol=0, atol=0)
+                        self.assertLess(output_without_relu.min().item(), 0)
+                        expected = output_without_relu[..., 1:-1, 1:-1]
+                    else:
+                        expected = reference(normalized)[..., 1:-1, 1:-1]
+                    torch.testing.assert_close(model.teacher(image), expected, rtol=0, atol=0)
                 del model
 
     def test_feature_ae_adapts_to_all_larger_cli_image_sizes(self):

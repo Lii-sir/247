@@ -53,6 +53,17 @@ def resolve_resnet_feature_mode(mode: str | None, version: int) -> str:
     return mode
 
 
+def resolve_teacher_output_activation(backbone: str, activation: str | None) -> str:
+    """New layer1v2 runs omit the final ReLU; checkpoint readers supply legacy relu."""
+    if activation is None:
+        activation = "none" if backbone == "resnet50_layer1v2" else "relu"
+    if activation not in ("relu", "none"):
+        raise ValueError("resnet_teacher_output_activation 必须为 relu 或 none。")
+    if activation == "none" and backbone != "resnet50_layer1v2":
+        raise ValueError("去掉 Teacher 最终 ReLU 目前仅支持 resnet50_layer1v2。")
+    return activation
+
+
 class ResNet18Layer2(nn.Module):
     """ResNet-18 stem through layer2, preserving a spatial feature map."""
 
@@ -108,9 +119,15 @@ class ResNet18Layer3(nn.Module):
 
 
 class ResNet50Features(nn.Module):
-    """Native ImageNet trunk; an optional output crop aligns valid student heads."""
+    """Native ImageNet trunk with optional output-boundary controls."""
 
-    def __init__(self, *, layer: int, pretrained: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        layer: int,
+        pretrained: bool = False,
+        remove_final_activation: bool = False,
+    ) -> None:
         super().__init__()
         from torchvision.models import ResNet50_Weights, resnet50
 
@@ -122,11 +139,56 @@ class ResNet50Features(nn.Module):
             *(getattr(source, f"layer{index}") for index in range(1, layer + 1)),
         )
         self.output_channels = 256 * 2 ** (layer - 1)
+        self.remove_final_activation = remove_final_activation
+
+    @staticmethod
+    def _forward_bottleneck_without_output_activation(
+        block: nn.Module, x: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run a torchvision Bottleneck without its final residual ReLU.
+
+        The Bottleneck's ``relu`` module is reused after conv1, conv2 and the
+        residual addition, so replacing ``block.relu`` with ``Identity`` would
+        incorrectly remove the two internal activations as well.
+        """
+        identity = x
+
+        out = block.conv1(x)
+        out = block.bn1(out)
+        out = block.relu(out)
+
+        out = block.conv2(out)
+        out = block.bn2(out)
+        out = block.relu(out)
+
+        out = block.conv3(out)
+        out = block.bn3(out)
+
+        if block.downsample is not None:
+            identity = block.downsample(x)
+
+        out += identity
+        return out
+
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Accept ImageNet-normalized input; return features before border cropping."""
+        if not self.remove_final_activation:
+            features = self.features(x)
+        else:
+            # Keep every earlier stage/block unchanged.  Only the final
+            # Bottleneck of the selected output stage omits its output ReLU.
+            x = self.features[:-1](x)
+            final_stage = self.features[-1]
+            for block in final_stage[:-1]:
+                x = block(x)
+            features = self._forward_bottleneck_without_output_activation(final_stage[-1], x)
+        return features
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         mean = x.new_tensor((0.485, 0.456, 0.406))[None, :, None, None]
         std = x.new_tensor((0.229, 0.224, 0.225))[None, :, None, None]
-        return crop_output_border(self, self.features((x - mean) / std))
+        features = self.forward_features((x - mean) / std)
+        return crop_output_border(self, features)
 
 
 class ResNet50Layer3(ResNet50Features):
@@ -244,6 +306,7 @@ def build_backbone_pair(
     teacher_pretrained: bool = False,
     resnet_architecture_version: int = 2,
     resnet_feature_mode: str | None = None,
+    resnet_teacher_output_activation: str | None = None,
 ) -> tuple[nn.Module, nn.Module, int]:
     """Build frozen-teacher and two-branch student feature extractors."""
 
@@ -253,6 +316,7 @@ def build_backbone_pair(
     if type(resnet_architecture_version) is not int or resnet_architecture_version not in (1, 2):
         raise ValueError("resnet_architecture_version 必须为 1（旧结构）或 2（整体扩宽）。")
     mode = resolve_resnet_feature_mode(resnet_feature_mode, resnet_architecture_version)
+    activation = resolve_teacher_output_activation(name, resnet_teacher_output_activation)
     if name.startswith("resnet") and mode == "valid" and resnet_architecture_version == 1:
         raise ValueError("valid 输出模式需要 resnet_architecture_version=2；旧结构请使用 native。")
     out_channels = spec.out_channels if teacher_out_channels is None else teacher_out_channels
@@ -277,7 +341,11 @@ def build_backbone_pair(
                 teacher = ResNet50Layer3(pretrained=teacher_pretrained).eval()
             else:
                 teacher_layer = 1 if name == "resnet50_layer1v2" else int(name.rsplit("_layer", 1)[1])
-                teacher = ResNet50Features(layer=teacher_layer, pretrained=teacher_pretrained).eval()
+                teacher = ResNet50Features(
+                    layer=teacher_layer,
+                    pretrained=teacher_pretrained,
+                    remove_final_activation=activation == "none",
+                ).eval()
         elif name == "resnet18_layer2":
             teacher = ResNet18Layer2(output_channels=128, pretrained=teacher_pretrained).eval()
         else:
@@ -290,8 +358,8 @@ def build_backbone_pair(
         else:
             student = ResNet18Layer3(output_channels=512, pretrained=False)
         if mode == "valid":
-            # Keep every pretrained residual block untouched. Only the final
-            # student projection becomes valid; crop the teacher by one cell.
+            # Align the valid student projection with a one-cell teacher crop.
+            # The independently configured activation does not change geometry.
             student.head.padding = (0, 0)
             teacher.output_border = 1
     else:  # pragma: no cover - get_backbone_spec gives the public error
@@ -304,7 +372,11 @@ def load_default_teacher_weights(name: str, teacher: nn.Module) -> None:
 
     if name in BACKBONE_SPECS and name.startswith("resnet50_"):
         layer = 1 if name == "resnet50_layer1v2" else int(name.rsplit("_layer", 1)[1])
-        pretrained = ResNet50Features(layer=layer, pretrained=True)
+        pretrained = ResNet50Features(
+            layer=layer,
+            pretrained=True,
+            remove_final_activation=teacher.remove_final_activation,
+        )
         teacher.load_state_dict(pretrained.state_dict())
         return
     if name == "resnet18_layer3":

@@ -198,6 +198,9 @@ def train_distributed(model, config: dict, manifest: dict, output: Path,
     config = dict(config)
     if hasattr(model.model, "resnet_architecture_version"):
         config["resnet_architecture_version"] = model.model.resnet_architecture_version
+    for key in ("resnet_feature_mode", "resnet_teacher_output_activation"):
+        if hasattr(model.model, key):
+            config[key] = getattr(model.model, key)
     devices = config["devices"]
     for name, count in (("训练集", len(manifest["train"])),
                         ("辅助集", len(model.imagenet_loader.dataset))):

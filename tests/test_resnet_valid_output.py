@@ -47,7 +47,10 @@ class ResNetValidOutputTests(unittest.TestCase):
                     image = torch.rand(1, 3, h, w)
                     normalized = (image - image.new_tensor([.485, .456, .406])[None, :, None, None])
                     normalized = normalized / image.new_tensor([.229, .224, .225])[None, :, None, None]
-                    full_teacher = model.teacher.features(normalized)
+                    if hasattr(model.teacher, "forward_features"):
+                        full_teacher = model.teacher.forward_features(normalized)
+                    else:
+                        full_teacher = model.teacher.features(normalized)
                     teacher = model.teacher(image)
                     torch.testing.assert_close(teacher, full_teacher[..., 1:-1, 1:-1], rtol=0, atol=0)
                     student, distance = model.compute_student_teacher_distance(image)
