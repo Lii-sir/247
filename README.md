@@ -1,11 +1,12 @@
-# 部件分割与模板找点
+# 部件分割、模板找点与银浆断连检测
 
-两个独立功能，**分割不调用找点，找点不加载 YOLO**：
+原有两个独立功能仍保持解耦；银浆检测在上层编排 **分割 → 芯片外扩环带 → 360° 连续性判断**：
 
 | 模块 | 职责 |
 | --- | --- |
 | `part_segmentation/` | 使用 `weights/best.pt` 展示部件实例分割 |
 | `point_matcher/` | 原有模板匹配、选点与坐标映射，代码保持不变 |
+| `silver_inspection/` | 银浆/芯片/遮挡类别筛选、芯片外圈连续性测量、GUI 与批量导出 |
 | `datasets/` | 输入图片，只读，不写入预测结果 |
 | `outputs/` | 生成的展示图和统计信息，已加入 Git 忽略 |
 
@@ -30,7 +31,41 @@ uv run python -m part_segmentation
 - 推理在后台线程运行；只保留当前图片结果，复用模型。处理期间不切换输入，关闭窗口会等待当前推理完成。
 - 不进行训练、不修改权重、不与找点结果组合。
 
-当前权重的类别名为 `bond`、`wire`、`chip`、`thin`，程序从权重读取类别名，而非硬编码。
+当前权重的类别名为 `bond`、`wire`、`chip`、`thin`、`silver`，程序从权重读取类别名，而非硬编码。
+
+## 银浆断连检测
+
+启动检测界面：
+
+```powershell
+uv run python main.py --segment   # 默认使用 CUDA 0，只做分割并显示结果
+uv run python main.py --silver    # 独立的银浆断连检测
+uv run python main.py --overflow --calibration outputs/boundary.json  # 独立的银浆溢出检测
+```
+
+操作顺序：
+
+断连和溢出是两个独立功能，不是互斥分类：
+
+- `--segment`：只执行分割并显示 `silver/chip/thin/bond` 掩膜，便于先检查模型效果。
+- `--silver`：执行 chip 外圈 360° 银浆连续性/断连判断。
+- `--overflow`：执行矩形框外溢判断，使用此前保存的四点框标定。
+
+断连界面也遵循“先分割、后判断”：先点击 **开始分割** 查看叠加结果，再点击 **断连检测**。
+
+选择待测图片或图片文件夹后，设置 `chip` 外扩检查距离，例如 `20 px`；程序对每个 chip 实例取轴对齐外接矩形，再向外扩展指定像素，使用两个矩形的差集作为 360° 检查区域。按角度划分环带，检查每个扇区是否存在 `silver`。被 `thin` 或 `bond` 覆盖的像素从分母中排除，不作为断连。
+
+无界面批量检测：
+
+```powershell
+uv run python -m silver_inspection --source datasets --export outputs/silver-check --silver-class silver --chip-class chip --outward-px 20
+```
+
+`--outward-px` 是芯片外扩环带宽度；`--sectors` 是每个 chip 的 360° 扇区数；`--min-silver-px` 与 `--min-coverage` 控制每个扇区的银浆存在阈值；`--occlusion-classes` 默认忽略 `thin,bond`。输出包含 `summary.json`、连续性叠加图和原图/结果对比图。未检出 `chip` 或 `silver`、检查环带无效时，结果为**无法判定**，不会自动判为合格。
+
+银浆入口默认使用 CUDA `--device 0`；当前机器的 PyTorch 是 CPU 版，因此本机需要安装 CUDA 版 PyTorch 才能直接运行。仅调试时可显式添加 `--device cpu`。
+
+当前 `weights/best.pt` 实际类别为 `bond`、`wire`、`chip`、`thin`、`silver`，可以直接进行该检测。
 
 ## 无界面批量导出
 

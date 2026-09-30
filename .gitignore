@@ -5,3 +5,5 @@ __pycache__/
 outputs/
 .pytest_cache/
 process
+weights/
+out/

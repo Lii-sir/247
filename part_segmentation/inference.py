@@ -21,10 +21,17 @@ class PartSegmenter:
         if self._model.task != "segment":
             raise ValueError("请选择实例分割权重；当前权重不是 segment 模型")
 
+    @property
+    def class_names(self) -> tuple[str, ...]:
+        """Expose model labels without leaking the Ultralytics adapter."""
+        names = self._model.names
+        return tuple(names.values()) if isinstance(names, dict) else tuple(names)
+
     def predict(self, image_path: str | Path, settings: SegmentationSettings) -> SegmentationResult:
         start = perf_counter()
         image_path = Path(image_path).resolve()
         image = read_image(image_path)
+        self._validate_device(settings.device)
         prediction = self._model.predict(
             source=image,
             conf=settings.confidence,
@@ -54,4 +61,20 @@ class PartSegmenter:
                     mask=mask,
                 ))
         return SegmentationResult(image_path, image, tuple(segments), (perf_counter() - start) * 1000)
+
+    @staticmethod
+    def _validate_device(device: str) -> None:
+        if device.strip().casefold() == "cpu":
+            return
+        try:
+            import torch
+            available = torch.cuda.is_available()
+            count = torch.cuda.device_count() if available else 0
+        except ImportError as exc:
+            raise RuntimeError("CUDA 推理需要安装带 CUDA 的 PyTorch") from exc
+        if not available:
+            raise RuntimeError("当前 PyTorch 不支持 CUDA；请安装 CUDA 版 PyTorch，或显式使用 --device cpu")
+        value = device.strip().casefold().replace("cuda:", "")
+        if value.isdigit() and int(value) >= count:
+            raise RuntimeError(f"CUDA 设备 {device} 不存在，当前只有 {count} 个 CUDA 设备")
 

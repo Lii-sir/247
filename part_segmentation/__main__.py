@@ -15,7 +15,7 @@ def main(argv=None) -> int:
     parser.add_argument("--conf", type=float, default=0.25, help="置信度阈值，默认 0.25")
     parser.add_argument("--iou", type=float, default=0.7, help="NMS IoU 阈值，默认 0.7")
     parser.add_argument("--imgsz", type=int, default=640, help="推理尺寸（32 的倍数），默认 640")
-    parser.add_argument("--device", default="cpu", help="cpu 或 GPU 编号，例如 0")
+    parser.add_argument("--device", default="0", help="CUDA GPU 编号，例如 0；仅调试时使用 cpu")
     parser.add_argument("--recursive", action="store_true", help="扫描子文件夹")
     parser.add_argument("--export", type=Path, metavar="DIRECTORY", help="批量导出，不打开界面")
     args = parser.parse_args(argv)

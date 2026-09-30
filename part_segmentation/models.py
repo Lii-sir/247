@@ -11,7 +11,7 @@ class SegmentationSettings:
     confidence: float = 0.25
     iou: float = 0.7
     image_size: int = 640
-    device: str = "cpu"
+    device: str = "0"
 
     def __post_init__(self):
         if not 0 <= self.confidence <= 1:

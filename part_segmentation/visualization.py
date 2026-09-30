@@ -6,7 +6,7 @@ import numpy as np
 from .models import SegmentationResult
 
 # 同一类别在所有图片中保持同色。
-PALETTE = ((60, 190, 255), (230, 170, 40), (120, 210, 100), (210, 100, 220))
+PALETTE = ((60, 190, 255), (230, 170, 40), (120, 210, 100), (210, 100, 220), (70, 70, 255))
 
 
 def class_color(class_id: int) -> tuple[int, int, int]:
