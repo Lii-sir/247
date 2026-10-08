@@ -58,7 +58,10 @@ class ResNetValidOutputTests(unittest.TestCase):
                             (w + spec.feature_stride - 1) // spec.feature_stride - 2)
                     self.assertEqual(tuple(teacher.shape), (1, spec.out_channels, *grid))
                     self.assertEqual(tuple(student.shape), (1, 2 * spec.out_channels, *grid))
-                    full_student = model.student.features(normalized)
+                    if hasattr(model.student, "forward_features"):
+                        full_student = model.student.forward_features(normalized)
+                    else:
+                        full_student = model.student.features(normalized)
                     reference = F.conv2d(full_student, model.student.head.weight,
                                          model.student.head.bias, padding=0)
                     torch.testing.assert_close(student, reference, rtol=0, atol=0)

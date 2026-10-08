@@ -269,12 +269,27 @@ class ResNet50Layer1V2Student(nn.Module):
             source.conv1, source.bn1, source.relu, source.maxpool, source.layer1,
         )
         self.output_channels = 512
+        # Keep the same activation convention as the layer1v2 teacher: the
+        # final Bottleneck keeps its two internal ReLUs, but omits the ReLU
+        # after the residual addition.
         self.head = nn.Conv2d(256, self.output_channels, kernel_size=3, padding=1)
+
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Run layer1 without the final residual-output activation."""
+        x = self.features[:-1](x)
+        final_stage = self.features[-1]
+        for block in final_stage[:-1]:
+            x = block(x)
+        return ResNet50Features._forward_bottleneck_without_output_activation(
+            final_stage[-1], x,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         mean = x.new_tensor((0.485, 0.456, 0.406))[None, :, None, None]
         std = x.new_tensor((0.229, 0.224, 0.225))[None, :, None, None]
-        return self.head(self.features((x - mean) / std))
+        features = self.forward_features((x - mean) / std)
+        # The 3x3 projection is deliberately linear: no ReLU follows it.
+        return self.head(features)
 
 
 def build_resnet18_layer2_pair(

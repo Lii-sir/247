@@ -57,6 +57,28 @@ class ResNet50StageTests(unittest.TestCase):
         self.assertEqual(model.student.head.padding, (0, 0))
         with torch.no_grad():
             image = torch.rand(1, 3, 256, 256)
+            # The student's final Bottleneck must omit only its residual
+            # output ReLU, while retaining the two internal ReLUs.
+            normalized = (image - image.new_tensor([.485, .456, .406])[None, :, None, None])
+            normalized = normalized / image.new_tensor([.229, .224, .225])[None, :, None, None]
+            stage_input = model.student.features[:-1](normalized)
+            final_stage = model.student.features[-1]
+            for block in final_stage[:-1]:
+                stage_input = block(stage_input)
+            final_block = final_stage[-1]
+            final_block.bn3.weight.zero_()
+            final_block.bn3.bias.fill_(-100.0)
+            without_output_relu = model.student.forward_features(normalized)
+            self.assertLess(without_output_relu.max().item(), 0.0)
+            with_output_relu = final_block(stage_input)
+            self.assertTrue(torch.count_nonzero(with_output_relu).item() == 0)
+            torch.testing.assert_close(with_output_relu, without_output_relu.clamp_min(0))
+
+            # The terminal 3x3 projection is also linear: there is no ReLU
+            # after the head, so a negative bias remains negative.
+            model.student.head.weight.zero_()
+            model.student.head.bias.fill_(-0.25)
+            self.assertTrue((model.student(image) == -0.25).all())
             self.assertEqual(tuple(model.teacher(image).shape), (1, 256, 62, 62))
             self.assertEqual(tuple(model.student(image).shape), (1, 512, 62, 62))
             self.assertEqual(tuple(model.autoencoder_features(image, (62, 62)).shape),
