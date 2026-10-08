@@ -5,11 +5,11 @@ from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
 
-from part_segmentation.image_io import collect_images, write_image
+from common.image_io import collect_images, write_image
 
-from .continuity import ContinuitySettings
-from .continuity_pipeline import SilverContinuityInspector
-from .continuity_visualization import render_continuity_comparison, render_continuity_overlay
+from .geometry import ContinuitySettings
+from .pipeline import SilverContinuityInspector
+from .visualization import render_continuity_comparison, render_continuity_overlay
 
 
 def export_continuity_batch(weights, source, output, settings, segmentation_settings, recursive=False):

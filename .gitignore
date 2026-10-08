@@ -7,3 +7,5 @@ outputs/
 process
 weights/
 out/
+datasets/
+tests/

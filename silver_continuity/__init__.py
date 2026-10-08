@@ -1,1 +1,1 @@
-"""Independent entry point for silver continuity; shared inference is reused."""
+"""Independent silver continuity algorithm, UI and batch workflow."""

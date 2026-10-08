@@ -1,13 +1,13 @@
 """Segmentation and chip-surrounding silver continuity orchestration."""
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 
-from part_segmentation.inference import PartSegmenter
-from part_segmentation.models import SegmentationResult, SegmentationSettings
+from common.segmentation.inference import PartSegmenter
+from common.segmentation.models import SegmentationResult, SegmentationSettings
 
-from .continuity import ContinuityMeasurement, ContinuitySettings, measure_continuity, _key
+from .geometry import ContinuityMeasurement, ContinuitySettings, measure_continuity, _key
 
 
 @dataclass

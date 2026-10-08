@@ -20,15 +20,14 @@ uv run --no-sync python main.py --silver --device 0
 
 | 文件 | 职责 |
 | --- | --- |
-| [silver_continuity/__main__.py](D:/python_programs/LXD_project/point-matcher/silver_continuity/__main__.py) | 独立入口 |
-| [silver_inspection/__main__.py](D:/python_programs/LXD_project/point-matcher/silver_inspection/__main__.py) | 命令行参数、GUI/批量路由 |
-| [part_segmentation/inference.py](D:/python_programs/LXD_project/point-matcher/part_segmentation/inference.py) | PartSegmenter：加载权重、推理、返回原图尺寸布尔掩膜 |
-| [silver_inspection/continuity.py](D:/python_programs/LXD_project/point-matcher/silver_inspection/continuity.py) | ContinuitySettings、measure_continuity：环带、遮挡、扇区测量 |
-| [silver_inspection/continuity_pipeline.py](D:/python_programs/LXD_project/point-matcher/silver_inspection/continuity_pipeline.py) | evaluate_continuity：汇总判定；SilverContinuityInspector：串联推理 |
-| [silver_inspection/continuity_app.py](D:/python_programs/LXD_project/point-matcher/silver_inspection/continuity_app.py) | 分割预览与断连界面、动态忽略类别图例 |
-| [silver_inspection/continuity_visualization.py](D:/python_programs/LXD_project/point-matcher/silver_inspection/continuity_visualization.py) | 环带、内外框、遮挡及缺失区域绘制 |
-| [silver_inspection/continuity_export.py](D:/python_programs/LXD_project/point-matcher/silver_inspection/continuity_export.py) | 批量图片和 JSON 导出 |
-| [tests/test_silver_continuity.py](D:/python_programs/LXD_project/point-matcher/tests/test_silver_continuity.py)、[tests/test_continuity_legend.py](D:/python_programs/LXD_project/point-matcher/tests/test_continuity_legend.py) | 算法、图例与 wire 忽略回归测试 |
+| [silver_continuity/__main__.py](D:/python_programs/LXD_project/point-matcher/silver_continuity/__main__.py) | 独立命令行入口、GUI/批量路由；共享参数在 common/cli.py |
+| [common/segmentation/inference.py](D:/python_programs/LXD_project/point-matcher/common/segmentation/inference.py) | PartSegmenter：加载权重、推理、返回原图尺寸布尔掩膜 |
+| [silver_continuity/geometry.py](D:/python_programs/LXD_project/point-matcher/silver_continuity/geometry.py) | ContinuitySettings、measure_continuity：环带、遮挡、扇区测量 |
+| [silver_continuity/pipeline.py](D:/python_programs/LXD_project/point-matcher/silver_continuity/pipeline.py) | evaluate_continuity：汇总判定；SilverContinuityInspector：串联推理 |
+| [silver_continuity/app.py](D:/python_programs/LXD_project/point-matcher/silver_continuity/app.py) | 分割预览与断连界面、动态忽略类别图例 |
+| [silver_continuity/visualization.py](D:/python_programs/LXD_project/point-matcher/silver_continuity/visualization.py) | 环带、内外框、遮挡及缺失区域绘制 |
+| [silver_continuity/export.py](D:/python_programs/LXD_project/point-matcher/silver_continuity/export.py) | 批量图片和 JSON 导出 |
+| [tests/silver_continuity/test_continuity.py](D:/python_programs/LXD_project/point-matcher/tests/silver_continuity/test_continuity.py)、[tests/silver_continuity/test_legend.py](D:/python_programs/LXD_project/point-matcher/tests/silver_continuity/test_legend.py) | 算法、图例与 wire 忽略回归测试 |
 
 ## 3. 检测流程
 

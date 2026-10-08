@@ -4,23 +4,16 @@
 
 ## 启动
 
-Windows：双击本目录的 **`start.bat`**。
-
-如果使用 uv，首次启动会在本目录创建独立虚拟环境并安装依赖；已安装时直接运行本地程序。也可以在项目根目录执行：
+在项目根目录、使用者已配置的环境中执行（不自动安装或同步依赖）：
 
 ```powershell
-uv run --project point_matcher python point_matcher/app.py
+uv run --no-sync python -m point_matcher
+# 原模块入口也保留
+uv run --no-sync python -m point_matcher.app
 ```
 
-没有 uv 时，使用 Python 3.10 或更高版本，在本目录执行：
-
-```powershell
-python -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements.txt
-.venv\Scripts\python.exe app.py
-```
-
-依赖只有 NumPy、OpenCV 和 PySide6-Essentials（Qt 桌面界面，不依赖 Tk/Tcl）。无需 GPU。已提供 uv.lock 供 uv 重现依赖。
+界面仅依赖 NumPy、OpenCV 和 PySide6，不加载 YOLO/Torch，不需要 GPU。
+共享算法与控件已迁到 common，本目录不再作为单独复制即可运行的独立工程。
 
 ## 使用步骤
 
@@ -59,14 +52,15 @@ python -m venv .venv
 
 ## 文件与测试
 
-- `app.py`：Qt 界面和后台批处理线程。
-- `core.py`：独立匹配算法、图片读写、坐标导出。
-- `tests/`：算法与界面回归测试，使用合成透视变换和离屏 Qt，不启动可见窗口。
+- [app.py](D:/python_programs/LXD_project/point-matcher/point_matcher/app.py)：本功能 Qt 界面和后台匹配线程。
+- [export.py](D:/python_programs/LXD_project/point-matcher/point_matcher/export.py)：本功能坐标 CSV/JSON 导出。
+- [common/matching.py](D:/python_programs/LXD_project/point-matcher/common/matching.py)：共享配准、坐标变换及结果绘图。
+- [common/image_io.py](D:/python_programs/LXD_project/point-matcher/common/image_io.py)：共享图片读写。
+- [common/widgets/point_view.py](D:/python_programs/LXD_project/point-matcher/common/widgets/point_view.py)：共享选点控件。
 
 在项目根目录执行：
 
 ```powershell
-point_matcher\.venv\Scripts\python.exe -m unittest discover -s point_matcher/tests -v
+uv run --no-sync python -m unittest discover -s tests/common -t . -v
+uv run --no-sync python -m unittest discover -s tests/point_matcher -t . -v
 ```
-
-也可在独立目录中执行 `uv run python -m unittest discover -s tests -v`。

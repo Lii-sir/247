@@ -5,7 +5,7 @@ from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
 
-from part_segmentation.image_io import collect_images, write_image
+from common.image_io import collect_images, write_image
 from .pipeline import SilverInspector
 from .visualization import render_comparison, render_overlay
 

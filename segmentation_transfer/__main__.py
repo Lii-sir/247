@@ -6,21 +6,19 @@ from pathlib import Path
 
 import cv2 as cv
 
-from part_segmentation.models import SegmentationSettings
-from point_matcher.core import MatchSettings
+from common.segmentation.models import SegmentationSettings
+from common.matching import MatchSettings
+from common.paths import PROJECT_ROOT
 
 from .calibration_io import load_calibration
 from .models import MappingSettings
-
-ROOT = Path(__file__).resolve().parent.parent
-
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="双模板对应点标定 → A1 分割 → B1 掩膜映射")
     parser.add_argument("--calibration", type=Path, help="GUI 保存的标定 JSON，路径相对 JSON 所在目录解析")
     parser.add_argument("--image-a", type=Path, help="图片 A1")
     parser.add_argument("--image-b", type=Path, help="图片 B1")
-    parser.add_argument("--weights", type=Path, default=ROOT / "weights/best.pt")
+    parser.add_argument("--weights", type=Path, default=PROJECT_ROOT / "weights/best.pt")
     parser.add_argument("--output", type=Path, help="新建结果目录；设置后无界面运行")
     parser.add_argument("--conf", type=float, default=0.25)
     parser.add_argument("--imgsz", type=int, default=640)

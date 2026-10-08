@@ -7,10 +7,10 @@ from time import perf_counter
 import cv2 as cv
 import numpy as np
 
-from part_segmentation.image_io import read_image
-from part_segmentation.inference import PartSegmenter
-from part_segmentation.models import SegmentationResult, SegmentationSettings
-from point_matcher.core import MatchResult, MatchSettings, TemplateMatcher
+from common.image_io import read_image
+from common.segmentation.inference import PartSegmenter
+from common.segmentation.models import SegmentationResult, SegmentationSettings
+from common.matching import MatchResult, MatchSettings, TemplateMatcher
 from .calibration import Calibration
 from .geometry import Boundary, OverflowMeasurement, OverflowSettings, measure_overflow
 

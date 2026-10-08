@@ -3,7 +3,7 @@
 import cv2 as cv
 import numpy as np
 
-from .continuity_pipeline import ContinuityResult
+from .pipeline import ContinuityResult
 
 
 def render_continuity_overlay(result: ContinuityResult):

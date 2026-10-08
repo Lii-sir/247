@@ -5,8 +5,8 @@ from pathlib import Path
 
 import numpy as np
 
-from part_segmentation.models import SegmentationResult
-from point_matcher.core import MatchResult
+from common.segmentation.models import SegmentationResult
+from common.matching import MatchResult
 
 
 @dataclass(frozen=True)

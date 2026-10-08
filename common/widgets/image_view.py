@@ -1,4 +1,4 @@
-"""仅用于分割预览的图片视图，不导入找点界面。"""
+"""共享的缩放/平移图片视图，不导入任何业务界面。"""
 
 import cv2 as cv
 from PySide6.QtCore import Qt

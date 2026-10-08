@@ -4,7 +4,7 @@ import json
 import os
 from pathlib import Path
 
-from part_segmentation.image_io import read_image
+from common.image_io import read_image
 
 from .geometry import fit_template_mapping
 from .models import Calibration, MappingSettings

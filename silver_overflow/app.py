@@ -10,9 +10,10 @@ from PySide6.QtWidgets import (
     QSplitter, QVBoxLayout, QWidget,
 )
 
-from part_segmentation.image_io import collect_images, read_image, write_image
-from part_segmentation.inference import PartSegmenter
-from point_matcher.app import IMAGE_FILTER, ImageView
+from common.image_io import collect_images, read_image, write_image
+from common.segmentation.inference import PartSegmenter
+from common.image_io import IMAGE_FILTER
+from common.widgets.point_view import PointImageView as ImageView
 from .calibration import Calibration, load_calibration, save_calibration
 from .geometry import Boundary, OverflowSettings
 from .pipeline import SilverInspector

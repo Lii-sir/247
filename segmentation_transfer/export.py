@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from part_segmentation.image_io import write_image
+from common.image_io import write_image
 
 from .calibration_io import calibration_document
 from .models import TransferResult

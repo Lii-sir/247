@@ -6,7 +6,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QPen
 from PySide6.QtWidgets import QGraphicsItem, QGraphicsItemGroup
 
-from part_segmentation.widgets import ImageView
+from common.widgets.image_view import ImageView
 
 
 class PointImageView(ImageView):

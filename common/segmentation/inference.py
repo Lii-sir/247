@@ -3,7 +3,7 @@
 from pathlib import Path
 from time import perf_counter
 
-from .image_io import read_image
+from common.image_io import read_image
 from .models import Segment, SegmentationResult, SegmentationSettings
 
 

@@ -4,10 +4,10 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
-from .image_io import collect_images, write_image
-from .inference import PartSegmenter
-from .models import SegmentationSettings
-from .visualization import render_comparison, render_overlay
+from common.image_io import collect_images, write_image
+from common.segmentation.inference import PartSegmenter
+from common.segmentation.models import SegmentationSettings
+from common.segmentation.visualization import render_comparison, render_overlay
 
 
 def export_batch(weights: Path, source: Path, output: Path, settings: SegmentationSettings,

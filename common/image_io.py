@@ -5,6 +5,8 @@ from pathlib import Path
 import cv2 as cv
 import numpy as np
 
+IMAGE_FILTER = "图片 (*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp);;所有文件 (*)"
+
 IMAGE_SUFFIXES = {".bmp", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".webp"}
 
 

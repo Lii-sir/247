@@ -1,1 +1,1 @@
-"""Independent entry point for silver overflow; shared inference is reused."""
+"""Independent silver overflow algorithm, calibration, UI and batch workflow."""

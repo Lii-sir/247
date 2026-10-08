@@ -13,10 +13,10 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from part_segmentation.image_io import read_image
-from part_segmentation.models import SegmentationSettings
-from part_segmentation.widgets import ImageView
-from point_matcher.core import MatchSettings
+from common.image_io import read_image
+from common.segmentation.models import SegmentationSettings
+from common.widgets.image_view import ImageView
+from common.matching import MatchSettings
 
 from .calibration_io import load_calibration, save_calibration
 from .export import export_result

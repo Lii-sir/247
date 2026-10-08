@@ -23,15 +23,15 @@ uv run --no-sync python main.py --overflow --device 0
 
 | 文件 | 职责 |
 | --- | --- |
-| [silver_overflow/__main__.py](D:/python_programs/LXD_project/point-matcher/silver_overflow/__main__.py)、[silver_inspection/__main__.py](D:/python_programs/LXD_project/point-matcher/silver_inspection/__main__.py) | 独立入口、参数、GUI/批量路由 |
-| [part_segmentation/inference.py](D:/python_programs/LXD_project/point-matcher/part_segmentation/inference.py) | PartSegmenter：银浆分割、CUDA 推理、原图尺寸掩膜 |
-| [point_matcher/core.py](D:/python_programs/LXD_project/point-matcher/point_matcher/core.py) | TemplateMatcher / MatchSettings：SIFT 配准、单应矩阵、边界点映射 |
-| [silver_inspection/calibration.py](D:/python_programs/LXD_project/point-matcher/silver_inspection/calibration.py) | Calibration：模板路径、边界点的保存和加载 |
-| [silver_inspection/geometry.py](D:/python_programs/LXD_project/point-matcher/silver_inspection/geometry.py) | Boundary / OverflowSettings / measure_overflow：距离、容差、面积过滤 |
-| [silver_inspection/pipeline.py](D:/python_programs/LXD_project/point-matcher/silver_inspection/pipeline.py) | SilverInspector 串联检测，evaluate 输出状态 |
-| [silver_inspection/app.py](D:/python_programs/LXD_project/point-matcher/silver_inspection/app.py) | 模板选点、参数和检测界面 |
-| [silver_inspection/visualization.py](D:/python_programs/LXD_project/point-matcher/silver_inspection/visualization.py)、[silver_inspection/export.py](D:/python_programs/LXD_project/point-matcher/silver_inspection/export.py) | 绘图、批量导出 |
-| [tests/test_silver_inspection.py](D:/python_programs/LXD_project/point-matcher/tests/test_silver_inspection.py)、[tests/test_silver_gui.py](D:/python_programs/LXD_project/point-matcher/tests/test_silver_gui.py) | 几何、匹配、导出及界面测试 |
+| [silver_overflow/__main__.py](D:/python_programs/LXD_project/point-matcher/silver_overflow/__main__.py) | 独立入口、参数、GUI/批量路由 |
+| [common/segmentation/inference.py](D:/python_programs/LXD_project/point-matcher/common/segmentation/inference.py) | PartSegmenter：银浆分割、CUDA 推理、原图尺寸掩膜 |
+| [common/matching.py](D:/python_programs/LXD_project/point-matcher/common/matching.py) | TemplateMatcher / MatchSettings：SIFT 配准、单应矩阵、边界点映射 |
+| [silver_overflow/calibration.py](D:/python_programs/LXD_project/point-matcher/silver_overflow/calibration.py) | Calibration：模板路径、边界点的保存和加载 |
+| [silver_overflow/geometry.py](D:/python_programs/LXD_project/point-matcher/silver_overflow/geometry.py) | Boundary / OverflowSettings / measure_overflow：距离、容差、面积过滤 |
+| [silver_overflow/pipeline.py](D:/python_programs/LXD_project/point-matcher/silver_overflow/pipeline.py) | SilverInspector 串联检测，evaluate 输出状态 |
+| [silver_overflow/app.py](D:/python_programs/LXD_project/point-matcher/silver_overflow/app.py) | 模板选点、参数和检测界面 |
+| [silver_overflow/visualization.py](D:/python_programs/LXD_project/point-matcher/silver_overflow/visualization.py)、[silver_overflow/export.py](D:/python_programs/LXD_project/point-matcher/silver_overflow/export.py) | 绘图、批量导出 |
+| [tests/silver_overflow/test_overflow.py](D:/python_programs/LXD_project/point-matcher/tests/silver_overflow/test_overflow.py)、[tests/silver_overflow/test_gui.py](D:/python_programs/LXD_project/point-matcher/tests/silver_overflow/test_gui.py) | 几何、匹配、导出及界面测试 |
 
 ## 3. 检测流程
 

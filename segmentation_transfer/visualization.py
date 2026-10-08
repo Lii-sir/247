@@ -3,9 +3,9 @@
 import cv2 as cv
 import numpy as np
 
-from part_segmentation.models import Segment, SegmentationResult
-from part_segmentation.visualization import render_overlay
-from point_matcher.core import annotate_image
+from common.segmentation.models import Segment, SegmentationResult
+from common.segmentation.visualization import render_overlay
+from common.matching import annotate_image
 
 from .models import TransferResult
 

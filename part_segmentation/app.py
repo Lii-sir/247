@@ -12,11 +12,11 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from .image_io import collect_images, read_image, write_image
-from .inference import PartSegmenter
-from .models import SegmentationSettings
-from .visualization import class_color, render_comparison, render_overlay
-from .widgets import ImageView
+from common.image_io import collect_images, read_image, write_image
+from common.segmentation.inference import PartSegmenter
+from common.segmentation.models import SegmentationSettings
+from common.segmentation.visualization import class_color, render_comparison, render_overlay
+from common.widgets.image_view import ImageView
 
 IMAGE_FILTER = "图片 (*.bmp *.png *.jpg *.jpeg *.tif *.tiff *.webp)"
 

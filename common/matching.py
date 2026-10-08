@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
-import csv
-import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 
 import cv2 as cv
 import numpy as np
 
-IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+from common.image_io import read_image
 
 
 class MatchError(ValueError):
@@ -64,43 +62,6 @@ class MatchResult:
     homography: list[list[float]] | None = None
     template_outline: list[list[float]] = field(default_factory=list)
     image_size: tuple[int, int] | None = None
-
-
-def read_image(path: str | Path) -> np.ndarray:
-    """Read Unicode/Chinese Windows paths without cv.imread's path limitations."""
-    path = Path(path)
-    try:
-        data = np.fromfile(str(path), dtype=np.uint8)
-        image = cv.imdecode(data, cv.IMREAD_COLOR) if data.size else None
-    except (OSError, cv.error) as exc:
-        raise MatchError(f"无法读取图片：{path.name}（{exc}）") from exc
-    if image is None:
-        raise MatchError(f"无法解码图片：{path.name}，文件可能损坏或格式不支持")
-    return image
-
-
-def write_image(path: str | Path, image: np.ndarray) -> None:
-    path = Path(path)
-    suffix = path.suffix.lower() or ".png"
-    ok, buffer = cv.imencode(suffix, image)
-    if not ok:
-        raise OSError(f"无法编码图片：{path.name}")
-    buffer.tofile(str(path))
-
-
-def collect_images(path: str | Path, recursive: bool = False) -> list[Path]:
-    path = Path(path).expanduser().resolve()
-    if path.is_file():
-        if path.suffix.lower() not in IMAGE_SUFFIXES:
-            raise MatchError("请选择 JPG、PNG、BMP、TIFF 或 WebP 图片")
-        return [path]
-    if not path.is_dir():
-        raise MatchError(f"目标路径不存在：{path}")
-    entries = path.rglob("*") if recursive else path.iterdir()
-    return sorted(
-        (p for p in entries if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES),
-        key=lambda p: str(p).casefold(),
-    )
 
 
 def transform_points(points: Sequence, matrix: np.ndarray) -> np.ndarray:
@@ -219,33 +180,3 @@ def annotate_image(image: np.ndarray, result: MatchResult) -> np.ndarray:
         cv.circle(annotated, (x, y), thickness * 5, (0, 225, 255), thickness, cv.LINE_AA)
         cv.putText(annotated, f"P{point.point_id}", (x + thickness * 6, y - thickness * 4), cv.FONT_HERSHEY_SIMPLEX, thickness * 0.35, (0, 225, 255), thickness, cv.LINE_AA)
     return annotated
-
-
-def export_csv(path: str | Path, results: Sequence[MatchResult], template_points: Sequence) -> None:
-    """One row per image/point, retaining failure rows instead of silently dropping them."""
-    with Path(path).open("w", encoding="utf-8-sig", newline="") as stream:
-        writer = csv.writer(stream)
-        writer.writerow(["image", "status", "message", "point_id", "template_x", "template_y", "target_x", "target_y", "inside_image", "good_matches", "inliers", "inlier_ratio", "median_error_px"])
-        for result in results:
-            points = result.points or [MappedPoint(i + 1, x, y, 0, 0, False) for i, (x, y) in enumerate(template_points)]
-            for point in points:
-                writer.writerow([
-                    result.image_path, result.status, result.message, point.point_id,
-                    round(point.template_x, 4), round(point.template_y, 4),
-                    round(point.target_x, 4) if result.points else "",
-                    round(point.target_y, 4) if result.points else "",
-                    point.inside_image if result.points else "", result.good_matches,
-                    result.inliers, round(result.inlier_ratio, 4),
-                    round(result.median_error, 4) if result.median_error is not None else "",
-                ])
-
-
-def export_json(path: str | Path, template_path: str, template_points: Sequence, results: Sequence[MatchResult]) -> None:
-    data = {
-        "schema_version": 1,
-        "coordinate_system": "original image pixels, origin top-left, x right, y down",
-        "template_path": template_path,
-        "template_points": [list(point) for point in template_points],
-        "results": [asdict(result) for result in results],
-    }
-    Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")

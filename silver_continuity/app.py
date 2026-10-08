@@ -10,16 +10,17 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from part_segmentation.image_io import collect_images, read_image, write_image
-from part_segmentation.inference import PartSegmenter
-from part_segmentation.models import SegmentationResult, SegmentationSettings
-from part_segmentation.visualization import render_comparison as render_segmentation_comparison
-from part_segmentation.visualization import render_overlay as render_segmentation_overlay
-from point_matcher.app import IMAGE_FILTER, ImageView
+from common.image_io import collect_images, read_image, write_image
+from common.segmentation.inference import PartSegmenter
+from common.segmentation.models import SegmentationResult, SegmentationSettings
+from common.segmentation.visualization import render_comparison as render_segmentation_comparison
+from common.segmentation.visualization import render_overlay as render_segmentation_overlay
+from common.image_io import IMAGE_FILTER
+from common.widgets.point_view import PointImageView as ImageView
 
-from .continuity import ContinuitySettings
-from .continuity_pipeline import ContinuityResult, evaluate_continuity
-from .continuity_visualization import render_continuity_comparison, render_continuity_overlay
+from .geometry import ContinuitySettings
+from .pipeline import ContinuityResult, evaluate_continuity
+from .visualization import render_continuity_comparison, render_continuity_overlay
 
 
 STATUS = {"ok": "检测合格", "disconnected": "银浆断连", "uncertain": "无法判定"}
@@ -52,7 +53,7 @@ class ContinuityWindow(QMainWindow):
         self.recursive = recursive
         self.paths, self.segmentation, self.result, self.worker, self.engine = [], None, None, None, None
         self._closing = False
-        self.setWindowTitle("银浆检测 · 分割 / 断连 / 溢出")
+        self.setWindowTitle("银浆断连检测 · 分割预览 / 连续性判断")
         self.resize(1420, 900)
         self._build_ui(weights)
         self.load_source(source)
