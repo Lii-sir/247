@@ -31,6 +31,7 @@ class ContinuitySettings:
     min_valid_sector_px: int = 1
     occlusion_dilation_px: int = 0
     min_chip_area_px: int = 100
+    min_visible_sector_ratio: float = 0.1
 
     def __post_init__(self):
         for field_name in ("silver_class", "chip_class"):
@@ -56,6 +57,8 @@ class ContinuitySettings:
             raise ValueError("遮挡膨胀像素必须是非负整数")
         if isinstance(self.min_chip_area_px, bool) or not isinstance(self.min_chip_area_px, int) or self.min_chip_area_px < 1:
             raise ValueError("芯片最小连通域面积必须是正整数")
+        if not np.isfinite(self.min_visible_sector_ratio) or not 0 <= self.min_visible_sector_ratio <= 1:
+            raise ValueError("扇区最小可见比例必须在 0 到 1 之间")
 
 
 @dataclass
@@ -161,9 +164,12 @@ def _measure_chip_component(component, chip_union, silver, occlusion, settings, 
         silver_px = int(silver_sector.sum())
         occluded_px = int(occluded_sector.sum())
         coverage = silver_px / valid_px if valid_px else None
-        if valid_px < settings.min_valid_sector_px:
+        visible_ratio = valid_px / ring_px if ring_px else 0.0
+        mostly_occluded = occluded_px > 0 and visible_ratio < settings.min_visible_sector_ratio
+        if valid_px < settings.min_valid_sector_px or mostly_occluded:
             status = "ignored" if occluded_px else "insufficient"
-            ignored_count += 1
+            if status == "ignored":
+                ignored_count += 1
         else:
             valid_count += 1
             covered = silver_px >= settings.min_sector_silver_px and coverage >= settings.min_sector_coverage
@@ -184,6 +190,7 @@ def _measure_chip_component(component, chip_union, silver, occlusion, settings, 
             "valid_px": valid_px,
             "silver_px": silver_px,
             "occluded_px": occluded_px,
+            "visible_ratio": visible_ratio,
             "coverage": coverage,
             "status": status,
         })

@@ -64,7 +64,7 @@ class ContinuityWindow(QMainWindow):
         title = QLabel("银浆断连检测")
         title.setStyleSheet("font-size: 23px; font-weight: 600; padding: 6px;")
         layout.addWidget(title)
-        info = QLabel("检测逻辑：取 chip 外接矩形向外扩展指定像素形成 360° 环带，按角度分段检查 silver；thin/bond 覆盖区域忽略。")
+        info = QLabel("检测逻辑：取 chip 外接矩形向外扩展指定像素形成 360° 环带，按角度分段检查 silver；按“忽略类别”配置排除遮挡区域。")
         info.setWordWrap(True)
         layout.addWidget(info)
         self.controls = []
@@ -84,7 +84,7 @@ class ContinuityWindow(QMainWindow):
         row.addWidget(self.chip_class)
         row.addWidget(QLabel("忽略类别"))
         self.occlusion_classes = QLineEdit(",".join(self.base_settings.occlusion_classes))
-        self.occlusion_classes.setToolTip("例如 thin,bond；这些类别覆盖的环带像素不参与判定")
+        self.occlusion_classes.setToolTip("例如 thin,bond,wire；这些类别覆盖的环带像素不参与判定")
         self.occlusion_classes.setMaximumWidth(160)
         row.addWidget(self.occlusion_classes)
         layout.addLayout(row)
@@ -111,10 +111,15 @@ class ContinuityWindow(QMainWindow):
         self.occlusion_dilation = QSpinBox()
         self.occlusion_dilation.setRange(0, 20)
         self.occlusion_dilation.setValue(self.base_settings.occlusion_dilation_px)
+        self.min_visible_ratio = QDoubleSpinBox()
+        self.min_visible_ratio.setRange(0, 1)
+        self.min_visible_ratio.setSingleStep(0.05)
+        self.min_visible_ratio.setValue(self.base_settings.min_visible_sector_ratio)
         for label, widget in (("外扩 px", self.outward), ("扇区", self.sectors),
                               ("每扇区最少 silver px", self.min_silver),
                               ("最少覆盖率", self.min_coverage), ("扇区最少有效 px", self.min_valid),
-                              ("遮挡膨胀 px", self.occlusion_dilation)):
+                               ("遮挡膨胀 px", self.occlusion_dilation),
+                               ("遮挡时最少可见比例", self.min_visible_ratio)):
             row.addWidget(QLabel(label))
             row.addWidget(widget)
         layout.addLayout(row)
@@ -155,12 +160,17 @@ class ContinuityWindow(QMainWindow):
         splitter.setSizes([120, 520, 520, 520])
         layout.addWidget(splitter, 1)
 
-        self.details = QLabel("第一步先点击“开始分割”查看 silver/chip/thin/bond 分割效果，再分别执行断连检测。")
+        self.details = QLabel("第一步先点击“开始分割”查看各类别分割效果，再执行断连检测。")
         self.details.setWordWrap(True)
         self.details.setStyleSheet("padding: 8px; font-size: 14px;")
         layout.addWidget(self.details)
         row = QHBoxLayout()
-        row.addWidget(QLabel("紫色：检查环带  ·  绿色：silver  ·  黄色：thin/bond 忽略  ·  红色：断连扇区"), 1)
+        self.legend = QLabel()
+        self.legend.setWordWrap(True)
+        row.addWidget(self.legend, 1)
+        self.update_legend()
+        self.occlusion_classes.textChanged.connect(self.update_legend)
+        self.silver_class.textChanged.connect(self.update_legend)
         self.save_button = self._button(row, "保存对比图…", self.save_result)
         self.save_button.setEnabled(False)
         self._button(row, "适应窗口", self.fit_views)
@@ -169,6 +179,7 @@ class ContinuityWindow(QMainWindow):
         self.controls.extend((self.weights, self.silver_class, self.chip_class, self.occlusion_classes, self.device,
                               self.image_list, self.outward, self.sectors, self.min_silver,
                               self.min_coverage, self.min_valid, self.occlusion_dilation,
+                               self.min_visible_ratio,
                               self.confidence, self.image_size))
         for widget in (self.weights, self.device):
             widget.textChanged.connect(self.invalidate_segmentation)
@@ -179,6 +190,17 @@ class ContinuityWindow(QMainWindow):
         for widget in (self.outward, self.sectors, self.min_silver, self.min_coverage, self.min_valid,
                        self.occlusion_dilation):
             widget.valueChanged.connect(self.invalidate_continuity)
+        self.min_visible_ratio.valueChanged.connect(self.invalidate_continuity)
+
+    def _occlusion_names(self):
+        return tuple(value.strip() for value in self.occlusion_classes.text().replace("，", ",").split(",")
+                     if value.strip())
+
+    def update_legend(self, *_):
+        classes = "/".join(self._occlusion_names())
+        ignored = f"{classes} 忽略" if classes else "未配置忽略类别"
+        self.legend.setText(f"紫色：检查环带  ·  绿色：{self.silver_class.text().strip()}  ·  "
+                            f"黄色：{ignored}  ·  红色：缺失扇区内未遮挡且无 silver 的区域")
 
     def _button(self, row, text, action):
         button = QPushButton(text)
@@ -243,10 +265,11 @@ class ContinuityWindow(QMainWindow):
             self._try(lambda: self.load_source(path))
 
     def settings(self):
-        classes = tuple(value.strip() for value in self.occlusion_classes.text().replace("，", ",").split(",") if value.strip())
+        classes = self._occlusion_names()
         return ContinuitySettings(self.silver_class.text(), self.chip_class.text(), classes,
                                   self.outward.value(), self.sectors.value(), self.min_silver.value(),
-                                  self.min_coverage.value(), self.min_valid.value(), self.occlusion_dilation.value())
+                                  self.min_coverage.value(), self.min_valid.value(), self.occlusion_dilation.value(),
+                                  100, self.min_visible_ratio.value())
 
     def _settings_for_run(self):
         settings = self.settings()
@@ -269,7 +292,7 @@ class ContinuityWindow(QMainWindow):
         self.invalidate_segmentation()
         for widget in self.controls:
             widget.setEnabled(False)
-        self.statusBar().showMessage(f"正在使用 {segmentation.device} 分割 chip、silver、thin/bond…")
+        self.statusBar().showMessage(f"正在使用 {segmentation.device} 执行部件分割…")
         engine = self.engine if self.engine is not None and self.engine.weights == weights else None
         self.worker = SegmentationWorker(weights, self.paths[row], segmentation, engine, self)
         self.worker.result_ready.connect(self.show_segmentation)

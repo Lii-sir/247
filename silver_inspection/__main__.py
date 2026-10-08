@@ -24,6 +24,8 @@ def main(argv=None):
     parser.add_argument("--min-silver-px", type=int, default=3, help="每个扇区判定有银浆所需的最少像素数")
     parser.add_argument("--min-coverage", type=float, default=0.01, help="扇区 silver / 有效环带像素的最低比例")
     parser.add_argument("--min-valid-px", type=int, default=1, help="扇区参与判定所需的最少有效像素数")
+    parser.add_argument("--min-visible-ratio", type=float, default=0.1,
+                        help="扇区被遮挡时，参与判定所需的最小可见比例")
     parser.add_argument("--occlusion-dilation-px", type=int, default=0, help="thin/bond 遮挡掩膜额外膨胀像素")
     parser.add_argument("--calibration", type=Path, help="溢出检测的矩形框标定 JSON")
     parser.add_argument("--tolerance-px", type=float, default=0, help="溢出检测允许越界距离")
@@ -62,7 +64,8 @@ def main(argv=None):
         occlusions = tuple(value.strip() for value in args.occlusion_classes.replace("，", ",").split(",") if value.strip())
         settings = ContinuitySettings(args.silver_class, args.chip_class, occlusions, args.outward_px,
                                       args.sectors, args.min_silver_px, args.min_coverage,
-                                      args.min_valid_px, args.occlusion_dilation_px)
+                                      args.min_valid_px, args.occlusion_dilation_px, 100,
+                                      args.min_visible_ratio)
         segmentation = SegmentationSettings(args.conf, args.iou, args.imgsz, args.device)
         if args.export:
             from .continuity_export import export_continuity_batch

@@ -76,12 +76,28 @@ class ContinuityGeometryTests(unittest.TestCase):
 
     def test_dilation_and_threshold_validation(self):
         for kwargs in ({"outward_length_px": 0}, {"sector_count": 3}, {"min_sector_silver_px": 0},
-                       {"min_sector_coverage": 1.1}, {"occlusion_dilation_px": -1}, {"min_chip_area_px": 0}):
+                       {"min_sector_coverage": 1.1}, {"occlusion_dilation_px": -1},
+                       {"min_chip_area_px": 0}, {"min_visible_sector_ratio": 1.1}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 ContinuitySettings(**kwargs)
         segments, settings = make_segments()
         with self.assertRaises(ValueError):
             measure_continuity(segments, (10, 10, 3), settings)
+
+    def test_mostly_occluded_sector_is_ignored(self):
+        segments, settings = make_segments(occluded_sector=4)
+        settings = ContinuitySettings(
+            outward_length_px=settings.outward_length_px,
+            sector_count=settings.sector_count,
+            min_sector_silver_px=settings.min_sector_silver_px,
+            min_sector_coverage=settings.min_sector_coverage,
+            min_visible_sector_ratio=0.99,
+        )
+        measurement = measure_continuity(segments, (140, 140, 3), settings)
+        sector = next(item for item in measurement.sectors if item["index"] == 4)
+        self.assertEqual(sector["status"], "ignored")
+        self.assertLess(sector["visible_ratio"], 0.99)
+        self.assertFalse(measurement.is_disconnected)
 
 
 class ContinuityPipelineTests(unittest.TestCase):
