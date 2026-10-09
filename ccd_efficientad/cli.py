@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import random
 import sys
 import time
+import warnings
 from collections import namedtuple
 from datetime import datetime
 from pathlib import Path
@@ -929,29 +931,74 @@ def report_duplicate_content(manifest: dict, output_dir: Path) -> Path | None:
     return report_path
 
 
-def prepare_circle_records(manifest: dict, config: dict) -> None:
-    """按类别检测每张图的目标圆，并把结果固化到 manifest。"""
+def prepare_circle_records(manifest: dict, config: dict, *,
+                           splits: tuple[str, ...] = ("train", "val", "threshold_val", "test")) -> None:
+    """固化默认 mask 或全图模式；预检旧快照，避免校准/评估混用检测区域。"""
+    records = [record for split in ("train", "val", "threshold_val", "test")
+               for record in manifest.get(split, [])]
+    active_records = [record for split in splits for record in manifest.get(split, [])]
+    has_saved_masks = any(record.get("circle") for record in active_records)
     circle_path = config.get("circle_config")
-    configs = load_configs(Path(circle_path)) if circle_path else {}
-    params = config.get("circle_params") or category_config(configs, manifest["category"])
-    if not params:
-        raise ValueError("当前模式要求所有图片使用默认 mask，请配置 --circle-config 和 default_mask。")
-    # 将本次训练实际使用的参数写入 checkpoint/config，避免外部 JSON
-    # 后续被修改后，单图预测与校准时的 mask 规则发生漂移。
-    config["circle_params"] = params
+    params = config.get("circle_params")
+
+    def full_image(reason: str, error: str | None = None) -> None:
+        for record in records:
+            record.pop("circle", None)
+        manifest.pop("default_mask_summary", None)
+        config.update(circle_config=None, circle_params=None, mask_mode="none")
+        manifest["mask_mode"] = "none"
+        if error is not None:
+            fallback = {"reason": reason, "error": error}
+            config["mask_fallback"] = fallback
+            manifest["mask_fallback"] = dict(fallback)
+            warnings.warn(
+                f"mask 文件不存在：{error}。训练/评估已切换为无 mask 模式（全图）。"
+                "检测区域改变后，旧阈值与归一化参数可能失效；训练/重新校准会按全图统计，"
+                "沿用 checkpoint 校准的评估需要重新验证效果。", RuntimeWarning, stacklevel=3,
+            )
+
+    if config.get("no_mask"):
+        if circle_path or params or has_saved_masks:
+            warnings.warn(
+                "已指定 --no-mask，训练/评估将使用全图；原 mask 的阈值和归一化参数可能不再适用。",
+                RuntimeWarning, stacklevel=2,
+            )
+        full_image("explicit_no_mask")
+        return
+    if not circle_path and not params and not has_saved_masks:
+        full_image("not_configured")
+        return
+    # 已固化的 circle 记录可以独立复现，不强制重读旧机器的配置 JSON。
+    needs_params = any(not record.get("circle") for record in active_records)
+    if needs_params and not params and circle_path:
+        params = category_config(load_configs(Path(circle_path)), manifest["category"])
+    if needs_params and circle_path and not params:
+        raise ValueError("mask 配置缺少类别/default_mask；请修复配置或显式指定 --no-mask。")
+    if params:
+        config["circle_params"] = params
     count = 0
-    for split in ("train", "val", "threshold_val", "test"):
+    for split in splits:
         for record in manifest.get(split, []):
+            if not record.get("circle") and not params:
+                continue
+            # 原图缺失/损坏必须报错，不能被当成 mask 缺失处理。
             image = read_rgb(Path(record["path"]))
             try:
-                record["circle"] = default_mask_record(
-                    image, params, base_dir=Path(circle_path).parent if circle_path else None
-                )
-            except ValueError as exc:
+                circle = record.get("circle") or default_mask_record(
+                    image, params, base_dir=Path(circle_path).parent if circle_path else None)
+                mask = mask_from_circle_record(image.shape[:2], circle)
+                if (mask != 0).all():
+                    raise ValueError("mask 遮住了全部像素，没有有效检测区域。")
+                record["circle"] = circle
+            except FileNotFoundError as exc:
+                full_image("mask_file_not_found", str(exc))
+                return
+            except (ValueError, OSError) as exc:
                 raise ValueError(f"默认 mask 配置/读取失败（{split}）：{record['path']}；{exc}") from exc
             count += 1
     if count:
         manifest["default_mask_summary"] = {"count": count}
+        config["mask_mode"] = manifest["mask_mode"] = "mask"
         print(f"默认 mask 已应用：{count} 张；当前不执行圆检测。")
 
 
@@ -969,7 +1016,7 @@ def train_one(args, category: str) -> None:
         previous = read_checkpoint(args.resume)
         if "optimizer_state" not in previous:
             raise ValueError("续训请使用 checkpoints/last.pt；model.pt 是推理用文件。")
-        config, manifest = previous["config"].copy(), previous["manifest"]
+        config, manifest = previous["config"].copy(), copy.deepcopy(previous["manifest"])
         saved_backbone = config.get("backbone") or f"pdn_{config.get('model_size', 'small')}"
         requested_backbone = args.backbone
         if args.model_size is not None:
@@ -1073,7 +1120,9 @@ def train_one(args, category: str) -> None:
         }
         configure_training_world(config, devices, resume=False)
         apply_localization_config(config, args)
-        prepare_circle_records(manifest, config)
+    if getattr(args, "no_mask", False):
+        config["no_mask"] = True
+    prepare_circle_records(manifest, config)
     seed_everything(config["seed"])
     write_json(output / "manifest.json", manifest)
     write_json(output / "config.json", config)
@@ -1217,6 +1266,8 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--num-workers", type=int, default=0, help="Windows 首次建议用 0")
             add_localization_arguments(command)
         if name in ("train", "evaluate"):
+            command.add_argument("--no-mask", action="store_true",
+                                 help="显式禁用配置/快照中的 mask，训练/校准/评估均使用全图")
             command.add_argument(
                 "--heatmaps", type=int, default=32,
                 help=("每种 score 的热图数量（三种方式分别保存）；0 不保存，-1 保存全部"
@@ -1374,7 +1425,7 @@ def main() -> None:
             train_one(args, category)
     elif args.command == "evaluate":
         model, config, saved = restore_for_inference(args)
-        manifest = json.loads(args.manifest.read_text(encoding="utf-8")) if args.manifest else saved["manifest"]
+        manifest = json.loads(args.manifest.read_text(encoding="utf-8")) if args.manifest else copy.deepcopy(saved["manifest"])
         if manifest["category"] != saved["manifest"]["category"]:
             raise ValueError("评估快照的 CCD 类别与 checkpoint 不一致。")
         saved_config = saved.get("config", {})
@@ -1427,13 +1478,10 @@ def main() -> None:
                 "评估快照未包含 threshold_val：已从 test 分层划出 "
                 f"{len(threshold_val)} 张；当前评估仅使用剩余 {len(test)} 张最终测试图。"
             )
-        scored_records = [
-            record
-            for split in ("val", "threshold_val", "test")
-            for record in manifest.get(split, [])
-        ]
-        if saved_config.get("circle_config") and any("circle" not in record for record in scored_records):
-            prepare_circle_records(manifest, saved_config)
+        if args.no_mask:
+            config["no_mask"] = True
+        prepare_circle_records(manifest, config,
+                               splits=("val", "threshold_val", "test") if explicit_score_mode else ("test",))
         if explicit_score_mode:
             threshold_labels = {int(record.get("label", 0)) for record in manifest.get("threshold_val", [])}
             if threshold_labels != {0, 1}:

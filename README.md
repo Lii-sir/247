@@ -102,6 +102,21 @@ uv run python run.py train --category CCD1 --max-steps 10000 --image-size 512
 
 训练默认使用 **batch size=1**、Adam、初始学习率 `1e-4`、权重衰减 `1e-5`；在总步数 95% 处将学习率乘以 0.1。输入只转 RGB、缩放和映射到 `[0,1]`，不能在外部再做 ImageNet Normalize。默认 backbone 是 `pdn_small`，也支持 `pdn_medium`、`resnet18_layer2`、`resnet18_layer3`、`resnet50_layer1`、`resnet50_layer1v2`、`resnet50_layer2` 和 `resnet50_layer3`。PDN 使用对应的预训练教师权重；ResNet 默认使用 torchvision 的 ImageNet 预训练主干（ResNet-18 V1、ResNet-50 V2），第一次运行会下载对应权重。
 
+### 无 mask 训练与评估
+
+新训练不指定 `--circle-config` 时直接使用全图，不要求提供 mask。训练、续训和评估可显式添加 `--no-mask`，清除配置及快照中的 mask，所有参与训练/校准/评估的图片均按全图处理：
+
+```powershell
+uv run python run.py train --category CCD1 --max-steps 10000 --no-mask
+uv run python run.py evaluate --checkpoint "D:\models\CCD1\model.pt" --no-mask
+# 用全图重新校准所选 score 公式及阈值，保存新的模型，不覆盖原模型。
+uv run python run.py evaluate --checkpoint "D:\models\CCD1\model.pt" --no-mask --score-mode "pool+top" --score-pool-kernel 7
+```
+
+已配置或快照中保存的 **mask 图片缺失** 时，先警告，再清除本次所有 mask 记录并使用全图；配置 JSON 缺失（且需要读取）、原图缺失、mask 损坏或全白等无效情况仍报错，除非明确用 `--no-mask` 忽略 mask 配置。实际模式记录在 `config.json` / `manifest.json` 的 `mask_mode`，缺失回退还记录 `mask_fallback`。
+
+训练会在全图上重新统计异常图、score 和阈值。`evaluate` 默认 `checkpoint` 模式仍沿用已保存的校准，换成全图可能使旧阈值或尺度基准失效；如需匹配新区域，应显式选择 `--score-mode` 重新校准，不能将全图评估误认为原区域校准效果的复现。多卡在创建 worker 前统一处理 mask，不给不同 rank 混用不同区域。运行过程中不得删除/修改仍在使用的资源文件。
+
 可以用同一份数据快照比较不同 backbone：
 
 ```powershell

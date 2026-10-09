@@ -28,6 +28,8 @@ def main() -> None:
     parser.add_argument("--ddp-test-device", choices=("cpu", "cuda:0"),
                         help="测试专用：在同一设备启动两个真实 DDP 进程，不代表两张物理卡的性能")
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--mask-mode", choices=("configured", "none", "missing"), default="configured",
+                        help="验证正常 mask、不配置 mask 或缺失 mask 的完整训练/评估链路")
     parser.add_argument("--score-pool-kernel", type=int,
                         help="同时检查训练后 pool+top 与旧版单尺度参数的传递")
     parser.add_argument("--batch-size", type=int, choices=(1, 2), default=2,
@@ -74,6 +76,8 @@ def main() -> None:
         circle_config.write_text(json.dumps({
             "CCD1": {"default_mask": str(default_mask)},
         }), encoding="utf-8")
+        if args.mask_mode == "missing":
+            default_mask.unlink()
         output = root / "outputs"
         entry = [sys.executable, str(PROJECT_DIR / "run.py")]
         environment = os.environ.copy()
@@ -91,7 +95,8 @@ def main() -> None:
             "--num-workers", str(args.num_workers),
             "--min-age-seconds", "0",
             "--teacher-weights", str(teacher_path), "--imagenette-dir", str(auxiliary.parent),
-            "--circle-config", str(circle_config), "--output-dir", str(output),
+            *(["--circle-config", str(circle_config)] if args.mask_mode != "none" else []),
+            "--output-dir", str(output),
             "--save-every", "1", "--heatmaps", "1",
             *(["--score-pool-kernel", str(args.score_pool_kernel)]
               if args.score_pool_kernel is not None else []))
@@ -99,6 +104,14 @@ def main() -> None:
         run_dir = model_path.parent
         assert json.loads((run_dir / "config.json").read_text(encoding="utf-8"))["backbone"] == args.backbone
         training_config = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+        if args.mask_mode != "configured":
+            assert training_config["mask_mode"] == "none"
+            assert training_config["circle_config"] is None
+            saved_manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            assert all("circle" not in record for split in ("train", "val", "threshold_val", "test")
+                       for record in saved_manifest[split])
+            if args.mask_mode == "missing":
+                assert training_config["mask_fallback"]["reason"] == "mask_file_not_found"
         assert training_config["world_size"] == (2 if args.ddp_test_device else 1)
         assert training_config["global_batch_size"] == global_batch_size
         assert training_config["max_steps"] == 2
