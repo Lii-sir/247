@@ -69,7 +69,7 @@ uv run python .\run.py infer `
 - `auto`：CUDA 可用时选第一张可见 GPU，否则 CPU。
 - `cpu`：明确使用 CPU。
 - `cuda` 或 `0`：第一张可见 GPU；`1` 表示第二张。一次只支持一个设备，编号受 `CUDA_VISIBLE_DEVICES` 影响。
-- 不需要再指定 `--backbone` / `--image-size`；score 默认从权重恢复，也可按下文显式选择。
+- 不需要再指定 `--backbone` / `--image-size`；`infer` 默认使用 `pool+top`、池化核 7，也可按下文显式选择其他公式。
 - 不要把热图拼图作为输入，应输入拍摄的原始图像。
 
 ### 手动指定 threshold
@@ -80,7 +80,7 @@ uv run python .\run.py infer `
 uv run python .\run.py infer --checkpoint $checkpoint --image $image --threshold 0.5
 ```
 
-- 不指定时，沿用 checkpoint 中保存的阈值；指定后仅覆盖本次推理，不修改原 `model.pt`，也不重新校准。
+- 不指定时，仅在实际 score 公式与池化参数匹配 checkpoint 时沿用保存的阈值；默认 `pool+top`、核 7 若与模型不匹配，须指定新阈值，或添加 `--score-mode checkpoint` 完整复现模型。指定阈值后仅覆盖本次推理，不修改原 `model.pt`，也不重新校准。
 - 阈值必须是有限数值，拒绝 NaN/Inf；score 不是概率，因此允许负数、0 和大于 1 的阈值。
 - OK/NG 判定、定位框、二值异常 mask、热图以及 JSON/CSV 都使用覆盖后的阈值；score 公式与归一化参数不变。
 - `score > threshold` 为 NG，否则 OK。增大阈值会减少 NG，降低阈值会增加 NG；手动调整后不再保证原校准时的目标召回率。
@@ -92,9 +92,9 @@ uv run python .\run.py infer --checkpoint $checkpoint --image $image --threshold
 
 | 参数值 | 计算方式 |
 |---|---|
-| `checkpoint`（默认） | 完整沿用模型保存的 score 公式及参数 |
+| `checkpoint` | 完整沿用模型保存的 score 公式及参数 |
 | `top` | mask 后最大单像素异常值 |
-| `pool+top` / `pool_topk` | mask-aware 单尺度平均池化后 Top-K 均值 |
+| `pool+top` / `pool_topk`（CLI 默认） | mask-aware 单尺度平均池化后 Top-K 均值，默认核 7 |
 | `multiscale_pool` | 使用模型保存的正常集基准进行多尺度归一化融合 |
 
 ```powershell
@@ -103,12 +103,12 @@ uv run python .\run.py infer --checkpoint $checkpoint --image $image --score-mod
 
 # 单尺度池化 + Top-K，可选调整正奇数池化核和 (0, 1] 的 Top-K 比例。
 uv run python .\run.py infer --checkpoint $checkpoint --image $image `
-  --score-mode "pool+top" --score-pool-kernel 21 --score-topk-ratio 0.001 --threshold 0.5
+  --score-mode "pool+top" --score-pool-kernel 7 --score-topk-ratio 0.001 --threshold 0.5
 ```
 
 - **实际改变 score 公式或池化参数时，必须同时指定 `--threshold`**，否则在生成结果前报错。不自动沿用不同公式的旧阈值，也不使用待测图片重新校准。
 - 显式选择与 checkpoint 相同的公式且未改变参数时，可以继续使用保存的阈值。
-- `pool+top` 已是模型保存的模式时，保留其池化核和比例；从其他模式切换时按模型 config 取值，缺省为核 21、比例 0.001。可用上述两个参数覆盖；它们仅允许与显式的 `pool+top` 一起使用。
+- CLI 选择 `pool+top` 时，未指定 `--score-pool-kernel` 统一使用 7，不随模型原池化核改变。Top-K 比例保留模型对应的单尺度设置，跨模式时读取模型 config，缺省为 0.001。可用上述两个参数覆盖；池化参数仅允许与 `pool+top` 使用（可以省略默认的 `--score-mode`）。显式选择 `checkpoint`、`top` 或 `multiscale_pool` 时不会注入默认池化核。
 - `multiscale_pool` 必须已有 checkpoint 保存的尺度列表、Top-K 比例及归一化参数；不能从缺少这些参数的 top/pool 模型凭空切换。缺失时需先用 `evaluate --score-mode multiscale_pool` 生成对应的 `model.pt`。推理不更改多尺度尺度列表或比例，以免归一化基准失配。
 - score、OK/NG、定位、热图和结果文件统一使用所选公式与实际阈值；模型网络、异常图校准统计和原 `model.pt` 不变。JSON 的 `score_method` 记录实际计算参数。
 - 此操作不做效果校准，不保证原目标召回率；需要自动选择匹配阈值时仍使用 `evaluate --score-mode ...`。
@@ -149,7 +149,7 @@ uv run python .\run.py infer `
 - mask 原尺寸不同时先按原图最近邻缩放，再缩放到模型输入大小。
 - mask 不会将网络输入图像涂白或置零；只用于异常响应的后处理。
 
-默认复现 checkpoint 中的 `circle_config` / `circle_params`。嵌入的 `circle_params` 可避免再次读取原配置 JSON，但其 `default_mask` PNG 仍须存在。当前流程始终使用配置的默认 mask，不在推理期间重新找圆。
+默认复现 checkpoint 中的 `circle_config` / `circle_params`。嵌入的 `circle_params` 可避免再次读取原配置 JSON。配置的 mask 图片存在时使用该 mask，不在推理期间重新找圆；mask 图片不存在时发出警告，并切换为无 mask 的全图检测。
 
 从 Linux 搬到 Windows 时，权重里的 `/media/.../mask.png` 通常不可用。此时显式指定**与训练等效**的本机 mask：
 
@@ -180,7 +180,9 @@ JSON 按 checkpoint 类别读取，例如：
 }
 ```
 
-这里的相对路径以 JSON 所在目录为基准。`--mask` 和 `--circle-config` 互斥，显式覆盖会给出警告。默认 mask 不可用时**不会静默退化为无 mask**。
+这里的相对路径以 JSON 所在目录为基准。`--mask` 和 `--circle-config` 互斥，显式覆盖会给出警告。**显式指定或模型配置的 mask 图片不存在时，会先警告，再切换为无 mask 模式，后续图片也按全图检测；同一实例只告警一次。** 模型权重、待测原图或配置 JSON 缺失仍报错；损坏 mask、权限错误、路径不是文件、全白 mask 或配置无效也不会自动跳过。
+
+回退结果在单图 `prediction.json` 和 `summary.json` 中记录 `mask_source="missing_mask_fallback"` 与 `mask_fallback`（原来源、错误原因）。当前 threshold 和 score 定义不自动改变或重新校准，但全图检测可能改变分数分布，使原阈值和归一化参数失效；生产使用应重新验证或校准。仍建议交付与训练一致的 mask。
 
 使用 **738×1144 全黑 mask**（检测全图；先将实际文件放到 `configs/masks/`）：
 
@@ -255,6 +257,8 @@ score 不是一律 `prediction.pred_score`：后者只是异常图最大值，�
 
 在项目环境和可导入项目模块的路径中运行：
 
+Python API 的默认值保持兼容：`score_mode="checkpoint"`，不传池化核时按原保存定义处理。上述 `pool+top`、核 7 是 CLI `infer` 的默认值；API 需要相同行为时显式传 `score_mode="pool+top", score_pool_kernel=7`，并按需指定匹配的 threshold。
+
 ```python
 from ccd_efficientad.inference import EfficientAdPredictor
 
@@ -296,11 +300,12 @@ uv run python -m unittest tests.test_infer_efficientad -v
 | 找不到权重                    | 替换示例路径，确认文件存在                                     |
 | 尚未校准                      | 使用训练结束或重新校准后的`model.pt`，不是续训 `last.pt`   |
 | 格式不匹配、参数键/形状不匹配 | 确认来自本项目；不能用教师单独权重或 Lightning`.ckpt` 代替   |
-| 找不到配置/mask               | 保留等效 mask，使用`--mask` 或 `--circle-config` 重定位    |
+| mask 图片不存在               | 告警后全图检测，结果记录 mask_fallback；建议重定位等效 mask 并检查阈值有效性 |
+| 找不到配置 JSON               | 仍报错；提供有效`--circle-config`，或直接用`--mask` 指定图片 |
 | mask 遮住全部像素             | 黑色是检测区，白色是忽略区，检查是否反了                       |
 | CUDA 不可用                   | 用`--device cpu`，或检查锁定环境中的 GPU 支持                |
 | 异常图分位数/教师标准差退化   | 检查训练/校准统计，不要绕过验证或随意填阈值                    |
 | 分数与历史报告不同            | 确认权重、原始图片、mask 和 score 模式一致；不要重复 Normalize |
 | 全黑 mask 后误报增多          | 检查是否扩大了原先忽略区，必要时重新校准                       |
 
-完整部署需保留上述项目模块和依赖；只有权重中的旧训练图片路径可以不迁移，mask 文件不能遗漏。
+完整部署需保留上述项目模块和依赖；权重中的旧训练图片路径可以不迁移。mask 图片缺失时虽可回退全图检测，但为了复现原检测区域和校准效果，仍应交付等效 mask。

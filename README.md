@@ -274,7 +274,7 @@ outputs/CCD1/<运行时间>/
 ## 6. 重跑评估、预测和续训
 
 需要独立的“加载权重 → 单图/文件夹推理”入口时，使用 `run.py infer`。
-它默认沿用 checkpoint 的预处理、score 和阈值，支持 `--threshold`、`--score-mode`、显式指定本机 mask，以及 JSON/CSV、异常数组和热图输出。改变 score 公式/池化参数时必须指定新阈值；多尺度归一化基准仍需由模型保存。
+它沿用 checkpoint 的预处理，CLI 默认 score 为 `pool+top`、池化核 7，支持 `--threshold`、`--score-mode`、显式指定本机 mask，以及 JSON/CSV、异常数组和热图输出。默认参数与模型不匹配或手动改变公式/池化参数时须指定新阈值；添加 `--score-mode checkpoint` 可完整复现保存的 score 和阈值。多尺度归一化基准仍需由模型保存。
 详细命令、mask 黑白含义、跨机器路径迁移和 Python API 见 [推理说明](docs/inference.md)。
 
 以下命令中的 `<运行时间>` 必须替换为实际目录名。

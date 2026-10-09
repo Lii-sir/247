@@ -17,6 +17,8 @@ from .mask import category_config, default_mask_record, load_configs, read_rgb
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+DEFAULT_SCORE_MODE = cli.SCORE_MODE_POOL_TOPK
+DEFAULT_POOL_KERNEL = 7
 
 
 def _finite_threshold(value: float | str) -> float:
@@ -94,6 +96,7 @@ class EfficientAdPredictor:
             raise ValueError("checkpoint 的 image_size 必须为正整数。")
         cli.check_statistics(self.model.model.mean_std)
         cli.check_statistics(self.model.model.quantiles, quantiles=True)
+        self.mask_fallback: dict | None = None
         self.mask_params, self.mask_base_dir, self.mask_source = self._mask_settings(mask, circle_config)
 
     def _score_settings(self, requested: str, threshold: float | None,
@@ -165,12 +168,25 @@ class EfficientAdPredictor:
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError("checkpoint 的 multiscale_pool 归一化参数缺失或无效；请重新校准。") from error
 
+    def _disable_missing_mask(self, error: FileNotFoundError, source: str) -> tuple[None, None, str]:
+        """缺少图片时告警并在本实例后续推理中使用全图，记录原因便于追溯。"""
+        self.mask_fallback = {"reason": "mask_file_not_found", "original_source": source, "error": str(error)}
+        warnings.warn(
+            f"mask 文件不存在：{error}。已切换为无 mask 模式（全图检测）。"
+            "检测区域可能与训练/校准不同，原阈值和归一化参数可能不再适用，请重新验证或校准。",
+            RuntimeWarning, stacklevel=3,
+        )
+        self.mask_params, self.mask_base_dir, self.mask_source = None, None, "missing_mask_fallback"
+        return None, None, self.mask_source
+
     def _mask_settings(self, mask, circle_config) -> tuple[dict | None, Path | None, str]:
-        """默认复现训练 mask；迁移机器时可显式重定位，不静默取消忽略区域。"""
+        """默认复现训练 mask；缺少 mask 图片时告警并改为无 mask。"""
         if mask is not None:
             path = Path(mask).resolve()
+            if not path.exists():
+                return self._disable_missing_mask(FileNotFoundError(f"找不到 mask：{path}"), "explicit_mask")
             if not path.is_file():
-                raise FileNotFoundError(f"找不到 mask：{path}")
+                raise ValueError(f"mask 路径不是文件：{path}")
             settings = ({"default_mask": str(path)}, path.parent, "explicit_mask")
         elif circle_config is not None:
             path = Path(circle_config).resolve()
@@ -200,10 +216,12 @@ class EfficientAdPredictor:
         if self.mask_params is not None:
             try:
                 record["circle"] = default_mask_record(rgb, self.mask_params, base_dir=self.mask_base_dir)
-            except (ValueError, FileNotFoundError, OSError) as error:
+            except FileNotFoundError as error:
+                self._disable_missing_mask(error, self.mask_source)
+            except (ValueError, OSError) as error:
                 raise ValueError(
                     f"无法使用训练/指定 mask：{error}。请用 --mask 或 --circle-config 指定本机路径；"
-                    "不会自动改为无 mask 推理。"
+                    "仅缺少 mask 文件时会改为无 mask；损坏或无效 mask 不会自动跳过。"
                 ) from error
         # 与原 predict 命令完全一致：EXIF -> RGB -> BILINEAR 方形缩放 -> [0,1]。
         batch = cli.collate_batch([cli.SnapshotDataset([record], self.config["image_size"])[0]])
@@ -243,6 +261,7 @@ class EfficientAdPredictor:
             "score_method": self.calibration.get("score_method") or {"name": cli.TOP_SCORE_METHOD},
             "prediction": "NG" if scores["score"] > self.threshold else "OK",
             "decision_rule": "score > threshold", "mask_source": self.mask_source,
+            "mask_fallback": self.mask_fallback,
             "image_size_original": {"width": width, "height": height},
             "anomaly_map_shape": [map_h, map_w], "boxes_original": boxes_original,
             "localization": cli.localization_summary(localization),
@@ -281,14 +300,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="本次推理使用的有限数值阈值；默认沿用 checkpoint，不修改权重；score > threshold 为 NG",
     )
     parser.add_argument(
-        "--score-mode", type=cli.parse_evaluation_score_mode, default=cli.SCORE_MODE_CHECKPOINT,
-        help="checkpoint=沿用模型（默认）；top=最大单像素；pool+top=池化 Top-K；multiscale_pool=保存的多尺度归一化",
+        "--score-mode", type=cli.parse_evaluation_score_mode, default=DEFAULT_SCORE_MODE,
+        help="pool+top=池化 Top-K（默认，核 7）；checkpoint=沿用模型；top=最大单像素；multiscale_pool=保存的多尺度归一化",
     )
-    parser.add_argument("--score-pool-kernel", type=int, help="pool+top 的池化核，正奇数；默认沿用模型设置或 21")
+    parser.add_argument("--score-pool-kernel", type=int, help="pool+top 的池化核，正奇数；默认 7，仅在 pool+top 模式生效")
     parser.add_argument("--score-topk-ratio", type=float, help="pool+top 的 Top-K 比例，(0, 1]；默认沿用模型设置或 0.001")
     parser.add_argument("--output-dir", type=Path, default=cli.PROJECT_DIR / "outputs" / "inference")
     masks = parser.add_mutually_exclusive_group()
-    masks.add_argument("--mask", type=Path, help="显式指定 ignore mask：非零忽略，0 保留；默认沿用训练设置")
+    masks.add_argument("--mask", type=Path, help="显式指定 ignore mask：非零忽略，0 保留；默认沿用训练设置；文件缺失时警告并全图检测")
     masks.add_argument("--circle-config", type=Path, help="本机 mask 配置 JSON，按 checkpoint 类别读取")
     parser.add_argument("--no-heatmaps", action="store_true", help="不生成可视化 PNG")
     parser.add_argument("--no-maps", action="store_true", help="不保存异常数组及二值 mask")
@@ -304,10 +323,14 @@ def main(argv: list[str] | None = None) -> Path:
         if not args.image.is_file():
             raise FileNotFoundError(f"图片不存在：{args.image}")
         images, input_root = [args.image.resolve()], None
+    # 仅为 pool+top 补默认核，不干扰显式 checkpoint/top/multiscale 模式。
+    pool_kernel = args.score_pool_kernel
+    if args.score_mode == cli.SCORE_MODE_POOL_TOPK and pool_kernel is None:
+        pool_kernel = DEFAULT_POOL_KERNEL
     predictor = EfficientAdPredictor(
         args.checkpoint, args.device, mask=args.mask, circle_config=args.circle_config,
         threshold=args.threshold,
-        score_mode=args.score_mode, score_pool_kernel=args.score_pool_kernel,
+        score_mode=args.score_mode, score_pool_kernel=pool_kernel,
         score_topk_ratio=args.score_topk_ratio,
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -333,6 +356,7 @@ def main(argv: list[str] | None = None) -> Path:
         "threshold": predictor.threshold, "decision_rule": "score > threshold",
         "score_method": predictor.calibration.get("score_method") or {"name": cli.TOP_SCORE_METHOD},
         "mask_source": predictor.mask_source, "mask_params": predictor.mask_params,
+        "mask_fallback": predictor.mask_fallback,
         "input_directory": str(input_root) if input_root is not None else None,
         "image_count": len(rows), "ok_count": sum(row["prediction"] == "OK" for row in rows),
         "ng_count": sum(row["prediction"] == "NG" for row in rows),

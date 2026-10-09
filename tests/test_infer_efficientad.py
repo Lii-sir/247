@@ -28,7 +28,7 @@ class InputTests(unittest.TestCase):
         self.assertEqual(args.device, "auto")
         self.assertIsNone(args.mask)
         self.assertIsNone(args.threshold)
-        self.assertEqual(args.score_mode, "checkpoint")
+        self.assertEqual(args.score_mode, "pool_topk")
         self.assertIsNone(args.score_pool_kernel)
         self.assertIsNone(args.score_topk_ratio)
         with patch("sys.stderr"), self.assertRaises(SystemExit):
@@ -417,13 +417,22 @@ class OfflineInferenceTests(unittest.TestCase):
         predictor = inference.EfficientAdPredictor(checkpoint, "cpu")
         self.assertEqual(predictor.predict(self.image)["mask_source"], "checkpoint")
 
-    def test_missing_training_mask_is_not_silently_disabled_and_can_be_relocated(self):
+    def test_missing_training_mask_warns_and_falls_back_and_can_be_relocated(self):
         config = {**self.config, "circle_config": str(self.root / "missing-config.json"),
                   "circle_params": {"default_mask": "missing-mask.png"}}
         checkpoint = self.save_checkpoint("missing-mask.pt", config=config, calibration=self.calibration)
         predictor = inference.EfficientAdPredictor(checkpoint, "cpu")
-        with self.assertRaisesRegex(ValueError, "不会自动改为无 mask"):
+        with self.assertWarnsRegex(RuntimeWarning, "已切换为无 mask"):
+            result = predictor.predict(self.image)
+        self.assertEqual(result["mask_source"], "missing_mask_fallback")
+        self.assertEqual(result["mask_fallback"]["original_source"], "checkpoint")
+        self.assertIn("missing-mask.png", result["mask_fallback"]["error"])
+        self.assertEqual(result["score"], self.predictor.predict(self.image)["score"])
+        self.assertIsNone(predictor.mask_params)
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always", RuntimeWarning)
             predictor.predict(self.image)
+        self.assertFalse(captured)
         black = self.root / "relocated-mask.png"
         Image.new("L", (10, 10), 0).save(black)
         config_path = self.root / "local-mask.json"
@@ -432,6 +441,83 @@ class OfflineInferenceTests(unittest.TestCase):
             warnings.simplefilter("ignore", RuntimeWarning)
             relocated = inference.EfficientAdPredictor(checkpoint, "cpu", circle_config=config_path)
         self.assertEqual(relocated.predict(self.image)["mask_source"], "explicit_config")
+
+    def test_missing_explicit_mask_warns_and_uses_full_image(self):
+        missing = self.root / "missing-explicit-mask.png"
+        with self.assertWarnsRegex(RuntimeWarning, "mask 文件不存在"):
+            predictor = inference.EfficientAdPredictor(self.checkpoint, "cpu", mask=missing)
+        result = predictor.predict(self.image)
+        self.assertEqual(result["mask_source"], "missing_mask_fallback")
+        self.assertEqual(result["mask_fallback"]["original_source"], "explicit_mask")
+        self.assertEqual(result["score"], self.predictor.predict(self.image)["score"])
+        batch, _ = predictor._prepare_batch(self.image)
+        self.assertFalse(batch.ignore_mask.any())
+
+    def test_config_relative_missing_mask_warns_and_falls_back(self):
+        config = self.root / "missing-mask-config.json"
+        config.write_text(json.dumps({"CCD1": {"default_mask": "missing-relative-mask.png"}}), encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            predictor = inference.EfficientAdPredictor(self.checkpoint, "cpu", circle_config=config)
+        with self.assertWarnsRegex(RuntimeWarning, "无 mask"):
+            result = predictor.predict(self.image)
+        self.assertEqual(result["mask_fallback"]["original_source"], "explicit_config")
+        self.assertIn("missing-relative-mask.png", result["mask_fallback"]["error"])
+        self.assertEqual(result["score"], self.predictor.predict(self.image)["score"])
+
+    def test_existing_mask_removed_before_prediction_falls_back(self):
+        mask = self.root / "removed-mask.png"
+        Image.new("L", (32, 32), 0).save(mask)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            predictor = inference.EfficientAdPredictor(self.checkpoint, "cpu", mask=mask)
+        mask.unlink()
+        with self.assertWarnsRegex(RuntimeWarning, "无 mask"):
+            result = predictor.predict(self.image)
+        self.assertEqual(result["mask_source"], "missing_mask_fallback")
+
+    def test_corrupt_mask_missing_config_and_missing_image_are_not_skipped(self):
+        mask = self.root / "corrupt-mask.png"
+        mask.write_bytes(b"not an image")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            predictor = inference.EfficientAdPredictor(self.checkpoint, "cpu", mask=mask)
+        with self.assertRaisesRegex(ValueError, "损坏或无效 mask"):
+            predictor.predict(self.image)
+        self.assertIsNone(predictor.mask_fallback)
+        with self.assertRaises(FileNotFoundError):
+            inference.EfficientAdPredictor(self.checkpoint, "cpu", circle_config=self.root / "no-config.json")
+        with self.assertRaises(FileNotFoundError):
+            predictor.predict(self.root / "no-image.png")
+        with self.assertRaisesRegex(ValueError, "不是文件"):
+            inference.EfficientAdPredictor(self.checkpoint, "cpu", mask=self.root)
+
+    def test_missing_mask_cli_records_fallback_and_saves_zero_ignore_mask(self):
+        inputs = self.root / "missing-mask-batch"
+        inputs.mkdir()
+        for name in ("one.png", "two.bmp"):
+            with Image.open(self.image) as image:
+                image.save(inputs / name)
+        config = self.root / "batch-missing-mask-config.json"
+        config.write_text(json.dumps({"CCD1": {"default_mask": "absent.png"}}), encoding="utf-8")
+        with patch("sys.stdout"), warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always", RuntimeWarning)
+            output = inference.main(["--checkpoint", str(self.checkpoint), "--image-dir", str(inputs),
+                                     "--device", "cpu", "--threshold", "1000000", "--circle-config", str(config),
+                                     "--output-dir", str(self.root / "missing-mask-output"), "--no-heatmaps"])
+        fallback_warnings = [item for item in captured if "已切换为无 mask" in str(item.message)]
+        self.assertEqual(len(fallback_warnings), 1)
+        summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["mask_source"], "missing_mask_fallback")
+        self.assertIsNone(summary["mask_params"])
+        self.assertEqual(summary["image_count"], 2)
+        self.assertEqual(summary["threshold"], 1000000)
+        for name in ("one.png", "two.bmp"):
+            result = json.loads((output / "images" / name / "prediction.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["mask_fallback"], summary["mask_fallback"])
+            self.assertEqual(result["mask_source"], "missing_mask_fallback")
+            with Image.open(output / "images" / name / "ignore_mask.png") as ignore_mask:
+                self.assertEqual(ignore_mask.getextrema(), (0, 0))
 
     def test_saved_arrays_and_masks_have_expected_shape_and_values(self):
         output = self.root / "saved-arrays"
@@ -453,13 +539,88 @@ class OfflineInferenceTests(unittest.TestCase):
         with patch("sys.stdout"):
             output = inference.main(["--checkpoint", str(self.checkpoint), "--image", str(self.image),
                                      "--device", "cpu", "--output-dir", str(self.root / "single-output"),
-                                     "--no-heatmaps", "--no-maps"])
+                                     "--score-mode", "checkpoint", "--no-heatmaps", "--no-maps"])
         destination = output / "images" / self.image.name
         self.assertEqual({p.name for p in destination.iterdir()}, {"prediction.json"})
         summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
         self.assertEqual(summary["image_count"], 1)
         self.assertEqual(summary["ng_count"] + summary["ok_count"], 1)
         self.assertEqual(summary["threshold"], self.calibration["threshold"])
+
+    def test_default_cli_uses_pool_topk_kernel_7_and_matches_reference(self):
+        with patch("sys.stdout"):
+            output = inference.main(["--checkpoint", str(self.checkpoint), "--image", str(self.image),
+                                     "--device", "cpu", "--threshold", "1000000",
+                                     "--output-dir", str(self.root / "default-output"), "--no-heatmaps", "--no-maps"])
+        summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+        result = json.loads((output / "images" / self.image.name / "prediction.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["score_mode"], "pool_topk")
+        self.assertEqual(summary["score_method"]["pool_kernel"], 7)
+        self.assertEqual(summary["score_method"]["topk_ratio"], 0.001)
+        self.assertEqual(result["localization"]["score_mode"], "pool_topk")
+        self.assertEqual(result["threshold"], 1000000)
+        batch, _ = self.predictor._prepare_batch(self.image)
+        with torch.inference_mode():
+            prediction = self.predictor.model.model(batch.image)
+        expected = cli.prediction_scores(prediction, batch, self.predictor.config, {"score_method": {
+            "name": cli.SINGLE_SCALE_SCORE_METHOD, "pool_kernel": 7, "topk_ratio": 0.001,
+        }})
+        self.assertEqual(result["score"], expected["score"])
+        with (output / "predictions.csv").open(encoding="utf-8-sig", newline="") as stream:
+            row, = list(csv.DictReader(stream))
+        self.assertEqual(row["score_mode"], "pool_topk")
+        self.assertEqual(float(row["score"]), expected["score"])
+
+    def test_default_cli_reuses_threshold_only_when_saved_pool_parameters_match(self):
+        for kernel in (7, 3):
+            checkpoint = self.save_checkpoint(f"default-pool-{kernel}.pt", calibration={
+                **self.calibration, "threshold": 1000000, "score_method": {
+                    "name": cli.SINGLE_SCALE_SCORE_METHOD, "pool_kernel": kernel, "topk_ratio": 0.01,
+                },
+            })
+            output_root = self.root / f"default-pool-{kernel}"
+            arguments = ["--checkpoint", str(checkpoint), "--image", str(self.image), "--device", "cpu",
+                         "--output-dir", str(output_root), "--no-heatmaps", "--no-maps"]
+            with self.subTest(kernel=kernel):
+                if kernel == 7:
+                    with patch("sys.stdout"):
+                        output = inference.main(arguments)
+                    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+                    self.assertEqual(summary["threshold"], 1000000)
+                    self.assertEqual(summary["score_method"]["pool_kernel"], 7)
+                    self.assertEqual(summary["score_method"]["topk_ratio"], 0.01)
+                else:
+                    with self.assertRaisesRegex(ValueError, "必须同时指定 --threshold"):
+                        inference.main(arguments)
+                    self.assertFalse(output_root.exists())
+
+    def test_default_cli_rejects_old_top_threshold_and_explicit_top_still_works(self):
+        arguments = ["--checkpoint", str(self.checkpoint), "--image", str(self.image), "--device", "cpu",
+                     "--output-dir", str(self.root / "default-invalid"), "--no-heatmaps", "--no-maps"]
+        with self.assertRaisesRegex(ValueError, "必须同时指定 --threshold"):
+            inference.main(arguments)
+        self.assertFalse((self.root / "default-invalid").exists())
+        with patch("sys.stdout"):
+            output = inference.main([*arguments, "--score-mode", "top"])
+        summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["score_mode"], "top")
+        self.assertEqual(summary["threshold"], self.calibration["threshold"])
+        self.assertNotIn("pool_kernel", summary["score_method"])
+
+    def test_default_batch_cli_honors_explicit_kernel_override(self):
+        inputs = self.root / "default-batch-inputs"
+        inputs.mkdir()
+        for name in ("one.png", "two.bmp"):
+            with Image.open(self.image) as image:
+                image.save(inputs / name)
+        with patch("sys.stdout"):
+            output = inference.main(["--checkpoint", str(self.checkpoint), "--image-dir", str(inputs),
+                                     "--device", "cpu", "--threshold", "1000000", "--score-pool-kernel", "3",
+                                     "--output-dir", str(self.root / "default-batch-output"), "--no-heatmaps", "--no-maps"])
+        summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["score_mode"], "pool_topk")
+        self.assertEqual(summary["score_method"]["pool_kernel"], 3)
+        self.assertEqual(summary["image_count"], 2)
 
     def test_single_image_cli_score_and_threshold_overrides_are_saved_in_all_reports(self):
         threshold = self.predictor.predict(self.image)["score"] + 1
