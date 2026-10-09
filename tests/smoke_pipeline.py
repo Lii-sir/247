@@ -17,7 +17,7 @@ from PIL import Image
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_DIR))
 
-from efficientad_ccd import load_runtime, new_model
+from ccd_efficientad.cli import load_runtime, new_model
 
 
 def main() -> None:
@@ -57,7 +57,7 @@ def main() -> None:
         teacher = new_model(config)
         if args.backbone.startswith("resnet"):
             from torchvision.models import ResNet18_Weights, ResNet50_Weights
-            from self_efficientad.backbones import load_default_teacher_weights
+            from ccd_efficientad.models.backbones import load_default_teacher_weights
 
             weights = (ResNet50_Weights.IMAGENET1K_V2 if args.backbone.startswith("resnet50_")
                        else ResNet18_Weights.IMAGENET1K_V1)
@@ -75,7 +75,7 @@ def main() -> None:
             "CCD1": {"default_mask": str(default_mask)},
         }), encoding="utf-8")
         output = root / "outputs"
-        entry = [sys.executable, str(PROJECT_DIR / "efficientad_ccd.py")]
+        entry = [sys.executable, str(PROJECT_DIR / "run.py")]
         environment = os.environ.copy()
         environment["PYTHONUTF8"] = "1"
         if args.ddp_test_device:

@@ -7,3 +7,7 @@ outputs/
 assets/
 pre_trained/
 *.log
+
+# 参考检出保留独立 Git 历史，不递归纳入本项目源码。
+references/efficientad_official/
+references/efficientad_alternative/

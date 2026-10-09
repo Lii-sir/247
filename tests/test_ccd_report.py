@@ -10,7 +10,7 @@ from unittest.mock import patch
 import numpy as np
 from PIL import Image
 
-from ccd_report import compute_metrics, save_heatmap, write_report
+from ccd_efficientad.report import compute_metrics, save_heatmap, write_report
 
 
 class MetricsTests(unittest.TestCase):

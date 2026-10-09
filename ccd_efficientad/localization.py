@@ -7,7 +7,7 @@ from numbers import Real
 import cv2
 import numpy as np
 
-from circle_mask import expanded_ignore_mask, mask_aware_average_pool
+from .mask import expanded_ignore_mask, mask_aware_average_pool
 
 
 DEFAULT_LOCALIZATION_PARAMS = {

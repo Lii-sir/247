@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from ccd_data import list_categories, prepare_manifest, resolve_data_root
+from ccd_efficientad.data import list_categories, prepare_manifest, resolve_data_root
 
 
 class ManifestTests(unittest.TestCase):
@@ -108,13 +108,13 @@ class ManifestTests(unittest.TestCase):
                 os.utime(changing_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
             return original_open(path, *args, **kwargs)
 
-        with patch("ccd_data.Image.open", side_effect=change_mtime_on_open):
+        with patch("ccd_efficientad.data.Image.open", side_effect=change_mtime_on_open):
             snapshot = self.manifest()
         self.assertEqual(snapshot["summary"]["skipped_by_reason"]["changed_during_scan"], 1)
         self.assertEqual(snapshot["summary"]["train"] + snapshot["summary"]["val"], 9)
 
     def test_missing_explicit_root_does_not_fall_back(self) -> None:
-        with patch("ccd_data.DEFAULT_DATA_ROOTS", (self.root,)):
+        with patch("ccd_efficientad.data.DEFAULT_DATA_ROOTS", (self.root,)):
             self.assertEqual(resolve_data_root(), self.root.resolve())
             with self.assertRaises(FileNotFoundError):
                 resolve_data_root(self.root / "missing")

@@ -10,10 +10,10 @@ import lightning
 import torch
 from torch import nn
 
-import efficientad_ccd as cli
-from self_efficientad import EfficientAd
-from self_efficientad.backbones import BACKBONE_SPECS, load_default_teacher_weights
-from self_efficientad.torch_model import EfficientAdModel
+from ccd_efficientad import cli
+from ccd_efficientad.models import EfficientAd
+from ccd_efficientad.models.backbones import BACKBONE_SPECS, load_default_teacher_weights
+from ccd_efficientad.models.torch_model import EfficientAdModel
 
 
 class ResNetCapacityTests(unittest.TestCase):
@@ -31,7 +31,7 @@ class ResNetCapacityTests(unittest.TestCase):
             self.assertEqual(tuple(model.student(x).shape), (1, 2048, 14, 14))
 
     def test_public_pair_factories_also_default_to_whole_student_widening(self):
-        from self_efficientad.backbones import build_resnet18_layer2_pair, build_resnet18_layer3_pair
+        from ccd_efficientad.models.backbones import build_resnet18_layer2_pair, build_resnet18_layer3_pair
         for factory in (build_resnet18_layer2_pair, build_resnet18_layer3_pair):
             with self.subTest(factory=factory.__name__):
                 teacher, student = factory()
@@ -103,7 +103,7 @@ class ResNetCapacityTests(unittest.TestCase):
         self.assertTrue(all(not p.requires_grad and p.grad is None for p in model.teacher.parameters()))
 
     def test_feature_ae_supports_all_cli_sizes_and_signed_rectangular_outputs(self):
-        from self_efficientad.resnet_autoencoder import ResNetFeatureAutoEncoder
+        from ccd_efficientad.models.resnet_autoencoder import ResNetFeatureAutoEncoder
         ae = ResNetFeatureAutoEncoder(256).eval()
         for image_size, feature_size in (
             ((256, 256), (16, 16)), ((384, 384), (24, 24)),
@@ -184,7 +184,7 @@ class ResNetCapacityTests(unittest.TestCase):
 
     def test_ddp_bootstrap_preserves_architecture_for_api_config_without_version(self):
         from types import SimpleNamespace
-        from ccd_distributed import train_distributed
+        from ccd_efficientad.distributed import train_distributed
         cli.load_runtime()
         config = dict(imagenette_dir="unused", model_size="small", lr=1e-4,
                       weight_decay=1e-5, device="cpu", backbone="resnet18_layer2",

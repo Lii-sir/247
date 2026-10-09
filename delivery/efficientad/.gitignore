@@ -1,0 +1,13 @@
+.venv/
+.uv-cache/
+__pycache__/
+*.pyc
+results/*
+!results/.gitkeep
+weights/*
+!weights/README.md
+masks/*
+!masks/README.md
+examples/*
+!examples/README.md
+configs/circle_config.json

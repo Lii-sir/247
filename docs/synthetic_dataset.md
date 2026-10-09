@@ -1,9 +1,9 @@
 # 随机划分正常图并生成测试 NG
 
-脚本 `make_anomaly_dataset.py` 仅依赖 Pillow，不需要 GPU。输入必须是正常图片目录。
+脚本 `run.py make-dataset` 仅依赖 Pillow，不需要 GPU。输入必须是正常图片目录。
 
 ```powershell
-uv run python D:\python_programs\LXD_project\247\make_anomaly_dataset.py `
+uv run python D:\python_programs\LXD_project\247\run.py make-dataset `
   --input-dir "D:\data\normal" `
   --output-dir "D:\data\CCD1" `
   --train-ratio 0.7 --test-good-ratio 0.15 --test-ng-ratio 0.15 `

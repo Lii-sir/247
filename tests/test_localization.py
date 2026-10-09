@@ -11,13 +11,13 @@ import numpy as np
 import torch
 from PIL import Image
 
-from ccd_localization import (
+from ccd_efficientad.localization import (
     build_localization,
     localization_summary,
     normalize_localization_params,
 )
-from ccd_report import save_heatmap
-from circle_mask import mask_aware_average_pool, pooled_topk_score
+from ccd_efficientad.report import save_heatmap
+from ccd_efficientad.mask import mask_aware_average_pool, pooled_topk_score
 
 
 TEST_PARAMS = {

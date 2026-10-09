@@ -9,8 +9,8 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-import efficientad_ccd as cli
-from circle_mask import multiscale_topk_scores
+from ccd_efficientad import cli
+from ccd_efficientad.mask import multiscale_topk_scores
 
 
 class MultiscaleScoreTests(unittest.TestCase):

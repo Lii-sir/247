@@ -7,7 +7,7 @@ to ``test/ng`` are never copied as good images; instead, a defect is rendered
 onto them and the rendered image is written to ``test/ng``.
 
 Example:
-    uv run python make_anomaly_dataset.py \
+    uv run python run.py make-dataset \
         --input-dir D:/data/normal \
         --output-dir D:/data/ccd_dataset \
         --train-ratio 0.70 \

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from PIL import Image, ImageChops
 
-import process.make_anomaly_dataset as dataset
+import tools.data.make_anomaly_dataset as dataset
 
 
 class DatasetTests(unittest.TestCase):

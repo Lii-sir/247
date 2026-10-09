@@ -11,8 +11,8 @@ import numpy as np
 import torch
 from PIL import Image
 
-from export_branch_maps import extract_maps, collect_images
-from self_efficientad.torch_model import EfficientAdModel
+from tools.diagnostics.export_branch_maps import extract_maps, collect_images
+from ccd_efficientad.models.torch_model import EfficientAdModel
 
 
 class BranchMapTests(unittest.TestCase):
@@ -82,7 +82,7 @@ class BranchMapTests(unittest.TestCase):
         self.assertNotIn("fused_calibrated", result)
 
     def test_cli_saves_images_arrays_and_metadata_offline(self):
-        import efficientad_ccd as cli
+        from ccd_efficientad import cli
         cli.load_runtime()
         config = dict(imagenette_dir="unused", model_size="small", lr=1e-4,
                       weight_decay=1e-5, device="cpu", backbone="resnet18_layer2",
@@ -96,8 +96,8 @@ class BranchMapTests(unittest.TestCase):
             cli.save_checkpoint(checkpoint, model, config, {"category": "synthetic"}, 0)
             image_path = root / "input.png"
             Image.fromarray(np.random.default_rng(3).integers(0, 256, (300, 400, 3), dtype=np.uint8)).save(image_path)
-            script = Path(__file__).resolve().parents[1] / "export_branch_maps.py"
-            subprocess.run([sys.executable, str(script), "--checkpoint", str(checkpoint),
+            script = Path(__file__).resolve().parents[1] / "run.py"
+            subprocess.run([sys.executable, str(script), "branch-maps", "--checkpoint", str(checkpoint),
                             "--image", str(image_path), "--device", "cpu", "--output-dir", str(root / "out")],
                            check=True, capture_output=True, text=True, timeout=90)
             output, = (root / "out").iterdir()
@@ -125,7 +125,7 @@ class BranchMapTests(unittest.TestCase):
             batch_output = inputs / "results"
             batch_output.mkdir()
             (batch_output / "previous.png").write_bytes(image_path.read_bytes())
-            subprocess.run([sys.executable, str(script), "--checkpoint", str(checkpoint),
+            subprocess.run([sys.executable, str(script), "branch-maps", "--checkpoint", str(checkpoint),
                             "--image-dir", str(inputs), "--device", "cpu", "--output-dir", str(batch_output),
                             "--vmax", "0.2"],
                            check=True, capture_output=True, text=True, timeout=90)

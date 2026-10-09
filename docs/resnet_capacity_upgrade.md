@@ -198,7 +198,7 @@ AE 在 256×256 输入下仍压缩到 1×1 瓶颈，再重建 64×64 或 32×32 
 在项目根目录运行，替换数据与 mask 配置路径。Linux 双卡示例：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 python efficientad_ccd.py train \
+CUDA_VISIBLE_DEVICES=0,1 python run.py train \
   --category CCD5-V3 \
   --data-root /path/to/dataset \
   --device 0 1 \
@@ -206,7 +206,7 @@ CUDA_VISIBLE_DEVICES=0,1 python efficientad_ccd.py train \
   --backbone resnet50_layer3 \
   --image-size 256 \
   --max-images 70000 \
-  --circle-config /path/to/circle_config.json \
+  --circle-config /path/to/configs/circle_config.json \
   --num-workers 4
 ```
 
@@ -219,14 +219,14 @@ CUDA_VISIBLE_DEVICES=0,1 python efficientad_ccd.py train \
 恢复同一架构：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 python efficientad_ccd.py train \
+CUDA_VISIBLE_DEVICES=0,1 python run.py train \
   --resume /path/to/run/checkpoints/last.pt --device 0 1 --num-workers 4
 ```
 
 评估已校准模型：
 
 ```bash
-python efficientad_ccd.py evaluate \
+python run.py evaluate \
   --checkpoint /path/to/run/model.pt --device 0 --heatmaps -1
 ```
 
@@ -346,12 +346,12 @@ DDP 仍使用同一 GPU 的两个 rank 与 Gloo，不等同于双物理卡 NCCL 
 
 ## 10. 代码位置
 
-- `self_efficientad/backbones.py`：teacher、整体扩宽 student、架构版本选择。
-- `self_efficientad/resnet_autoencoder.py`：新版特征 AE。
-- `self_efficientad/torch_model.py`：编码器参数化、损失与推理的 AE 尺寸接口。
-- `self_efficientad/lightning_model.py`：ResNet 统计和 Lightning 旧模型兼容。
-- `efficientad_ccd.py`：CLI 选项及 checkpoint 版本读写。
-- `ccd_distributed.py`：DDP 启动文件保留实际架构版本。
+- `ccd_efficientad/models/backbones.py`：teacher、整体扩宽 student、架构版本选择。
+- `ccd_efficientad/models/resnet_autoencoder.py`：新版特征 AE。
+- `ccd_efficientad/models/torch_model.py`：编码器参数化、损失与推理的 AE 尺寸接口。
+- `ccd_efficientad/models/lightning_model.py`：ResNet 统计和 Lightning 旧模型兼容。
+- `ccd_efficientad/cli.py`：CLI 选项及 checkpoint 版本读写。
+- `ccd_efficientad/distributed.py`：DDP 启动文件保留实际架构版本。
 - `tests/test_resnet_capacity.py`、`tests/test_backbones.py`：结构、梯度与兼容测试。
 - `tests/test_resnet50_stages.py`：ResNet-50 layer1/layer2 的结构、梯度、多尺寸和恢复测试。
 - `tests/smoke_pipeline.py`：CLI 全流程测试。

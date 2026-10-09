@@ -11,9 +11,9 @@ from unittest.mock import patch
 import torch
 import lightning
 
-import efficientad_ccd as cli
-from self_efficientad import EfficientAd
-from self_efficientad.torch_model import EfficientAdModel, SmallPatchDescriptionNetwork
+from ccd_efficientad import cli
+from ccd_efficientad.models import EfficientAd
+from ccd_efficientad.models.torch_model import EfficientAdModel, SmallPatchDescriptionNetwork
 
 
 class BackboneTests(unittest.TestCase):
@@ -100,7 +100,7 @@ class BackboneTests(unittest.TestCase):
             source = {name: value.detach().clone() for name, value in model.model.teacher.state_dict().items()}
             source["conv1.bias"].fill_(0.125)
             torch.save(source, weights / "pretrained_teacher_medium.pth")
-            with patch("self_efficientad.lightning_model.Path", return_value=Path(temporary)):
+            with patch("ccd_efficientad.models.lightning_model.Path", return_value=Path(temporary)):
                 model.prepare_pretrained_model()
         torch.testing.assert_close(model.model.teacher.conv1.bias, source["conv1.bias"], rtol=0, atol=0)
 
@@ -227,7 +227,7 @@ class BackboneTests(unittest.TestCase):
 
     def test_resnet18_layer3_teacher_loads_pretrained_features_without_random_head(self) -> None:
         from torchvision.models import resnet18
-        from self_efficientad.backbones import load_default_teacher_weights
+        from ccd_efficientad.models.backbones import load_default_teacher_weights
 
         model = EfficientAdModel(backbone="resnet18_layer3")
         pretrained = resnet18(weights=None).state_dict()
@@ -280,8 +280,8 @@ class BackboneTests(unittest.TestCase):
         def prepare_data(*_args, **_kwargs) -> None:
             model.imagenet_loader = SimpleNamespace(dataset=[object()])
 
-        with patch("efficientad_ccd.Path.is_file", return_value=True), \
-                patch("efficientad_ccd.torch.load", return_value=model.model.teacher.state_dict()) as load, \
+        with patch("ccd_efficientad.cli.Path.is_file", return_value=True), \
+                patch("ccd_efficientad.cli.torch.load", return_value=model.model.teacher.state_dict()) as load, \
                 patch.object(model, "prepare_imagenette_data", side_effect=prepare_data):
             cli.prepare_assets(model, config, load_teacher=True)
         self.assertIn("pretrained_teacher_medium.pth", str(load.call_args.args[0]))

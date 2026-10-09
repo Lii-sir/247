@@ -10,10 +10,10 @@ from unittest.mock import patch
 import lightning
 import torch
 
-import efficientad_ccd as cli
-from self_efficientad import EfficientAd
-from self_efficientad.backbones import ResNet50Features, load_default_teacher_weights
-from self_efficientad.torch_model import EfficientAdModel
+from ccd_efficientad import cli
+from ccd_efficientad.models import EfficientAd
+from ccd_efficientad.models.backbones import ResNet50Features, load_default_teacher_weights
+from ccd_efficientad.models.torch_model import EfficientAdModel
 
 
 KEY = "resnet_teacher_output_activation"
@@ -214,7 +214,7 @@ class TeacherActivationTests(unittest.TestCase):
                 del original, restored, trainer, resumed, optimizer
 
     def test_ddp_handoff_keeps_activation_and_geometry_without_caller_metadata(self):
-        from ccd_distributed import train_distributed
+        from ccd_efficientad.distributed import train_distributed
         config = configuration(devices=["cpu", "cpu"], global_batch_size=2, batch_size=1)
         model = cli.new_model(config)
         model.imagenet_loader = SimpleNamespace(dataset=[0, 1])

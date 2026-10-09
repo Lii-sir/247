@@ -10,7 +10,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-import efficientad_ccd as cli
+from ccd_efficientad import cli
 
 
 class ToyNetwork(nn.Module):
@@ -42,7 +42,7 @@ def toy_collate(items):
 
 
 def optimization_worker(rank, root, distributed, invalid):
-    from ccd_distributed import optimize
+    from ccd_efficientad.distributed import optimize
 
     cli.load_runtime()
     torch.set_num_threads(1)
@@ -76,7 +76,7 @@ def optimization_worker(rank, root, distributed, invalid):
 
 
 def mid_epoch_resume_worker(rank, root, num_workers=0):
-    from ccd_distributed import optimize
+    from ccd_efficientad.distributed import optimize
 
     cli.load_runtime()
     torch.set_num_threads(1)
@@ -138,7 +138,7 @@ class DistributedConfigurationTests(unittest.TestCase):
                     cli.choose_devices(devices)
 
     def test_global_image_budget_and_resume_world_size(self):
-        from ccd_distributed import configure_training_world
+        from ccd_efficientad.distributed import configure_training_world
         config = {"batch_size": 4, "max_steps": 99, "max_images_requested": 101}
         configure_training_world(config, ["cuda:0", "cuda:1"], resume=False)
         self.assertEqual(config["global_batch_size"], 8)
@@ -153,7 +153,7 @@ class DistributedConfigurationTests(unittest.TestCase):
 
     def test_samplers_are_disjoint_complete_batches_and_change_epoch(self):
         from torch.utils.data import DataLoader, TensorDataset
-        from ccd_distributed import distributed_loader
+        from ccd_efficientad.distributed import distributed_loader
         source = DataLoader(TensorDataset(cli.torch.arange(11)), batch_size=2)
         loaders = [distributed_loader(source, rank=rank, world_size=2, seed=42) for rank in range(2)]
         shards = [[int(value) for batch in loader for value in batch[0]] for loader in loaders]

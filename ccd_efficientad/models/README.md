@@ -31,8 +31,8 @@ https://arxiv.org/pdf/2303.14535.pdf
 在项目根目录运行：
 
 ```python
-from self_efficientad import EfficientAd
-from self_efficientad.torch_model import EfficientAdModel, EfficientAdModelSize
+from ccd_efficientad.models import EfficientAd
+from ccd_efficientad.models.torch_model import EfficientAdModel, EfficientAdModelSize
 
 model = EfficientAd(
     imagenet_dir="assets/imagenette",
@@ -112,16 +112,16 @@ score = prediction.pred_score
 
 ## 接入当前 CCD 脚本
 
-当前 `efficientad_ccd.py` 已经使用这个本地副本：
+当前 `run.py train` 已经使用这个本地副本：
 
 ```python
-from self_efficientad import EfficientAd
+from ccd_efficientad.models import EfficientAd
 ```
 
 权重下载配置也从本地模块导入：
 
 ```python
-from self_efficientad.lightning_model import WEIGHTS_DOWNLOAD_INFO
+from ccd_efficientad.models.lightning_model import WEIGHTS_DOWNLOAD_INFO
 ```
 
 下面的导入仍然可以保留：
@@ -139,7 +139,7 @@ from anomalib.data.utils import download_and_extract
 - 修改批量训练的 hard loss：编辑 `student_teacher_hard_loss`。
 - 修改异常图尺寸、补边、插值或归一化：编辑 `EfficientAdModel.compute_maps`。
 - 修改教师权重、ImageNette 或 Lightning 生命周期：编辑 `lightning_model.py`。
-- 修改当前 CCD 的自定义训练循环、阈值和评分方式：编辑项目根目录的 `efficientad_ccd.py`。
+- 修改当前 CCD 的自定义训练循环、阈值和评分方式：编辑 `ccd_efficientad/cli.py`；根目录 `run.py` 仅负责启动。
 
 修改网络输出通道数、输入尺寸或模型状态字典后，原有教师权重和 checkpoint 可能无法继续使用，需要重新训练或重新导出权重。
 

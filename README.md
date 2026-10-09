@@ -2,6 +2,18 @@
 
 这个项目提供数据检查、训练、正常样本阈值校准、独立测试和单图预测脚本。代码注释使用中文，环境由 **uv** 管理。网络结构、教师网络和三项训练损失基于 **anomalib 2.2.0 的 EfficientAD 实现**；训练循环自行管理，便于固定数据快照、按步调整学习率和断点续训。
 
+## 目录与入口
+
+- `ccd_efficientad/`：模型、训练、推理、数据与后处理核心代码。
+- `tools/`：按 `data/`、`masks/`、`diagnostics/` 分组的工具。
+- `configs/`：配置；原 `circle_config.json` 已移至这里。
+- `tests/`、`docs/`、`references/`：测试、说明、参考实现。
+- `assets/`、`outputs/`：运行资源与结果，旧路径保持不变。
+- `delivery/efficientad/`：独立推理交付包。
+
+**统一入口：`uv run python run.py --help`。** 完整目录、迁移对照和 Python API 见 [项目目录结构](docs/project_structure.md)。
+根目录 `efficientad_ccd.py`、`infer_efficientad.py` 只用于兼容旧命令；请在核心包内修改业务代码。
+
 ## 1. 已适配的数据目录
 
 本机实际找到的路径为：
@@ -48,10 +60,10 @@ uv run python -c "import torch; print('Torch:', torch.__version__); print('CUDA:
 ## 3. 先检查 CCD1
 
 ```powershell
-uv run python efficientad_ccd.py inspect --category CCD1
+uv run python run.py inspect --category CCD1
 
 # 显式指定数据根目录的等价写法。
-uv run python efficientad_ccd.py inspect --data-root "D:\datasets\20260909_ccd1-6_ok+v5ng" --category CCD1
+uv run python run.py inspect --data-root "D:\datasets\20260909_ccd1-6_ok+v5ng" --category CCD1
 ```
 
 检查会保存 `outputs/inspection/CCD1/<时间>/manifest.json`，其中包含文件清单、原始尺寸、SHA256、跳过原因和最终划分：
@@ -71,19 +83,19 @@ uv run python efficientad_ccd.py inspect --data-root "D:\datasets\20260909_ccd1-
 先用 1,000 步确认效果输出和流程：
 
 ```powershell
-uv run python efficientad_ccd.py train --category CCD1 --max-steps 1000 --image-size 256 --heatmaps 32
+uv run python run.py train --category CCD1 --max-steps 1000 --image-size 256 --heatmaps 32
 ```
 
 进行较完整的初步实验：
 
 ```powershell
-uv run python efficientad_ccd.py train --category CCD1 --max-steps 10000 --image-size 256
+uv run python run.py train --category CCD1 --max-steps 10000 --image-size 256
 ```
 
 考虑到原图为 2000×1500，细小缺陷缩到 256×256 后可能不明显，可再运行 512 分辨率对照：
 
 ```powershell
-uv run python efficientad_ccd.py train --category CCD1 --max-steps 10000 --image-size 512
+uv run python run.py train --category CCD1 --max-steps 10000 --image-size 512
 ```
 
 1,000 步仅用于快速试跑，10,000 步也不保证收敛。需要更长训练时可设 `--max-steps 70000`；在相同数据快照、相同训练参数下比较效果更有意义。默认将整张图缩放为方形，保留整张画面但会改变长宽比；本脚本未实现 ROI 或分块。若小缺陷在缩放后消失，后续应根据实际缺陷位置增加 ROI/分块处理。
@@ -93,12 +105,12 @@ uv run python efficientad_ccd.py train --category CCD1 --max-steps 10000 --image
 可以用同一份数据快照比较不同 backbone：
 
 ```powershell
-uv run python efficientad_ccd.py train `
+uv run python run.py train `
   --category CCD1 `
   --backbone resnet18_layer2 `
   --max-steps 10000 `
   --image-size 256 `
-  --circle-config "D:\python_programs\LXD_project\247\circle_config.json"
+  --circle-config "D:\python_programs\LXD_project\247\configs\circle_config.json"
 ```
 
 `--backbone` 与旧版 `--model-size` 互斥，不能同时传入；未指定 `--backbone` 时，`small/medium` 分别映射到 `pdn_small/pdn_medium`。续训默认沿用 checkpoint 的结构，显式指定不同 backbone 会报错；切换结构必须重新训练并重新校准阈值。
@@ -125,7 +137,7 @@ ResNet 通道统计使用双精度累积；若部分 ReLU 通道在训练集上�
 当前也支持显式批量训练。例如：
 
 ```powershell
-uv run python efficientad_ccd.py train --category CCD1 --batch-size 4 --max-images 70000
+uv run python run.py train --category CCD1 --batch-size 4 --max-images 70000
 ```
 
 `batch-size` 是**每张卡**的训练 batch，正常样本统计、异常图校准、测试和热图仍使用单张图片。每卡 `batch-size` 大于 1 或使用多卡时，程序启用逐图片 Q99.9 hard loss，并让辅助 loader 使用相同的每卡 batch。单卡 `batch-size=1` 保留原始全局 hard loss 和旧 checkpoint 语义。
@@ -135,14 +147,14 @@ uv run python efficientad_ccd.py train --category CCD1 --batch-size 4 --max-imag
 ### 单机多卡训练
 
 ```powershell
-uv run python efficientad_ccd.py train `
+uv run python run.py train `
   --category CCD1 `
   --device 0 1 `
   --batch-size 4 `
   --backbone resnet18_layer2 `
   --max-images 70000 `
   --imagenette-dir "assets\visa_aux" `
-  --circle-config "circle_config.json"
+  --circle-config "configs/circle_config.json"
 ```
 
 此命令由两张卡共同训练一个模型：每卡 4 张，全局 batch 为 8，执行 8,750 个 optimizer steps。`--max-images` 是所有卡合计的图片预算，向上取整到完整全局 batch；例如两卡、每卡 4 张、预算 101 张，实际执行 13 步、104 张。`--max-steps` 则始终是同步优化步数。学习率保持 `--lr` 指定值，不自动按卡数放大。
@@ -153,7 +165,7 @@ uv run python efficientad_ccd.py train `
 
 续训必须保持原来的卡数，每卡 batch、优化器和总步数沿用 checkpoint，允许换用其他 GPU 编号。旧 checkpoint 视为单卡；已训练的多卡 `model.pt` 可在单 GPU 或 CPU 推理。多卡中断时保留最近一次成功写入的 `checkpoints/last.pt`，保存间隔由 `--save-every` 控制。多卡恢复会分别恢复训练集和辅助集的 sampler epoch，并跳过本轮已处理的 batch；因此样本顺序可以接续，但随机增强和 Dropout 的 RNG 状态未保存，仍不保证与不中断训练逐位一致。
 
-优先使用 NCCL（通常是 Linux CUDA），不可用时使用 Gloo。本功能针对 `efficientad_ccd.py` 单机训练；未扩展为多机训练，也不代表独立 Lightning/Engine 入口已完成 DDP 适配。
+优先使用 NCCL（通常是 Linux CUDA），不可用时使用 Gloo。本功能针对 `run.py train` 单机训练；未扩展为多机训练，也不代表独立 Lightning/Engine 入口已完成 DDP 适配。
 
 训练结束后会自动完成：正常验证集异常图校准 → 图像阈值校准 → 测试集推理 → 指标和热图保存。默认每 1,000 步保存 `checkpoints/last.pt`；Ctrl+C 在训练循环中会保存最近完成步数的续训文件。
 
@@ -167,18 +179,18 @@ uv run python efficientad_ccd.py train `
 下载使用 anomalib 的官方地址和校验信息。有现成文件时可以显式指定：
 
 ```powershell
-uv run python efficientad_ccd.py train --category CCD1 --max-steps 10000 --teacher-weights "D:\models\pretrained_teacher_small.pth" --imagenette-dir "D:\datasets\imagenette2\train"
+uv run python run.py train --category CCD1 --max-steps 10000 --teacher-weights "D:\models\pretrained_teacher_small.pth" --imagenette-dir "D:\datasets\imagenette2\train"
 ```
 
 这里的路径是示例，必须改成实际存在的位置。教师权重必须与所选 `--backbone` 匹配；`pdn_small/pdn_medium` 使用官方对应权重，三个 ResNet 选项均可以省略该参数并自动使用 torchvision 的 ImageNet 权重。辅助图片目录需要兼容 `ImageFolder`，例如 `train/n01440764/*.JPEG`。仅有 CCD 图片不足以复现官方带 ImageNette 正则项的配置。**不要预先创建空的 `assets/imagenette` 目录**：官方辅助函数看到目录存在就会尝试读取，空目录应删除或改用新的有效目录后重试。
 
 ResNet 自定义 `--teacher-weights` 应保存本项目适配器的 `model.teacher.state_dict()`（Lightning 包装实例为 `model.model.teacher.state_dict()`）；完整 torchvision ResNet 的原始 state dict 键名与其不同，不能直接传入。已训练的 `model.pt` 包含教师参数，推理和 CLI 续训不需要重新下载教师。
 
-直接使用 `self_efficientad.EfficientAd` 的 Lightning 入口时，学习率也按 optimizer step 调度；`EfficientAd.load_from_checkpoint(...)` 从 checkpoint 恢复教师，即使保存时设置了 `teacher_pretrained=True`，也不再读取外部预训练权重。
+直接使用 `ccd_efficientad.models.EfficientAd` 的 Lightning 入口时，学习率也按 optimizer step 调度；`EfficientAd.load_from_checkpoint(...)` 从 checkpoint 恢复教师，即使保存时设置了 `teacher_pretrained=True`，也不再读取外部预训练权重。
 
 ### 使用 VisA 作为工业辅助数据集
 
-如果不使用 ImageNette，也可以下载 VisA 的训练正常图片作为辅助数据。项目中的 `download_visa_aux.py` 会读取官方 `VisA_20220922.tar`，只保留 `train` 且标签为 `normal/good` 的图片，并整理为当前 `ImageFolder` 需要的格式：
+如果不使用 ImageNette，也可以下载 VisA 的训练正常图片作为辅助数据。项目中的 `run.py download-visa` 会读取官方 `VisA_20220922.tar`，只保留 `train` 且标签为 `normal/good` 的图片，并整理为当前 `ImageFolder` 需要的格式：
 
 ```text
 D:\datasets\visa_aux\
@@ -190,7 +202,7 @@ D:\datasets\visa_aux\
 PowerShell 下载并整理命令如下；归档路径放在输出目录之外：
 
 ```powershell
-uv run python download_visa_aux.py `
+uv run python run.py download-visa `
   --output "D:\datasets\visa_aux" `
   --archive "D:\datasets\VisA_20220922.tar"
 ```
@@ -200,11 +212,11 @@ uv run python download_visa_aux.py `
 整理完成后，把输出目录传给现有的兼容参数 `--imagenette-dir` 即可；参数名沿用旧版，但底层只要求 `ImageFolder` 目录：
 
 ```powershell
-uv run python efficientad_ccd.py train `
+uv run python run.py train `
   --data-root "D:\datasets\20260909_ccd1-6_ok+v5ng" `
   --category CCD1 `
   --imagenette-dir "D:\datasets\visa_aux" `
-  --circle-config "D:\python_programs\LXD_project\247\circle_config.json"
+  --circle-config "D:\python_programs\LXD_project\247\configs\circle_config.json"
 ```
 
 ## 5. 读取效果报告
@@ -261,29 +273,33 @@ outputs/CCD1/<运行时间>/
 
 ## 6. 重跑评估、预测和续训
 
+需要独立的“加载权重 → 单图/文件夹推理”入口时，使用 `run.py infer`。
+它沿用 checkpoint 的预处理、score 和阈值，支持显式指定本机 mask，以及 JSON/CSV、异常数组和热图输出。
+详细命令、mask 黑白含义、跨机器路径迁移和 Python API 见 [推理说明](docs/inference.md)。
+
 以下命令中的 `<运行时间>` 必须替换为实际目录名。
 
 ```powershell
 # 完整复现 checkpoint 保存时的 score 方式和 threshold（默认）。
-uv run python efficientad_ccd.py evaluate --checkpoint "outputs\CCD1\<运行时间>\model.pt" --heatmaps -1
+uv run python run.py evaluate --checkpoint "outputs\CCD1\<运行时间>\model.pt" --heatmaps -1
 
 # 单像素最大值（Git 中“单像素最大作为 score”的方式）。
-uv run python efficientad_ccd.py evaluate --checkpoint "outputs\CCD1\<运行时间>\model.pt" --score-mode top --heatmaps -1
+uv run python run.py evaluate --checkpoint "outputs\CCD1\<运行时间>\model.pt" --score-mode top --heatmaps -1
 
 # 单尺度局部平均池化 + Top-K 均值。
-uv run python efficientad_ccd.py evaluate --checkpoint "outputs\CCD1\<运行时间>\model.pt" --score-mode "pool+top" --score-pool-kernel 21 --score-topk-ratio 0.001 --heatmaps -1
+uv run python run.py evaluate --checkpoint "outputs\CCD1\<运行时间>\model.pt" --score-mode "pool+top" --score-pool-kernel 21 --score-topk-ratio 0.001 --heatmaps -1
 
 # 多尺度池化；各尺度用正常验证集归一化后取最大值。
-uv run python efficientad_ccd.py evaluate --checkpoint "outputs\CCD1\<运行时间>\model.pt" --score-mode multiscale_pool --score-pool-kernels 1,7,21 --score-topk-ratio 0.001 --heatmaps -1
+uv run python run.py evaluate --checkpoint "outputs\CCD1\<运行时间>\model.pt" --score-mode multiscale_pool --score-pool-kernels 1,7,21 --score-topk-ratio 0.001 --heatmaps -1
 
 # 下载完成后先 inspect，生成新快照，再评估其中的测试图片。
-uv run python efficientad_ccd.py evaluate --checkpoint "outputs\CCD1\<运行时间>\model.pt" --manifest "outputs\inspection\CCD1\<检查时间>\manifest.json"
+uv run python run.py evaluate --checkpoint "outputs\CCD1\<运行时间>\model.pt" --manifest "outputs\inspection\CCD1\<检查时间>\manifest.json"
 
 # 单张新图推理，输出 prediction.json、2×3 prediction.png；多尺度模型另存 prediction_scales.png。
-uv run python efficientad_ccd.py predict --checkpoint "outputs\CCD1\<运行时间>\model.pt" --image "D:\datasets\新图片.bmp"
+uv run python run.py predict --checkpoint "outputs\CCD1\<运行时间>\model.pt" --image "D:\datasets\新图片.bmp"
 
 # 中断后续训：沿用 checkpoint 内的数据快照、分辨率和总训练步数。
-uv run python efficientad_ccd.py train --resume "outputs\CCD1\<运行时间>\checkpoints\last.pt"
+uv run python run.py train --resume "outputs\CCD1\<运行时间>\checkpoints\last.pt"
 ```
 
 `checkpoint` 是 `--score-mode` 的默认值，严格沿用模型里保存的分数公式和阈值。显式选择 `top`、`pool+top` 或 `multiscale_pool` 时，程序使用同一份 `threshold_val` 为所选公式重新选择匹配阈值，并在本次 `evaluation` 目录保存 `calibration.json`、`config.json` 和新的 `model.pt`；原 checkpoint 不会被覆盖。若快照没有 `threshold_val`，程序会从 `test` 各子目录分层划出一部分，因此用于最终报告的测试图片会相应减少。
@@ -295,8 +311,8 @@ uv run python efficientad_ccd.py train --resume "outputs\CCD1\<运行时间>\che
 等 CCD1～CCD6 都下载完整并检查通过后，可依次训练：
 
 ```powershell
-uv run python efficientad_ccd.py inspect --category all
-uv run python efficientad_ccd.py train --category all --max-steps 10000 --image-size 256
+uv run python run.py inspect --category all
+uv run python run.py train --category all --max-steps 10000 --image-size 256
 ```
 
 `all` 按目录顺序串行运行，每个相机各有自己的权重和报告。训练遇到未就绪类别会停止并报错；下载阶段请选择已经完整的相机。
@@ -326,8 +342,8 @@ uv run python tests/smoke_pipeline.py --ddp-test-device cpu
 # 不代表两张物理 GPU 的性能验证；正式训练禁止重复选择同一 GPU。
 uv run python tests/smoke_pipeline.py --ddp-test-device cuda:0 --num-workers 1
 
-uv run python efficientad_ccd.py --help
-uv run python efficientad_ccd.py train --help
+uv run python run.py --help
+uv run python run.py train --help
 ```
 
 - Windows 默认 `--num-workers 0` 便于定位读取问题；稳定后可尝试 `--num-workers 2`。
@@ -337,7 +353,7 @@ uv run python efficientad_ccd.py train --help
 - 只有一种测试类别时 AUROC 无定义，报告记录为 `null`；没有测试图时仍会保存训练完成的模型与校准结果。
 
 ```
-uv run python efficientad_ccd.py train `
+uv run python run.py train `
   --data-root "D:\datasets\20260909_ccd1-6_ok+v5ng" `
   --category CCD1 `
   --model-size small `
@@ -352,16 +368,16 @@ uv run python efficientad_ccd.py train `
   $env:UV_CACHE_DIR=".uv-cache"
 
 # 无需修改 JSON：打开界面，拖框选择 ROI，检测并保存 mask。
-uv run python circle_mask_gui.py
+uv run python run.py mask-gui
 # 也可打开整个图片文件夹，选定统一 ROI 后批量检测，再用按钮或左右方向键逐张查看。
 
-uv run python generate_circle_mask.py `
+uv run python run.py generate-mask `
   --input "D:\datasets\20260913_caijian_liugongwei\2lixiaodong\CCD1\good\B20260731_01_CCD1_0003.bmp" `
   --output-dir "circle_mask_generated_CCD1" `
-  --circle-config "circle_config.json" `
+  --circle-config "configs/circle_config.json" `
   --category CCD1
 
-uv run python detect_background_circle.py `
+uv run python run.py detect-circle `
   --input "D:\datasets\20260913_caijian_liugongwei\2lixiaodong\CCD1\good" `
   --output-dir "circle_test_bmp_tight" `
   --roi "0.58,0.33,0.28,0.36" `
@@ -381,7 +397,7 @@ uv run python detect_background_circle.py `
 
 
 
-CUDA_VISIBLE_DEVICES=1 python efficientad_ccd.py evaluate \
+CUDA_VISIBLE_DEVICES=1 python run.py evaluate \
   --checkpoint "/media/pe/5fe0ba86-cd64-483b-bfc5-dd83088ea652/lxd/outputs/CCD1-v2/<时间目录>/model.pt" \
   --output-dir "outputs" \
   --heatmaps -1 \
@@ -391,7 +407,7 @@ CUDA_VISIBLE_DEVICES=1 python efficientad_ccd.py evaluate \
 
 目录输入会递归检测，并在输出目录中保留输入图片的相对子目录，避免不同缺陷目录中的同名图片互相覆盖。输出目录可以放在输入目录下，脚本会排除该目录；但输入目录与输出目录不能完全相同。
 
-`generate_circle_mask.py` 从一张参考图生成原图尺寸的单通道 `default_mask.png`：圆内为 255、圆外为 0。同时输出检测叠加图、白色填充预览和带检测耗时的 `circle_mask.json`。确认结果后，可将该 PNG 配置为对应型号的 `default_mask`。
+`run.py generate-mask` 从一张参考图生成原图尺寸的单通道 `default_mask.png`：圆内为 255、圆外为 0。同时输出检测叠加图、白色填充预览和带检测耗时的 `circle_mask.json`。确认结果后，可将该 PNG 配置为对应型号的 `default_mask`。
 
 圆检测界面固定使用 `outer_inner_ring`：先检测外侧大圆，再利用大小圆之间的黑色环带定位内圆。该模式只要求内圆完整位于外圆内部，不要求两者
 同心。程序先用最大暗色圆形外轮廓直接拟合外圆，再保留外圆内部与外侧环带相连的

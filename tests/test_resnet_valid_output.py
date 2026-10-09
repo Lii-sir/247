@@ -12,11 +12,11 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-import efficientad_ccd as cli
-from export_branch_maps import extract_maps
-from self_efficientad import EfficientAd
-from self_efficientad.backbones import BACKBONE_SPECS
-from self_efficientad.torch_model import EfficientAdModel
+from ccd_efficientad import cli
+from tools.diagnostics.export_branch_maps import extract_maps
+from ccd_efficientad.models import EfficientAd
+from ccd_efficientad.models.backbones import BACKBONE_SPECS
+from ccd_efficientad.models.torch_model import EfficientAdModel
 
 
 RESNETS = tuple(name for name in BACKBONE_SPECS if name.startswith("resnet"))

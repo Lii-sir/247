@@ -47,7 +47,7 @@ def distributed_loader(loader: DataLoader, *, rank: int, world_size: int, seed: 
 
 def optimize(model, config: dict, manifest: dict, output: Path, previous: dict | None,
              save_every: int, *, rank: int = 0, world_size: int = 1) -> int:
-    import efficientad_ccd as cli
+    from . import cli
 
     cli.load_runtime()
     distributed = world_size > 1
@@ -164,7 +164,7 @@ def optimize(model, config: dict, manifest: dict, output: Path, previous: dict |
 
 def _worker(rank: int, devices: list[str], bootstrap: str, rendezvous: str,
             output: str, save_every: int, backend: str) -> None:
-    import efficientad_ccd as cli
+    from . import cli
 
     cli.load_runtime()
     device = devices[rank]
@@ -190,7 +190,7 @@ def _worker(rank: int, devices: list[str], bootstrap: str, rendezvous: str,
 def train_distributed(model, config: dict, manifest: dict, output: Path,
                       previous: dict | None, save_every: int) -> int:
     """Prepare once, spawn workers, then restore rank-zero weights for calibration."""
-    import efficientad_ccd as cli
+    from . import cli
 
     # API callers can omit the version while constructing a new default model.
     # Persist its actual architecture before workers interpret missing versions

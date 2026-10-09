@@ -11,9 +11,9 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-import circle_mask
-import detect_background_circle as detector_cli
-from detect_background_circle import iter_images, output_stem
+from ccd_efficientad import mask as circle_mask
+from tools.masks import detect_background_circle as detector_cli
+from tools.masks.detect_background_circle import iter_images, output_stem
 
 
 class RobustCircleDetectionTests(unittest.TestCase):

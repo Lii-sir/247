@@ -6,8 +6,8 @@ import unittest
 
 import torch
 
-from efficientad_ccd import load_runtime, make_loader
-from self_efficientad.torch_model import student_teacher_hard_loss
+from ccd_efficientad.cli import load_runtime, make_loader
+from ccd_efficientad.models.torch_model import student_teacher_hard_loss
 
 
 class BatchTrainingTests(unittest.TestCase):

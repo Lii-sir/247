@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 
 from PIL import Image
 
-import efficientad_ccd as cli
+from ccd_efficientad import cli
 
 
 class CommandTests(unittest.TestCase):
@@ -35,7 +35,7 @@ class CommandTests(unittest.TestCase):
         """运行真实参数解析和评估分支，仅替换耗时的模型加载与前向计算。"""
         path = self.root / "manifest.json"
         path.write_text(json.dumps(manifest), encoding="utf-8")
-        arguments = ["efficientad_ccd.py", "evaluate", "--checkpoint", "unused.pt",
+        arguments = ["run.py", "evaluate", "--checkpoint", "unused.pt",
                      "--manifest", str(path), "--output-dir", str(self.root / "results")]
         with patch("sys.argv", arguments), patch.object(cli, "load_runtime"), \
                 patch.object(cli, "restore_for_inference", return_value=(object(), {}, self.saved)), \
@@ -81,7 +81,7 @@ class CommandTests(unittest.TestCase):
         manifest_path = self.root / "explicit-manifest.json"
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         arguments = [
-            "efficientad_ccd.py", "evaluate", "--checkpoint", "unused.pt",
+            "run.py", "evaluate", "--checkpoint", "unused.pt",
             "--manifest", str(manifest_path), "--output-dir", str(self.root / "explicit-results"),
             "--score-mode", "pool+top", "--score-pool-kernel", "15",
             "--score-topk-ratio", "0.01",
@@ -110,7 +110,7 @@ class CommandTests(unittest.TestCase):
         path = self.root / "checkpoint-manifest.json"
         path.write_text(json.dumps({"category": "CCD1", "test": records}), encoding="utf-8")
         arguments = [
-            "efficientad_ccd.py", "evaluate", "--checkpoint", "unused.pt",
+            "run.py", "evaluate", "--checkpoint", "unused.pt",
             "--manifest", str(path), "--output-dir", str(self.root / "checkpoint-results"),
         ]
         with patch("sys.argv", arguments), patch.object(cli, "load_runtime"), \
@@ -125,7 +125,7 @@ class CommandTests(unittest.TestCase):
 
     def test_checkpoint_mode_rejects_pooling_overrides(self) -> None:
         arguments = [
-            "efficientad_ccd.py", "evaluate", "--checkpoint", "unused.pt",
+            "run.py", "evaluate", "--checkpoint", "unused.pt",
             "--score-pool-kernel", "15",
         ]
         with patch("sys.argv", arguments), patch.object(cli, "load_runtime"), \
@@ -147,7 +147,7 @@ class CommandTests(unittest.TestCase):
         ]
         for extra_arguments, message in cases:
             arguments = [
-                "efficientad_ccd.py", "evaluate", "--checkpoint", "unused.pt",
+                "run.py", "evaluate", "--checkpoint", "unused.pt",
                 *extra_arguments,
             ]
             with self.subTest(arguments=extra_arguments), patch("sys.argv", arguments), \
@@ -213,7 +213,7 @@ class CommandTests(unittest.TestCase):
             Image.new("RGB", (8, 8), (index, 0, 0)).save(complete / f"{index}.png")
         (data / "CCD2/train/good").mkdir(parents=True)
         output = self.root / "inspections"
-        arguments = ["efficientad_ccd.py", "inspect", "--data-root", str(data),
+        arguments = ["run.py", "inspect", "--data-root", str(data),
                      "--category", "all", "--min-age-seconds", "0", "--output-dir", str(output)]
         with patch("sys.argv", arguments), self.assertRaisesRegex(ValueError, "CCD2"):
             cli.main()
@@ -228,7 +228,7 @@ class CommandTests(unittest.TestCase):
         data = self.root / "empty_dataset"
         data.mkdir()
         for command in ("inspect", "train"):
-            arguments = ["efficientad_ccd.py", command, "--data-root", str(data), "--category", "all"]
+            arguments = ["run.py", command, "--data-root", str(data), "--category", "all"]
             with self.subTest(command=command), patch("sys.argv", arguments), \
                     patch.object(cli, "load_runtime"), self.assertRaises(ValueError):
                 cli.main()
@@ -325,7 +325,7 @@ class CommandTests(unittest.TestCase):
                             "params": {}, "scales": [],
                         }), \
                         patch.object(cli, "torch", SimpleNamespace(inference_mode=nullcontext), create=True), \
-                        patch.dict("sys.modules", {"ccd_report": fake_report}):
+                        patch.dict("sys.modules", {"ccd_efficientad.report": fake_report}):
                     cli.predict(args)
                 paths = list(output.glob("CCD1/*/prediction.json"))
                 self.assertEqual(len(paths), 1)

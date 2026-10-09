@@ -5,11 +5,15 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 
 import cv2
 import numpy as np
 
-from circle_mask import (
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from ccd_efficientad.mask import (
     category_config,
     detect_circle,
     effective_mask_radius,

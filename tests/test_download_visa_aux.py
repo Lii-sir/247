@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from download_visa_aux import main
+from tools.data.download_visa_aux import main
 
 
 class VisaAuxTests(unittest.TestCase):

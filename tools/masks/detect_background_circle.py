@@ -1,7 +1,7 @@
 """独立验证圆检测、偏心内圆选择和白色 mask 的脚本。
 
 示例：
-    uv run python detect_background_circle.py --input "图片目录" \
+    uv run python run.py detect-circle --input "图片目录" \
         --output-dir circle_test --circle-target inner \
         --roi "0.55,0.20,0.35,0.50"
 """
@@ -11,11 +11,15 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 
 import cv2
 import numpy as np
 
-from circle_mask import category_config, detect_circle, load_configs, make_mask, overlay_diagnostics, read_rgb
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from ccd_efficientad.mask import category_config, detect_circle, load_configs, make_mask, overlay_diagnostics, read_rgb
 
 
 IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}

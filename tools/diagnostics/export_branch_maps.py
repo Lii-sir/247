@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import sys
 from tempfile import mkdtemp
 
 import numpy as np
@@ -19,6 +20,11 @@ import torch
 from PIL import Image, ImageOps
 from torch.nn import functional as F
 from torchvision.transforms.functional import to_tensor
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from ccd_efficientad.paths import PROJECT_DIR
 
 
 def collect_images(root: Path, output_root: Path) -> list[Path]:
@@ -170,7 +176,7 @@ def main(argv: list[str] | None = None) -> Path:
     inputs.add_argument("--image", type=Path, help="Original source image, not a heatmap montage")
     inputs.add_argument("--image-dir", type=Path, help="Recursively export a directory of original images")
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda or visible GPU index (e.g. 0)")
-    parser.add_argument("--output-dir", type=Path, default=Path(__file__).resolve().parent / "outputs/branch_maps")
+    parser.add_argument("--output-dir", type=Path, default=PROJECT_DIR / "outputs/branch_maps")
     parser.add_argument("--vmax", type=float, help="Fixed positive PNG upper limit across images; does not alter NPZ")
     args = parser.parse_args(argv)
     if args.vmax is not None and (not np.isfinite(args.vmax) or args.vmax <= 0):
@@ -185,7 +191,7 @@ def main(argv: list[str] | None = None) -> Path:
             parser.error(f"Image does not exist: {args.image}")
         images = [args.image.resolve()]
 
-    import efficientad_ccd as cli
+    from ccd_efficientad import cli
     cli.load_runtime()
     saved = cli.read_checkpoint(args.checkpoint)
     config = dict(saved["config"])

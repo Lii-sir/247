@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 import queue
 import threading
 import tkinter as tk
@@ -13,7 +14,10 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
-from circle_mask import (
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from ccd_efficientad.mask import (
     CIRCLE_DETECTION_DEFAULTS,
     dark_region_mask,
     detect_circle,
