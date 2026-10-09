@@ -14,7 +14,7 @@
     {
       "source": "ccd_efficientad/inference.py",
       "destination": "src/ccd_efficientad/inference.py",
-      "sha256": "bf85f505486152f11a6233596b29545035880444be7bffc9cca1854331d60600"
+      "sha256": "e3f37835e557afc07bcfb47ecb4ddf741620502775c383aaa447ab641eafac64"
     },
     {
       "source": "ccd_efficientad/cli.py",

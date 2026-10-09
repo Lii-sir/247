@@ -274,7 +274,7 @@ outputs/CCD1/<运行时间>/
 ## 6. 重跑评估、预测和续训
 
 需要独立的“加载权重 → 单图/文件夹推理”入口时，使用 `run.py infer`。
-它沿用 checkpoint 的预处理、score 和阈值，支持显式指定本机 mask，以及 JSON/CSV、异常数组和热图输出。
+它默认沿用 checkpoint 的预处理、score 和阈值，支持 `--threshold`、`--score-mode`、显式指定本机 mask，以及 JSON/CSV、异常数组和热图输出。改变 score 公式/池化参数时必须指定新阈值；多尺度归一化基准仍需由模型保存。
 详细命令、mask 黑白含义、跨机器路径迁移和 Python API 见 [推理说明](docs/inference.md)。
 
 以下命令中的 `<运行时间>` 必须替换为实际目录名。
@@ -302,7 +302,7 @@ uv run python run.py predict --checkpoint "outputs\CCD1\<运行时间>\model.pt"
 uv run python run.py train --resume "outputs\CCD1\<运行时间>\checkpoints\last.pt"
 ```
 
-`checkpoint` 是 `--score-mode` 的默认值，严格沿用模型里保存的分数公式和阈值。显式选择 `top`、`pool+top` 或 `multiscale_pool` 时，程序使用同一份 `threshold_val` 为所选公式重新选择匹配阈值，并在本次 `evaluation` 目录保存 `calibration.json`、`config.json` 和新的 `model.pt`；原 checkpoint 不会被覆盖。若快照没有 `threshold_val`，程序会从 `test` 各子目录分层划出一部分，因此用于最终报告的测试图片会相应减少。
+对于 `evaluate` 命令，`checkpoint` 是 `--score-mode` 的默认值，严格沿用模型里保存的分数公式和阈值。显式选择 `top`、`pool+top` 或 `multiscale_pool` 时，程序使用同一份 `threshold_val` 为所选公式重新选择匹配阈值，并在本次 `evaluation` 目录保存 `calibration.json`、`config.json` 和新的 `model.pt`；原 checkpoint 不会被覆盖。若快照没有 `threshold_val`，程序会从 `test` 各子目录分层划出一部分，因此用于最终报告的测试图片会相应减少。`infer` 命令则不访问校准数据或自动重选阈值。
 
 续训结果放入新的运行目录，不覆盖原结果。续训恢复模型、优化器和调度器；单卡会重新开始随机数据顺序，多卡会接续两套数据的分片顺序。随机增强和 Dropout 的 RNG 状态未保存，因此不保证与不中断训练逐位相同。若要改变总步数、分辨率、阈值分位数、加入新下载的训练图片或改用另一份辅助数据，请启动一次新的训练；`--resume` 会沿用原配置，只允许改变运行设备（卡数保持一致）、数据读取进程数、保存频率和热图数量。
 

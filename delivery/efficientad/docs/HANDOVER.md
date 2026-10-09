@@ -44,7 +44,9 @@ uv run python .\run_inference.py `
 ## 结果解释
 
 - `score > threshold` 为 NG，等于阈值为 OK。
-- score 不是概率，三种 score 定义都沿用权重，不应手工换公式配旧阈值。
+- 可用 `--threshold 0.5` 覆盖本次推理阈值，默认沿用 checkpoint；不修改权重或分数公式，不保证原目标召回率。
+- score 不是概率，默认沿用权重定义；可用 `--score-mode` 选择其他公式，但实际改变公式/池化参数时必须指定 `--threshold`，不能套用旧阈值。
+- `pool+top` 可调整 `--score-pool-kernel` / `--score-topk-ratio`；多尺度仅复用模型已有的归一化参数。`score_method` 记录本次实际参数。
 - `prediction.json` 包含原图坐标框；PNG 与二值异常 mask 是定位启发式，不是像素真值。
 - NPY 保留未遮挡的有符号异常图；ignore mask 单独输出。
 - 整批完成才有 summary.json。损坏图片或配置错误会报错，前面已经生成的单图文件不代表整批成功。

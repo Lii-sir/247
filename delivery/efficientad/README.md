@@ -73,6 +73,23 @@ uv run python .\run_inference.py `
 结果默认写入本交付包的 `results/inference_<随机标识>/`，包含 JSON、CSV、异常数组和可视化。
 `--output-dir` 可指定其他位置。`--no-heatmaps --no-maps` 只保存 JSON/CSV。
 
+单图和目录推理均可添加 `--threshold 0.5`，仅覆盖本次阈值，不修改权重、不重新校准；省略时沿用 checkpoint。
+阈值须为有限数值（允许负数、0 或大于 1，拒绝 NaN/Inf）。`score > threshold` 为 NG，否则 OK。
+判定、定位、热图和 JSON/CSV 统一使用指定阈值，分数公式不变；手动调整后不保证原校准的目标召回率。
+
+也可指定 `--score-mode top`、`--score-mode "pool+top"` 或 `--score-mode multiscale_pool`；默认 `checkpoint` 保留原公式。
+改变公式或池化参数时必须同时给出 `--threshold`，例如：
+
+```powershell
+uv run python .\run_inference.py --checkpoint ".\weights\CCD1\model.pt" `
+  --image ".\examples\sample.bmp" --mask ".\masks\CCD1.png" `
+  --score-mode "pool+top" --score-pool-kernel 21 --score-topk-ratio 0.001 --threshold 0.5
+```
+
+池化核和 Top-K 比例仅可与显式 `pool+top` 一起使用；正奇数核、比例范围 `(0, 1]`。
+多尺度必须使用 checkpoint 已保存的归一化基准，缺失时须在原项目重新校准，不能用待测图片估计。
+score、定位及所有结果统一使用本次计算方式；JSON 的 `score_method` 记录实际参数，不修改原权重。
+
 ## 5. 交付和验收
 
 - 交付整个本目录，不必交付原项目、训练数据、缓存或虚拟环境。

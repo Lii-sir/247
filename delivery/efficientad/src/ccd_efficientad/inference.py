@@ -19,6 +19,17 @@ from .mask import category_config, default_mask_record, load_configs, read_rgb
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
 
+def _finite_threshold(value: float | str) -> float:
+    """CLI 与 API 共用校验；分数不是概率，因此不限制阈值范围。"""
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("threshold 必须是有限数值（不能为 NaN/Inf）。") from error
+    if not math.isfinite(threshold):
+        raise ValueError("threshold 必须是有限数值（不能为 NaN/Inf）。")
+    return threshold
+
+
 def collect_images(root: Path, output_root: Path) -> list[Path]:
     """递归获取文件清单，排除输出树、符号链接和 Windows junction。"""
     root, output_root = Path(root).resolve(), Path(output_root).resolve()
@@ -48,7 +59,13 @@ class EfficientAdPredictor:
     """模型只加载一次；predict() 逐图复用，不访问训练集或下载教师权重。"""
 
     def __init__(self, checkpoint: Path | str, device: str = "auto", *,
-                 mask: Path | str | None = None, circle_config: Path | str | None = None) -> None:
+                 mask: Path | str | None = None, circle_config: Path | str | None = None,
+                 threshold: float | None = None, score_mode: str = cli.SCORE_MODE_CHECKPOINT,
+                 score_pool_kernel: int | None = None, score_topk_ratio: float | None = None) -> None:
+        """仅覆盖本实例的 score/阈值；默认沿用 checkpoint，不修改权重或重新校准。"""
+        score_mode = cli.normalize_score_mode(score_mode, allow_checkpoint=True)
+        if threshold is not None:
+            threshold = _finite_threshold(threshold)
         if mask is not None and circle_config is not None:
             raise ValueError("mask 与 circle_config 不能同时指定。")
         self.checkpoint = Path(checkpoint).resolve()
@@ -59,19 +76,94 @@ class EfficientAdPredictor:
         self.model, self.config, saved = cli.restore_for_inference(SimpleNamespace(
             checkpoint=self.checkpoint, device=device, num_workers=0,
         ))
+        self.config = dict(self.config)
         self.category = saved.get("manifest", {}).get("category", "unknown")
-        self.calibration = saved["calibration"]
+        self.calibration = dict(saved["calibration"])
         self.score_mode = cli.calibration_score_mode(self.calibration)
         self.threshold = float(self.calibration["threshold"])
         display_max = float(self.calibration["display_max"])
         if not math.isfinite(self.threshold) or not math.isfinite(display_max) or display_max <= 0:
             raise ValueError("checkpoint 的 threshold 必须有限，display_max 必须有限且大于 0。")
+        self._score_settings(score_mode, threshold, score_pool_kernel, score_topk_ratio)
+        if threshold is not None:
+            # 定位与可视化同样读取 calibration，必须与整图判定使用同一阈值。
+            self.threshold = threshold
+            self.calibration["threshold"] = threshold
         size = self.config.get("image_size")
         if not isinstance(size, int) or isinstance(size, bool) or size < 1:
             raise ValueError("checkpoint 的 image_size 必须为正整数。")
         cli.check_statistics(self.model.model.mean_std)
         cli.check_statistics(self.model.model.quantiles, quantiles=True)
         self.mask_params, self.mask_base_dir, self.mask_source = self._mask_settings(mask, circle_config)
+
+    def _score_settings(self, requested: str, threshold: float | None,
+                        pool_kernel: int | None, topk_ratio: float | None) -> None:
+        """选择离线 score 定义，禁止给新公式静默套用旧阈值或伪造归一化。"""
+        has_pool_overrides = pool_kernel is not None or topk_ratio is not None
+        if has_pool_overrides and requested != cli.SCORE_MODE_POOL_TOPK:
+            raise ValueError("score-pool-kernel / score-topk-ratio 仅可与 --score-mode pool+top 一起使用。")
+        if requested == cli.SCORE_MODE_CHECKPOINT:
+            return
+        saved_mode = self.score_mode
+        saved_method = self.calibration.get("score_method") or {}
+        changed = requested != saved_mode
+        if requested == cli.SCORE_MODE_TOP:
+            method = cli.build_score_method([], self.config, requested)
+        elif requested == cli.SCORE_MODE_POOL_TOPK:
+            method = cli.build_score_method([], self.config, requested)
+            if saved_mode == requested:
+                method.update(saved_method)
+            original_kernel, original_ratio = method["pool_kernel"], method["topk_ratio"]
+            if pool_kernel is not None:
+                method["pool_kernel"] = pool_kernel
+            if topk_ratio is not None:
+                method["topk_ratio"] = float(topk_ratio)
+            kernel, ratio = method["pool_kernel"], method["topk_ratio"]
+            if isinstance(kernel, bool) or not isinstance(kernel, int) or kernel < 1 or kernel % 2 == 0:
+                raise ValueError("score-pool-kernel 必须为正奇数。")
+            if not math.isfinite(ratio) or not 0 < ratio <= 1:
+                raise ValueError("score-topk-ratio 必须是 (0, 1] 内的有限数值。")
+            changed = changed or kernel != original_kernel or ratio != original_ratio
+        else:
+            if saved_mode != cli.SCORE_MODE_MULTISCALE:
+                raise ValueError(
+                    "checkpoint 未保存 multiscale_pool 所需的正常集归一化参数；"
+                    "请先用 evaluate --score-mode multiscale_pool 生成匹配的 model.pt。"
+                )
+            method = dict(saved_method)
+            self._check_multiscale_method(method)
+        if changed and threshold is None:
+            raise ValueError(
+                "修改 score 计算方式或池化参数时必须同时指定 --threshold（API: threshold）；"
+                "不同公式不能直接复用 checkpoint 的旧阈值。"
+            )
+        self.score_mode = requested
+        method["mode"] = requested
+        self.config["score_mode"] = requested
+        self.calibration.update(score_mode=requested, score_method=method)
+        if changed:
+            self.calibration["inference_score_override"] = {
+                "checkpoint_score_mode": saved_mode, "recalibrated": False,
+            }
+
+    @staticmethod
+    def _check_multiscale_method(method: dict) -> None:
+        """显式选择多尺度时提前检查保存的基准；不读取任何验证/待测数据。"""
+        try:
+            kernels = method["pool_kernels"]
+            ratio = method["topk_ratio"]
+            if not kernels or not math.isfinite(ratio) or not 0 < ratio <= 1:
+                raise ValueError
+            for kernel in kernels:
+                if isinstance(kernel, bool) or not isinstance(kernel, int) or kernel < 1 or kernel % 2 == 0:
+                    raise ValueError
+                reference = method["normalization"][str(kernel)]
+                if (not math.isfinite(reference["median"])
+                        or not math.isfinite(reference["denominator"])
+                        or reference["denominator"] <= 0):
+                    raise ValueError
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("checkpoint 的 multiscale_pool 归一化参数缺失或无效；请重新校准。") from error
 
     def _mask_settings(self, mask, circle_config) -> tuple[dict | None, Path | None, str]:
         """默认复现训练 mask；迁移机器时可显式重定位，不静默取消忽略区域。"""
@@ -148,6 +240,7 @@ class EfficientAdPredictor:
             "image": str(image_path), "checkpoint": str(self.checkpoint),
             "category": self.category, "backbone": self.config["backbone"],
             "score_mode": self.score_mode, **scores, "threshold": self.threshold,
+            "score_method": self.calibration.get("score_method") or {"name": cli.TOP_SCORE_METHOD},
             "prediction": "NG" if scores["score"] > self.threshold else "OK",
             "decision_rule": "score > threshold", "mask_source": self.mask_source,
             "image_size_original": {"width": width, "height": height},
@@ -183,6 +276,16 @@ def build_parser() -> argparse.ArgumentParser:
     inputs.add_argument("--image", type=Path, help="单张原始图片")
     inputs.add_argument("--image-dir", type=Path, help="递归推理该目录的图片（不要求 train/test 结构）")
     parser.add_argument("--device", default="auto", help="auto/cpu/cuda 或单个可见 GPU 编号，如 0")
+    parser.add_argument(
+        "--threshold", type=_finite_threshold, default=None,
+        help="本次推理使用的有限数值阈值；默认沿用 checkpoint，不修改权重；score > threshold 为 NG",
+    )
+    parser.add_argument(
+        "--score-mode", type=cli.parse_evaluation_score_mode, default=cli.SCORE_MODE_CHECKPOINT,
+        help="checkpoint=沿用模型（默认）；top=最大单像素；pool+top=池化 Top-K；multiscale_pool=保存的多尺度归一化",
+    )
+    parser.add_argument("--score-pool-kernel", type=int, help="pool+top 的池化核，正奇数；默认沿用模型设置或 21")
+    parser.add_argument("--score-topk-ratio", type=float, help="pool+top 的 Top-K 比例，(0, 1]；默认沿用模型设置或 0.001")
     parser.add_argument("--output-dir", type=Path, default=cli.PROJECT_DIR / "outputs" / "inference")
     masks = parser.add_mutually_exclusive_group()
     masks.add_argument("--mask", type=Path, help="显式指定 ignore mask：非零忽略，0 保留；默认沿用训练设置")
@@ -203,6 +306,9 @@ def main(argv: list[str] | None = None) -> Path:
         images, input_root = [args.image.resolve()], None
     predictor = EfficientAdPredictor(
         args.checkpoint, args.device, mask=args.mask, circle_config=args.circle_config,
+        threshold=args.threshold,
+        score_mode=args.score_mode, score_pool_kernel=args.score_pool_kernel,
+        score_topk_ratio=args.score_topk_ratio,
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     output = Path(mkdtemp(prefix="inference_", dir=args.output_dir.resolve()))
@@ -225,6 +331,7 @@ def main(argv: list[str] | None = None) -> Path:
         "backbone": predictor.config["backbone"], "device": predictor.config["device"],
         "model_image_size": predictor.config["image_size"], "score_mode": predictor.score_mode,
         "threshold": predictor.threshold, "decision_rule": "score > threshold",
+        "score_method": predictor.calibration.get("score_method") or {"name": cli.TOP_SCORE_METHOD},
         "mask_source": predictor.mask_source, "mask_params": predictor.mask_params,
         "input_directory": str(input_root) if input_root is not None else None,
         "image_count": len(rows), "ok_count": sum(row["prediction"] == "OK" for row in rows),

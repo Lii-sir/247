@@ -69,8 +69,49 @@ uv run python .\run.py infer `
 - `auto`：CUDA 可用时选第一张可见 GPU，否则 CPU。
 - `cpu`：明确使用 CPU。
 - `cuda` 或 `0`：第一张可见 GPU；`1` 表示第二张。一次只支持一个设备，编号受 `CUDA_VISIBLE_DEVICES` 影响。
-- 不需要再指定 `--backbone` / `--image-size` / score 参数，全部从权重恢复。
+- 不需要再指定 `--backbone` / `--image-size`；score 默认从权重恢复，也可按下文显式选择。
 - 不要把热图拼图作为输入，应输入拍摄的原始图像。
+
+### 手动指定 threshold
+
+单图和文件夹推理都可添加 `--threshold`，例如：
+
+```powershell
+uv run python .\run.py infer --checkpoint $checkpoint --image $image --threshold 0.5
+```
+
+- 不指定时，沿用 checkpoint 中保存的阈值；指定后仅覆盖本次推理，不修改原 `model.pt`，也不重新校准。
+- 阈值必须是有限数值，拒绝 NaN/Inf；score 不是概率，因此允许负数、0 和大于 1 的阈值。
+- OK/NG 判定、定位框、二值异常 mask、热图以及 JSON/CSV 都使用覆盖后的阈值；score 公式与归一化参数不变。
+- `score > threshold` 为 NG，否则 OK。增大阈值会减少 NG，降低阈值会增加 NG；手动调整后不再保证原校准时的目标召回率。
+- 负阈值的空间定位仍遵循项目既有的下限 0 规则，避免整幅图被选中；整图分类使用指定的原始阈值。
+
+### 指定 score 计算方式
+
+单图和目录推理均支持 `--score-mode`：
+
+| 参数值 | 计算方式 |
+|---|---|
+| `checkpoint`（默认） | 完整沿用模型保存的 score 公式及参数 |
+| `top` | mask 后最大单像素异常值 |
+| `pool+top` / `pool_topk` | mask-aware 单尺度平均池化后 Top-K 均值 |
+| `multiscale_pool` | 使用模型保存的正常集基准进行多尺度归一化融合 |
+
+```powershell
+# 改为单像素最大值，必须为新公式指定阈值。
+uv run python .\run.py infer --checkpoint $checkpoint --image $image --score-mode top --threshold 0.5
+
+# 单尺度池化 + Top-K，可选调整正奇数池化核和 (0, 1] 的 Top-K 比例。
+uv run python .\run.py infer --checkpoint $checkpoint --image $image `
+  --score-mode "pool+top" --score-pool-kernel 21 --score-topk-ratio 0.001 --threshold 0.5
+```
+
+- **实际改变 score 公式或池化参数时，必须同时指定 `--threshold`**，否则在生成结果前报错。不自动沿用不同公式的旧阈值，也不使用待测图片重新校准。
+- 显式选择与 checkpoint 相同的公式且未改变参数时，可以继续使用保存的阈值。
+- `pool+top` 已是模型保存的模式时，保留其池化核和比例；从其他模式切换时按模型 config 取值，缺省为核 21、比例 0.001。可用上述两个参数覆盖；它们仅允许与显式的 `pool+top` 一起使用。
+- `multiscale_pool` 必须已有 checkpoint 保存的尺度列表、Top-K 比例及归一化参数；不能从缺少这些参数的 top/pool 模型凭空切换。缺失时需先用 `evaluate --score-mode multiscale_pool` 生成对应的 `model.pt`。推理不更改多尺度尺度列表或比例，以免归一化基准失配。
+- score、OK/NG、定位、热图和结果文件统一使用所选公式与实际阈值；模型网络、异常图校准统计和原 `model.pt` 不变。JSON 的 `score_method` 记录实际计算参数。
+- 此操作不做效果校准，不保证原目标召回率；需要自动选择匹配阈值时仍使用 `evaluate --score-mode ...`。
 
 ## 4. 文件夹批量推理
 
@@ -177,10 +218,11 @@ outputs/inference/inference_<随机标识>/
 | 字段                    | 说明                                               |
 | ----------------------- | -------------------------------------------------- |
 | `prediction`          | `OK` 或 `NG`                                   |
-| `score`               | 与 checkpoint 阈值同定义的最终整图异常分数         |
+| `score`               | 按本次实际 score 公式计算的最终整图异常分数         |
 | `score_max`           | 有效区域异常图的单像素最大值，不一定是最终判定分数 |
-| `threshold`           | checkpoint 保存的阈值，不在本批图片上重新估计      |
+| `threshold`           | 本次实际阈值：默认来自 checkpoint，可用 `--threshold` 覆盖，不在本批图片上重新估计 |
 | `score_mode`          | `top`、`pool_topk` 或 `multiscale_pool`      |
+| `score_method`        | 本次实际 score 定义、池化参数及可用的归一化基准 |
 | `localization.boxes`  | 模型异常图坐标空间的定位框，保留原定位字段         |
 | `boxes_original`      | 映射到原图的`x0, y0, x1, y1` 半开区间坐标        |
 | `image_size_original` | EXIF 校正后的原图宽高                              |
@@ -196,8 +238,8 @@ outputs/inference/inference_<随机标识>/
 2. 双线性缩放为 checkpoint 的 `image_size × image_size`；不保持长宽比、不裁 ROI、不分块。
 3. 转为 float Tensor，范围 `[0,1]`，形状 `[1,3,H,W]`。**不要外部再做 ImageNet Normalize**；网络内部有归一化。
 4. 恢复 Teacher、Student、AE 和统计量，调用 `eval()`，在 `torch.inference_mode()` 中前向。
-5. 得到校准后的融合异常图，用保存的 mask / score 公式计算整图分数。
-6. 用保存的阈值给出 OK/NG，生成定位信息和可选输出。
+5. 得到校准后的融合异常图，用保存的 mask 和保存/显式选择的 score 公式计算整图分数。
+6. 用保存的阈值（或显式指定的 `--threshold`）给出 OK/NG，生成定位信息和可选输出。
 
 ResNet 的架构版本、`valid/native` 输出边界、Teacher 最终激活沿用 checkpoint；缺少相关字段的旧权重使用项目现有兼容逻辑（版本 1、native、relu），不会自动变成新版结构。`resnet50_layer1v2` 的 Student 前向同样复用当前项目实现。
 
@@ -207,7 +249,7 @@ score 不是一律 `prediction.pred_score`：后者只是异常图最大值，�
 - `pool_topk`：mask-aware 局部平均池化后 Top-K 均值。
 - `multiscale_pool`：各尺度 Top-K 均值按保存的正常集基准归一化，再取尺度最大值。
 
-不能随意换 score 公式后沿用旧 threshold。需要比较其他模式时用原 `evaluate --score-mode ...` 生成匹配的新 `model.pt`，再将它传给本脚本。
+不能换 score 公式后直接沿用旧 threshold。推理中切换公式须显式指定新阈值；需要自动校准匹配阈值或建立多尺度归一化参数时，用 `evaluate --score-mode ...` 生成新的 `model.pt`，再传给本脚本。
 
 ## 8. 在自己的 Python 程序中调用
 
@@ -220,6 +262,10 @@ from ccd_efficientad.inference import EfficientAdPredictor
 predictor = EfficientAdPredictor(
     checkpoint=r"D:\models\CCD1\model.pt",
     device="auto",
+    # threshold=0.5,  # 可选：仅覆盖本实例阈值；默认 None 沿用 checkpoint
+    # score_mode="pool+top",  # 可选：切换公式时须同时提供 threshold
+    # score_pool_kernel=21,  # 可选：仅支持显式 pool+top
+    # score_topk_ratio=0.001,  # 可选：仅支持显式 pool+top
     # mask=r"D:\datasets\mask\CCD1.png",  # 可选：默认沿用训练设置
 )
 
