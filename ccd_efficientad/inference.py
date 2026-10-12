@@ -91,9 +91,7 @@ class EfficientAdPredictor:
             # 定位与可视化同样读取 calibration，必须与整图判定使用同一阈值。
             self.threshold = threshold
             self.calibration["threshold"] = threshold
-        size = self.config.get("image_size")
-        if not isinstance(size, int) or isinstance(size, bool) or size < 1:
-            raise ValueError("checkpoint 的 image_size 必须为正整数。")
+        self.input_size = cli.validate_rectangular_input_size(cli.config_input_size(self.config))
         cli.check_statistics(self.model.model.mean_std)
         cli.check_statistics(self.model.model.quantiles, quantiles=True)
         self.mask_fallback: dict | None = None
@@ -223,8 +221,8 @@ class EfficientAdPredictor:
                     f"无法使用训练/指定 mask：{error}。请用 --mask 或 --circle-config 指定本机路径；"
                     "仅缺少 mask 文件时会改为无 mask；损坏或无效 mask 不会自动跳过。"
                 ) from error
-        # 与原 predict 命令完全一致：EXIF -> RGB -> BILINEAR 方形缩放 -> [0,1]。
-        batch = cli.collate_batch([cli.SnapshotDataset([record], self.config["image_size"])[0]])
+        # 与 predict 一致：EXIF -> RGB -> BILINEAR resize 到保存的 (H,W) -> [0,1]，不补边。
+        batch = cli.collate_batch([cli.SnapshotDataset([record], self.input_size)[0]])
         if batch.ignore_mask.all().item():
             raise ValueError("mask 遮住了全部像素，没有有效检测区域。")
         return batch, (int(rgb.shape[1]), int(rgb.shape[0]))
@@ -246,14 +244,12 @@ class EfficientAdPredictor:
         anomaly_map = prediction.anomaly_map[0, 0].detach().cpu().numpy()
         ignore_mask = batch.ignore_mask[0, 0].cpu().numpy()
         map_h, map_w = anomaly_map.shape
+        if (map_h, map_w) != self.input_size:
+            raise ValueError(f"异常图尺寸 {(map_h, map_w)} 与模型输入尺寸 {self.input_size} 不一致。")
         width, height = original_size
-        boxes_original = [{
-            "x0": max(0, math.floor(box["x0"] * width / map_w)),
-            "y0": max(0, math.floor(box["y0"] * height / map_h)),
-            "x1": min(width, math.ceil(box["x1"] * width / map_w)),
-            "y1": min(height, math.ceil(box["y1"] * height / map_h)),
-            "source_scales": box["source_scales"],
-        } for box in localization["boxes"]]
+        boxes_original = cli.boxes_to_original(
+            localization["boxes"], (map_h, map_w), original_size,
+        )
         result = {
             "image": str(image_path), "checkpoint": str(self.checkpoint),
             "category": self.category, "backbone": self.config["backbone"],
@@ -263,6 +259,7 @@ class EfficientAdPredictor:
             "decision_rule": "score > threshold", "mask_source": self.mask_source,
             "mask_fallback": self.mask_fallback,
             "image_size_original": {"width": width, "height": height},
+            "model_input_size": {"height": map_h, "width": map_w},
             "anomaly_map_shape": [map_h, map_w], "boxes_original": boxes_original,
             "localization": cli.localization_summary(localization),
         }
@@ -352,7 +349,10 @@ def main(argv: list[str] | None = None) -> Path:
     cli.write_json(output / "summary.json", {
         "checkpoint": str(predictor.checkpoint), "category": predictor.category,
         "backbone": predictor.config["backbone"], "device": predictor.config["device"],
-        "model_image_size": predictor.config["image_size"], "score_mode": predictor.score_mode,
+        "model_input_size": list(predictor.input_size),
+        "model_image_size": (predictor.input_size[0] if predictor.input_size[0] == predictor.input_size[1]
+                             else list(predictor.input_size)),
+        "score_mode": predictor.score_mode,
         "threshold": predictor.threshold, "decision_rule": "score > threshold",
         "score_method": predictor.calibration.get("score_method") or {"name": cli.TOP_SCORE_METHOD},
         "mask_source": predictor.mask_source, "mask_params": predictor.mask_params,

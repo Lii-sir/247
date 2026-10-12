@@ -168,6 +168,27 @@ class OfflineInferenceTests(unittest.TestCase):
             self.assertTrue(0 <= box["x0"] < box["x1"] <= 71)
             self.assertTrue(0 <= box["y0"] < box["y1"] <= 45)
 
+    def test_rectangular_checkpoint_drives_preprocess_maps_scores_and_original_coordinates(self):
+        config = {**self.config, "input_size": [288, 512], "input_height": 288, "input_width": 512,
+                  "image_size": 512}
+        checkpoint = self.save_checkpoint("rectangular.pt", config=config, calibration=self.calibration)
+        predictor = inference.EfficientAdPredictor(checkpoint, "cpu")
+        output = self.root / "rectangular-output"
+        result = predictor.predict(self.image, output, save_heatmaps=False)
+        self.assertEqual(predictor.input_size, (288, 512))
+        self.assertEqual(result["model_input_size"], {"height": 288, "width": 512})
+        self.assertEqual(result["anomaly_map_shape"], [288, 512])
+        self.assertEqual(result["image_size_original"], {"width": 71, "height": 45})
+        batch, _ = predictor._prepare_batch(self.image)
+        self.assertEqual(tuple(batch.image.shape), (1, 3, 288, 512))
+        self.assertEqual(tuple(batch.ignore_mask.shape), (1, 1, 288, 512))
+        self.assertEqual(np.load(output / "anomaly_map.npy").shape, (288, 512))
+        with Image.open(output / "anomaly_mask.png") as anomaly_mask:
+            self.assertEqual(anomaly_mask.size, (71, 45))
+        self.assertTrue(all(0 <= box["x0"] < box["x1"] <= 71
+                            and 0 <= box["y0"] < box["y1"] <= 45
+                            for box in result["boxes_original"]))
+
     def test_score_equal_to_threshold_is_ok(self):
         score = self.predictor.predict(self.image)["score"]
         predictor = inference.EfficientAdPredictor(self.checkpoint, "cpu", threshold=score)
@@ -658,6 +679,9 @@ class OfflineInferenceTests(unittest.TestCase):
         self.assertFalse(output.exists())
 
     def test_delivery_batch_entry_supports_score_override_in_isolated_mode(self):
+        delivery_entry = Path(__file__).resolve().parents[1] / "delivery" / "efficientad" / "run_inference.py"
+        if not delivery_entry.is_file():
+            self.skipTest("交付目录不存在；当前仅验证主项目推理，不自动重建 delivery。")
         inputs = self.root / "delivery-inputs"
         inputs.mkdir()
         for name in ("one.png", "two.bmp"):

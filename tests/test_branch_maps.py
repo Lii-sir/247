@@ -11,11 +11,29 @@ import numpy as np
 import torch
 from PIL import Image
 
-from tools.diagnostics.export_branch_maps import extract_maps, collect_images
+from tools.diagnostics.export_branch_maps import extract_maps, collect_images, export_image
 from ccd_efficientad.models.torch_model import EfficientAdModel
 
 
 class BranchMapTests(unittest.TestCase):
+    def test_branch_export_uses_rectangular_checkpoint_size(self):
+        from ccd_efficientad import cli
+
+        cli.load_runtime()
+        config = {"imagenette_dir": "unused", "model_size": "small", "backbone": "resnet18_layer2",
+                  "lr": 1e-4, "weight_decay": 1e-5, "device": "cpu", "input_size": [288, 512]}
+        model = cli.new_model(config).eval()
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            image = root / "original.png"
+            Image.new("RGB", (77, 49), (50, 100, 150)).save(image)
+            output = root / "branches"
+            export_image(model, config, root / "model.pt", image, output, None)
+            metadata = json.loads((output / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["input_size"], [288, 512])
+            with np.load(output / "maps.npz") as maps:
+                self.assertEqual(maps["st_raw"].shape, (288, 512))
+
     def test_folder_scan_recurses_and_excludes_previous_outputs(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)

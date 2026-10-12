@@ -71,6 +71,7 @@ uv run python .\run.py infer `
 - `cuda` 或 `0`：第一张可见 GPU；`1` 表示第二张。一次只支持一个设备，编号受 `CUDA_VISIBLE_DEVICES` 影响。
 - 不需要再指定 `--backbone` / `--image-size`；`infer` 默认使用 `pool+top`、池化核 7，也可按下文显式选择其他公式。
 - 不要把热图拼图作为输入，应输入拍摄的原始图像。
+- 新模型如以矩形宽高训练，checkpoint 会保存 `input_size=[height, width]`；推理自动恢复该尺寸，不要求重新传宽高。旧 checkpoint 仍按旧 `image_size` 正方形方式处理。
 
 ### 手动指定 threshold
 
@@ -228,7 +229,7 @@ outputs/inference/inference_<随机标识>/
 | `localization.boxes`  | 模型异常图坐标空间的定位框，保留原定位字段         |
 | `boxes_original`      | 映射到原图的`x0, y0, x1, y1` 半开区间坐标        |
 | `image_size_original` | EXIF 校正后的原图宽高                              |
-| `anomaly_map_shape`   | `[高度, 宽度]`，等于权重保存的方形输入尺寸       |
+| `anomaly_map_shape`   | `[高度, 宽度]`，等于 checkpoint 保存的方形或矩形输入尺寸 |
 
 判定统一为 **`score > threshold` 则 NG，否则 OK**；等于阈值时是 OK。分数不是缺陷概率，不必限制在 `[0,1]`，多尺度分数可以大于 1。异常图 NPY 保留负值，不截断、不按单图 min-max 归一化；PNG 为展示会裁剪颜色范围。
 
@@ -237,7 +238,7 @@ outputs/inference/inference_<随机标识>/
 ## 7. 预处理和前向过程
 
 1. 读取并 EXIF 校正，转 RGB。
-2. 双线性缩放为 checkpoint 的 `image_size × image_size`；不保持长宽比、不裁 ROI、不分块。
+2. 双线性直接 resize 为 checkpoint 保存的 `input_size=[高度, 宽度]`；不保持原图长宽比、不补边、不裁 ROI、不分块。旧 checkpoint 的 `image_size` 自动视为正方形。
 3. 转为 float Tensor，范围 `[0,1]`，形状 `[1,3,H,W]`。**不要外部再做 ImageNet Normalize**；网络内部有归一化。
 4. 恢复 Teacher、Student、AE 和统计量，调用 `eval()`，在 `torch.inference_mode()` 中前向。
 5. 得到校准后的融合异常图，用保存的 mask 和保存/显式选择的 score 公式计算整图分数。

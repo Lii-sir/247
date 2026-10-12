@@ -34,7 +34,13 @@ def main() -> None:
                         help="同时检查训练后 pool+top 与旧版单尺度参数的传递")
     parser.add_argument("--batch-size", type=int, choices=(1, 2), default=2,
                         help="每个 rank 的合成测试 batch；大模型 DDP 可用 1 降低显存占用")
+    parser.add_argument("--image-width", type=int, default=None,
+                        help="可选矩形训练输入宽度")
+    parser.add_argument("--image-height", type=int, default=None,
+                        help="可选矩形训练输入高度")
     args = parser.parse_args()
+    if (args.image_width is None) != (args.image_height is None):
+        parser.error("矩形 smoke 测试必须同时提供 --image-width 和 --image-height")
     load_runtime()
     torch.manual_seed(2026)
     rng = np.random.default_rng(2026)
@@ -45,7 +51,11 @@ def main() -> None:
             destination = data / "CCD1" / folder
             destination.mkdir(parents=True)
             for index in range(count):
-                pixels = rng.integers(0, 256, (256, 256, 3), dtype=np.uint8)
+                # Original image sizes differ; preprocessing must still create
+                # a uniform rectangular tensor batch without padding.
+                source_height = 240 + (index % 3) * 7
+                source_width = 320 + (index % 2) * 13
+                pixels = rng.integers(0, 256, (source_height, source_width, 3), dtype=np.uint8)
                 Image.fromarray(pixels).save(destination / f"{index}.png")
         auxiliary = root / "auxiliary" / "dummy_class"
         auxiliary.mkdir(parents=True)
@@ -90,6 +100,8 @@ def main() -> None:
             subprocess.run(entry + list(arguments), cwd=PROJECT_DIR, check=True, env=environment)
 
         global_batch_size = args.batch_size * (2 if args.ddp_test_device else 1)
+        rectangular_size = (["--image-width", str(args.image_width), "--image-height", str(args.image_height)]
+                            if args.image_width is not None or args.image_height is not None else [])
         run("train", "--backbone", args.backbone, "--data-root", str(data), "--batch-size", str(args.batch_size),
             "--max-images", str(2 * global_batch_size),
             "--num-workers", str(args.num_workers),
@@ -98,12 +110,17 @@ def main() -> None:
             *(["--circle-config", str(circle_config)] if args.mask_mode != "none" else []),
             "--output-dir", str(output),
             "--save-every", "1", "--heatmaps", "1",
+            *rectangular_size,
             *(["--score-pool-kernel", str(args.score_pool_kernel)]
               if args.score_pool_kernel is not None else []))
         model_path = next(output.glob("CCD1/*/model.pt"))
         run_dir = model_path.parent
         assert json.loads((run_dir / "config.json").read_text(encoding="utf-8"))["backbone"] == args.backbone
         training_config = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+        if args.image_width is not None or args.image_height is not None:
+            assert training_config["input_size"] == [args.image_height, args.image_width]
+            assert training_config["input_width"] == args.image_width
+            assert training_config["input_height"] == args.image_height
         if args.mask_mode != "configured":
             assert training_config["mask_mode"] == "none"
             assert training_config["circle_config"] is None
@@ -115,6 +132,8 @@ def main() -> None:
         assert training_config["world_size"] == (2 if args.ddp_test_device else 1)
         assert training_config["global_batch_size"] == global_batch_size
         assert training_config["max_steps"] == 2
+        expected_input = [args.image_height, args.image_width] if rectangular_size else [256, 256]
+        assert training_config["input_size"] == expected_input
         assert training_config["resnet_architecture_version"] == 2
         expected_activation = "none" if args.backbone == "resnet50_layer1v2" else "relu"
         assert training_config["resnet_teacher_output_activation"] == expected_activation
@@ -217,6 +236,11 @@ def main() -> None:
             switched_result = json.loads(
                 switched_predictions[0].read_text(encoding="utf-8")
             )
+            if args.image_width is not None or args.image_height is not None:
+                assert switched_result["model_input_size"] == {
+                    "height": args.image_height, "width": args.image_width,
+                }
+                assert switched_result["anomaly_map_shape"] == [args.image_height, args.image_width]
             assert switched_result["threshold"] == score_checkpoint["calibration"]["threshold"]
             assert switched_result["localization"]["score_mode"] == score_checkpoint["calibration"]["score_mode"]
             prediction_folder = switched_predictions[0].parent
@@ -225,8 +249,33 @@ def main() -> None:
 
         run("predict", "--checkpoint", str(model_path), "--image", str(data / "CCD1/test/good/0.png"),
             "--output-dir", str(root / "predictions"))
+        prediction_json, = (root / "predictions").glob("CCD1/*/prediction.json")
+        prediction_result = json.loads(prediction_json.read_text(encoding="utf-8"))
+        assert prediction_result["model_input_size"] == {
+            "height": expected_input[0], "width": expected_input[1],
+        }
+        assert prediction_result["anomaly_map_shape"] == expected_input
         assert len(list((root / "predictions").glob("CCD1/*/prediction.png"))) == 1
         assert len(list((root / "predictions").glob("CCD1/*/prediction_scales.png"))) == 1
+        inference_root = root / "inference"
+        run("infer", "--checkpoint", str(model_path), "--image", str(data / "CCD1/test/good/0.png"),
+            "--device", "cpu", "--score-mode", "checkpoint", "--output-dir", str(inference_root),
+            "--no-heatmaps")
+        inference_dir, = inference_root.glob("inference_*")
+        inference_summary = json.loads((inference_dir / "summary.json").read_text(encoding="utf-8"))
+        assert inference_summary["model_input_size"] == expected_input
+        assert inference_summary["threshold"] == metrics["threshold"]
+        inference_image = inference_dir / "images" / "0.png"
+        inference_result = json.loads((inference_image / "prediction.json").read_text(encoding="utf-8"))
+        assert inference_result["anomaly_map_shape"] == expected_input
+        assert list(np.load(inference_image / "anomaly_map.npy").shape) == expected_input
+        with Image.open(data / "CCD1/test/good/0.png") as original, \
+                Image.open(inference_image / "anomaly_mask.png") as output_mask:
+            assert output_mask.size == original.size
+        for box in inference_result["boxes_original"]:
+            size = inference_result["image_size_original"]
+            assert 0 <= box["x0"] < box["x1"] <= size["width"]
+            assert 0 <= box["y0"] < box["y1"] <= size["height"]
         # 仅在合成验证中将目标步数延长一步，确认恢复后确实执行一次优化。
         resume_payload = torch.load(run_dir / "checkpoints/last.pt", map_location="cpu", weights_only=True)
         assert resume_payload["config"]["resnet_teacher_output_activation"] == expected_activation
@@ -242,6 +291,8 @@ def main() -> None:
         assert resumed["config"]["backbone"] == args.backbone
         assert resumed["config"]["resnet_architecture_version"] == 2
         assert resumed["config"]["resnet_teacher_output_activation"] == expected_activation
+        if args.image_width is not None or args.image_height is not None:
+            assert resumed["config"]["input_size"] == [args.image_height, args.image_width]
         for label in ("top", "pool+top", "multipool"):
             report_dir = resumed_path.parent / "score_reports" / label
             assert (report_dir / "metrics.json").is_file(), label

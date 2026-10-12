@@ -1022,14 +1022,24 @@ def effective_mask_radius(selected: dict, params: dict) -> int:
     return max(1, int(round(selected["radius"] * scale)) + margin)
 
 
-def preprocess_record(path: Path, params: dict, image_size: int) -> tuple[np.ndarray, np.ndarray, dict]:
+def preprocess_record(path: Path, params: dict, image_size: int | tuple[int, int]) -> tuple[np.ndarray, np.ndarray, dict]:
     """读取原图并返回未填充的网络输入和对应 ignore mask。"""
     image_rgb = read_rgb(path)
     result = detect_circle(image_rgb, params)
     selected = result["selected"]
     mask = make_mask(image_rgb.shape[:2], selected, params)
-    image = np.asarray(Image.fromarray(image_rgb).resize((image_size, image_size), Image.Resampling.BILINEAR))
-    resized_mask = np.asarray(Image.fromarray(mask).resize((image_size, image_size), Image.Resampling.NEAREST)) > 0
+    if isinstance(image_size, int) and not isinstance(image_size, bool):
+        output_height = output_width = image_size
+    elif isinstance(image_size, (tuple, list)) and len(image_size) == 2:
+        output_height, output_width = image_size
+    else:
+        raise ValueError("image_size 必须是正方形边长或 (height, width)。")
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 1
+           for value in (output_height, output_width)):
+        raise ValueError("image_size 的高和宽必须是正整数。")
+    output_size = (output_width, output_height)
+    image = np.asarray(Image.fromarray(image_rgb).resize(output_size, Image.Resampling.BILINEAR))
+    resized_mask = np.asarray(Image.fromarray(mask).resize(output_size, Image.Resampling.NEAREST)) > 0
     metadata = {"params": params, **selected, "mask_radius": effective_mask_radius(selected, params) if selected.get("enabled", True) else 0}
     return image, resized_mask, {"result": result, "selected": metadata}
 

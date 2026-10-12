@@ -138,8 +138,9 @@ def export_image(model, config: dict, checkpoint: Path, image_path: Path,
                  output: Path, vmax: float | None) -> None:
     with Image.open(image_path) as source:
         original = ImageOps.exif_transpose(source).convert("RGB")
-    size = int(config["image_size"])
-    resized = original.resize((size, size), Image.Resampling.BILINEAR)
+    from ccd_efficientad.cli import config_input_size, validate_rectangular_input_size
+    input_height, input_width = validate_rectangular_input_size(config_input_size(config))
+    resized = original.resize((input_width, input_height), Image.Resampling.BILINEAR)
     tensor = to_tensor(resized).unsqueeze(0).to(config["device"])
     maps = extract_maps(model.model, tensor)
     output.mkdir(parents=True, exist_ok=True)
@@ -149,7 +150,7 @@ def export_image(model, config: dict, checkpoint: Path, image_path: Path,
     scales = save_figures(original, maps, output, vmax)
     metadata = {
         "checkpoint": str(checkpoint.resolve()), "image": str(image_path.resolve()),
-        "backbone": model.model.backbone, "input_size": size,
+        "backbone": model.model.backbone, "input_size": [input_height, input_width],
         "mask_applied": False, "pooling_applied": False,
         "teacher_channel_standardization_applied": bool(model.model.is_set(model.model.mean_std)),
         "display_scales": scales,

@@ -128,6 +128,14 @@ uv run python run.py train `
   --circle-config "D:\python_programs\LXD_project\247\configs\circle_config.json"
 ```
 
+训练支持指定矩形网络输入。原图会直接 resize 到指定宽高（不保持原图比例、不补边）；高和宽可分别指定为任意至少 256 的 32 倍数，不限于固定尺寸列表。旧的 `--image-size N` 仍表示 `N×N` 方形输入。示例 `1022×511` 原图 resize 到宽 512、高 288 时，模型输入 tensor 为 `[B, 3, 288, 512]`：
+
+```powershell
+uv run python run.py train --category CCD1 --image-width 512 --image-height 288 --no-mask --max-steps 10000
+```
+
+宽高与预处理配置写入 checkpoint；评估、续训和推理从 checkpoint 恢复尺寸。固定目标宽高时，不同原图大小仍可组成同尺寸 batch。矩形输入改变了预处理和 score 分布，需用新尺寸重新训练、校准；不应沿用旧正方形模型的阈值。
+
 `--backbone` 与旧版 `--model-size` 互斥，不能同时传入；未指定 `--backbone` 时，`small/medium` 分别映射到 `pdn_small/pdn_medium`。续训默认沿用 checkpoint 的结构，显式指定不同 backbone 会报错；切换结构必须重新训练并重新校准阈值。
 
 ResNet 新训练默认采用架构版本 2、`resnet_feature_mode="valid"`：**保留主干内部 padding，仅最终输出不补边**。Teacher 保留并冻结原生预训练主干，输出裁掉四周各 1 格；student 末尾无激活的 `3×3` 输出卷积使用 `padding=0`；AE 最后一个 `3×3` 输出卷积同样不补边，三路特征严格对齐。除了 `layer1v2`，student 的 stem 和所有保留 stage 通道整体扩大 2 倍。256×256 输入时：

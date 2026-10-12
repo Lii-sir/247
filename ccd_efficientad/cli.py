@@ -35,6 +35,104 @@ from .paths import PROJECT_DIR
 Batch = namedtuple("Batch", ["image", "gt_label", "ignore_mask"])
 
 
+def normalize_input_size(value, *, name: str = "input_size") -> tuple[int, int]:
+    """Return model input size as ``(height, width)``.
+
+    Legacy checkpoints store one integer ``image_size``; that value remains a
+    square input. New checkpoints may store ``input_size=[height, width]``.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{name} 必须是正整数或 [height, width]。")
+    if isinstance(value, int):
+        height = width = value
+    elif isinstance(value, (list, tuple)) and len(value) == 2:
+        height, width = value
+    else:
+        raise ValueError(f"{name} 必须是正整数或 [height, width]。")
+    if any(isinstance(item, bool) or not isinstance(item, int) or item < 1
+           for item in (height, width)):
+        raise ValueError(f"{name} 的高和宽必须是正整数。")
+    return int(height), int(width)
+
+
+def config_input_size(config: dict) -> tuple[int, int]:
+    """Read new rectangular input metadata while preserving old checkpoints."""
+    if config.get("input_size") is not None:
+        size = normalize_input_size(config["input_size"], name="config.input_size")
+        if config.get("input_height") is not None or config.get("input_width") is not None:
+            explicit = normalize_input_size([config.get("input_height"), config.get("input_width")],
+                                            name="config.input_height/input_width")
+            if explicit != size:
+                raise ValueError("checkpoint 的 input_size 与 input_height/input_width 不一致。")
+        return size
+    if config.get("input_height") is not None or config.get("input_width") is not None:
+        if config.get("input_height") is None or config.get("input_width") is None:
+            raise ValueError("input_height 和 input_width 必须同时存在。")
+        return normalize_input_size(
+            [config["input_height"], config["input_width"]], name="config.input_size"
+        )
+    return normalize_input_size(config.get("image_size", 256), name="config.image_size")
+
+
+def args_input_size(args) -> tuple[int, int]:
+    """Resolve CLI dimensions as ``(height, width)``."""
+    width = getattr(args, "image_width", None)
+    height = getattr(args, "image_height", None)
+    legacy = getattr(args, "image_size", None)
+    if (width is None) != (height is None):
+        raise ValueError("--image-width 和 --image-height 必须同时指定。")
+    if width is not None:
+        if legacy is not None:
+            raise ValueError("--image-size 不能与 --image-width/--image-height 同时使用。")
+        return validate_rectangular_input_size((height, width))
+    side = 256 if legacy is None else legacy
+    return validate_rectangular_input_size((side, side))
+
+
+def requested_input_size(args) -> tuple[int, int] | None:
+    """Return a user-specified size or ``None`` when a resume should inherit it."""
+    if (getattr(args, "image_width", None) is None
+            and getattr(args, "image_height", None) is None
+            and getattr(args, "image_size", None) is None):
+        return None
+    return args_input_size(args)
+
+
+def validate_rectangular_input_size(size: tuple[int, int], *, minimum: int = 256) -> tuple[int, int]:
+    """Validate the first supported rectangular-input envelope.
+
+    All current EfficientAD branches downsample repeatedly. Requiring each
+    axis to be a 32-multiple keeps the feature grids predictable; the minimum
+    protects the PDN 8x8 bottleneck. Future backbones may relax this per model.
+    """
+    height, width = size
+    if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0
+           for value in (height, width)):
+        raise ValueError("输入高和宽必须是正整数。")
+    if height < minimum or width < minimum:
+        raise ValueError(f"输入高宽必须都不少于 {minimum}，当前为 {height}x{width}。")
+    if height % 32 or width % 32:
+        raise ValueError(f"输入高宽必须都是 32 的倍数，当前为 {height}x{width}。")
+    return size
+
+
+def boxes_to_original(boxes: list[dict], map_size: tuple[int, int],
+                      original_size: tuple[int, int]) -> list[dict]:
+    """Map half-open boxes with independent X/Y scales; no padding/cropping.
+
+    map_size is (height, width); original_size follows PIL's (width, height).
+    """
+    map_height, map_width = map_size
+    width, height = original_size
+    return [{
+        **box,
+        "x0": max(0, math.floor(box["x0"] * width / map_width)),
+        "y0": max(0, math.floor(box["y0"] * height / map_height)),
+        "x1": min(width, math.ceil(box["x1"] * width / map_width)),
+        "y1": min(height, math.ceil(box["y1"] * height / map_height)),
+    } for box in boxes]
+
+
 def write_json(path: Path, data: dict) -> None:
     """使用 UTF-8 保存记录，保留中文目录名。"""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -97,9 +195,9 @@ def load_runtime() -> None:
 class SnapshotDataset:
     """始终读取快照中的文件；下载继续进行时，不自动吸收新图片。"""
 
-    def __init__(self, records: list[dict], image_size: int) -> None:
+    def __init__(self, records: list[dict], input_size: tuple[int, int] | int) -> None:
         self.records = records
-        self.image_size = image_size
+        self.input_size = validate_rectangular_input_size(normalize_input_size(input_size), minimum=32)
 
     def __len__(self) -> int:
         return len(self.records)
@@ -124,8 +222,9 @@ class SnapshotDataset:
             mask = mask_from_circle_record((image.height, image.width), circle)
         else:
             mask = np.zeros((image.height, image.width), dtype=np.uint8)
-        resized_mask = Image.fromarray(mask).resize((self.image_size, self.image_size), Image.Resampling.NEAREST)
-        image = image.resize((self.image_size, self.image_size), Image.Resampling.BILINEAR)
+        input_height, input_width = self.input_size
+        resized_mask = Image.fromarray(mask).resize((input_width, input_height), Image.Resampling.NEAREST)
+        image = image.resize((input_width, input_height), Image.Resampling.BILINEAR)
         # EfficientAD 在网络内部归一化；输入必须是 [0, 1]，不能再用 Normalize。
         return TF.to_tensor(image), record["label"], TF.to_tensor(resized_mask) > 0.5
 
@@ -152,7 +251,7 @@ def make_loader(records: list[dict], config: dict, *, shuffle: bool = False, tra
             f"当前为 {len(records)} < {batch_size}；请减小 batch-size 或增加训练图片。"
         )
     return DataLoader(
-        SnapshotDataset(records, config["image_size"]),
+        SnapshotDataset(records, config_input_size(config)),
         batch_size=batch_size,
         shuffle=shuffle,
         drop_last=training,
@@ -253,7 +352,7 @@ def prepare_assets(model, config: dict, *, load_teacher: bool) -> None:
     # 仅建立父目录，空的叶目录会让官方函数误判为已经下载完成。
     imagenette.parent.mkdir(parents=True, exist_ok=True)
     model.prepare_imagenette_data(
-        (config["image_size"], config["image_size"]),
+        config_input_size(config),
         num_workers=config["num_workers"],
         start_iterator=config.get("world_size", 1) == 1,
     )
@@ -1011,12 +1110,24 @@ def new_output(base: Path, category: str) -> Path:
 def train_one(args, category: str) -> None:
     from .distributed import configure_training_world, optimize, train_distributed
 
+    requested_input_size(args)  # reject incomplete/conflicting dimensions before outputs/data scanning
     devices = choose_devices(args.device)
     if args.resume:
         previous = read_checkpoint(args.resume)
         if "optimizer_state" not in previous:
             raise ValueError("续训请使用 checkpoints/last.pt；model.pt 是推理用文件。")
         config, manifest = previous["config"].copy(), copy.deepcopy(previous["manifest"])
+        requested_size = requested_input_size(args)
+        if requested_size is not None and requested_size != config_input_size(config):
+            raise ValueError(
+                f"续训不能更改输入宽高：checkpoint={config_input_size(config)}，请求={requested_size}；"
+                "请移除 --resume 并按新尺寸重新训练、校准。"
+            )
+        saved_height, saved_width = config_input_size(config)
+        config.setdefault("input_size", [saved_height, saved_width])
+        config.setdefault("input_height", saved_height)
+        config.setdefault("input_width", saved_width)
+        config.setdefault("image_size", saved_height if saved_height == saved_width else max(saved_height, saved_width))
         saved_backbone = config.get("backbone") or f"pdn_{config.get('model_size', 'small')}"
         requested_backbone = args.backbone
         if args.model_size is not None:
@@ -1071,6 +1182,7 @@ def train_one(args, category: str) -> None:
                 f"请处理后重试；完整报告：{duplicate_report_path}"
             )
         assets = args.assets_dir.resolve()
+        input_height, input_width = args_input_size(args)
         batch_size = args.batch_size
         hard_loss_mode = "per_image" if batch_size > 1 else "global"
         if args.max_images is not None:
@@ -1084,7 +1196,11 @@ def train_one(args, category: str) -> None:
         max_images = max_steps * batch_size
         config = {
             "device": devices[0], "num_workers": args.num_workers,
-            "image_size": args.image_size,
+            # image_size remains a legacy/max-edge alias. Runtime prefers the
+            # explicit pair; old checkpoints with only image_size remain square.
+            "image_size": input_height if input_height == input_width else max(input_height, input_width),
+            "input_size": [input_height, input_width],
+            "input_height": input_height, "input_width": input_width,
             "model_size": (args.backbone.removeprefix("pdn_")
                            if args.backbone and args.backbone.startswith("pdn_")
                            else args.model_size or "small"),
@@ -1162,6 +1278,7 @@ def restore_for_inference(args):
     if not saved.get("calibration"):
         raise ValueError("此 checkpoint 尚未校准，请使用训练结束生成的 model.pt。")
     config = saved["config"].copy()
+    validate_rectangular_input_size(config_input_size(config))
     config.setdefault("model_size", "small")
     config.setdefault("backbone", f"pdn_{config['model_size']}")
     config.update(device=choose_device(args.device), num_workers=args.num_workers)
@@ -1184,11 +1301,13 @@ def predict(args) -> None:
     image_path = args.image.resolve()
     stat = image_path.stat()
     record = {"path": str(image_path), "size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns, "label": 0}
+    rgb = read_rgb(image_path)
+    original_size = (int(rgb.shape[1]), int(rgb.shape[0]))
     circle_path = config.get("circle_config")
     if circle_path:
         params = config.get("circle_params") or category_config(load_configs(Path(circle_path)), saved["manifest"]["category"])
         record["circle"] = default_mask_record(
-            read_rgb(image_path), params, base_dir=Path(circle_path).parent
+            rgb, params, base_dir=Path(circle_path).parent
         )
     batch = next(iter(make_loader([record], config)))
     with torch.inference_mode():
@@ -1201,9 +1320,14 @@ def predict(args) -> None:
     localization = prediction_localization(
         prediction, batch, config, calibration, score_values
     )
+    input_height, input_width = config_input_size(config)
     result = {
         "image": str(image_path), **score_values, "threshold": calibration["threshold"],
         "prediction": "NG" if score_values["score"] > calibration["threshold"] else "OK",
+        "model_input_size": {"height": input_height, "width": input_width},
+        "anomaly_map_shape": [input_height, input_width],
+        "image_size_original": {"width": original_size[0], "height": original_size[1]},
+        "boxes_original": boxes_to_original(localization["boxes"], (input_height, input_width), original_size),
         "localization": localization_summary(localization),
     }
     write_json(output / "prediction.json", result)
@@ -1285,7 +1409,10 @@ def build_parser() -> argparse.ArgumentParser:
                 "--batch-size", type=int, default=1,
                 help="每张卡的训练 batch，默认 1；多卡或大于 1 时启用逐图片 hard loss。评估始终使用 1",
             )
-            command.add_argument("--image-size", type=int, choices=[256, 384, 512, 768], default=256)
+            command.add_argument("--image-size", type=int, default=None,
+                                 help="兼容旧参数：正方形输入边长；与矩形宽高参数互斥")
+            command.add_argument("--image-width", type=int, help="输入宽度；须与 --image-height 同时指定")
+            command.add_argument("--image-height", type=int, help="输入高度；须与 --image-width 同时指定")
             backbone_group = command.add_mutually_exclusive_group()
             backbone_group.add_argument("--model-size", choices=["small", "medium"], default=None,
                                         help="旧版 PDN 大小选项；新训练未指定架构时默认 small")
@@ -1405,6 +1532,7 @@ def main() -> None:
         return
     load_runtime()
     if args.command == "train":
+        args_input_size(args)
         if ((args.max_steps < 1 and args.max_images is None) or args.save_every < 1
                 or not math.isfinite(args.lr) or args.lr <= 0
                 or not math.isfinite(args.weight_decay) or args.weight_decay < 0):
