@@ -188,8 +188,7 @@ class Detect2D:
 
     def _predict(self, roi: np.ndarray):
         params = {**self.algorithm_parameters, "verbose": False, "retina_masks": True}
-        with redirect_stdout(io.StringIO()):
-            return self.model.predict(source=roi, **params)
+        return self.model.predict(source=roi, **params)
 
     def take_last_visualization(self):
         """Return and clear the most recent in-process visualization payload."""

@@ -2,7 +2,9 @@ import json
 import sys
 import time
 import traceback
-from contextlib import redirect_stdout
+import os
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Dict
 
@@ -19,6 +21,18 @@ class AlgorithmServer:
         # Keep the legacy modules loadable while callers migrate to detect_board.
         self.two_d = None
         self.three_d = None
+        workers = int(os.environ.get("BRIDGE_MAX_WORKERS", "13"))
+        if not 2 <= workers <= 13:
+            raise ValueError("BRIDGE_MAX_WORKERS must be between 2 and 13")
+        self.cpu_pool = ThreadPoolExecutor(max_workers=workers - 1, thread_name_prefix="bridge-cpu")
+        self.gpu_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bridge-gpu")
+        self.pipeline = None
+        self._write_lock = threading.Lock()
+        self._pending_lock = threading.Lock()
+        self._pending = set()
+        self._capacity = threading.BoundedSemaphore(26)
+        self._stop = threading.Event()
+        self._closed = False
 
     def log(self, msg: str):
         # stdout 只输出一行 JSON 响应；日志必须走 stderr，避免 C# 解析失败。
@@ -60,10 +74,10 @@ class AlgorithmServer:
 
         # Streaming requests are selected by explicit board/piece IDs. A
         # plain stage=2d or stage=3d request remains a standalone call.
-        if stage == "2d" and req.get("board_id") is not None and req.get("piece_id") is not None:
+        if stage == "2d" and req.get("board_id") and int(req.get("piece_id") or 0) > 0:
             return self.get_board().handle_detect_2d_piece(req)
 
-        if stage == "3d" and req.get("board_id") is not None:
+        if stage == "3d" and req.get("board_id"):
             return self.get_board().handle_detect_3d_board(req)
 
         if stage == "board":
@@ -162,62 +176,143 @@ class AlgorithmServer:
             },
         }
 
-    def run(self):
-        self.log("python bridge protocol server started")
+    def get_pipeline(self):
+        if self.pipeline is None:
+            from algorithm.board_pipeline import BoardPipeline
+            self.pipeline = BoardPipeline(
+                self.get_board(), self.cpu_pool, self.gpu_pool,
+                timeout_seconds=float(os.environ.get("BRIDGE_BOARD_TIMEOUT_SECONDS", "90")),
+                max_pending_boards=int(os.environ.get("BRIDGE_MAX_PENDING_BOARDS", "4")))
+        return self.pipeline
 
-        while True:
-            raw_line = sys.stdin.buffer.readline()
+    def dispatch(self, req):
+        cmd, stage = req.get("cmd"), str(req.get("stage", "board")).lower()
+        board_id = req.get("board_id")
+        if cmd == "detect_2d_piece" or (cmd == "detect" and stage == "2d" and board_id):
+            return self.get_pipeline().submit_2d(req)
+        if cmd == "detect_3d_board" or (cmd == "detect" and stage == "3d" and board_id):
+            return self.get_pipeline().submit_3d(req)
+        if cmd == "release_board":
+            board_id = self.get_board()._stream_board_id(req)
+            return self.get_pipeline().release_board(board_id)
+        if cmd in {"detect", "detect_board"}:
+            # The shared model has exactly one owner. No CPU worker blocks on GPU work.
+            pool = self.cpu_pool if cmd == "detect" and stage == "3d" else self.gpu_pool
+            return pool.submit(self.handle_request, req)
+        return self.handle_request(req)
 
-            if not raw_line:
-                self.log("stdin closed")
-                break
+    def _write_response(self, stream, req, response):
+        response = dict(response)
+        if req.get("request_id") is not None:
+            response["request_id"] = req["request_id"]
+        with self._write_lock:
+            print(json.dumps(response, ensure_ascii=True), file=stream, flush=True)
 
-            line = raw_line.decode("utf-8-sig").strip()
-            # .NET Framework can decode a UTF-8 BOM as two visible characters
-            # on the first line. Protocol requests are JSON objects, so trim
-            # any transport prefix before the first opening brace.
-            # Strip any UTF-8 BOM/prefix by starting at the JSON object.
-            object_start = line.find("{")
-            if object_start >= 0:
-                line = line[object_start:]
-            else:
-                continue
+    def _error(self, req, exc):
+        self.log(traceback.format_exc())
+        return {"ok": False, "cmd": req.get("cmd", "unknown"),
+                "error": str(exc), "board_id": req.get("board_id", "")}
 
-            if not line:
-                continue
+    def _accept(self, req, stream):
+        if not self._capacity.acquire(blocking=False):
+            self._write_response(stream, req, {"ok": False, "cmd": req.get("cmd"),
+                                             "error": "server_busy", "message": "maximum pending requests reached"})
+            return
+        try:
+            result = self.dispatch(req)
+        except Exception as exc:
+            self._capacity.release()
+            self._write_response(stream, req, self._error(req, exc))
+            return
+        if not isinstance(result, Future):
+            self._capacity.release()
+            self._write_response(stream, req, result)
+            return
+        with self._pending_lock:
+            self._pending.add(result)
 
+        def completed(future):
             try:
-                req = json.loads(line)
-                cmd = req.get("cmd")
-                # stdout is a strict one-line JSON protocol. Third-party
-                # algorithms (notably Ultralytics) may print banners or
-                # progress text; route all such output to stderr while the
-                # request is handled, then write only the JSON response to
-                # the saved protocol stream.
-                protocol_stdout = sys.stdout
-                with redirect_stdout(sys.stderr):
-                    response = self.handle_request(req)
+                try:
+                    response = future.result()
+                except Exception as exc:
+                    response = self._error(req, exc)
+                self._write_response(stream, req, response)
+            finally:
+                with self._pending_lock:
+                    self._pending.discard(future)
+                self._capacity.release()
+        result.add_done_callback(completed)
 
-                # The Windows Python process may expose stdout as GBK while
-                # C# reads the pipe as UTF-8. ASCII-escape non-ASCII characters
-                # in the protocol so JSON remains encoding-independent; the
-                # C# JSON deserializer restores the original Chinese text.
-                print(json.dumps(response, ensure_ascii=True), file=protocol_stdout, flush=True)
+    def _expire(self):
+        while not self._stop.wait(0.25):
+            if self.pipeline is not None:
+                self.pipeline.expire_pending()
 
-                if cmd == "exit" or cmd == "release":
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._stop.set()
+        if self.pipeline is not None:
+            self.pipeline.close()
+        # CPU completions may still enqueue GPU jobs, which then enqueue CPU postprocessing.
+        # Drain request futures before closing either executor.
+        with self._pending_lock:
+            pending = list(self._pending)
+        if pending:
+            wait(pending)
+        self.gpu_pool.shutdown(wait=True)
+        self.cpu_pool.shutdown(wait=True)
+
+    def run(self):
+        self.log("python bridge concurrent protocol server started")
+        protocol_stdout = sys.stdout
+        # One process-wide redirection for the lifetime of the worker pools, never per thread.
+        sys.stdout = sys.stderr
+        reaper = threading.Thread(target=self._expire, name="bridge-cache-expiry", daemon=True)
+        reaper.start()
+        try:
+            while True:
+                raw_line = sys.stdin.buffer.readline()
+                if not raw_line:
                     break
-
-            except Exception as e:
-                error_response = {
-                    "ok": False,
-                    "cmd": "unknown",
-                    "error": str(e),
-                    "traceback": traceback.format_exc(),
-                }
-
-                print(json.dumps(error_response, ensure_ascii=True), file=sys.stdout, flush=True)
-
-                self.log(traceback.format_exc())
+                req = {}
+                try:
+                    line = raw_line.decode("utf-8-sig").strip()
+                    opening = line.find("{")
+                    if opening < 0:
+                        continue
+                    req = json.loads(line[opening:])
+                    if not isinstance(req, dict):
+                        raise ValueError("protocol request must be an object")
+                    cmd = req.get("cmd")
+                    if cmd in {"exit", "release"}:
+                        self.close()
+                        self._write_response(protocol_stdout, req, self.handle_shutdown(cmd, "detector exited"))
+                        break
+                    if cmd in {"init", "init_algorithm", "reload_defect_config"}:
+                        with self._pending_lock:
+                            busy = bool(self._pending) or bool(self.pipeline and self.pipeline.has_pending)
+                        if busy:
+                            self._write_response(protocol_stdout, req, {"ok": False, "cmd": cmd,
+                                                                      "error": "initialization/configuration requires an idle detector"})
+                        else:
+                            self._write_response(protocol_stdout, req, self.handle_request(req))
+                    elif req.get("request_id") is None:
+                        # Old bridges depend on ordered replies; preserve that protocol.
+                        result = self.dispatch(req)
+                        self._write_response(protocol_stdout, req,
+                                             result.result() if isinstance(result, Future) else result)
+                    else:
+                        self._accept(req, protocol_stdout)
+                except Exception as exc:
+                    self._write_response(protocol_stdout, req, self._error(req, exc))
+        finally:
+            self.close()
+            self.handle_shutdown("release", "stdin closed")
+            reaper.join(timeout=1)
+            sys.stdout = protocol_stdout
 
     @staticmethod
     def elapsed_ms(start_time: float) -> float:

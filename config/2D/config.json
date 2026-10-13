@@ -148,7 +148,9 @@
         }
       ],
       "padding_ratio": 0.02,
-      "max_rotation_deg": 5.0
+      "max_rotation_deg": 5.0,
+      "score_mode": "pool+top",
+      "score_pool_kernel": 7
     }
   }
 }

@@ -40,7 +40,7 @@ from algorithm.registration import (
     register_platform_masks,
 )
 from algorithm.perspective_registration import estimate_perspective
-from transport.shared_memory import read_shared_memory
+from transport.shared_memory import read_shared_memory, SharedImage
 
 
 _segment = import_module("algorithm.3D.segment")
@@ -88,6 +88,7 @@ class DetectBoard:
         # never retained by Python.
         self._piece_cache: Dict[str, Dict[int, Dict[str, Any]]] = {}
         self._piece_cache_lock = threading.RLock()
+        self._inference_lock = threading.RLock()
 
     def handle_init(self, req: Dict[str, Any]) -> Dict[str, Any]:
         start = time.perf_counter()
@@ -238,35 +239,65 @@ class DetectBoard:
     # Streaming board protocol
     # ------------------------------------------------------------------
     def handle_detect_2d_piece(self, req: Dict[str, Any]) -> Dict[str, Any]:
-        """Process and cache exactly one 2D image.
+        """Synchronous compatibility entry; the server schedules the phases separately."""
+        prepared = None
+        try:
+            prepared = self.prepare_2d_piece(req)
+            self.infer_2d_piece(prepared)
+            return self.finish_2d_piece(prepared)
+        except (ValueError, OSError, RuntimeError) as exc:
+            return self._stream_failure(
+                "2d_piece_failed", str(exc),
+                board_id=str(req.get("board_id") or ""),
+                piece_id=self._optional_piece_id(req),
+            )
+        finally:
+            if prepared is not None:
+                self.release_prepared_2d(prepared)
 
-        The cache key is the explicit ``board_id`` and ``piece_id`` pair.  A
-        repeated piece replaces the previous result atomically, which lets a
-        caller retry a failed camera frame without leaving a half-written
-        entry in the board cache.
-        """
+    def prepare_2d_piece(self, req: Dict[str, Any]) -> Dict[str, Any]:
+        """CPU-only read/decode, circle ROI and registration-mask preparation."""
         start = time.perf_counter()
-        try:
-            board_id = self._stream_board_id(req)
-        except ValueError as exc:
-            return self._stream_failure("invalid_board_id", str(exc), board_id="")
-        try:
-            try:
-                piece_id = self._stream_piece_id(req)
-            except ValueError as exc:
-                return self._stream_failure(
-                    "invalid_piece_id", str(exc), board_id=board_id,
-                    piece_id=self._optional_piece_id(req)
-                )
-            read_start = time.perf_counter()
+        board_id = self._stream_board_id(req)
+        piece_id = self._stream_piece_id(req)
+        read_start = time.perf_counter()
+        owner = None
+        image_format = str(req.get("image_format", "encoded")).lower()
+        if image_format == "bgr8" or (image_format == "raw" and int(req.get("image_channels", 3)) == 3):
+            owner = SharedImage(req)
+            image = owner.image
+        else:
             image = self._read_2d(req)
-            circle_start = time.perf_counter()
+        circle_start = time.perf_counter()
+        try:
             crop, crop_box, circle, roi_boxes = self._stream_crop(image)
-            crop = crop.copy()
+            crop = crop.copy()  # Model-owned ROI; camera pixels themselves are never copied here.
             circle_crop_ms = self.elapsed_ms(circle_start)
             registration_mask = platform_mask_2d(image, self.registration_config)
-            read_decode_ms = self.elapsed_ms(read_start)
+        except Exception:
+            image = None
+            if owner is not None:
+                owner.close()
+            raise
+        read_decode_ms = self.elapsed_ms(read_start)
 
+        return dict(start=start, board_id=board_id, piece_id=piece_id,
+                    image=image, crop=crop, crop_box=crop_box, circle=circle,
+                    roi_boxes=roi_boxes, registration_mask=registration_mask,
+                    read_decode_ms=read_decode_ms, circle_crop_ms=circle_crop_ms, image_owner=owner)
+
+    @staticmethod
+    def release_prepared_2d(prepared):
+        owner = prepared.pop("image_owner", None)
+        prepared.pop("image", None)
+        if owner is not None:
+            owner.close()
+
+    def infer_2d_piece(self, prepared: Dict[str, Any]) -> None:
+        """Serialized GPU phase; CPU workers never wait for a model lock."""
+        crop = prepared["crop"]
+        image, crop_box = prepared["image"], prepared["crop_box"]
+        with self._inference_lock:
             if self.model is None:
                 raise RuntimeError("board/stream 2D model is not initialized")
             inference_start = time.perf_counter()
@@ -279,131 +310,140 @@ class DetectBoard:
                     f"YOLO returned {len(predictions)} results for one 2D image"
                 )
 
-            postprocess_start = time.perf_counter()
             instances = self._extract_instances(predictions[0], crop.shape[:2])
-            wire_measurements = self._measure_2d_wire_instances(
-                instances, roi_boxes, crop_box
-            )
-            wire_roi_checks = _wire_roi_presence.check_wire_roi_presence(
-                instances, roi_boxes, crop_box[:2]
-            )
-            chip_diagnostics = _chip_alignment.measure_chip_alignment(
-                instances, self.chip_alignment_config, crop_box[:2]
-            )
             if self.chip_anomaly_inspector is None:
                 raise RuntimeError("chip anomaly inspector is not initialized")
             chip_anomaly_diagnostics = self.chip_anomaly_inspector.inspect(
                 image, instances, crop_box
             )
-            diagnostics = _silver_inspection.inspect_masks(
-                instances,
-                crop.shape[:2],
-                self.silver_config,
-                crop_box=crop_box,
-                circle=circle,
-                image=image,
-                base_dir=self._silver_config_base_dir(),
-            )
-            diagnostics = _silver_inspection.offset_geometry(diagnostics, crop_box[:2])
-            postprocess_ms = self.elapsed_ms(postprocess_start)
+        prepared.update(instances=instances, inference_ms=inference_ms,
+                        chip_anomaly_diagnostics=chip_anomaly_diagnostics)
 
-            entry = {
-                "piece_id": piece_id,
-                # Retain only grayscale pixels needed for perspective fitting;
-                # dropping the original BGR image avoids ~32 MB per piece.
-                "gray_image": cv2.cvtColor(image, cv2.COLOR_BGR2GRAY),
-                "image_shape": [int(image.shape[1]), int(image.shape[0])],
-                "crop_box": tuple(int(value) for value in crop_box),
-                "circle": circle,
-                "roi_boxes": [tuple(int(value) for value in item) for item in roi_boxes],
-                "registration_mask": registration_mask,
-                "instances": instances,
-                "wire_measurements": wire_measurements,
-                "wire_roi_checks": wire_roi_checks,
-                "chip_rotation_2d": chip_diagnostics,
-                "chip_anomaly_2d": chip_anomaly_diagnostics,
-                "silver_overflow_2d": diagnostics["silver_overflow"],
-                "silver_continuity_2d": diagnostics["disconnection"],
-                "received_at": time.time(),
-            }
+    def finish_2d_piece(self, prepared: Dict[str, Any], *, publish_cache: bool = True):
+        """CPU postprocessing. A concurrent pipeline owns publication when False."""
+        start, board_id, piece_id = (prepared[key] for key in ("start", "board_id", "piece_id"))
+        image, crop, crop_box, circle, roi_boxes = (
+            prepared[key] for key in ("image", "crop", "crop_box", "circle", "roi_boxes"))
+        registration_mask = prepared["registration_mask"]
+        read_decode_ms, circle_crop_ms, inference_ms = (
+            prepared[key] for key in ("read_decode_ms", "circle_crop_ms", "inference_ms"))
+        instances = prepared["instances"]
+        chip_anomaly_diagnostics = prepared["chip_anomaly_diagnostics"]
+        postprocess_start = time.perf_counter()
+        wire_measurements = self._measure_2d_wire_instances(
+            instances, roi_boxes, crop_box
+        )
+        wire_roi_checks = _wire_roi_presence.check_wire_roi_presence(
+            instances, roi_boxes, crop_box[:2]
+        )
+        chip_diagnostics = _chip_alignment.measure_chip_alignment(
+            instances, self.chip_alignment_config, crop_box[:2]
+        )
+        diagnostics = _silver_inspection.inspect_masks(
+            instances,
+            crop.shape[:2],
+            self.silver_config,
+            crop_box=crop_box,
+            circle=circle,
+            image=image,
+            base_dir=self._silver_config_base_dir(),
+        )
+        diagnostics = _silver_inspection.offset_geometry(diagnostics, crop_box[:2])
+        postprocess_ms = self.elapsed_ms(postprocess_start)
+
+        entry = {
+            "piece_id": piece_id,
+            # Retain only grayscale pixels needed for perspective fitting;
+            # dropping the original BGR image avoids ~32 MB per piece.
+            "gray_image": cv2.cvtColor(image, cv2.COLOR_BGR2GRAY),
+            "image_shape": [int(image.shape[1]), int(image.shape[0])],
+            "crop_box": tuple(int(value) for value in crop_box),
+            "circle": circle,
+            "roi_boxes": [tuple(int(value) for value in item) for item in roi_boxes],
+            "registration_mask": registration_mask,
+            "instances": instances,
+            "wire_measurements": wire_measurements,
+            "wire_roi_checks": wire_roi_checks,
+            "chip_rotation_2d": chip_diagnostics,
+            "chip_anomaly_2d": chip_anomaly_diagnostics,
+            "silver_overflow_2d": diagnostics["silver_overflow"],
+            "silver_continuity_2d": diagnostics["disconnection"],
+            "received_at": time.time(),
+        }
+        replaced = False
+        cache_state = {}
+        if publish_cache:
             with self._piece_cache_lock:
                 board_cache = self._piece_cache.setdefault(board_id, {})
                 replaced = piece_id in board_cache
                 board_cache[piece_id] = entry
                 cache_state = self._cache_state_locked(board_id)
-
-            total_ms = self.elapsed_ms(start)
-            public_instances = [self._public_2d_instance(item, crop_box) for item in instances]
-            checks = [bool(item.get("is_ok")) for item in instances]
-            checks.extend(bool(item.get("is_ok")) for item in wire_roi_checks)
-            if chip_diagnostics.get("enabled") and chip_diagnostics.get("is_ok") is not True:
+        total_ms = self.elapsed_ms(start)
+        public_instances = [self._public_2d_instance(item, crop_box) for item in instances]
+        checks = [bool(item.get("is_ok")) for item in instances]
+        checks.extend(bool(item.get("is_ok")) for item in wire_roi_checks)
+        if chip_diagnostics.get("enabled") and chip_diagnostics.get("is_ok") is not True:
+            checks.append(False)
+        if (chip_anomaly_diagnostics.get("enabled")
+                and chip_anomaly_diagnostics.get("is_ok") is not True):
+            checks.append(False)
+        for check in (diagnostics.get("silver_overflow"), diagnostics.get("disconnection")):
+            if (
+                diagnostics.get("enabled")
+                and check
+                and check.get("status") not in {None, "disabled"}
+                and check.get("is_ok") is not True
+            ):
                 checks.append(False)
-            if (chip_anomaly_diagnostics.get("enabled")
-                    and chip_anomaly_diagnostics.get("is_ok") is not True):
-                checks.append(False)
-            for check in (diagnostics.get("silver_overflow"), diagnostics.get("disconnection")):
-                if (
-                    diagnostics.get("enabled")
-                    and check
-                    and check.get("status") not in {None, "disabled"}
-                    and check.get("is_ok") is not True
-                ):
-                    checks.append(False)
-            return {
-                "ok": True,
-                "cmd": "detect_2d_piece",
-                "stage": "2d",
-                "board_id": board_id,
-                "piece_id": piece_id,
-                "results_2d": {
-                    "is_ok": bool(checks) and all(checks),
-                    "circle": ({"x": circle[0], "y": circle[1], "radius": circle[2]}
-                               if circle is not None else None),
-                    "crop_box": list(crop_box),
-                    "wire_rois_2d": [list(roi) for roi in roi_boxes],
-                    "rectangles": [
-                        {"points": item.get("rectangle"),
-                         "mask_ratio": item.get("rectangle_ratio", 0.0),
-                         "is_ok": item.get("is_ok", False)}
-                        for item in instances if item.get("rectangle") is not None
-                    ],
-                    "instances": public_instances,
-                    "wire_measurements": wire_measurements,
-                    "wire_roi_checks": wire_roi_checks,
-                    "wire_bending_2d": {
-                        "enabled": True,
-                        "is_ok": bool(wire_roi_checks) and all(
-                            item["is_ok"] for item in wire_roi_checks
-                        ),
-                        "roi_checks": wire_roi_checks,
-                        "measurements": wire_measurements,
-                    },
-                    "chip_rotation_2d": chip_diagnostics,
-                    "chip_anomaly_2d": chip_anomaly_diagnostics,
-                    "silver_overflow_2d": diagnostics["silver_overflow"],
-                    "silver_continuity_2d": diagnostics["disconnection"],
+        response = {
+            "ok": True,
+            "cmd": "detect_2d_piece",
+            "stage": "2d",
+            "board_id": board_id,
+            "piece_id": piece_id,
+            "results_2d": {
+                "is_ok": bool(checks) and all(checks),
+                "circle": ({"x": circle[0], "y": circle[1], "radius": circle[2]}
+                           if circle is not None else None),
+                "crop_box": list(crop_box),
+                "wire_rois_2d": [list(roi) for roi in roi_boxes],
+                "rectangles": [
+                    {"points": item.get("rectangle"),
+                     "mask_ratio": item.get("rectangle_ratio", 0.0),
+                     "is_ok": item.get("is_ok", False)}
+                    for item in instances if item.get("rectangle") is not None
+                ],
+                "instances": public_instances,
+                "wire_measurements": wire_measurements,
+                "wire_roi_checks": wire_roi_checks,
+                "wire_bending_2d": {
+                    "enabled": True,
+                    "is_ok": bool(wire_roi_checks) and all(
+                        item["is_ok"] for item in wire_roi_checks
+                    ),
+                    "roi_checks": wire_roi_checks,
+                    "measurements": wire_measurements,
                 },
-                "cache_state": cache_state,
-                "timings": {
-                    "shared_memory_read_decode_ms": read_decode_ms,
-                    "circle_crop_ms": circle_crop_ms,
-                    "yolo_inference_ms": inference_ms,
-                    "mask_postprocess_ms": postprocess_ms,
-                    "total_detect_ms": total_ms,
-                },
-                "elapsed_ms": total_ms,
-                "message": (
-                    "2D piece segmented and cached"
-                    + (" (replaced previous piece)" if replaced else "")
-                ),
-            }
-        except (ValueError, OSError, RuntimeError) as exc:
-            return self._stream_failure(
-                "2d_piece_failed",
-                str(exc),
-                board_id=board_id,
-                piece_id=self._optional_piece_id(req),
-            )
+                "chip_rotation_2d": chip_diagnostics,
+                "chip_anomaly_2d": chip_anomaly_diagnostics,
+                "silver_overflow_2d": diagnostics["silver_overflow"],
+                "silver_continuity_2d": diagnostics["disconnection"],
+            },
+            "cache_state": cache_state,
+            "timings": {
+                "shared_memory_read_decode_ms": read_decode_ms,
+                "circle_crop_ms": circle_crop_ms,
+                "yolo_inference_ms": inference_ms,
+                "mask_postprocess_ms": postprocess_ms,
+                "total_detect_ms": total_ms,
+            },
+            "elapsed_ms": total_ms,
+            "message": (
+                "2D piece segmented and cached"
+                + (" (replaced previous piece)" if replaced else "")
+            ),
+        }
+        return response if publish_cache else (response, entry)
 
     def handle_detect_3d_board(self, req: Dict[str, Any]) -> Dict[str, Any]:
         """Consume one 3D board and the ten cached 2D piece results."""
@@ -448,77 +488,7 @@ class DetectBoard:
             perspective_config = self.perspective_registration_config
             for index, piece in enumerate(depth_pieces):
                 piece_id = index + 1
-                entry = entries[piece_id]
-                y1, y2 = int(piece["y1"]), int(piece["y2"])
-                local_depth = depth[y1:y2]
-                registration = register_platform_masks(
-                    entry["registration_mask"],
-                    platform_mask_3d(local_depth, self.registration_config),
-                    self.registration_config,
-                )
-                registration = refine_affine_registration(
-                    entry["gray_image"],
-                    local_depth,
-                    registration,
-                    self.dynamic_affine_config,
-                )
-                registration = estimate_perspective(
-                    entry["gray_image"], local_depth, registration, perspective_config
-                )
-                aligned_masks = [
-                    self._align_instance(
-                        item, local_depth.shape, registration, entry.get("crop_box", self.crop_roi)
-                    )
-                    for item in entry["instances"]
-                ]
-                measurement = self._measure_piece(
-                    local_depth,
-                    aligned_masks,
-                    registration,
-                    entry.get("roi_boxes", self.wire_rois),
-                    crop_box=entry.get("crop_box", self.crop_roi),
-                    circle=entry.get("circle"),
-                )
-                diagnostics_ok = all(
-                    check.get("is_ok") is True
-                    for check in (
-                        entry.get("silver_overflow_2d", {}),
-                        entry.get("silver_continuity_2d", {}),
-                        entry.get("chip_anomaly_2d", {}),
-                    )
-                    if isinstance(check, dict) and check.get("status") not in {None, "disabled"}
-                )
-                diagnostics_present = any(
-                    check.get("status") not in {None, "disabled"}
-                    for check in (
-                        entry.get("silver_overflow_2d", {}),
-                        entry.get("silver_continuity_2d", {}),
-                        entry.get("chip_anomaly_2d", {}),
-                    )
-                    if isinstance(check, dict)
-                )
-                results.append(
-                    {
-                        "piece_id": piece_id,
-                        "image_2d_size": entry["image_shape"],
-                        "crop_2d": list(entry.get("crop_box", self.crop_roi)),
-                        "wire_rois_2d": [list(roi) for roi in entry.get("roi_boxes", self.wire_rois)],
-                        "wire_roi_checks": entry.get("wire_roi_checks", []),
-                        "depth_start_row": y1,
-                        "depth_end_row": y2,
-                        "registration": registration,
-                        "is_ok": bool(
-                            measurement["is_ok"]
-                            and all(item.get("is_ok") is True for item in entry.get("wire_roi_checks", []))
-                            and (not diagnostics_present or diagnostics_ok)
-                        ),
-                        "reference_planes": measurement["reference_planes"],
-                        "wire_measurements": measurement["wire_measurements"],
-                        "solder_measurements": measurement["solder_measurements"],
-                        "chip_anomaly_2d": entry.get("chip_anomaly_2d", {"status": "disabled", "is_ok": None}),
-                        "masks": [self._public_instance(item) for item in aligned_masks],
-                    }
-                )
+                results.append(self.measure_prepared_piece(piece_id, entries[piece_id], depth, piece))
             alignment_ms = self.elapsed_ms(align_start)
             total_ms = self.elapsed_ms(start)
             return {
@@ -566,6 +536,81 @@ class DetectBoard:
             if cache_count == self.expected_piece_count:
                 with self._piece_cache_lock:
                     self._piece_cache.pop(board_id, None)
+
+    def measure_prepared_piece(self, piece_id: int, entry: Dict[str, Any],
+                               depth: np.ndarray, piece: Dict[str, Any]) -> Dict[str, Any]:
+        """CPU-only joint work after the matching 2D and depth piece are ready."""
+        perspective_config = self.perspective_registration_config
+        y1, y2 = int(piece["y1"]), int(piece["y2"])
+        local_depth = depth[y1:y2]
+        registration = register_platform_masks(
+            entry["registration_mask"],
+            platform_mask_3d(local_depth, self.registration_config),
+            self.registration_config,
+        )
+        registration = refine_affine_registration(
+            entry["gray_image"],
+            local_depth,
+            registration,
+            self.dynamic_affine_config,
+        )
+        registration = estimate_perspective(
+            entry["gray_image"], local_depth, registration, perspective_config
+        )
+        aligned_masks = [
+            self._align_instance(
+                item, local_depth.shape, registration, entry.get("crop_box", self.crop_roi)
+            )
+            for item in entry["instances"]
+        ]
+        measurement = self._measure_piece(
+            local_depth,
+            aligned_masks,
+            registration,
+            entry.get("roi_boxes", self.wire_rois),
+            crop_box=entry.get("crop_box", self.crop_roi),
+            circle=entry.get("circle"),
+        )
+        diagnostics_ok = all(
+            check.get("is_ok") is True
+            for check in (
+                entry.get("silver_overflow_2d", {}),
+                entry.get("silver_continuity_2d", {}),
+                entry.get("chip_anomaly_2d", {}),
+                entry.get("chip_rotation_2d", {}),
+            )
+            if isinstance(check, dict) and check.get("status") not in {None, "disabled"}
+        )
+        diagnostics_present = any(
+            check.get("status") not in {None, "disabled"}
+            for check in (
+                entry.get("silver_overflow_2d", {}),
+                entry.get("silver_continuity_2d", {}),
+                entry.get("chip_anomaly_2d", {}),
+                entry.get("chip_rotation_2d", {}),
+            )
+            if isinstance(check, dict)
+        )
+        return {
+            "piece_id": piece_id,
+            "image_2d_size": entry["image_shape"],
+            "crop_2d": list(entry.get("crop_box", self.crop_roi)),
+            "wire_rois_2d": [list(roi) for roi in entry.get("roi_boxes", self.wire_rois)],
+            "wire_roi_checks": entry.get("wire_roi_checks", []),
+            "depth_start_row": y1,
+            "depth_end_row": y2,
+            "registration": registration,
+            "is_ok": bool(
+                measurement["is_ok"]
+                and all(item.get("is_ok") is True for item in entry.get("wire_roi_checks", []))
+                and (not diagnostics_present or diagnostics_ok)
+            ),
+            "reference_planes": measurement["reference_planes"],
+            "wire_measurements": measurement["wire_measurements"],
+            "solder_measurements": measurement["solder_measurements"],
+            "chip_anomaly_2d": entry.get("chip_anomaly_2d", {"status": "disabled", "is_ok": None}),
+            "masks": [self._public_instance(item) for item in aligned_masks],
+        }
 
     def handle_release_board(self, req: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -896,7 +941,7 @@ class DetectBoard:
 
     def _predict_batch(self, crops: Sequence[np.ndarray]):
         parameters = {**self.yolo_parameters, "verbose": False, "retina_masks": True}
-        with redirect_stdout(io.StringIO()):
+        with self._inference_lock:
             return list(self.model.predict(source=list(crops), **parameters))
 
     def _synchronize_model(self) -> None:

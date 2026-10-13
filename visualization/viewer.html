@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>检测结果复核 · Bridge Viewer</title>
+<style>/*__VIEWER_CSS__*/</style>
+</head>
+<body>
+<header class="app-header"><div><div class="eyebrow">BRIDGE / RESULT INSPECTOR</div><h1 id="report-title">检测结果复核</h1></div><div class="header-actions"><span class="offline">离线报告 · 不执行检测</span><button id="export-json" type="button">导出原始 JSON</button></div></header>
+<main>
+<section class="overview" aria-label="整板结果"><div><span class="muted">板号</span><strong id="board-id">—</strong></div><div><span class="muted">服务请求</span><strong id="service-status">—</strong></div><div><span id="verdict-label" class="muted">算法整板结论</span><strong id="board-status">—</strong></div><div><span class="muted">配准</span><strong id="registration-status">—</strong></div><div><span class="muted">总耗时</span><strong id="elapsed">—</strong></div></section>
+<div id="notice" class="notice" role="status" hidden></div>
+<div id="error" class="error" role="alert" hidden></div>
+<section class="piece-section"><div class="section-head"><h2>片号选择</h2><span id="piece-count" class="muted"></span></div><nav id="pieces" class="piece-grid" aria-label="选择检测片"></nav></section>
+<section class="inspection"><div class="section-head"><div><h2 id="piece-title">选择一片查看</h2><p id="piece-subtitle" class="muted"></p></div><div class="layer-controls"><label><input id="show-masks" type="checkbox" checked> 掩码</label><label><input id="show-rois" type="checkbox" checked> ROI / 平台</label><label><input id="show-points" type="checkbox" checked> 测高点</label><label><input id="show-labels" type="checkbox" checked> 标注</label><button id="fit-views" type="button">适应画布</button></div></div>
+<div class="legend"><span><i class="chip"></i>chip 芯片</span><span><i class="wire"></i>wire 引线</span><span><i class="thin"></i>thin 细线</span><span><i class="bond"></i>bond 焊点</span><span><i class="silver"></i>silver 银浆</span><span><i class="overflow"></i>silver 溢出缺陷</span><span class="muted">滚轮缩放 · 拖动平移 · 点击下方测量高亮</span></div>
+<div class="view-grid"><article class="image-panel"><div class="image-head"><h3>2D 原图与检测轮廓</h3><span id="image2d-info" class="muted"></span></div><div class="canvas-wrap"><canvas id="canvas2d" role="img" aria-label="2D 图像、掩码和 ROI 叠加"></canvas></div><p id="image2d-note" class="image-note muted"></p></article><article class="image-panel"><div class="image-head"><h3>3D 深度与对齐轮廓</h3><span id="image3d-info" class="muted"></span></div><div class="canvas-wrap"><canvas id="canvas3d" role="img" aria-label="深度伪彩、对齐掩码及测高点"></canvas></div><p id="image3d-note" class="image-note muted">深度伪彩仅用于观察；毫米值来自算法结果，不由预览计算。</p></article></div>
+</section>
+<section class="diagnostics"><div class="section-head"><h2>检测项目</h2><span class="muted">“未提供”不等于通过；仅展示服务实际返回值</span></div><div id="checks" class="checks-grid"></div></section>
+<section class="measurements"><div class="section-head"><h2>引线与焊脚测量</h2><span class="muted">毫米 mm · 无效测量不显示为 0</span></div><div class="table-wrap"><table><thead><tr><th>对象</th><th>类型 / 位置</th><th>2D 弯曲</th><th>覆盖率</th><th>高度差 mm</th><th>参考面</th><th>高度结论</th></tr></thead><tbody id="measurements"></tbody></table></div></section>
+<details class="details"><summary>配准、参考平面与阶段耗时</summary><pre id="detail-json"></pre></details>
+<details class="details"><summary>芯片旋转、外观异常与银浆诊断明细</summary><pre id="diagnostics-json"></pre></details>
+<details class="details"><summary>原始服务响应 JSON</summary><pre id="raw-json"></pre></details>
+<footer>独立结果查看器 · 图像预览已缩小，轮廓仍按原始像素坐标绘制 · 不修改检测算法或合格结论</footer>
+</main>
+<script id="report-data" type="application/json">__REPORT_JSON__</script>
+<script>/*__VIEWER_JS__*/</script>
+</body>
+</html>

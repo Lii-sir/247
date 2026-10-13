@@ -29,6 +29,8 @@ def validate_config(config: Dict[str, Any] | None) -> Dict[str, Any]:
             "aspect_ratio_models": [],
             "padding_ratio": 0.02,
             "max_rotation_deg": 5.0,
+            "score_mode": None,
+            "score_pool_kernel": None,
         }
     raw = dict(config)
     selection = raw.get("aspect_ratio_models")
@@ -76,12 +78,25 @@ def validate_config(config: Dict[str, Any] | None) -> Dict[str, Any]:
         raise ValueError("chip_anomaly_2d.padding_ratio must be in [0, 0.5]")
     if not math.isfinite(max_rotation) or not 0 <= max_rotation <= 45:
         raise ValueError("chip_anomaly_2d.max_rotation_deg must be in [0, 45]")
+    score_mode = raw.get("score_mode")
+    if score_mode is not None:
+        score_mode = str(score_mode).strip().casefold().replace("_", "-")
+        if score_mode not in {"pool+top", "pool-top", "pooltop"}:
+            raise ValueError("chip_anomaly_2d.score_mode must be pool+top")
+        score_mode = "pool+top"
+    score_pool_kernel = raw.get("score_pool_kernel")
+    if score_pool_kernel is not None:
+        if isinstance(score_pool_kernel, bool) or int(score_pool_kernel) < 1 or int(score_pool_kernel) % 2 == 0:
+            raise ValueError("chip_anomaly_2d.score_pool_kernel must be a positive odd integer")
+        score_pool_kernel = int(score_pool_kernel)
     return {
         "configured": True,
         "chip_class": str(raw.get("chip_class", "chip")),
         "device": str(raw.get("device", "auto")),
         "padding_ratio": padding,
         "max_rotation_deg": max_rotation,
+        "score_mode": score_mode,
+        "score_pool_kernel": score_pool_kernel,
         "aspect_ratio_models": ranges,
     }
 
@@ -182,10 +197,19 @@ def _scores_and_response(
     anomaly_map: torch.Tensor,
     calibration: Dict[str, Any],
     model_config: Dict[str, Any],
+    score_mode: str | None = None,
+    score_pool_kernel: int | None = None,
 ) -> tuple[Dict[str, float], np.ndarray, np.ndarray, list[int]]:
     method = calibration.get("score_method") or {}
     method_name = method.get("name")
-    threshold = float(calibration["threshold"])
+    runtime_mode = str(score_mode or model_config.get("score_mode") or "").strip().casefold()
+    runtime_kernel = score_pool_kernel or model_config.get("score_pool_kernel")
+    force_pool_top = runtime_mode in {"pool+top", "pool-top", "pooltop"}
+    if force_pool_top:
+        method_name = SINGLE_SCALE_SCORE_METHOD
+        method = dict(method)
+        method["pool_kernel"] = int(runtime_kernel or 7)
+    threshold = float(calibration.get("pool_top_threshold", calibration["threshold"]) if force_pool_top else calibration["threshold"])
     topk_ratio = float(method.get("topk_ratio", model_config.get("score_topk_ratio", 0.001)))
     raw_map = anomaly_map[0, 0].detach().cpu().numpy().astype(np.float32, copy=True)
 
@@ -228,6 +252,15 @@ def _scores_and_response(
         kernel = int(method.get("pool_kernel", model_config.get("score_pool_kernel", 21)))
         score, pooled = _pooled_topk(anomaly_map, kernel, topk_ratio)
         response = pooled[0, 0].detach().cpu().numpy().astype(np.float32)
+        normalizations = method.get("normalization") or {}
+        normalization = normalizations if "median" in normalizations else normalizations.get(str(kernel))
+        if normalization:
+            median = float(normalization["median"])
+            denominator = float(normalization["denominator"])
+            if denominator <= 0 or not math.isfinite(denominator):
+                raise ValueError(f"invalid EfficientAD normalization for pool kernel {kernel}")
+            score = max(0.0, (score - median) / denominator)
+            response = np.maximum(0.0, (response - median) / denominator).astype(np.float32)
         scores = {"score": score, "score_topk": score, "score_max": float(anomaly_map.max())}
         binary = response > max(0.0, threshold) if score > threshold else np.zeros_like(response, bool)
         return scores, response, binary, [kernel] if score > threshold else []
@@ -319,14 +352,15 @@ class _LoadedPredictor:
         self.model.to(device).eval()
         self._lock = threading.RLock()
 
-    def predict(self, crop: np.ndarray) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    def predict(self, crop: np.ndarray, *, score_mode: str | None = None, score_pool_kernel: int | None = None) -> tuple[Dict[str, Any], Dict[str, Any]]:
         tensor = _preprocess(crop, self.image_size, self.device)
         with self._lock, torch.inference_mode():
             prediction = self.model(tensor)
             scores, response, binary, active_scales = _scores_and_response(
-                prediction.anomaly_map, self.calibration, self.config
+                prediction.anomaly_map, self.calibration, self.config, score_mode, score_pool_kernel
             )
-        threshold = float(self.calibration["threshold"])
+        active_mode = score_mode or self.config.get("score_mode")
+        threshold = float(self.calibration.get("pool_top_threshold", self.calibration["threshold"]) if active_mode == "pool+top" else self.calibration["threshold"])
         score = float(scores["score"])
         boxes = _component_boxes(binary, self.config.get("localization", {}))
         return ({
@@ -340,6 +374,9 @@ class _LoadedPredictor:
             "decision_rule": "score > threshold",
             "is_ok": bool(score <= threshold),
             "active_scales": active_scales,
+            "score_mode": score_mode or self.config.get("score_mode") or self.calibration.get("score_method", {}).get("name"),
+            "score_pool_kernel": score_pool_kernel or self.config.get("score_pool_kernel") or self.calibration.get("score_method", {}).get("pool_kernel"),
+            "threshold_source": "pool_top_threshold" if active_mode == "pool+top" and "pool_top_threshold" in self.calibration else "checkpoint_threshold",
         }, {
             "response": response,
             "binary": binary,
@@ -421,7 +458,7 @@ class ChipAnomalyInspector:
             predictor = self.predictors.get(model_name)
             if predictor is None:
                 raise RuntimeError(f"EfficientAD model {model_name!r} is not loaded")
-            prediction, artifacts = predictor.predict(crop)
+            prediction, artifacts = predictor.predict(crop, score_mode=self.config.get("score_mode"), score_pool_kernel=self.config.get("score_pool_kernel"))
             inverse = np.linalg.inv(matrix)
             anomaly_boxes = []
             for box in artifacts["boxes"]:

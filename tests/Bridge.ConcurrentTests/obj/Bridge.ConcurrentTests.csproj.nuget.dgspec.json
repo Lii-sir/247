@@ -1,0 +1,137 @@
+{
+  "format": 1,
+  "restore": {
+    "D:\\python_programs\\LXD_project\\247-likai\\tests\\Bridge.ConcurrentTests\\Bridge.ConcurrentTests.csproj": {}
+  },
+  "projects": {
+    "D:\\python_programs\\LXD_project\\247-likai\\src\\Bridge\\Bridge.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "D:\\python_programs\\LXD_project\\247-likai\\src\\Bridge\\Bridge.csproj",
+        "projectName": "Bridge",
+        "projectPath": "D:\\python_programs\\LXD_project\\247-likai\\src\\Bridge\\Bridge.csproj",
+        "packagesPath": "C:\\Users\\xinxin\\.nuget\\packages\\",
+        "outputPath": "D:\\python_programs\\LXD_project\\247-likai\\src\\Bridge\\obj\\",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "C:\\Users\\xinxin\\AppData\\Roaming\\NuGet\\NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net48"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net48": {
+            "framework": "net48",
+            "targetAlias": "net48",
+            "projectReferences": {}
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        },
+        "SdkAnalysisLevel": "10.0.400"
+      },
+      "frameworks": {
+        "net48": {
+          "framework": "net48",
+          "targetAlias": "net48",
+          "dependencies": {
+            "Costura.Fody": {
+              "suppressParent": "All",
+              "target": "Package",
+              "version": "[6.2.0, )"
+            },
+            "Fody": {
+              "suppressParent": "All",
+              "target": "Package",
+              "version": "[6.9.3, )"
+            },
+            "Microsoft.NETFramework.ReferenceAssemblies": {
+              "suppressParent": "All",
+              "target": "Package",
+              "version": "[1.0.3, )",
+              "autoReferenced": true
+            },
+            "System.Text.Json": {
+              "target": "Package",
+              "version": "[10.0.8, )"
+            }
+          },
+          "runtimeIdentifierGraphPath": "D:\\python_programs\\LXD_project\\247-likai\\.dotnet\\sdk\\10.0.400\\RuntimeIdentifierGraph.json"
+        }
+      }
+    },
+    "D:\\python_programs\\LXD_project\\247-likai\\tests\\Bridge.ConcurrentTests\\Bridge.ConcurrentTests.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "D:\\python_programs\\LXD_project\\247-likai\\tests\\Bridge.ConcurrentTests\\Bridge.ConcurrentTests.csproj",
+        "projectName": "Bridge.ConcurrentTests",
+        "projectPath": "D:\\python_programs\\LXD_project\\247-likai\\tests\\Bridge.ConcurrentTests\\Bridge.ConcurrentTests.csproj",
+        "packagesPath": "C:\\Users\\xinxin\\.nuget\\packages\\",
+        "outputPath": "D:\\python_programs\\LXD_project\\247-likai\\tests\\Bridge.ConcurrentTests\\obj\\",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "C:\\Users\\xinxin\\AppData\\Roaming\\NuGet\\NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net48"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net48": {
+            "framework": "net48",
+            "targetAlias": "net48",
+            "projectReferences": {
+              "D:\\python_programs\\LXD_project\\247-likai\\src\\Bridge\\Bridge.csproj": {
+                "projectPath": "D:\\python_programs\\LXD_project\\247-likai\\src\\Bridge\\Bridge.csproj"
+              }
+            }
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        },
+        "SdkAnalysisLevel": "10.0.400"
+      },
+      "frameworks": {
+        "net48": {
+          "framework": "net48",
+          "targetAlias": "net48",
+          "dependencies": {
+            "Microsoft.NETFramework.ReferenceAssemblies": {
+              "suppressParent": "All",
+              "target": "Package",
+              "version": "[1.0.3, )",
+              "autoReferenced": true
+            }
+          },
+          "runtimeIdentifierGraphPath": "D:\\python_programs\\LXD_project\\247-likai\\.dotnet\\sdk\\10.0.400\\RuntimeIdentifierGraph.json"
+        }
+      },
+      "runtimes": {
+        "win-x64": {
+          "#import": []
+        }
+      }
+    }
+  }
+}
