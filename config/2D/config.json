@@ -106,13 +106,11 @@
     }
   },
   "silver_overflow_2d": {
-    "description": "银浆掩码超出设定矩形边界检测",
+    "description": "基于模板预标定多边形，经SIFT/RANSAC配准后的银浆越界检测；未标定或配准失败不判OK",
     "parameters": {
       "boundary": {
-        "mode": "chip_expansion",
-        "chip_class": "chip",
-        "outward_length_px": 20,
-        "min_chip_area_px": 100
+        "mode": "polygon",
+        "calibration_path": "calibration/silver_boundary.json"
       },
       "silver_class": "silver",
       "tolerance_px": 0.0,
@@ -150,7 +148,11 @@
       "padding_ratio": 0.02,
       "max_rotation_deg": 5.0,
       "score_mode": "pool+top",
-      "score_pool_kernel": 7
+      "score_pool_kernel": 7,
+      "threshold": {
+        "chip_short": 0.89511,
+        "chip_long": 10.2000
+        }
     }
   }
 }

@@ -7,7 +7,7 @@
   竖向分割、掩码和 YOLO 参数。
 - `wire_bending_2d.parameters`：引线/细线 ROI 和弯曲度阈值。
 - `silver_continuity_2d.parameters`：银浆断连/联通参数。
-- `silver_overflow_2d.parameters`：银浆矩形边界、容差和最小缺陷面积。
+- `silver_overflow_2d.parameters`：预标定多边形经 SIFT/RANSAC 配准后的银浆允许边界、容差和最小缺陷面积。
 - `chip_rotation_2d.parameters`：芯片外接矩形角度阈值。
 - `chip_anomaly_2d.parameters`：芯片外观异常和 EfficientAD 模型区间映射。
 
@@ -18,8 +18,16 @@
 
 `vertical_split.offset_radius` 控制实验脚本中的竖向分割线：
 `split_x = round(circle_x + offset_radius * radius + offset_px)`。ROI 工具保存时
-会更新 `common_2d.parameters` 和对应功能块的 `parameters`，银浆边界保存为圆心
-相对的矩形四点。
+会更新 `common_2d.parameters` 和对应功能块的 `parameters`。
+银浆溢出边界单独保存在 `calibration/silver_boundary.json`，不再从芯片外接框生成。
+
+运行 `visualization/calibrate_silver_boundary.py --image <模板原图> --open`，在现有
+HTML 查看器中按顺序点选真实允许区域顶点并下载 JSON；之后使用同一脚本的
+`--image <同一模板原图> --apply <下载的JSON>` 安装标定。
+模板点为完整模板原图像素坐标，`template_path` 相对于标定 JSON 解析。真实图像通过
+SIFT/FLANN/RANSAC 得到模板到当前图的 Homography，再将边界转到检测 crop 作越界判断。
+初始 `template_points` 为空，必须完成真实标定后使用；未标定/配准失败不会回退
+`chip_expansion`，而是返回 `not_configured`/`uncertain` 和 `is_ok=null`。
 
 运行 `scripts/roi_configurator.py` 可在同一张 2D 图片上标定 3D 引脚平台参考区：
 按 `F` 添加矩形，拖动框内移动、拖动角点拉伸，`V` 清空平台框，`U` 撤销，

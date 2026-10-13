@@ -19,6 +19,40 @@ from algorithm.efficientad_models import EfficientAdModel
 MULTISCALE_SCORE_METHOD = "masked_multiscale_normalized_topk_max"
 SINGLE_SCALE_SCORE_METHOD = "masked_local_average_topk_mean"
 TOP_SCORE_METHOD = "masked_pixel_max"
+
+
+def validate_threshold(value: Any, model_names: set[str] | None = None):
+    """Validate a scalar override or independently named model overrides."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        result = {}
+        for name, threshold in value.items():
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("EfficientAD threshold model names must be non-empty strings")
+            if model_names is not None and name not in model_names:
+                raise ValueError(f"Unknown EfficientAD threshold model: {name}")
+            if threshold is None or isinstance(threshold, dict):
+                raise ValueError(f"EfficientAD threshold for {name} must be a finite non-negative number")
+            result[name] = validate_threshold(threshold)
+        return result
+    if isinstance(value, bool):
+        raise ValueError("EfficientAD threshold must be a finite non-negative number")
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("EfficientAD threshold must be a finite non-negative number") from exc
+    if not math.isfinite(threshold) or threshold < 0:
+        raise ValueError("EfficientAD threshold must be a finite non-negative number")
+    return threshold
+
+
+def model_threshold(value: Any, name: str) -> float | None:
+    """A missing named override falls back to this model's own calibration."""
+    validated = validate_threshold(value)
+    return validated.get(name) if isinstance(validated, dict) else validated
+
+
 def validate_config(config: Dict[str, Any] | None) -> Dict[str, Any]:
     """Return the compact, validated production configuration."""
     if config is None:
@@ -31,6 +65,7 @@ def validate_config(config: Dict[str, Any] | None) -> Dict[str, Any]:
             "max_rotation_deg": 5.0,
             "score_mode": None,
             "score_pool_kernel": None,
+            "threshold": None,
         }
     raw = dict(config)
     selection = raw.get("aspect_ratio_models")
@@ -89,6 +124,7 @@ def validate_config(config: Dict[str, Any] | None) -> Dict[str, Any]:
         if isinstance(score_pool_kernel, bool) or int(score_pool_kernel) < 1 or int(score_pool_kernel) % 2 == 0:
             raise ValueError("chip_anomaly_2d.score_pool_kernel must be a positive odd integer")
         score_pool_kernel = int(score_pool_kernel)
+    threshold = validate_threshold(raw.get("threshold"), {rule["model"] for rule in ranges})
     return {
         "configured": True,
         "chip_class": str(raw.get("chip_class", "chip")),
@@ -97,6 +133,7 @@ def validate_config(config: Dict[str, Any] | None) -> Dict[str, Any]:
         "max_rotation_deg": max_rotation,
         "score_mode": score_mode,
         "score_pool_kernel": score_pool_kernel,
+        "threshold": threshold,
         "aspect_ratio_models": ranges,
     }
 
@@ -199,6 +236,7 @@ def _scores_and_response(
     model_config: Dict[str, Any],
     score_mode: str | None = None,
     score_pool_kernel: int | None = None,
+    threshold: float | None = None,
 ) -> tuple[Dict[str, float], np.ndarray, np.ndarray, list[int]]:
     method = calibration.get("score_method") or {}
     method_name = method.get("name")
@@ -209,7 +247,7 @@ def _scores_and_response(
         method_name = SINGLE_SCALE_SCORE_METHOD
         method = dict(method)
         method["pool_kernel"] = int(runtime_kernel or 7)
-    threshold = float(calibration.get("pool_top_threshold", calibration["threshold"]) if force_pool_top else calibration["threshold"])
+    threshold = _effective_threshold(calibration, force_pool_top, threshold)
     topk_ratio = float(method.get("topk_ratio", model_config.get("score_topk_ratio", 0.001)))
     raw_map = anomaly_map[0, 0].detach().cpu().numpy().astype(np.float32, copy=True)
 
@@ -270,6 +308,21 @@ def _scores_and_response(
     score = float(anomaly_map.max())
     binary = raw_map > max(0.0, threshold) if score > threshold else np.zeros_like(raw_map, bool)
     return {"score": score, "score_topk": score, "score_max": score}, raw_map, binary, [1] if score > threshold else []
+
+
+def _effective_threshold(
+    calibration: Dict[str, Any], pool_top: bool, override: float | None
+) -> float:
+    value = override if override is not None else (
+        calibration.get("pool_top_threshold", calibration["threshold"])
+        if pool_top else calibration["threshold"]
+    )
+    if isinstance(value, bool):
+        raise ValueError("EfficientAD threshold must be a finite non-negative number")
+    threshold = float(value)
+    if not math.isfinite(threshold) or threshold < 0:
+        raise ValueError("EfficientAD threshold must be a finite non-negative number")
+    return threshold
 
 
 def _component_boxes(binary: np.ndarray, params: Dict[str, Any]) -> list[list[int]]:
@@ -352,15 +405,24 @@ class _LoadedPredictor:
         self.model.to(device).eval()
         self._lock = threading.RLock()
 
-    def predict(self, crop: np.ndarray, *, score_mode: str | None = None, score_pool_kernel: int | None = None) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    def predict(self, crop: np.ndarray, *, score_mode: str | None = None,
+                score_pool_kernel: int | None = None,
+                threshold: float | Dict[str, float] | None = None) -> tuple[Dict[str, Any], Dict[str, Any]]:
         tensor = _preprocess(crop, self.image_size, self.device)
+        active_mode = score_mode or self.config.get("score_mode")
+        pool_top = str(active_mode or "").strip().casefold() in {"pool+top", "pool-top", "pooltop"}
+        runtime_threshold = model_threshold(threshold, self.name)
+        if runtime_threshold is None:
+            runtime_threshold = model_threshold(self.config.get("threshold"), self.name)
+        effective_threshold = _effective_threshold(
+            self.calibration, pool_top, runtime_threshold
+        )
         with self._lock, torch.inference_mode():
             prediction = self.model(tensor)
             scores, response, binary, active_scales = _scores_and_response(
-                prediction.anomaly_map, self.calibration, self.config, score_mode, score_pool_kernel
+                prediction.anomaly_map, self.calibration, self.config,
+                score_mode, score_pool_kernel, runtime_threshold
             )
-        active_mode = score_mode or self.config.get("score_mode")
-        threshold = float(self.calibration.get("pool_top_threshold", self.calibration["threshold"]) if active_mode == "pool+top" else self.calibration["threshold"])
         score = float(scores["score"])
         boxes = _component_boxes(binary, self.config.get("localization", {}))
         return ({
@@ -369,19 +431,23 @@ class _LoadedPredictor:
             "score": score,
             "score_topk": float(scores["score_topk"]),
             "score_max": float(scores["score_max"]),
-            "threshold": threshold,
-            "prediction": "NG" if score > threshold else "OK",
+            "threshold": effective_threshold,
+            "prediction": "NG" if score > effective_threshold else "OK",
             "decision_rule": "score > threshold",
-            "is_ok": bool(score <= threshold),
+            "is_ok": bool(score <= effective_threshold),
             "active_scales": active_scales,
             "score_mode": score_mode or self.config.get("score_mode") or self.calibration.get("score_method", {}).get("name"),
             "score_pool_kernel": score_pool_kernel or self.config.get("score_pool_kernel") or self.calibration.get("score_method", {}).get("pool_kernel"),
-            "threshold_source": "pool_top_threshold" if active_mode == "pool+top" and "pool_top_threshold" in self.calibration else "checkpoint_threshold",
+            "threshold_source": (
+                "runtime_threshold" if runtime_threshold is not None else
+                "pool_top_threshold" if pool_top and "pool_top_threshold" in self.calibration else
+                "checkpoint_threshold"
+            ),
         }, {
             "response": response,
             "binary": binary,
             "boxes": boxes,
-            "display_max": float(self.calibration.get("display_max", max(1.0, threshold))),
+            "display_max": float(self.calibration.get("display_max", max(1.0, effective_threshold))),
         })
 
 
@@ -435,9 +501,11 @@ class ChipAnomalyInspector:
         crop_box: Sequence[int],
         *,
         include_visualization: bool = False,
+        threshold: float | Dict[str, float] | None = None,
     ) -> Dict[str, Any]:
         if not self.enabled:
             return {"enabled": False, "status": "disabled", "is_ok": None, "chips": []}
+        thresholds = validate_threshold(threshold, {rule["model"] for rule in self.config["aspect_ratio_models"]})
         chips = [
             item for item in instances
             if str(item.get("class_name", "")).casefold() == self.config["chip_class"].casefold()
@@ -458,7 +526,15 @@ class ChipAnomalyInspector:
             predictor = self.predictors.get(model_name)
             if predictor is None:
                 raise RuntimeError(f"EfficientAD model {model_name!r} is not loaded")
-            prediction, artifacts = predictor.predict(crop, score_mode=self.config.get("score_mode"), score_pool_kernel=self.config.get("score_pool_kernel"))
+            runtime_threshold = model_threshold(thresholds, model_name)
+            if runtime_threshold is None:
+                runtime_threshold = model_threshold(self.config.get("threshold"), model_name)
+            prediction, artifacts = predictor.predict(
+                crop,
+                score_mode=self.config.get("score_mode"),
+                score_pool_kernel=self.config.get("score_pool_kernel"),
+                threshold=runtime_threshold,
+            )
             inverse = np.linalg.inv(matrix)
             anomaly_boxes = []
             for box in artifacts["boxes"]:

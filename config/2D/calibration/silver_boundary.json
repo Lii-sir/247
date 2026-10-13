@@ -1,0 +1,35 @@
+{
+  "mode": "polygon",
+  "coordinate_system": "template",
+  "template_path": "001.png",
+  "template_size": [
+    5320,
+    3032
+  ],
+  "template_sha256": "722ca5e3d3deac6930ddf9a454ba5a8dc834bd43e279c41d1189fe29be0d67fd",
+  "template_points": [
+    [
+      2451.1,
+      223.97
+    ],
+    [
+      3831.18,
+      257.85
+    ],
+    [
+      3795.46,
+      2472.07
+    ],
+    [
+      2419.36,
+      2454.86
+    ]
+  ],
+  "ratio_threshold": 0.7,
+  "min_matches": 11,
+  "ransac_threshold": 5,
+  "min_inliers": 8,
+  "min_inlier_ratio": 0.25,
+  "max_image_side": 2400,
+  "max_features": 10000
+}

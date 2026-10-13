@@ -9,8 +9,9 @@ defined in original-image or circle-relative coordinates.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
+import hashlib
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -19,6 +20,10 @@ import numpy as np
 
 
 EPSILON = 1e-6
+
+
+class CalibrationNotConfiguredError(ValueError):
+    """Missing real calibration is not a passing inspection or a fallback boundary."""
 
 
 def _key(name: str) -> str:
@@ -31,6 +36,7 @@ class Boundary:
 
     points: tuple[tuple[float, float], ...]
     mode: str = "polygon"
+    registration: dict[str, Any] | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         points = np.asarray(self.points, dtype=np.float64)
@@ -219,6 +225,8 @@ class OverflowMeasurement:
     defect_mask: np.ndarray
 
     def summary(self) -> dict[str, Any]:
+        contours, _ = cv2.findContours(self.defect_mask.astype(np.uint8), cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
         return {
             "silver_area_px": self.silver_area_px,
             "outside_area_px": self.outside_area_px,
@@ -231,6 +239,8 @@ class OverflowMeasurement:
             ),
             "max_outside_distance_px": self.max_outside_distance_px,
             "regions": self.regions,
+            "defect_contours": [cv2.approxPolyDP(contour, 0.5, True).reshape(-1, 2).tolist()
+                                for contour in contours if len(contour) >= 3],
         }
 
 
@@ -654,7 +664,9 @@ def _read_image(path: str | Path) -> np.ndarray:
 def _registered_template_points(
     image: np.ndarray,
     boundary: Mapping[str, Any],
-) -> list[tuple[float, float]]:
+    *,
+    return_registration: bool = False,
+):
     """Map calibrated template points into this image with SIFT + RANSAC.
 
     This is the headless equivalent of the external project's
@@ -663,9 +675,19 @@ def _registered_template_points(
     """
     template_path = boundary.get("template_path")
     points = boundary.get("template_points", boundary.get("points"))
-    if not template_path or not isinstance(points, (list, tuple)):
-        raise ValueError("template boundary needs template_path and template_points")
+    if not template_path or not isinstance(points, (list, tuple)) or len(points) < 3:
+        raise CalibrationNotConfiguredError("银浆边界尚未标定：需要模板图和至少三个按顺序标定的边界点")
     template = _read_image(template_path)
+    template_size = [int(template.shape[1]), int(template.shape[0])]
+    calibrated_size = boundary.get("template_size")
+    if calibrated_size is not None and list(map(int, calibrated_size)) != template_size:
+        raise ValueError("silver boundary template dimensions changed after calibration")
+    template_digest = boundary.get("template_sha256")
+    if template_digest is not None and hashlib.sha256(Path(template_path).read_bytes()).hexdigest() != str(template_digest):
+        raise ValueError("silver boundary template image changed after calibration")
+    calibrated = Boundary(tuple(tuple(point) for point in points),
+                          str(boundary.get("mode", "polygon")))
+    calibrated.validate_image(template.shape[:2])
     template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
     target_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     max_side = int(boundary.get("max_image_side", 2400))
@@ -711,7 +733,8 @@ def _registered_template_points(
         cv2.RANSAC,
         float(boundary.get("ransac_threshold", 5.0)),
     )
-    if matrix is None or inlier_mask is None or not np.isfinite(matrix).all():
+    if (matrix is None or inlier_mask is None or not np.isfinite(matrix).all()
+            or np.linalg.matrix_rank(matrix) < 3):
         raise ValueError("silver boundary template homography is invalid")
     inliers = int(inlier_mask.ravel().sum())
     min_inliers = int(boundary.get("min_inliers", 8))
@@ -719,10 +742,26 @@ def _registered_template_points(
     if inliers < min_inliers or inlier_ratio < float(boundary.get("min_inlier_ratio", 0.25)):
         raise ValueError("silver boundary template registration is unreliable")
     source_points = np.asarray(points, dtype=np.float32).reshape(-1, 1, 2)
+    denominators = np.column_stack((source_points[:, 0], np.ones(len(source_points)))) @ matrix[2]
+    if (np.any(np.abs(denominators) < 1e-10)
+            or np.min(denominators) * np.max(denominators) < 0):
+        raise ValueError("silver boundary crosses the projective horizon")
     mapped = cv2.perspectiveTransform(source_points, matrix).reshape(-1, 2)
     if not np.isfinite(mapped).all():
         raise ValueError("silver boundary template points are invalid")
-    return [tuple(map(float, point)) for point in mapped]
+    result = [tuple(map(float, point)) for point in mapped]
+    if not return_registration:
+        return result
+    selected = inlier_mask.ravel().astype(bool)
+    reprojection = cv2.perspectiveTransform(source.astype(np.float32).reshape(-1, 1, 2), matrix).reshape(-1, 2)
+    error = float(np.mean(np.linalg.norm(reprojection[selected] - destination[selected], axis=1)))
+    return result, {
+        "method": "sift_ransac", "status": "ok", "is_valid": True,
+        "matches": len(good), "inliers": inliers, "inlier_ratio": float(inlier_ratio),
+        "reprojection_error_px": error, "template_name": Path(template_path).name,
+        "template_size": template_size, "template_sha256": template_digest,
+        "homography_template_to_image": matrix.tolist(),
+    }
 
 
 def build_boundary(
@@ -743,6 +782,8 @@ def build_boundary(
         path = Path(str(calibration_path)).expanduser()
         if not path.is_absolute() and base_dir is not None:
             path = Path(base_dir).expanduser() / path
+        if not path.is_file():
+            raise CalibrationNotConfiguredError(f"银浆边界标定文件不存在：{path}")
         data = json.loads(path.read_text(encoding="utf-8-sig"))
         if not isinstance(data, dict):
             raise ValueError("silver calibration file must contain an object")
@@ -757,18 +798,20 @@ def build_boundary(
             }
         if image is None:
             raise ValueError("silver boundary template registration needs the source image")
-        mapped = _registered_template_points(image, calibration)
+        mapped, registration = _registered_template_points(image, calibration, return_registration=True)
         points = [
             (float(point[0]) - float(crop_box[0]), float(point[1]) - float(crop_box[1]))
             for point in mapped
         ]
     else:
         points = _points_from_config(calibration, crop_box=crop_box, circle=circle)
+        registration = {"method": "fixed_points", "status": "ok", "is_valid": True}
     boundary = Boundary(
         tuple(points),
         str(calibration.get("mode", calibration.get("boundary_mode", "polygon")))
         .strip()
         .casefold(),
+        registration=registration,
     )
     boundary.validate_image(image_shape)
     return boundary
@@ -844,6 +887,7 @@ def inspect_masks(
 
     shape = (int(image_shape[0]), int(image_shape[1]))
     boundary_error = None
+    calibration_missing = False
     overflow_config = dict(overflow_config or {})
     continuity_config = dict(continuity_config or {})
     raw_boundary = overflow_config.get("boundary")
@@ -864,9 +908,10 @@ def inspect_masks(
                 image=image,
                 base_dir=base_dir,
             )
-        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError, TypeError, json.JSONDecodeError, cv2.error) as exc:
             boundary = None
             boundary_error = str(exc)
+            calibration_missing = isinstance(exc, CalibrationNotConfiguredError)
     instances = list(instances)
 
     overflow: dict[str, Any]
@@ -890,6 +935,7 @@ def inspect_masks(
                     "mode": "chip_expansion",
                     "chip_class": str(expansion.get("chip_class", "chip")),
                     "outward_length_px": int(expansion.get("outward_length_px", 20)),
+                    "coordinate_system": "crop",
                 },
                 "measurement": measurement.summary(),
             }
@@ -906,9 +952,12 @@ def inspect_masks(
             }
     elif boundary is None:
         overflow = {
-            "status": "uncertain" if boundary_error else "not_configured",
+            "status": "not_configured" if calibration_missing or not boundary_error else "uncertain",
             "is_ok": None,
             "message": boundary_error or "silver overflow boundary is not configured",
+            "registration": {"method": "sift_ransac" if (raw_boundary or {}).get("calibration_path") or (raw_boundary or {}).get("template_path") else "fixed_points",
+                             "status": "not_configured" if calibration_missing else "failed", "is_valid": False,
+                             "message": boundary_error or "silver overflow boundary is not configured"},
         }
     else:
         try:
@@ -932,7 +981,9 @@ def inspect_masks(
                 "boundary": {
                     "mode": boundary.mode,
                     "points": [list(point) for point in boundary.points],
+                    "coordinate_system": "crop",
                 },
+                "registration": boundary.registration,
                 "measurement": measurement.summary(),
             }
         except ValueError as exc:
@@ -943,7 +994,9 @@ def inspect_masks(
                 "boundary": {
                     "mode": boundary.mode,
                     "points": [list(point) for point in boundary.points],
+                    "coordinate_system": "crop",
                 },
+                "registration": boundary.registration,
             }
 
     if not continuity_enabled:
@@ -976,17 +1029,19 @@ def inspect_masks(
 
 
 def offset_geometry(value: Any, offset: Sequence[int]) -> Any:
-    """Translate diagnostic geometry from crop-local to original-image pixels."""
+    """Translate crop-local geometry once; never translate SIFT metadata or matrices."""
     if isinstance(value, dict):
-        return {
-            key: offset_geometry(item, offset)
+        result = {
+            key: item if key == "registration" else offset_geometry(item, offset)
             for key, item in value.items()
             if key not in {"silver_mask", "outside_mask", "defect_mask", "chip_mask", "ring_mask", "occlusion_mask", "missing_mask"}
         }
+        if value.get("coordinate_system") == "crop" and "points" in value:
+            result["coordinate_system"] = "image"
+        return result
     if isinstance(value, (list, tuple)):
         if len(value) == 4 and all(isinstance(item, (int, float)) for item in value):
-            converted = [value[0] + offset[0], value[1] + offset[1], value[2] + offset[0], value[3] + offset[1]]
-            return converted
+            return [value[0] + offset[0], value[1] + offset[1], value[2] + offset[0], value[3] + offset[1]]
         if len(value) == 2 and all(isinstance(item, (int, float)) for item in value):
             return [value[0] + offset[0], value[1] + offset[1]]
         return [offset_geometry(item, offset) for item in value]

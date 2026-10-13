@@ -148,6 +148,8 @@ def build_payload(document: Any, *, base_dir: Path, images_2d: Path | None = Non
         "response": response,
         "pieces": [pieces[k] for k in sorted(pieces)],
         "warnings": warnings,
+        "timeline": envelope.get("timeline") if isinstance(envelope.get("timeline"), list) else [],
+        "calibration": envelope.get("calibration") if isinstance(envelope.get("calibration"), dict) else None,
     }
 
 

@@ -259,7 +259,8 @@ class Detect2D:
             if self.chip_anomaly_inspector is None:
                 raise RuntimeError("chip anomaly inspector is not initialized")
             chip_anomaly_diagnostics = self.chip_anomaly_inspector.inspect(
-                image, results, roi_box, include_visualization=True
+                image, results, roi_box, include_visualization=True,
+                threshold=req.get("threshold")
             )
             diagnostics = silver_inspection.inspect_masks(
                 results,

@@ -70,6 +70,29 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("</script>", encoded)
         self.assertEqual(json.loads(encoded)["name"], "</script><img onerror='alert(1)'>")
 
+    def test_calibration_preview_preserves_original_coordinates_and_digest(self):
+        document = {"response": {"ok": True, "results_2d": {"is_ok": None}},
+                    "calibration": {"enabled": True, "template_size": [5320, 3032],
+                                    "template_points": [[1234, 789], [1800, 789], [1800, 1600]],
+                                    "template_sha256": "a" * 64}}
+        payload = report.build_payload(document, base_dir=self.root)
+        self.assertEqual(payload["calibration"], document["calibration"])
+        html = report.render_report(document, self.root / "calibration.html", base_dir=self.root).read_text(encoding="utf-8")
+        self.assertIn('id="calibration-export"', html)
+        self.assertIn('id="show-silver-boundary"', html)
+
+    def test_silver_boundary_and_registration_survive_report_join(self):
+        diagnostic = {"status": "overflow", "is_ok": False,
+                      "boundary": {"mode": "polygon", "coordinate_system": "image",
+                                   "points": [[15, 10], [80, 10], [80, 60], [15, 60]]},
+                      "registration": {"method": "sift_ransac", "matches": 42, "inliers": 40,
+                                       "homography_template_to_image": [[1, 0, 7], [0, 1, 8], [0, 0, 1]]},
+                      "measurement": {"defect_contours": [[[81, 25], [85, 25], [85, 30]]]}}
+        reply = {"ok": True, "board_id": "board-1", "piece_id": 1,
+                 "results_2d": {"is_ok": False, "silver_overflow_2d": diagnostic}}
+        payload = report.build_payload([reply, self.response], base_dir=self.root)
+        self.assertEqual(payload["pieces"][0]["results_2d"]["silver_overflow_2d"], diagnostic)
+
     def test_report_is_standalone_and_no_overwrite(self):
         target = self.root / "report.html"
         report.render_report(self.response, target, base_dir=self.root)

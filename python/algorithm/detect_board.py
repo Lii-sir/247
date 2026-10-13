@@ -284,7 +284,8 @@ class DetectBoard:
         return dict(start=start, board_id=board_id, piece_id=piece_id,
                     image=image, crop=crop, crop_box=crop_box, circle=circle,
                     roi_boxes=roi_boxes, registration_mask=registration_mask,
-                    read_decode_ms=read_decode_ms, circle_crop_ms=circle_crop_ms, image_owner=owner)
+                    read_decode_ms=read_decode_ms, circle_crop_ms=circle_crop_ms, image_owner=owner,
+                    threshold=req.get("threshold"))
 
     @staticmethod
     def release_prepared_2d(prepared):
@@ -314,7 +315,7 @@ class DetectBoard:
             if self.chip_anomaly_inspector is None:
                 raise RuntimeError("chip anomaly inspector is not initialized")
             chip_anomaly_diagnostics = self.chip_anomaly_inspector.inspect(
-                image, instances, crop_box
+                image, instances, crop_box, threshold=prepared.get("threshold")
             )
         prepared.update(instances=instances, inference_ms=inference_ms,
                         chip_anomaly_diagnostics=chip_anomaly_diagnostics)
@@ -609,6 +610,8 @@ class DetectBoard:
             "wire_measurements": measurement["wire_measurements"],
             "solder_measurements": measurement["solder_measurements"],
             "chip_anomaly_2d": entry.get("chip_anomaly_2d", {"status": "disabled", "is_ok": None}),
+            "silver_overflow_2d": entry.get("silver_overflow_2d", {"status": "disabled", "is_ok": None}),
+            "silver_continuity_2d": entry.get("silver_continuity_2d", {"status": "disabled", "is_ok": None}),
             "masks": [self._public_instance(item) for item in aligned_masks],
         }
 
