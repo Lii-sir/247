@@ -249,7 +249,8 @@ def measure_overflow(
 ) -> OverflowMeasurement:
     if mask.ndim != 2 or mask.dtype != np.bool_:
         raise ValueError("silver mask must be a 2D boolean array")
-    boundary.validate_image(mask.shape)
+    # The allowed polygon may extend beyond the detection ROI. Evaluate the
+    # observed mask pixels against the full polygon without clipping its edges.
     ys, xs = np.nonzero(mask)
     distances = np.empty(len(xs), dtype=np.float64)
     for offset in range(0, len(xs), 100_000):
@@ -667,12 +668,7 @@ def _registered_template_points(
     *,
     return_registration: bool = False,
 ):
-    """Map calibrated template points into this image with SIFT + RANSAC.
-
-    This is the headless equivalent of the external project's
-    ``TemplateMatcher``. It is optional; circle-relative points avoid feature
-    matching when the product has a reliable circular landmark.
-    """
+    """Map template points per image, optionally using unchanged points on failure."""
     template_path = boundary.get("template_path")
     points = boundary.get("template_points", boundary.get("points"))
     if not template_path or not isinstance(points, (list, tuple)) or len(points) < 3:
@@ -688,6 +684,50 @@ def _registered_template_points(
     calibrated = Boundary(tuple(tuple(point) for point in points),
                           str(boundary.get("mode", "polygon")))
     calibrated.validate_image(template.shape[:2])
+    registration = {
+        "method": "sift_ransac", "status": "ok", "is_valid": True,
+        "fallback_used": False, "matches": 0, "inliers": 0, "inlier_ratio": 0.0,
+        "template_name": Path(template_path).name, "template_size": template_size,
+        "template_sha256": template_digest,
+    }
+    try:
+        result = _match_template_points(image, template, boundary, registration)
+        Boundary(tuple(result), calibrated.mode).validate_image(image.shape[:2])
+    except (ValueError, cv2.error) as exc:
+        if not boundary.get("fallback_to_template_points", False):
+            raise
+        # These are target ORIGINAL-image coordinates, not crop coordinates.
+        # Keep calibration integrity errors above outside the fallback path.
+        result = _fallback_template_points(boundary, image.shape[:2], registration, str(exc))
+    return (result, registration) if return_registration else result
+
+
+def _fallback_template_points(
+    calibration: Mapping[str, Any], image_shape: Sequence[int],
+    registration: dict[str, Any], reason: str,
+) -> list[tuple[float, float]]:
+    boundary = Boundary(tuple(tuple(point) for point in calibration.get(
+        "template_points", calibration.get("points", []))),
+        str(calibration.get("mode", "polygon")))
+    boundary.validate_image(image_shape)
+    registration.pop("reprojection_error_px", None)
+    registration.update({
+        "method": "template_points_fallback", "status": "fallback",
+        "is_valid": False, "fallback_used": True,
+        "message": f"使用模板原始边界点回退，未使用配准结果：{reason}",
+        "homography_template_to_image": np.eye(3).tolist(),
+    })
+    return list(boundary.points)
+
+
+def _match_template_points(
+    image: np.ndarray,
+    template: np.ndarray,
+    boundary: Mapping[str, Any],
+    registration: dict[str, Any],
+) -> list[tuple[float, float]]:
+    """Estimate a fresh transform and preserve matching statistics on failure."""
+    points = boundary.get("template_points", boundary.get("points"))
     template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
     target_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     max_side = int(boundary.get("max_image_side", 2400))
@@ -722,6 +762,7 @@ def _registered_template_points(
     for match in sorted(good, key=lambda item: item.distance):
         unique.setdefault(match.trainIdx, match)
     good = list(unique.values())
+    registration["matches"] = len(good)
     min_matches = int(boundary.get("min_matches", 11))
     if len(good) < min_matches:
         raise ValueError(f"silver boundary template matches are insufficient: {len(good)} / {min_matches}")
@@ -739,8 +780,14 @@ def _registered_template_points(
     inliers = int(inlier_mask.ravel().sum())
     min_inliers = int(boundary.get("min_inliers", 8))
     inlier_ratio = inliers / len(good)
+    registration.update({"inliers": inliers, "inlier_ratio": float(inlier_ratio)})
     if inliers < min_inliers or inlier_ratio < float(boundary.get("min_inlier_ratio", 0.25)):
-        raise ValueError("silver boundary template registration is unreliable")
+        raise ValueError(
+            "silver boundary template registration is unreliable: "
+            f"inliers={inliers}/{len(good)} (minimum {min_inliers}), "
+            f"inlier_ratio={inlier_ratio:.3f} "
+            f"(minimum {float(boundary.get('min_inlier_ratio', 0.25)):.3f})"
+        )
     source_points = np.asarray(points, dtype=np.float32).reshape(-1, 1, 2)
     denominators = np.column_stack((source_points[:, 0], np.ones(len(source_points)))) @ matrix[2]
     if (np.any(np.abs(denominators) < 1e-10)
@@ -750,18 +797,14 @@ def _registered_template_points(
     if not np.isfinite(mapped).all():
         raise ValueError("silver boundary template points are invalid")
     result = [tuple(map(float, point)) for point in mapped]
-    if not return_registration:
-        return result
     selected = inlier_mask.ravel().astype(bool)
     reprojection = cv2.perspectiveTransform(source.astype(np.float32).reshape(-1, 1, 2), matrix).reshape(-1, 2)
     error = float(np.mean(np.linalg.norm(reprojection[selected] - destination[selected], axis=1)))
-    return result, {
-        "method": "sift_ransac", "status": "ok", "is_valid": True,
-        "matches": len(good), "inliers": inliers, "inlier_ratio": float(inlier_ratio),
-        "reprojection_error_px": error, "template_name": Path(template_path).name,
-        "template_size": template_size, "template_sha256": template_digest,
+    registration.update({
+        "reprojection_error_px": error,
         "homography_template_to_image": matrix.tolist(),
-    }
+    })
+    return result
 
 
 def build_boundary(
@@ -813,7 +856,6 @@ def build_boundary(
         .casefold(),
         registration=registration,
     )
-    boundary.validate_image(image_shape)
     return boundary
 
 
@@ -912,6 +954,13 @@ def inspect_masks(
             boundary = None
             boundary_error = str(exc)
             calibration_missing = isinstance(exc, CalibrationNotConfiguredError)
+    boundary_within_crop = None
+    if boundary is not None:
+        try:
+            boundary.validate_image(shape)
+            boundary_within_crop = True
+        except ValueError:
+            boundary_within_crop = False
     instances = list(instances)
 
     overflow: dict[str, Any]
@@ -959,6 +1008,9 @@ def inspect_masks(
                              "status": "not_configured" if calibration_missing else "failed", "is_valid": False,
                              "message": boundary_error or "silver overflow boundary is not configured"},
         }
+        if boundary_error and isinstance(raw_boundary, Mapping) and raw_boundary.get("fallback_to_template_points"):
+            overflow["registration"].update({"fallback_used": True,
+                "method": "template_points_fallback", "status": "fallback"})
     else:
         try:
             silver_mask, silver_count = _union_masks(
@@ -982,6 +1034,7 @@ def inspect_masks(
                     "mode": boundary.mode,
                     "points": [list(point) for point in boundary.points],
                     "coordinate_system": "crop",
+                    "is_within_crop": boundary_within_crop,
                 },
                 "registration": boundary.registration,
                 "measurement": measurement.summary(),
@@ -995,9 +1048,12 @@ def inspect_masks(
                     "mode": boundary.mode,
                     "points": [list(point) for point in boundary.points],
                     "coordinate_system": "crop",
+                    "is_within_crop": boundary_within_crop,
                 },
                 "registration": boundary.registration,
             }
+        if boundary is not None and overflow.get("boundary") is not None:
+            overflow["boundary"]["is_within_crop"] = boundary_within_crop
 
     if not continuity_enabled:
         continuity = {"status": "disabled", "is_ok": None}

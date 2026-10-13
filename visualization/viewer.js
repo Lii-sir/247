@@ -265,13 +265,15 @@
           });
           const registration = overflow?.registration;
           if (registration) {
-            const text = registration.status === "ok"
+            const text = registration.fallback_used
+              ? "silver boundary · fallback: original template points"
+              : registration.status === "ok"
               ? registration.method === "sift_ransac"
                 ? `silver boundary · SIFT ${registration.inliers ?? "—"}/${registration.matches ?? "—"} inliers · err ${number(registration.reprojection_error_px, 1)} px`
                 : "silver boundary · calibrated points"
               : `silver boundary · ${registration.status}: ${registration.message || "mapping failed"}`;
             drawText(ctx, points[0][0], points[0][1] - 18 / view.scale, text,
-              registration.status === "ok" ? "#ffe05a" : "#ff8d91");
+              registration.fallback_used || registration.status === "ok" ? "#ffe05a" : "#ff8d91");
           }
         }
       }
@@ -296,8 +298,15 @@
     }
     if (kind === "3d" && state.showPoints) {
       const points = [];
-      (piece.wire_measurements || []).forEach((item) => (item.height_3d?.point ? points.push({ ...item.height_3d.point, label: `wire #${item.instance_id}`, ok: item.height_3d.is_ok }) : null));
-      (piece.solder_measurements || []).forEach((item) => (item.height_3d?.point ? points.push({ ...item.height_3d.point, label: `solder ${item.endpoint}`, ok: item.height_3d.is_ok }) : null));
+      const appendHeightPoint = (height, label) => {
+        if (!height?.point) return;
+        const space = height.point_coordinate_space || piece.height_point_coordinate_space;
+        const originRow = Number(piece.depth_origin_row ?? piece.depth_start_row ?? 0);
+        const y = Number(height.point.y) - (space === "board_3d" ? originRow : 0);
+        points.push({ ...height.point, y, label, ok: height.is_ok });
+      };
+      (piece.wire_measurements || []).forEach((item) => appendHeightPoint(item.height_3d, `wire #${item.instance_id}`));
+      (piece.solder_measurements || []).forEach((item) => appendHeightPoint(item.height_3d, `solder ${item.endpoint}`));
       (piece.points || []).forEach((item, index) => points.push({ x: item.x, y: item.y, label: `point #${index + 1} ${number(item.height_diff_mm, 3)} mm`, ok: null }));
       for (const point of points) {
         const color = point.ok === true ? "#65d8b1" : point.ok === false ? "#ff8d91" : "#f4cb76";
@@ -337,6 +346,12 @@
         const status = { not_configured: "未标定", uncertain: "配准/测量不确定", overflow: "存在越界银浆", ok: "通过" };
         const note = document.createElement("p");
         note.textContent = overflow?.message || status[overflow?.status] || overflow?.status || "未返回边界诊断";
+        if (overflow?.registration?.fallback_used) {
+          note.textContent = `已回退到模板原始点（未配准） · ${overflow.registration.message || "匹配失败"} · ${status[overflow?.status] || overflow?.status}`;
+        }
+        if (overflow?.boundary?.is_within_crop === false) {
+          note.textContent += " · 完整边界超出 ROI，仍按原始完整多边形判断 ROI 内银浆";
+        }
         if (overflow?.registration?.method === "sift_ransac" && overflow.registration.is_valid) {
           note.textContent += ` · 内点 ${overflow.registration.inliers}/${overflow.registration.matches} · 误差 ${number(overflow.registration.reprojection_error_px, 2)} px`;
         }
@@ -402,8 +417,9 @@
       template_size: size,
       template_sha256: digest,
       template_points: state.calibrationPoints.map((point) => point.map((value) => Math.round(value * 100) / 100)),
-      ratio_threshold: 0.7, min_matches: 11, ransac_threshold: 5.0,
-      min_inliers: 8, min_inlier_ratio: 0.25, max_image_side: 2400, max_features: 10000,
+      ratio_threshold: 0.8, min_matches: 8, ransac_threshold: 8.0,
+      min_inliers: 6, min_inlier_ratio: 0.15, max_image_side: 3200, max_features: 15000,
+      fallback_to_template_points: true,
     };
     $("calibration-json").textContent = JSON.stringify(payload, null, 2);
     const validation = calibrationError(payload.template_points);

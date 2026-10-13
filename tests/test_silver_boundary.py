@@ -86,6 +86,76 @@ class SilverBoundaryTests(unittest.TestCase):
         self.assertIsNone(result["is_ok"])
         self.assertFalse(result["registration"]["is_valid"])
 
+    def enable_fallback(self, **overrides):
+        self.calibration.update(fallback_to_template_points=True, **overrides)
+        self.json_path.write_text(json.dumps(self.calibration), encoding="utf-8")
+
+    def test_featureless_fallback_keeps_points_and_crop_offset(self):
+        self.enable_fallback()
+        boundary = self.build(np.zeros_like(self.template),
+                              crop=(40, 30, 480, 360), shape=(330, 440))
+        np.testing.assert_allclose(boundary.points, np.asarray(self.points) - [40, 30])
+        self.assertEqual(boundary.registration["status"], "fallback")
+        self.assertFalse(boundary.registration["is_valid"])
+        self.assertTrue(boundary.registration["fallback_used"])
+        np.testing.assert_equal(boundary.registration["homography_template_to_image"], np.eye(3))
+        self.assertIn("insufficient features", boundary.registration["message"])
+        public = silver.offset_geometry(dict(boundary=dict(points=boundary.points),
+                    registration=boundary.registration), (40, 30))
+        np.testing.assert_allclose(public["boundary"]["points"], self.points)
+        self.assertTrue(public["registration"]["fallback_used"])
+
+    def test_insufficient_matches_and_unreliable_registration_fall_back(self):
+        for overrides, reason in [({"min_matches": 100000}, "matches are insufficient"),
+                                  ({"min_inliers": 100000}, "registration is unreliable")]:
+            with self.subTest(overrides=overrides):
+                self.enable_fallback(min_matches=11, min_inliers=8)
+                self.enable_fallback(**overrides)
+                boundary = self.build()
+                np.testing.assert_allclose(boundary.points, self.points)
+                self.assertTrue(boundary.registration["fallback_used"])
+                self.assertIn(reason, boundary.registration["message"])
+                self.assertGreater(boundary.registration["matches"], 0)
+                if "min_inliers" in overrides:
+                    self.assertGreater(boundary.registration["inliers"], 0)
+                    self.assertIn("inlier_ratio=", boundary.registration["message"])
+
+    def test_fallback_continues_actual_overflow_measurement(self):
+        self.enable_fallback()
+        for outside in (False, True):
+            with self.subTest(outside=outside):
+                mask = np.zeros((360, 480), dtype=np.uint8)
+                mask[120:130, 150:160] = 1
+                if outside:
+                    mask[120:130, 360:370] = 1
+                result = silver.inspect_masks([dict(class_name="silver", mask=mask)],
+                    mask.shape, dict(overflow=self.config),
+                    image=np.zeros_like(self.template), base_dir=self.root)["silver_overflow"]
+                self.assertEqual(result["status"], "overflow" if outside else "ok")
+                self.assertEqual(result["is_ok"], not outside)
+                self.assertEqual(result["measurement"]["defect_area_px"], 100 if outside else 0)
+                self.assertTrue(result["registration"]["fallback_used"])
+
+    def test_fallback_still_checks_template_and_boundary_integrity(self):
+        self.enable_fallback(template_sha256="wrong")
+        with self.assertRaisesRegex(ValueError, "changed after calibration"):
+            self.build(np.zeros_like(self.template))
+        self.enable_fallback(template_sha256=hashlib.sha256(self.path.read_bytes()).hexdigest())
+        with self.assertRaisesRegex(ValueError, "outside the 2D crop"):
+            self.build(np.zeros_like(self.template), crop=(300, 250, 480, 360), shape=(110, 180))
+
+    def test_shared_calibration_maps_each_target_independently(self):
+        self.enable_fallback()
+        original = self.json_path.read_bytes()
+        for dx, dy in [(12, 8), (-15, 10)]:
+            target = cv2.warpPerspective(self.template, np.array(
+                [[1, 0, dx], [0, 1, dy], [0, 0, 1]], np.float64), (480, 360))
+            boundary = self.build(target)
+            np.testing.assert_allclose(boundary.points, np.asarray(self.points) + [dx, dy], atol=1.5)
+            self.assertFalse(boundary.registration["fallback_used"])
+            self.assertTrue(boundary.registration["is_valid"])
+        self.assertEqual(self.json_path.read_bytes(), original)
+
     def test_template_hash_and_size_are_checked(self):
         self.calibration["template_sha256"] = "bad-hash"
         self.json_path.write_text(json.dumps(self.calibration), encoding="utf-8")
@@ -133,6 +203,7 @@ class SilverBoundaryTests(unittest.TestCase):
         self.assertEqual(diagnostics["boundary"]["points"][0], [1, 2])
 
     def test_installer_keeps_thresholds_backs_up_and_resolves_template(self):
+        self.enable_fallback()
         config_file = self.root / "config.json"
         config = dict(silver_overflow_2d=dict(parameters=dict(
             boundary=dict(mode="chip_expansion"), tolerance_px=2.5, min_area_px=5)),
@@ -145,6 +216,7 @@ class SilverBoundaryTests(unittest.TestCase):
         self.assertTrue(target.is_file())
         saved = json.loads(target.read_text(encoding="utf-8"))
         self.assertEqual(saved["template_points"], self.points)
+        self.assertTrue(saved["fallback_to_template_points"])
         self.assertTrue((target.parent / saved["template_path"]).is_file())
         after = json.loads(config_file.read_text(encoding="utf-8"))
         self.assertEqual(after["unrelated_feature"], config["unrelated_feature"])

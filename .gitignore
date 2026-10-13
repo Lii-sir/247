@@ -1,8 +1,6 @@
 .vnev
 src/
 .dotnet/
-demodatasets/
-process/
 visualization/output/
 visualization/smoke-run/
 echo "__pycache__/" >> .gitignore

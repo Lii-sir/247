@@ -40,8 +40,14 @@ SIFT 匹配的是模板与当前图像的特征点，得到 Homography 后映射
 
 查看器的“银浆标定边界”开关显示黄色多边形及 B1/B2…顶点，紫色表示银浆，红色轮廓是
 实际越界像素。银浆边界配准卡片显示匹配数、内点数和重投影误差；详细 JSON 保存
-`homography_template_to_image`。匹配不足、模板内容变化、边界落出 crop 时返回
-`uncertain / is_ok=null`，不得解释为通过。
+`homography_template_to_image`。所有目标图共用同一个标定文件，每张图独立计算变换。
+当前标定启用 `fallback_to_template_points=true`：匹配不足或配准不可靠时，直接把
+`template_points` 当作目标原图坐标，随后正常检测银浆溢出；不缩放、不平移点集。
+此时 `registration.status=fallback`、`fallback_used=true`、`is_valid=false`，
+查看器显示“已回退到模板原始点（未配准）”，检测结论仍来自实际越界像素。
+该方式适合模板与目标图像素尺寸和拍摄位置一致的场景；目标位置变化时回退边界不会跟随。
+设为 `false` 可恢复匹配失败时返回 `uncertain / is_ok=null`。
+模板内容或尺寸与标定记录不一致、标定点非法、边界落出 crop 时仍返回不确定结果。
 
 也可仅为本次检测选择其它标定文件，不改生产配置：
 
@@ -177,3 +183,5 @@ File.WriteAllText("D:/results/board-001.json", JsonSerializer.Serialize(response
 ```
 
 注意：深度伪彩预览将有效灰度归一化，不能当作毫米高度图；精确毫米数只展示算法返回的测量。原图会缩小嵌入报告，叠加轮廓仍使用原始图像坐标。输入 JSON 应来自可信本地检测程序。
+
+联合 3D 检测的 `height_3d.point` 返回整板原始深度图坐标（`point_coordinate_space: "board_3d"`）：当前按行切片，因此 `x` 不变，`y = 分片内 y + depth_start_row`。引线、焊脚和实例中的高度点一致；`mask_3d_local` 与参考平面仍使用分片坐标。报告显示分片预览时自动减回行偏移；旧报告缺少坐标标记时继续按旧的局部坐标解释。独立 3D 引线测高的 `results_3d.pieces[].points` 原本已经是整图坐标，不再加偏移。

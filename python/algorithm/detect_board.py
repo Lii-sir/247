@@ -27,6 +27,7 @@ from algorithm.height_measurement import (
     fit_chip_plane,
     fit_local_platform_plane,
     fit_platform_plane,
+    height_points_to_board,
     map_platform_rois,
     measure_mask_height,
     split_thin_mask,
@@ -592,7 +593,7 @@ class DetectBoard:
             )
             if isinstance(check, dict)
         )
-        return {
+        return height_points_to_board({
             "piece_id": piece_id,
             "image_2d_size": entry["image_shape"],
             "crop_2d": list(entry.get("crop_box", self.crop_roi)),
@@ -613,7 +614,7 @@ class DetectBoard:
             "silver_overflow_2d": entry.get("silver_overflow_2d", {"status": "disabled", "is_ok": None}),
             "silver_continuity_2d": entry.get("silver_continuity_2d", {"status": "disabled", "is_ok": None}),
             "masks": [self._public_instance(item) for item in aligned_masks],
-        }
+        })
 
     def handle_release_board(self, req: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -779,7 +780,7 @@ class DetectBoard:
                     wire_rois=roi_boxes, crop_box=crop_box, circle=circle,
                 )
                 results.append(
-                    {
+                    height_points_to_board({
                         "piece_id": int(descriptor["piece_id"]),
                         "image_2d_size": image_shapes[index],
                         "crop_2d": list(crop_box),
@@ -792,7 +793,7 @@ class DetectBoard:
                         "wire_measurements": measurement["wire_measurements"],
                         "solder_measurements": measurement["solder_measurements"],
                         "masks": [self._public_instance(item) for item in aligned_masks],
-                    }
+                    })
                 )
             alignment_ms = self.elapsed_ms(align_start)
             elapsed_ms = self.elapsed_ms(start)

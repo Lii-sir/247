@@ -40,9 +40,13 @@ def validate_calibration(document: dict, image: Path) -> dict:
     boundary.validate_image((height, width))
     saved = {"mode": "polygon", "template_points": [list(point) for point in boundary.points],
              "template_size": [width, height], "template_sha256": digest}
-    defaults = {"ratio_threshold": 0.7, "min_matches": 11, "ransac_threshold": 5.0,
-                "min_inliers": 8, "min_inlier_ratio": 0.25,
-                "max_image_side": 2400, "max_features": 10000}
+    fallback = document.get("fallback_to_template_points", True)
+    if not isinstance(fallback, bool):
+        raise ValueError("fallback_to_template_points 必须为布尔值")
+    saved["fallback_to_template_points"] = fallback
+    defaults = {"ratio_threshold": 0.8, "min_matches": 8, "ransac_threshold": 8.0,
+                "min_inliers": 6, "min_inlier_ratio": 0.15,
+                "max_image_side": 3200, "max_features": 15000}
     for key, default in defaults.items():
         value = document.get(key, default)
         if isinstance(value, bool) or not isinstance(value, (int, float)):

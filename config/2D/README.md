@@ -26,8 +26,12 @@ HTML 查看器中按顺序点选真实允许区域顶点并下载 JSON；之后�
 `--image <同一模板原图> --apply <下载的JSON>` 安装标定。
 模板点为完整模板原图像素坐标，`template_path` 相对于标定 JSON 解析。真实图像通过
 SIFT/FLANN/RANSAC 得到模板到当前图的 Homography，再将边界转到检测 crop 作越界判断。
-初始 `template_points` 为空，必须完成真实标定后使用；未标定/配准失败不会回退
-`chip_expansion`，而是返回 `not_configured`/`uncertain` 和 `is_ok=null`。
+所有图片使用同一份模板和点集，逐张配准。当前标定启用
+`fallback_to_template_points=true`，匹配失败时直接将模板点作为目标原图坐标，
+继续进行越界判断，结果中标记 `registration.status=fallback`、`fallback_used=true`。
+回退不缩放或移动边界，需要模板与目标图拍摄位置和像素尺寸一致。
+未标定、模板校验失败或边界落出检测 crop 时仍返回 `not_configured`/`uncertain`，
+`is_ok=null`。设为 `false` 可禁用配准失败回退。
 
 运行 `scripts/roi_configurator.py` 可在同一张 2D 图片上标定 3D 引脚平台参考区：
 按 `F` 添加矩形，拖动框内移动、拖动角点拉伸，`V` 清空平台框，`U` 撤销，

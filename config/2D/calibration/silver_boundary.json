@@ -1,7 +1,7 @@
 {
   "mode": "polygon",
   "coordinate_system": "template",
-  "template_path": "001.png",
+  "template_path": "D:\\python_programs\\LXD_project\\247-likai\\config\\2D\\calibration\\silver_boundary_template.png",
   "template_size": [
     5320,
     3032
@@ -25,11 +25,12 @@
       2454.86
     ]
   ],
-  "ratio_threshold": 0.7,
-  "min_matches": 11,
-  "ransac_threshold": 5,
-  "min_inliers": 8,
-  "min_inlier_ratio": 0.25,
-  "max_image_side": 2400,
-  "max_features": 10000
+  "ratio_threshold": 0.8,
+  "min_matches": 8,
+  "ransac_threshold": 8,
+  "min_inliers": 6,
+  "min_inlier_ratio": 0.15,
+  "max_image_side": 3200,
+  "max_features": 15000,
+  "fallback_to_template_points": true
 }
