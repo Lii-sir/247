@@ -1,0 +1,25 @@
+[project]
+name = "247-likai"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "numpy>=1.24",
+    "pillow>=10,<13",
+    "pyyaml>=6,<7",
+    "opencv-python>=4.8,<6",
+    "scipy>=1.10,<2",
+    "ultralytics>=8.3,<9",
+]
+
+[project.scripts]
+247-likai = "247_likai:main"
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = ""
+module-name = "247_likai"

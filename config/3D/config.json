@@ -1,0 +1,134 @@
+{
+  "common_3d": {
+    "description": "3D板级输入公共参数",
+    "parameters": {
+      "input": {
+        "piece_count": 10
+      }
+    }
+  },
+  "segmentation_3d": {
+    "description": "将一张整板深度图分割为十片",
+    "parameters": {
+      "expected_piece_count": 10
+    }
+  },
+  "wire_height_3d": {
+    "description": "3D独立接口的引线中心线P95高度检测",
+    "parameters": {
+      "substrate_aois": [
+        [
+          0.02,
+          0.0,
+          0.18,
+          0.35
+        ],
+        [
+          0.02,
+          0.65,
+          0.18,
+          1.0
+        ]
+      ],
+      "wire_x_range": [
+        280,
+        420
+      ],
+      "mask_threshold_gray": 80.0,
+      "mask_percentile": 65.0,
+      "min_component_area_px": 300,
+      "depth_percentile": 95.0,
+      "gray_offset": 32768.0,
+      "vertical_resolution_mm": 0.00105,
+      "max_wire_substrate_height_mm": 0.8
+    }
+  },
+  "registration_3d": {
+    "description": "2D掩码到每片3D深度图的初始尺度匹配",
+    "parameters": {
+      "scale": 0.306,
+      "threshold_2d": 50,
+      "roi_3d": [
+        120,
+        50,
+        480,
+        720
+      ],
+      "search_2d_scaled": [
+        250,
+        0,
+        950,
+        900
+      ],
+      "morphology_kernel_size": 5,
+      "minimum_score": 0.7
+    }
+  },
+  "dynamic_affine_3d": {
+    "description": "每片运行时动态拟合仿射变换",
+    "parameters": {
+      "preview_scale": 0.5,
+      "threshold_2d": 50,
+      "morphology_kernel_size": 3,
+      "scale_delta": 0.02,
+      "shear_limit": 0.02,
+      "translation_delta": [
+        35,
+        25
+      ],
+      "penalty_weight": 0.005,
+      "maxiter": 35,
+      "xtol": 0.0001,
+      "ftol": 0.0001
+    }
+  },
+  "perspective_registration_3d": {
+    "description": "根据左侧引脚框架边缘和圆特征动态拟合透视变换",
+    "parameters": {
+      "threshold_2d": 50,
+      "max_edge_samples": 1100,
+      "max_nfev": 45,
+      "circle_search_scale": 0.25,
+      "circle_2d_min_radius": 115,
+      "circle_2d_max_radius": 165,
+      "circle_3d_min_radius": 135,
+      "circle_3d_max_radius": 205
+    }
+  },
+  "height_measurement_3d": {
+    "description": "使用ROI工具标定的2D引脚平台区域，经每片透视矩阵映射到3D拟合平台面；检测焊脚和引线相对平台/芯片平面的高度差",
+    "parameters": {
+      "platform_roi_offsets": [
+        [
+          -4.0369,
+          -2.1845,
+          -3.5536,
+          -0.7469
+        ],
+        [
+          -4.0439,
+          0.6591,
+          -3.5729,
+          2.0967
+        ]
+      ],
+      "invalid_values": [
+        0,
+        65535
+      ],
+      "gray_offset": 32768.0,
+      "vertical_resolution_mm": 0.00105,
+      "height_percentile": 95.0,
+      "plane_percentile": 35.0,
+      "plane_min_valid_points": 100,
+      "chip_min_valid_points": 100,
+      "max_wire_platform_height_mm": 0.8,
+      "max_solder_platform_height_mm": 0.8,
+      "max_solder_chip_height_mm": 0.8,
+      "thin_solder_end_ratio": 0.02,
+      "thin_solder_search_dilation_px": 6,
+      "platform_local_ring_px": 24,
+      "semantic_exclusion_dilation_px": 3
+    }
+  }
+}
