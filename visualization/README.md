@@ -1,5 +1,10 @@
 # 独立检测结果查看器
 
+上位机调用后的返回字段见 [上位机接口返回参数说明](OUTPUT_PARAMETERS.md)，按当前 C#
+Bridge DTO 说明通用响应、2D/联合3D结果、银浆回退、测高坐标及返回对象中的耗时参数。
+文档第 14 节专门列出上位机可视化图层对应的返回字段、坐标转换和当前不支持的图层。
+测试脚本、CSV 和日志的使用说明仍见本 README。
+
 ## 银浆允许边界：模板标定 → SIFT 映射 → 查看黄色边界
 
 银浆溢出现在使用 `config/2D/calibration/silver_boundary.json` 中的预标定多边形。
@@ -126,7 +131,7 @@ $env:BRIDGE_TIMING_CUDA_SYNC = "1"
 
 服务 stderr（客户端保存到 `python.log`）中的 `[TIMING]` 行是 JSON，含 `board_id`、
 `piece_id`、`request_id`、`pid`、`thread`、`phase`、`stage`、`elapsed_ms`。
-`event=begin/end` 是成对的阶段开始/结束；`duration` 是队列等待；异常也保存结束耗时。
+`event=begin/end` 是成对的阶段开始/结束；`duration` 记录队列、锁等待或框架上报耗时；异常也保存结束耗时。
 `phase_summary` 汇总一个阶段的所有测量，`efficientad_chip_begin/end` 标明芯片实例，
 `gpu_memory` 记录当前显存分配和保留量，`silver_fallback` 记录匹配失败原因。
 这些日志不会进入协议 stdout。关闭文本日志可设 `BRIDGE_TIMING_LOG=0`，JSON 计时仍保留。

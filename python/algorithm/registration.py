@@ -192,6 +192,9 @@ def refine_affine_registration(
     if not rois:
         result["affine_error"] = f"no valid affine scoring zones for depth shape {target_mask.shape}"
         return result
+    target_rois = tuple(
+        target_mask[y0:y1, x0:x1] for x0, y0, x1, y1 in rois
+    )
 
     initial_matrix = _registration_matrix(coarse_registration)
     p0 = _affine_parameters_from_matrix(initial_matrix, preview_scale)
@@ -243,13 +246,8 @@ def refine_affine_registration(
             borderValue=0,
         )
         losses = [
-            float(
-                np.abs(
-                    warped[y0:y1, x0:x1].astype(np.int16)
-                    - target_mask[y0:y1, x0:x1].astype(np.int16)
-                ).mean()
-            )
-            for x0, y0, x1, y1 in rois
+            float(np.count_nonzero(warped[y0:y1, x0:x1] != target_roi) / target_roi.size)
+            for (x0, y0, x1, y1), target_roi in zip(rois, target_rois)
         ]
         # Penalize shear more than translation, matching the reference
         # experiment while allowing real lens/perspective anisotropy.
