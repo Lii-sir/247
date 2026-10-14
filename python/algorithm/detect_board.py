@@ -42,6 +42,7 @@ from algorithm.registration import (
 )
 from algorithm.perspective_registration import estimate_perspective
 from transport.shared_memory import read_shared_memory, SharedImage
+from algorithm.timing import timed_call, measure, note, record_duration
 
 
 _segment = import_module("algorithm.3D.segment")
@@ -98,21 +99,21 @@ class DetectBoard:
         model_paths = raw_model_paths if isinstance(raw_model_paths, dict) else {}
         self.model_path = str(model_paths.get("YOLO") or "") or None
         try:
-            self._load_config(str(req.get("config_text") or ""))
+            timed_call("init_config_ms", self._load_config, str(req.get("config_text") or ""))
             if not self.model_path:
                 raise ValueError("model_path.YOLO is empty")
-            self._validate_gpu_requirement()
+            timed_call("init_cuda_check_ms", self._validate_gpu_requirement)
             load_start = time.perf_counter()
-            with redirect_stdout(io.StringIO()):
-                from ultralytics import YOLO
-
-                self.model = YOLO(self.model_path)
+            with measure("init_yolo_load_ms"):
+                with redirect_stdout(io.StringIO()):
+                    from ultralytics import YOLO
+                    self.model = YOLO(self.model_path)
             model_load_ms = self.elapsed_ms(load_start)
             self.chip_anomaly_inspector = _chip_anomaly.ChipAnomalyInspector(
                 self.chip_anomaly_config,
                 {str(name): str(path) for name, path in model_paths.items()},
             )
-            anomaly_load_timings = self.chip_anomaly_inspector.load()
+            anomaly_load_timings = timed_call("init_efficientad_load_ms", self.chip_anomaly_inspector.load)
         except Exception as exc:
             self.model = None
             self.chip_anomaly_inspector = None
@@ -265,23 +266,22 @@ class DetectBoard:
         owner = None
         image_format = str(req.get("image_format", "encoded")).lower()
         if image_format == "bgr8" or (image_format == "raw" and int(req.get("image_channels", 3)) == 3):
-            owner = SharedImage(req)
+            owner = timed_call("input_shared_view_ms", SharedImage, req)
             image = owner.image
         else:
-            image = self._read_2d(req)
+            image = timed_call("input_read_decode_ms", self._read_2d, req)
+        read_decode_ms = self.elapsed_ms(read_start)
         circle_start = time.perf_counter()
         try:
-            crop, crop_box, circle, roi_boxes = self._stream_crop(image)
-            crop = crop.copy()  # Model-owned ROI; camera pixels themselves are never copied here.
+            crop, crop_box, circle, roi_boxes = timed_call("roi_prepare_ms", self._stream_crop, image)
+            crop = timed_call("roi_copy_ms", crop.copy)
             circle_crop_ms = self.elapsed_ms(circle_start)
-            registration_mask = platform_mask_2d(image, self.registration_config)
+            registration_mask = timed_call("platform_mask_2d_ms", platform_mask_2d, image, self.registration_config)
         except Exception:
             image = None
             if owner is not None:
                 owner.close()
             raise
-        read_decode_ms = self.elapsed_ms(read_start)
-
         return dict(start=start, board_id=board_id, piece_id=piece_id,
                     image=image, crop=crop, crop_box=crop_box, circle=circle,
                     roi_boxes=roi_boxes, registration_mask=registration_mask,
@@ -299,25 +299,39 @@ class DetectBoard:
         """Serialized GPU phase; CPU workers never wait for a model lock."""
         crop = prepared["crop"]
         image, crop_box = prepared["image"], prepared["crop_box"]
+        note("input_shape", image_shape=list(image.shape), roi_shape=list(crop.shape),
+             imgsz=self.yolo_parameters.get("imgsz"))
+        lock_start = time.perf_counter()
         with self._inference_lock:
+            record_duration("model_lock_wait_ms", self.elapsed_ms(lock_start))
             if self.model is None:
                 raise RuntimeError("board/stream 2D model is not initialized")
             inference_start = time.perf_counter()
-            self._synchronize_model()
-            predictions = self._predict_batch([crop])
-            self._synchronize_model()
+            timed_call("cuda_before_yolo_ms", self._synchronize_model)
+            predictions = timed_call("yolo_predict_wall_ms", self._predict_batch, [crop])
+            timed_call("cuda_after_yolo_ms", self._synchronize_model)
             inference_ms = self.elapsed_ms(inference_start)
             if len(predictions) != 1:
                 raise RuntimeError(
                     f"YOLO returned {len(predictions)} results for one 2D image"
                 )
+            speed = getattr(predictions[0], "speed", None)
+            if isinstance(speed, dict):
+                for stage in ("preprocess", "inference", "postprocess"):
+                    value = speed.get(stage)
+                    if isinstance(value, (int, float)) and np.isfinite(value):
+                        record_duration(f"yolo_reported_{stage}_ms", float(value))
 
-            instances = self._extract_instances(predictions[0], crop.shape[:2])
+            instances = timed_call("mask_extract_to_cpu_ms", self._extract_instances, predictions[0], crop.shape[:2])
             if self.chip_anomaly_inspector is None:
                 raise RuntimeError("chip anomaly inspector is not initialized")
-            chip_anomaly_diagnostics = self.chip_anomaly_inspector.inspect(
+            chip_anomaly_diagnostics = timed_call("efficientad_total_ms", self.chip_anomaly_inspector.inspect,
                 image, instances, crop_box, threshold=prepared.get("threshold")
             )
+            device = getattr(self.model, "device", None)
+            if isinstance(device, torch.device) and device.type == "cuda":
+                note("gpu_memory", allocated_mb=round(torch.cuda.memory_allocated(device) / 1048576, 2),
+                     reserved_mb=round(torch.cuda.memory_reserved(device) / 1048576, 2), instances=len(instances))
         prepared.update(instances=instances, inference_ms=inference_ms,
                         chip_anomaly_diagnostics=chip_anomaly_diagnostics)
 
@@ -332,16 +346,16 @@ class DetectBoard:
         instances = prepared["instances"]
         chip_anomaly_diagnostics = prepared["chip_anomaly_diagnostics"]
         postprocess_start = time.perf_counter()
-        wire_measurements = self._measure_2d_wire_instances(
+        wire_measurements = timed_call("wire_bending_ms", self._measure_2d_wire_instances,
             instances, roi_boxes, crop_box
         )
-        wire_roi_checks = _wire_roi_presence.check_wire_roi_presence(
+        wire_roi_checks = timed_call("wire_roi_presence_ms", _wire_roi_presence.check_wire_roi_presence,
             instances, roi_boxes, crop_box[:2]
         )
-        chip_diagnostics = _chip_alignment.measure_chip_alignment(
+        chip_diagnostics = timed_call("chip_rotation_ms", _chip_alignment.measure_chip_alignment,
             instances, self.chip_alignment_config, crop_box[:2]
         )
-        diagnostics = _silver_inspection.inspect_masks(
+        diagnostics = timed_call("silver_total_ms", _silver_inspection.inspect_masks,
             instances,
             crop.shape[:2],
             self.silver_config,
@@ -350,14 +364,14 @@ class DetectBoard:
             image=image,
             base_dir=self._silver_config_base_dir(),
         )
-        diagnostics = _silver_inspection.offset_geometry(diagnostics, crop_box[:2])
+        diagnostics = timed_call("silver_geometry_offset_ms", _silver_inspection.offset_geometry, diagnostics, crop_box[:2])
         postprocess_ms = self.elapsed_ms(postprocess_start)
 
         entry = {
             "piece_id": piece_id,
             # Retain only grayscale pixels needed for perspective fitting;
             # dropping the original BGR image avoids ~32 MB per piece.
-            "gray_image": cv2.cvtColor(image, cv2.COLOR_BGR2GRAY),
+            "gray_image": timed_call("cache_gray_image_ms", cv2.cvtColor, image, cv2.COLOR_BGR2GRAY),
             "image_shape": [int(image.shape[1]), int(image.shape[0])],
             "crop_box": tuple(int(value) for value in crop_box),
             "circle": circle,
@@ -381,7 +395,7 @@ class DetectBoard:
                 board_cache[piece_id] = entry
                 cache_state = self._cache_state_locked(board_id)
         total_ms = self.elapsed_ms(start)
-        public_instances = [self._public_2d_instance(item, crop_box) for item in instances]
+        public_instances = timed_call("public_2d_geometry_ms", lambda: [self._public_2d_instance(item, crop_box) for item in instances])
         checks = [bool(item.get("is_ok")) for item in instances]
         checks.extend(bool(item.get("is_ok")) for item in wire_roi_checks)
         if chip_diagnostics.get("enabled") and chip_diagnostics.get("is_ok") is not True:
@@ -545,27 +559,28 @@ class DetectBoard:
         perspective_config = self.perspective_registration_config
         y1, y2 = int(piece["y1"]), int(piece["y2"])
         local_depth = depth[y1:y2]
-        registration = register_platform_masks(
+        depth_mask = timed_call("platform_mask_3d_ms", platform_mask_3d, local_depth, self.registration_config)
+        registration = timed_call("coarse_registration_ms", register_platform_masks,
             entry["registration_mask"],
-            platform_mask_3d(local_depth, self.registration_config),
+            depth_mask,
             self.registration_config,
         )
-        registration = refine_affine_registration(
+        registration = timed_call("affine_registration_ms", refine_affine_registration,
             entry["gray_image"],
             local_depth,
             registration,
             self.dynamic_affine_config,
         )
-        registration = estimate_perspective(
+        registration = timed_call("perspective_registration_ms", estimate_perspective,
             entry["gray_image"], local_depth, registration, perspective_config
         )
-        aligned_masks = [
+        aligned_masks = timed_call("mask_alignment_ms", lambda: [
             self._align_instance(
                 item, local_depth.shape, registration, entry.get("crop_box", self.crop_roi)
             )
             for item in entry["instances"]
-        ]
-        measurement = self._measure_piece(
+        ])
+        measurement = timed_call("height_measurement_ms", self._measure_piece,
             local_depth,
             aligned_masks,
             registration,
@@ -593,7 +608,8 @@ class DetectBoard:
             )
             if isinstance(check, dict)
         )
-        return height_points_to_board({
+        public_masks = timed_call("public_3d_geometry_ms", lambda: [self._public_instance(item) for item in aligned_masks])
+        return timed_call("height_points_to_board_ms", height_points_to_board, {
             "piece_id": piece_id,
             "image_2d_size": entry["image_shape"],
             "crop_2d": list(entry.get("crop_box", self.crop_roi)),
@@ -613,7 +629,7 @@ class DetectBoard:
             "chip_anomaly_2d": entry.get("chip_anomaly_2d", {"status": "disabled", "is_ok": None}),
             "silver_overflow_2d": entry.get("silver_overflow_2d", {"status": "disabled", "is_ok": None}),
             "silver_continuity_2d": entry.get("silver_continuity_2d", {"status": "disabled", "is_ok": None}),
-            "masks": [self._public_instance(item) for item in aligned_masks],
+            "masks": public_masks,
         })
 
     def handle_release_board(self, req: Dict[str, Any]) -> Dict[str, Any]:
@@ -847,7 +863,7 @@ class DetectBoard:
         name = str(descriptor.get("shm_name", ""))
         if not name or size <= 0:
             raise ValueError("each 2D image requires shm_name and image_size")
-        data = read_shared_memory(name, size)
+        data = timed_call("input_shared_memory_read_ms", read_shared_memory, name, size)
         image_format = str(descriptor.get("image_format", "encoded")).lower()
         if image_format in {"rgb8", "bgr8", "gray8", "raw"}:
             width = int(descriptor.get("image_width", 0))
@@ -862,7 +878,8 @@ class DetectBoard:
             if channels == 1:
                 return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
             return cv2.cvtColor(image, cv2.COLOR_RGB2BGR) if image_format == "rgb8" else image.copy()
-        image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+        image = timed_call("input_image_decode_ms", cv2.imdecode,
+                           np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
         if image is None:
             raise ValueError(f"unable to decode 2D image for piece {descriptor.get('piece_id')}")
         return image
@@ -873,8 +890,9 @@ class DetectBoard:
         name = str(descriptor.get("shm_name", ""))
         if not name or size <= 0:
             raise ValueError("image_3d requires shm_name and data_size")
-        data = read_shared_memory(name, size)
-        return decode_depth_png(data, str(descriptor.get("data_format", "png")))
+        data = timed_call("depth_shared_memory_read_ms", read_shared_memory, name, size)
+        return timed_call("depth_image_decode_ms", decode_depth_png,
+                          data, str(descriptor.get("data_format", "png")))
 
     def _fixed_crop(self, image: np.ndarray) -> np.ndarray:
         x1, y1, x2, y2 = self.crop_roi
@@ -926,18 +944,19 @@ class DetectBoard:
             crop = self._fixed_crop(image)
             return crop, tuple(self.crop_roi), None, [tuple(item) for item in self.wire_rois]
         config = self.circle_crop_config
-        circle = _circle_roi.find_circle(
+        circle = timed_call("circle_find_ms", _circle_roi.find_circle,
             image,
             fixed_radius=config["circle_radius"],
             radius_tolerance=config["radius_tolerance_pixels"] / config["circle_radius"],
             search_roi=config["circle_search_roi"],
         )
-        crop, box = _circle_roi.crop_from_config(
+        crop, box = timed_call("circle_detection_crop_ms", _circle_roi.crop_from_config,
             image, circle, {"roi_offsets": config["detection_roi_offsets"]}
         )
         roi_boxes = []
         for offsets in config["rectangle_roi_offsets"]:
-            _, full = _circle_roi.crop_from_config(image, circle, {"roi_offsets": offsets})
+            _, full = timed_call("circle_wire_roi_ms", _circle_roi.crop_from_config,
+                                 image, circle, {"roi_offsets": offsets})
             roi_boxes.append(
                 (full[0] - box[0], full[1] - box[1], full[2] - box[0], full[3] - box[1])
             )
@@ -1099,7 +1118,7 @@ class DetectBoard:
         other semantic masks are excluded.
         """
         crop_box = tuple(crop_box or self.crop_roi)
-        semantic_exclusion = self._semantic_exclusion_mask(instances, depth.shape)
+        semantic_exclusion = timed_call("height_semantic_exclusion_ms", self._semantic_exclusion_mask, instances, depth.shape)
         platform_plane = None
         platform_diagnostics: Dict[str, Any] = {
             "status": "not_configured", "error": "platform_roi_offsets is empty",
@@ -1130,7 +1149,7 @@ class DetectBoard:
                         sampling_mask, offset=(0, 0), epsilon=0.0
                     ),
                 )
-                platform_plane = fit_platform_plane(
+                platform_plane = timed_call("height_fit_platform_plane_ms", fit_platform_plane,
                     depth, self.height_config, roi_mask, exclude_mask=semantic_exclusion
                 )
                 platform_diagnostics.update(status="ok", error=None)
@@ -1151,7 +1170,7 @@ class DetectBoard:
                 skip_instance_id=chip["instance_id"],
             )
             try:
-                chip_planes[chip["instance_id"]] = fit_chip_plane(
+                chip_planes[chip["instance_id"]] = timed_call("height_fit_chip_plane_ms", fit_chip_plane,
                     depth,
                     chip["_mask_3d_array"],
                     self.height_config,
@@ -1160,7 +1179,7 @@ class DetectBoard:
             except ValueError:
                 chip_planes[chip["instance_id"]] = None
 
-        wire_measurements = self._measure_wire_regions(
+        wire_measurements = timed_call("height_wire_regions_ms", self._measure_wire_regions,
             depth,
             instances,
             registration,
@@ -1198,7 +1217,7 @@ class DetectBoard:
                         self.height_config.thin_solder_search_dilation_px,
                     )
                     solder_measurements.append(
-                        self._measure_solder(
+                        timed_call("height_solder_ms", self._measure_solder,
                             depth,
                             solder_mask_2d,
                             solder_mask_3d,
@@ -1217,7 +1236,7 @@ class DetectBoard:
                 )
             elif class_name == "bond":
                 solder_measurements.append(
-                    self._measure_solder(
+                    timed_call("height_solder_ms", self._measure_solder,
                         depth,
                         instance["_mask_2d_array"],
                         instance["_mask_3d_array"],

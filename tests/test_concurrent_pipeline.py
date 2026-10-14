@@ -89,6 +89,14 @@ class PipelineTests(unittest.TestCase):
 
     def test_timeout_reports_missing_and_releases(self):
         board = self.pipeline.submit_3d(dict(board_id="A"))
+        # Expiry intentionally ignores active decoding; wait until it is idle.
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            with self.pipeline._lock:
+                if not self.pipeline._boards["A"].depth_inflight:
+                    break
+            time.sleep(0.001)
+        self.assertFalse(self.pipeline._boards["A"].depth_inflight)
         with self.pipeline._lock:
             self.pipeline._boards["A"].touched -= 2
         self.pipeline.expire_pending()
@@ -110,6 +118,23 @@ class PipelineTests(unittest.TestCase):
     def test_gpu_failure_releases_input(self):
         self.assertFalse(self.pipeline.submit_2d(dict(board_id="A", piece_id=1, fail_gpu=True)).result(2)["ok"])
         self.assertEqual(self.detector.closed_inputs, 1)
+
+    def test_detailed_queue_and_phase_timings_are_returned(self):
+        self.detector.gpu_gate.clear()
+        first = self.pipeline.submit_2d(dict(board_id="A", piece_id=1, request_id="first"))
+        self.assertTrue(self.detector.gpu_started.wait(1))
+        second = self.pipeline.submit_2d(dict(board_id="A", piece_id=2, request_id="second"))
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and len(self.detector.prepared_ids) < 2:
+            time.sleep(0.001)
+        time.sleep(0.025)
+        self.detector.gpu_gate.set()
+        self.assertTrue(first.result(2)["ok"])
+        response = second.result(2)
+        self.assertGreater(response["timings"]["gpu_queue_ms"], 10)
+        for key in ("cpu_prepare_queue_ms", "cpu_prepare_phase_ms", "gpu_phase_ms",
+                    "cpu_postprocess_queue_ms", "cpu_postprocess_phase_ms", "request_pipeline_ms"):
+            self.assertGreaterEqual(response["timings"][key], 0)
 
     def test_3d_failure_and_joint_failure_finish_board(self):
         failed = self.pipeline.submit_3d(dict(board_id="A", fail_3d=True)).result(2)

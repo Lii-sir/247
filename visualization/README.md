@@ -79,6 +79,102 @@ SIFT 匹配的是模板与当前图像的特征点，得到 Homography 后映射
 
 输出保存在 `visualization/output/<时间戳>/`：`result.json`、`report.html` 和 `python.log`。报告自包含；查看时不需要保持 Python 服务运行。
 
+### 连续两批：首次启动推理 → 复用已加载模型再次推理
+
+```powershell
+$root = "D:\python_programs\LXD_project\247-likai"
+Set-Location $root
+$env:PYTHONDONTWRITEBYTECODE = "1"
+$env:BRIDGE_MAX_WORKERS = "13"
+$env:BRIDGE_BOARD_TIMEOUT_SECONDS = "900"
+& "$root\.venv\Scripts\python.exe" -B "$root\visualization\detect_and_view.py" `
+  --mode stream --parallel --repeat 2 --timeout 900 --open
+```
+
+`--repeat 2` 只启动一个服务进程、只调用一次 `init_algorithm`。第一批完整结束后，
+第二批直接推理同一批 10 张 2D 和整板 3D 图片，不重新加载模型。每批使用独立板号
+（`-run-01`、`-run-02`），防止缓存串板；每批重新建立共享内存，模拟新的采集批次。
+所有批次完成后才释放模型并生成 HTML，避免报告生成干扰后续推理计时。
+
+输出目录包含：
+
+- `startup.json`：服务 PID、初始化响应、模型加载耗时及初始化次数。
+- `summary.json`：逐批输入准备、客户端检测耗时、请求时间窗口及是否复用模型。
+- `batch-01/result.json`、`batch-01/report.html`：第一批。
+- `batch-02/result.json`、`batch-02/report.html`：第二批。
+- `python.log`：同一个服务进程的日志。
+
+`batch_wall_ms` 含本批文件读取及共享内存准备，不含初始化、释放服务和报告生成；
+`total_with_startup_ms` 仅在第一批额外计入初始化。第二批仍进行真实推理，不复用检测结果。
+产品 NG 不阻止下一批；协议/检测请求失败则保留已有结果并停止后续批次。
+不指定 `--repeat` 时仍只运行一次，保留原有 `result.json`、`report.html` 输出路径。
+
+### 详细耗时日志：定位排队、GPU 等待和 CPU 后处理
+
+```powershell
+$root = "D:\python_programs\LXD_project\247-likai"
+Set-Location $root
+$env:PYTHONDONTWRITEBYTECODE = "1"
+$env:BRIDGE_MAX_WORKERS = "13"
+$env:BRIDGE_BOARD_TIMEOUT_SECONDS = "900"
+$env:BRIDGE_TIMING_LOG = "1"
+# 可选诊断开关：额外同步 EfficientAD GPU 工作；会影响吞吐，不用于正常性能基准。
+$env:BRIDGE_TIMING_CUDA_SYNC = "1"
+& "$root\.venv\Scripts\python.exe" -B "$root\visualization\detect_and_view.py" `
+  --mode stream --parallel --repeat 2 --timeout 900 --open
+```
+
+服务 stderr（客户端保存到 `python.log`）中的 `[TIMING]` 行是 JSON，含 `board_id`、
+`piece_id`、`request_id`、`pid`、`thread`、`phase`、`stage`、`elapsed_ms`。
+`event=begin/end` 是成对的阶段开始/结束；`duration` 是队列等待；异常也保存结束耗时。
+`phase_summary` 汇总一个阶段的所有测量，`efficientad_chip_begin/end` 标明芯片实例，
+`gpu_memory` 记录当前显存分配和保留量，`silver_fallback` 记录匹配失败原因。
+这些日志不会进入协议 stdout。关闭文本日志可设 `BRIDGE_TIMING_LOG=0`，JSON 计时仍保留。
+
+每批 `result.json` 的 `responses_2d[*].timings` 包含详细 2D 耗时；
+`response.results_board.pieces[*].timings` 包含逐片联合 3D 耗时。
+每批另外导出 UTF-8 `timings.csv`（`board_id,phase,piece_id,stage,elapsed_ms`），
+HTML 中展开“配准、参考平面与阶段耗时”可查看选中片的 2D/联合 3D/整板计时。
+
+主要字段：
+
+| 阶段 | 字段 |
+| --- | --- |
+| 线程池排队 | `cpu_prepare_queue_ms`, `gpu_queue_ms`, `cpu_postprocess_queue_ms`, `joint_queue_ms` |
+| 2D 输入与 ROI | `input_shared_memory_read_ms`, `input_image_decode_ms`, `circle_find_ms`, `roi_copy_ms` |
+| YOLO | `cuda_before_yolo_ms`, `yolo_predict_wall_ms`, `cuda_after_yolo_ms`, `mask_extract_to_cpu_ms`，以及框架返回的 `yolo_reported_preprocess_ms`, `yolo_reported_inference_ms`, `yolo_reported_postprocess_ms` |
+| 芯片外观 | `efficientad_chip_rectify_ms`, `efficientad_preprocess_ms`, `efficientad_forward_enqueue_ms`, `efficientad_cuda_after_ms`, `efficientad_score_and_response_ms` |
+| 银浆边界 | `silver_template_read_decode_ms`, `silver_template_hash_ms`, `silver_template_sift_ms`, `silver_target_sift_ms`, `silver_flann_match_ms`, `silver_ransac_ms` |
+| 银浆检测 | `silver_overflow_measure_ms`, `silver_continuity_measure_ms` |
+| 联合 3D | `coarse_registration_ms`, `affine_registration_ms`, `perspective_registration_ms`, `mask_alignment_ms`, `height_measurement_ms` |
+| 高度子步骤 | `height_fit_platform_plane_ms`, `height_fit_chip_plane_ms`, `height_wire_regions_ms`, `height_solder_ms` |
+| 协议输出，仅日志 | `response_json_encode_ms`, `response_write_lock_wait_ms`, `response_pipe_write_ms` |
+
+`matching_input_wait_ms` 表示一方数据已就绪后等待另一方的时间，不占用工作线程。
+`shared_memory_read_decode_ms` 现在仅统计实际输入读取/解码，不再把 ROI/平台掩码算入其中。
+所有计时单位为毫秒；父阶段包含子阶段、多片可能重叠，不能将全部字段相加。
+YOLO 框架返回的三项耗时不一定覆盖首次 warmup/初始化等整个 `predict()` 调用开销；
+若 `yolo_predict_wall_ms` 很长而 `yolo_reported_*` 很小，应优先检查框架调用的额外开销。
+单片重复操作（如多个芯片的 EfficientAD）在该片 JSON/CSV 中累加，日志保留每次调用。
+未开启额外 CUDA 同步时，`efficientad_forward_enqueue_ms` 主要反映 CPU 提交时间，
+异步 GPU 等待可能计入 `efficientad_score_and_response_ms`；不能把提交时间当成纯 GPU 推理时间。
+
+查看最新一次运行中最慢的 30 个阶段：
+
+```powershell
+$run = Get-ChildItem "$root\visualization\output" -Directory |
+  Where-Object { Test-Path (Join-Path $_.FullName "summary.json") } |
+  Sort-Object LastWriteTime -Descending | Select-Object -First 1
+Get-ChildItem $run.FullName -Filter timings.csv -Recurse |
+  ForEach-Object { Import-Csv $_.FullName } |
+  Sort-Object { [double]$_.elapsed_ms } -Descending |
+  Select-Object -First 30 board_id,phase,piece_id,stage,elapsed_ms |
+  Format-Table -AutoSize
+```
+
+恢复正常吞吐测试时使用 `$env:BRIDGE_TIMING_CUDA_SYNC = "0"`；额外同步不影响算法判定，
+但改变 CPU/GPU 交叠与计时分布，必须在相同诊断设置下比较各批数据。
+
 指定自己的数据：
 
 ```powershell

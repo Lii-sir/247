@@ -1,5 +1,6 @@
 """Rectify YOLO chip masks and inspect the resulting crops with EfficientAD."""
 from __future__ import annotations
+from algorithm.timing import timed_call, note, cuda_sync_enabled
 
 import math
 import threading
@@ -408,7 +409,7 @@ class _LoadedPredictor:
     def predict(self, crop: np.ndarray, *, score_mode: str | None = None,
                 score_pool_kernel: int | None = None,
                 threshold: float | Dict[str, float] | None = None) -> tuple[Dict[str, Any], Dict[str, Any]]:
-        tensor = _preprocess(crop, self.image_size, self.device)
+        tensor = timed_call("efficientad_preprocess_ms", _preprocess, crop, self.image_size, self.device)
         active_mode = score_mode or self.config.get("score_mode")
         pool_top = str(active_mode or "").strip().casefold() in {"pool+top", "pool-top", "pooltop"}
         runtime_threshold = model_threshold(threshold, self.name)
@@ -418,13 +419,17 @@ class _LoadedPredictor:
             self.calibration, pool_top, runtime_threshold
         )
         with self._lock, torch.inference_mode():
-            prediction = self.model(tensor)
-            scores, response, binary, active_scales = _scores_and_response(
+            if cuda_sync_enabled() and self.device.type == "cuda":
+                timed_call("efficientad_cuda_before_ms", torch.cuda.synchronize, self.device)
+            prediction = timed_call("efficientad_forward_enqueue_ms", self.model, tensor)
+            if cuda_sync_enabled() and self.device.type == "cuda":
+                timed_call("efficientad_cuda_after_ms", torch.cuda.synchronize, self.device)
+            scores, response, binary, active_scales = timed_call("efficientad_score_and_response_ms", _scores_and_response,
                 prediction.anomaly_map, self.calibration, self.config,
                 score_mode, score_pool_kernel, runtime_threshold
             )
         score = float(scores["score"])
-        boxes = _component_boxes(binary, self.config.get("localization", {}))
+        boxes = timed_call("efficientad_component_boxes_ms", _component_boxes, binary, self.config.get("localization", {}))
         return ({
             "model": self.name,
             "category": self.category,
@@ -517,8 +522,9 @@ class ChipAnomalyInspector:
         results = []
         visualizations = []
         for instance in chips:
-            points = _chip_contour_points(instance["mask"], crop_box[:2])
-            crop, ratio, correction, corners, matrix = rectified_chip_crop(
+            note("efficientad_chip_begin", instance_id=instance.get("instance_id"), cuda_sync=cuda_sync_enabled())
+            points = timed_call("efficientad_chip_contour_ms", _chip_contour_points, instance["mask"], crop_box[:2])
+            crop, ratio, correction, corners, matrix = timed_call("efficientad_chip_rectify_ms", rectified_chip_crop,
                 image, points, self.config["padding_ratio"], self.config["max_rotation_deg"]
             )
             model_rule = self._model_rule(ratio)
@@ -529,7 +535,7 @@ class ChipAnomalyInspector:
             runtime_threshold = model_threshold(thresholds, model_name)
             if runtime_threshold is None:
                 runtime_threshold = model_threshold(self.config.get("threshold"), model_name)
-            prediction, artifacts = predictor.predict(
+            prediction, artifacts = timed_call("efficientad_chip_predict_ms", predictor.predict,
                 crop,
                 score_mode=self.config.get("score_mode"),
                 score_pool_kernel=self.config.get("score_pool_kernel"),
@@ -563,6 +569,7 @@ class ChipAnomalyInspector:
             instance["chip_anomaly_2d"] = result
             instance["is_ok"] = bool(instance.get("is_ok", True) and result["is_ok"])
             results.append(result)
+            note("efficientad_chip_end", instance_id=instance.get("instance_id"), model=model_name)
             if include_visualization:
                 visualizations.append({
                     "instance_id": result["instance_id"],

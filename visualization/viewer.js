@@ -397,7 +397,9 @@
   }
 
   function renderDetails(piece) {
-    $("detail-json").textContent = JSON.stringify({ registration: piece?.registration, reference_planes: piece?.reference_planes, timings: data.response?.timings }, null, 2);
+    $("detail-json").textContent = JSON.stringify({ registration: piece?.registration,
+      reference_planes: piece?.reference_planes, timings_2d: piece?.timings_2d,
+      timings_joint_3d: piece?.timings, timings_board: data.response?.timings }, null, 2);
     const two = result2dOfPiece(piece);
     $("diagnostics-json").textContent = JSON.stringify({ chip_rotation_2d: two.chip_rotation_2d || null,
       chip_anomaly_2d: piece?.chip_anomaly_2d || two.chip_anomaly_2d || null,

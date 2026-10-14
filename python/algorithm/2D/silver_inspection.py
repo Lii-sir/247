@@ -17,6 +17,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import cv2
 import numpy as np
+from algorithm.timing import timed_call, note
 
 
 EPSILON = 1e-6
@@ -673,13 +674,14 @@ def _registered_template_points(
     points = boundary.get("template_points", boundary.get("points"))
     if not template_path or not isinstance(points, (list, tuple)) or len(points) < 3:
         raise CalibrationNotConfiguredError("银浆边界尚未标定：需要模板图和至少三个按顺序标定的边界点")
-    template = _read_image(template_path)
+    template = timed_call("silver_template_read_decode_ms", _read_image, template_path)
     template_size = [int(template.shape[1]), int(template.shape[0])]
     calibrated_size = boundary.get("template_size")
     if calibrated_size is not None and list(map(int, calibrated_size)) != template_size:
         raise ValueError("silver boundary template dimensions changed after calibration")
     template_digest = boundary.get("template_sha256")
-    if template_digest is not None and hashlib.sha256(Path(template_path).read_bytes()).hexdigest() != str(template_digest):
+    if template_digest is not None and timed_call("silver_template_hash_ms",
+            lambda: hashlib.sha256(Path(template_path).read_bytes()).hexdigest()) != str(template_digest):
         raise ValueError("silver boundary template image changed after calibration")
     calibrated = Boundary(tuple(tuple(point) for point in points),
                           str(boundary.get("mode", "polygon")))
@@ -699,6 +701,7 @@ def _registered_template_points(
         # These are target ORIGINAL-image coordinates, not crop coordinates.
         # Keep calibration integrity errors above outside the fallback path.
         result = _fallback_template_points(boundary, image.shape[:2], registration, str(exc))
+        note("silver_fallback", reason=str(exc), matches=registration["matches"], inliers=registration["inliers"])
     return (result, registration) if return_registration else result
 
 
@@ -728,8 +731,8 @@ def _match_template_points(
 ) -> list[tuple[float, float]]:
     """Estimate a fresh transform and preserve matching statistics on failure."""
     points = boundary.get("template_points", boundary.get("points"))
-    template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
-    target_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    template_gray = timed_call("silver_template_gray_ms", cv2.cvtColor, template, cv2.COLOR_BGR2GRAY)
+    target_gray = timed_call("silver_target_gray_ms", cv2.cvtColor, image, cv2.COLOR_BGR2GRAY)
     max_side = int(boundary.get("max_image_side", 2400))
 
     def features(gray: np.ndarray):
@@ -746,12 +749,14 @@ def _match_template_points(
         coordinates *= [width / resized.shape[1], height / resized.shape[0]]
         return coordinates, descriptors
 
-    template_points_features, template_descriptors = features(template_gray)
-    target_points_features, target_descriptors = features(target_gray)
+    template_points_features, template_descriptors = timed_call("silver_template_sift_ms", features, template_gray)
+    target_points_features, target_descriptors = timed_call("silver_target_sift_ms", features, target_gray)
+    note("silver_features", template_features=len(template_points_features),
+         target_features=len(target_points_features), max_image_side=max_side)
     if template_descriptors is None or target_descriptors is None:
         raise ValueError("silver boundary template has insufficient features")
     matcher = cv2.FlannBasedMatcher(dict(algorithm=1, trees=5), dict(checks=80))
-    pairs = matcher.knnMatch(template_descriptors, target_descriptors, k=2)
+    pairs = timed_call("silver_flann_match_ms", matcher.knnMatch, template_descriptors, target_descriptors, k=2)
     ratio = float(boundary.get("ratio_threshold", 0.7))
     good = [
         pair[0]
@@ -768,7 +773,7 @@ def _match_template_points(
         raise ValueError(f"silver boundary template matches are insufficient: {len(good)} / {min_matches}")
     source = template_points_features[[match.queryIdx for match in good]]
     destination = target_points_features[[match.trainIdx for match in good]]
-    matrix, inlier_mask = cv2.findHomography(
+    matrix, inlier_mask = timed_call("silver_ransac_ms", cv2.findHomography,
         source,
         destination,
         cv2.RANSAC,
@@ -793,7 +798,7 @@ def _match_template_points(
     if (np.any(np.abs(denominators) < 1e-10)
             or np.min(denominators) * np.max(denominators) < 0):
         raise ValueError("silver boundary crosses the projective horizon")
-    mapped = cv2.perspectiveTransform(source_points, matrix).reshape(-1, 2)
+    mapped = timed_call("silver_points_project_ms", cv2.perspectiveTransform, source_points, matrix).reshape(-1, 2)
     if not np.isfinite(mapped).all():
         raise ValueError("silver boundary template points are invalid")
     result = [tuple(map(float, point)) for point in mapped]
@@ -827,7 +832,7 @@ def build_boundary(
             path = Path(base_dir).expanduser() / path
         if not path.is_file():
             raise CalibrationNotConfiguredError(f"银浆边界标定文件不存在：{path}")
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        data = timed_call("silver_calibration_read_ms", lambda: json.loads(path.read_text(encoding="utf-8-sig")))
         if not isinstance(data, dict):
             raise ValueError("silver calibration file must contain an object")
         calibration = {**data, **{key: value for key, value in raw.items() if key != "calibration_path"}}
@@ -841,7 +846,8 @@ def build_boundary(
             }
         if image is None:
             raise ValueError("silver boundary template registration needs the source image")
-        mapped, registration = _registered_template_points(image, calibration, return_registration=True)
+        mapped, registration = timed_call("silver_template_registration_ms", _registered_template_points,
+                                           image, calibration, return_registration=True)
         points = [
             (float(point[0]) - float(crop_box[0]), float(point[1]) - float(crop_box[1]))
             for point in mapped
@@ -942,7 +948,7 @@ def inspect_masks(
         boundary = None
     else:
         try:
-            boundary = build_boundary(
+            boundary = timed_call("silver_boundary_build_ms", build_boundary,
                 overflow_config,
                 crop_box=crop_box,
                 circle=circle,
@@ -1013,7 +1019,7 @@ def inspect_masks(
                 "method": "template_points_fallback", "status": "fallback"})
     else:
         try:
-            silver_mask, silver_count = _union_masks(
+            silver_mask, silver_count = timed_call("silver_mask_union_ms", _union_masks,
                 instances,
                 (str(overflow_config.get("silver_class", "silver")),),
                 shape,
@@ -1022,7 +1028,7 @@ def inspect_masks(
                 raise ValueError(
                     f"no {overflow_config.get('silver_class', 'silver')} mask was detected"
                 )
-            measurement = measure_overflow(
+            measurement = timed_call("silver_overflow_measure_ms", measure_overflow,
                 silver_mask,
                 boundary,
                 overflow_settings(overflow_config),
@@ -1037,7 +1043,7 @@ def inspect_masks(
                     "is_within_crop": boundary_within_crop,
                 },
                 "registration": boundary.registration,
-                "measurement": measurement.summary(),
+                "measurement": timed_call("silver_overflow_summary_ms", measurement.summary),
             }
         except ValueError as exc:
             overflow = {
@@ -1059,7 +1065,7 @@ def inspect_masks(
         continuity = {"status": "disabled", "is_ok": None}
     else:
         try:
-            measurement = measure_continuity(
+            measurement = timed_call("silver_continuity_measure_ms", measure_continuity,
                 instances, shape, continuity_settings(continuity_config)
             )
             disconnected = measurement.is_disconnected
@@ -1072,7 +1078,7 @@ def inspect_masks(
                     else "ok"
                 ),
                 "is_ok": None if disconnected is None else not disconnected,
-                "measurement": measurement.summary(),
+                "measurement": timed_call("silver_continuity_summary_ms", measurement.summary),
             }
         except ValueError as exc:
             continuity = {"status": "uncertain", "is_ok": None, "message": str(exc)}

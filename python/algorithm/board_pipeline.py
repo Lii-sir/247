@@ -6,6 +6,7 @@ import time
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import Any
+from algorithm.timing import timing_context, measure, record_duration, timed_call, note
 
 
 @dataclass
@@ -22,6 +23,8 @@ class _Board:
     completion: Future | None = None
     started: float = 0.0
     timings: dict = field(default_factory=dict)
+    depth_ready_at: float = 0.0
+    request_id: str | None = None
 
 
 class BoardPipeline:
@@ -65,6 +68,25 @@ class BoardPipeline:
                     received_piece_count=len(ids), piece_ids=ids,
                     ready_for_3d=len(ids) == self.detector.expected_piece_count)
 
+    def _submit_timed(self, pool, phase, timings, board_id, piece_id, request_id, function, *args):
+        queued = time.perf_counter()
+        def invoke():
+            started = time.perf_counter()
+            with timing_context(timings, phase=phase, board_id=board_id, piece_id=piece_id,
+                                request_id=request_id, log=getattr(self.detector, "log", None)):
+                record_duration(phase + "_queue_ms", (started - queued) * 1000)
+                with measure(phase + "_phase_ms"):
+                    result = function(*args)
+                note("phase_summary", timings_ms=dict(timings))
+                if phase == "cpu_postprocess" and isinstance(result, tuple):
+                    response, entry = result
+                    response.setdefault("timings", {}).update(timings)
+                    entry["_2d_ready_at"] = time.perf_counter()
+                elif phase == "joint" and isinstance(result, dict):
+                    result.setdefault("timings", {}).update(timings)
+                return result
+        return pool.submit(invoke)
+
     def submit_2d(self, req):
         board_id = str(req.get("board_id") or "")
         piece_id = req.get("piece_id")
@@ -79,16 +101,21 @@ class BoardPipeline:
         except (ValueError, TypeError) as exc:
             return self._completed(self._failure(board_id, "invalid_piece", str(exc), piece_id))
         output = Future()
+        detail_timings = {}
+        accepted_at = time.perf_counter()
 
         def failed(exc):
             with self._lock:
                 if self._current(state):
                     state.inflight.discard(piece_id)
-            output.set_result(self._failure(board_id, "2d_piece_failed", str(exc), piece_id))
+            response = self._failure(board_id, "2d_piece_failed", str(exc), piece_id)
+            response["timings"] = dict(detail_timings)
+            output.set_result(response)
 
         def postprocessed(future):
             try:
                 response, entry = future.result()
+                response.setdefault("timings", {})["request_pipeline_ms"] = (time.perf_counter() - accepted_at) * 1000
                 with self._lock:
                     if not self._current(state):
                         raise RuntimeError("board was released or expired during 2D processing")
@@ -109,7 +136,8 @@ class BoardPipeline:
                         return self.detector.finish_2d_piece(prepared, publish_cache=False)
                     finally:
                         self.detector.release_prepared_2d(prepared)
-                self.cpu_pool.submit(finish).add_done_callback(postprocessed)
+                self._submit_timed(self.cpu_pool, "cpu_postprocess", detail_timings, board_id,
+                                   piece_id, req.get("request_id"), finish).add_done_callback(postprocessed)
             except Exception as exc:
                 self.detector.release_prepared_2d(prepared)
                 failed(exc)
@@ -118,14 +146,16 @@ class BoardPipeline:
             value = None
             try:
                 value = future.result()
-                self.gpu_pool.submit(self.detector.infer_2d_piece, value).add_done_callback(
+                self._submit_timed(self.gpu_pool, "gpu", detail_timings, board_id, piece_id,
+                                   req.get("request_id"), self.detector.infer_2d_piece, value).add_done_callback(
                     lambda result: inferred(result, value))
             except Exception as exc:
                 if value is not None:
                     self.detector.release_prepared_2d(value)
                 failed(exc)
 
-        self.cpu_pool.submit(self.detector.prepare_2d_piece, req).add_done_callback(prepared)
+        self._submit_timed(self.cpu_pool, "cpu_prepare", detail_timings, board_id, piece_id,
+                           req.get("request_id"), self.detector.prepare_2d_piece, req).add_done_callback(prepared)
         return output
 
     def submit_3d(self, req):
@@ -139,6 +169,7 @@ class BoardPipeline:
                 state.completion = Future()
                 state.depth_inflight = True
                 state.started = time.perf_counter()
+                state.request_id = req.get("request_id")
         except (ValueError, TypeError) as exc:
             return self._completed(self._failure(board_id, "invalid_board", str(exc)))
 
@@ -147,10 +178,11 @@ class BoardPipeline:
             from importlib import import_module
             segment = import_module("algorithm.3D.segment")
             start = time.perf_counter()
-            depth = self.detector._read_3d(req)
+            depth = timed_call("depth_read_decode_ms", self.detector._read_3d, req)
             read_ms = (time.perf_counter() - start) * 1000
             start = time.perf_counter()
-            pieces = segment.segment_depth_image(depth, self.detector.segmentation_config)
+            pieces = timed_call("depth_segmentation_ms", segment.segment_depth_image,
+                                depth, self.detector.segmentation_config)
             if len(pieces) != self.detector.expected_piece_count:
                 raise ValueError("3D piece count does not match board configuration")
             return depth, pieces, read_ms, (time.perf_counter() - start) * 1000
@@ -162,6 +194,7 @@ class BoardPipeline:
                     if self._current(state):
                         state.depth_inflight = False
                         state.depth, state.pieces = depth, pieces
+                        state.depth_ready_at = time.perf_counter()
                         state.timings.update(shared_memory_read_decode_ms=read_ms,
                                              segmentation_3d_ms=segment_ms)
                         self._schedule_ready(state)
@@ -170,7 +203,8 @@ class BoardPipeline:
                     state.depth_inflight = False
                     self._terminate(state, self._failure(board_id, "3d_board_failed", str(exc)))
 
-        self.cpu_pool.submit(decode).add_done_callback(decoded)
+        self._submit_timed(self.cpu_pool, "depth", state.timings, board_id, None,
+                           req.get("request_id"), decode).add_done_callback(decoded)
         return state.completion
 
     def _schedule_ready(self, state):
@@ -182,8 +216,12 @@ class BoardPipeline:
             if piece_id not in state.entries or piece_id in state.claimed:
                 continue
             state.claimed.add(piece_id)
-            future = self.cpu_pool.submit(self.detector.measure_prepared_piece,
-                                          piece_id, state.entries[piece_id], state.depth, piece)
+            entry = state.entries[piece_id]
+            pair_wait = abs(state.depth_ready_at - entry.get("_2d_ready_at", state.depth_ready_at)) * 1000
+            timings = {"matching_input_wait_ms": pair_wait}
+            future = self._submit_timed(self.cpu_pool, "joint", timings, state.board_id, piece_id,
+                                       state.request_id, self.detector.measure_prepared_piece,
+                                       piece_id, entry, state.depth, piece)
             future.add_done_callback(lambda result, pid=piece_id: self._measured(state, pid, result))
 
     def _measured(self, state, piece_id, future):

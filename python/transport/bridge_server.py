@@ -13,6 +13,8 @@ if str(PYTHON_ROOT) not in sys.path:
     # 允许直接以脚本方式运行 python/transport/bridge_server.py 时仍能导入 python 根包
     sys.path.insert(0, str(PYTHON_ROOT))
 
+from algorithm.timing import timing_context, timed_call, record_duration
+
 
 class AlgorithmServer:
     def __init__(self):
@@ -54,7 +56,8 @@ class AlgorithmServer:
         stage = str(req.get("stage", "")).lower()
 
         if stage == "board":
-            return self.get_board().handle_init(req)
+            board = timed_call("init_board_import_and_construct_ms", self.get_board)
+            return board.handle_init(req)
 
         if stage == "2d":
             return self.get_two_d().handle_init(req)
@@ -205,8 +208,14 @@ class AlgorithmServer:
         response = dict(response)
         if req.get("request_id") is not None:
             response["request_id"] = req["request_id"]
-        with self._write_lock:
-            print(json.dumps(response, ensure_ascii=True), file=stream, flush=True)
+        timings = {}
+        with timing_context(timings, phase="transport", board_id=req.get("board_id") or req.get("batch_id"),
+                            piece_id=req.get("piece_id"), request_id=req.get("request_id"), log=self.log):
+            payload = timed_call("response_json_encode_ms", json.dumps, response, ensure_ascii=True)
+            queued = time.perf_counter()
+            with self._write_lock:
+                record_duration("response_write_lock_wait_ms", (time.perf_counter() - queued) * 1000)
+                timed_call("response_pipe_write_ms", print, payload, file=stream, flush=True)
 
     def _error(self, req, exc):
         self.log(traceback.format_exc())
@@ -298,7 +307,11 @@ class AlgorithmServer:
                             self._write_response(protocol_stdout, req, {"ok": False, "cmd": cmd,
                                                                       "error": "initialization/configuration requires an idle detector"})
                         else:
-                            self._write_response(protocol_stdout, req, self.handle_request(req))
+                            timings = {}
+                            with timing_context(timings, phase="init", request_id=req.get("request_id"), log=self.log):
+                                response = timed_call("init_dispatch_ms", self.handle_request, req)
+                            response.setdefault("timings", {}).update(timings)
+                            self._write_response(protocol_stdout, req, response)
                     elif req.get("request_id") is None:
                         # Old bridges depend on ordered replies; preserve that protocol.
                         result = self.dispatch(req)

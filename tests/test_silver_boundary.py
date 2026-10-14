@@ -141,8 +141,9 @@ class SilverBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "changed after calibration"):
             self.build(np.zeros_like(self.template))
         self.enable_fallback(template_sha256=hashlib.sha256(self.path.read_bytes()).hexdigest())
-        with self.assertRaisesRegex(ValueError, "outside the 2D crop"):
-            self.build(np.zeros_like(self.template), crop=(300, 250, 480, 360), shape=(110, 180))
+        boundary = self.build(np.zeros_like(self.template), crop=(300, 250, 480, 360), shape=(110, 180))
+        np.testing.assert_allclose(boundary.points, np.asarray(self.points) - [300, 250])
+        self.assertTrue(boundary.registration["fallback_used"])
 
     def test_shared_calibration_maps_each_target_independently(self):
         self.enable_fallback()
@@ -172,9 +173,19 @@ class SilverBoundaryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.build()
 
-    def test_out_of_crop_boundary_is_not_silently_clipped(self):
-        with self.assertRaisesRegex(ValueError, "outside the 2D crop"):
-            self.build(crop=(300, 250, 480, 360), shape=(110, 180))
+    def test_out_of_crop_boundary_is_allowed_and_not_clipped(self):
+        boundary = self.build(crop=(300, 250, 480, 360), shape=(110, 180))
+        np.testing.assert_allclose(boundary.points, np.asarray(self.points) - [300, 250], atol=1)
+        self.assertTrue(boundary.registration["is_valid"])
+
+    def test_out_of_crop_polygon_still_measures_observed_overflow(self):
+        boundary = self.build(crop=(300, 250, 480, 360), shape=(110, 180))
+        mask = np.zeros((110, 180), dtype=bool)
+        mask[5:15, 10:20] = True  # Within the full polygon, even though vertices are outside ROI.
+        mask[5:15, 50:60] = True  # Outside the right boundary at local X=40.
+        measurement = silver.measure_overflow(mask, boundary, silver.OverflowSettings())
+        self.assertEqual(measurement.silver_area_px, 200)
+        self.assertEqual(measurement.defect_area_px, 100)
 
     def test_overflow_pixels_contours_and_tolerance(self):
         boundary = silver.Boundary(((5, 5), (20, 5), (20, 20), (5, 20)))

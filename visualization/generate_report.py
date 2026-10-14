@@ -85,6 +85,8 @@ def build_payload(document: Any, *, base_dir: Path, images_2d: Path | None = Non
         if isinstance(reply.get("results_2d"), dict):
             piece = pieces.setdefault(pid, {"piece_id": pid})
             piece["results_2d"] = reply["results_2d"]
+            if isinstance(reply.get("timings"), dict):
+                piece["timings_2d"] = reply["timings"]
             if "is_ok" not in piece:
                 piece["is_ok"] = reply["results_2d"].get("is_ok")
     if len({str(r.get("board_id") or r.get("batch_id")) for r in [response, *replies] if r.get("board_id") or r.get("batch_id")}) > 1:

@@ -57,6 +57,14 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(result["pieces"], [])
         self.assertNotIn("is_ok", result["response"])
 
+    def test_detailed_2d_and_joint_timings_survive_report_join(self):
+        self.response["results_board"]["pieces"][0]["timings"] = {"affine_registration_ms": 123}
+        reply = {"ok": True, "board_id": "board-1", "piece_id": 1,
+                 "results_2d": {}, "timings": {"gpu_queue_ms": 456, "silver_target_sift_ms": 789}}
+        result = report.build_payload([reply, self.response], base_dir=self.root)
+        self.assertEqual(result["pieces"][0]["timings_2d"], reply["timings"])
+        self.assertEqual(result["pieces"][0]["timings"]["affine_registration_ms"], 123)
+
     def test_no_algorithm_import(self):
         self.assertFalse(any(name.startswith("algorithm.") for name in sys.modules))
 

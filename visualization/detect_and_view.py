@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import mmap
@@ -13,7 +14,7 @@ import threading
 import time
 import uuid
 import webbrowser
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
@@ -190,6 +191,115 @@ def mapped_file(stack: ExitStack, path: Path, kind: str, piece_id: int | None = 
     return {"shm_name": name, "data_size": len(raw), "data_format": "png"}
 
 
+def save_timing_csv(envelope: dict, path: Path) -> None:
+    """Flatten existing measurements only; do not infer or add overlapping stages."""
+    rows = []
+    def collect(phase, piece_id, timings):
+        for stage, value in (timings or {}).items():
+            if isinstance(value, (float, int)) and not isinstance(value, bool):
+                rows.append(dict(board_id=envelope["board_id"], phase=phase,
+                                 piece_id=piece_id, stage=stage, elapsed_ms=round(value, 3)))
+    for reply in envelope.get("responses_2d", []):
+        collect("2d", reply.get("piece_id"), reply.get("timings"))
+    response = envelope.get("response", {})
+    collect("board", "", response.get("timings"))
+    for piece in response.get("results_board", {}).get("pieces", []):
+        collect("joint_3d", piece.get("piece_id"), piece.get("timings"))
+    with path.open("w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=["board_id", "phase", "piece_id", "stage", "elapsed_ms"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def detect_batch(client: ProtocolClient, args, paths: list[Path], depth: Path,
+                 envelope: dict) -> None:
+    """Run one board on an already initialized service; never reload models."""
+    board_id = envelope["board_id"]
+    started = time.perf_counter()
+    timeline_index = len(client.timeline)
+    input_prepare_ms = 0.0
+
+    def send(request):
+        response = client.request(request, args.timeout)
+        label = (f"2D #{request['piece_id']}" if request.get("piece_id")
+                 else "3D board" if request["cmd"] == "detect_3d_board" else "Batch board")
+        print(f"[{board_id}] {label} returned: request_ok={response.get('ok')}, "
+              f"algorithm_ms={response.get('elapsed_ms', 'not provided')}", flush=True)
+        timings = response.get("timings", {})
+        keys = ("gpu_queue_ms", "cuda_before_yolo_ms", "yolo_predict_wall_ms", "cuda_after_yolo_ms",
+                "mask_extract_to_cpu_ms", "efficientad_total_ms", "silver_total_ms",
+                "cpu_postprocess_queue_ms")
+        details = "; ".join(f"{key}={timings[key]:.1f}ms" for key in keys if key in timings)
+        if details:
+            print(f"[{board_id}] {label} timings: {details}", flush=True)
+        return response
+
+    def map_image(stack, path, kind, piece_id=None):
+        nonlocal input_prepare_ms
+        start = time.perf_counter()
+        value = mapped_file(stack, path, kind, piece_id)
+        input_prepare_ms += (time.perf_counter() - start) * 1000
+        return value
+
+    try:
+        if args.mode == "stream" and args.parallel:
+            print("Parallel stream: submit 10 2D pieces and 1 3D board scan...", flush=True)
+            with ExitStack() as stack, ThreadPoolExecutor(max_workers=11) as pool:
+                descriptors = [map_image(stack, path, "2d", index)
+                               for index, path in enumerate(paths, 1)]
+                depth_descriptor = map_image(stack, depth, "3d")
+                depth_future = pool.submit(send, {"cmd": "detect_3d_board", "stage": "3d",
+                                                 "board_id": board_id, **depth_descriptor})
+                piece_futures = [pool.submit(send, {
+                    "cmd": "detect_2d_piece", "stage": "2d", "board_id": board_id,
+                    **threshold_request(args.threshold), **descriptor}) for descriptor in descriptors]
+                for future in as_completed(piece_futures):
+                    envelope["responses_2d"].append(future.result())
+                failures = [item for item in envelope["responses_2d"] if not item.get("ok")]
+                if failures:
+                    client.request({"cmd": "release_board", "board_id": board_id}, args.timeout)
+                response = depth_future.result()
+                if failures:
+                    response = {"ok": False, "cmd": "detect_3d_board", "board_id": board_id,
+                                "error": "2d_piece_failed", "message": "; ".join(
+                                    f"piece {item.get('piece_id')}: {item.get('message') or item.get('error')}"
+                                    for item in failures)}
+        elif args.mode == "stream":
+            for index, path in enumerate(paths, 1):
+                print(f"2D piece {index}/10: {path.name}", flush=True)
+                with ExitStack() as stack:
+                    piece_response = send({"cmd": "detect_2d_piece", "stage": "2d",
+                        "board_id": board_id, **threshold_request(args.threshold),
+                        **map_image(stack, path, "2d", index)})
+                envelope["responses_2d"].append(piece_response)
+                if not piece_response.get("ok"):
+                    raise RuntimeError(piece_response.get("error") or f"2D piece {index} failed")
+            with ExitStack() as stack:
+                response = send({"cmd": "detect_3d_board", "stage": "3d", "board_id": board_id,
+                                 **map_image(stack, depth, "3d")})
+        else:
+            with ExitStack() as stack:
+                response = send({"cmd": "detect_board", "stage": "board", "batch_id": board_id,
+                    "images_2d": [map_image(stack, path, "2d", index + 1)
+                                  for index, path in enumerate(paths)],
+                    "image_3d": map_image(stack, depth, "3d")})
+        envelope["response"] = response
+    except (OSError, ValueError, RuntimeError, TimeoutError) as exc:
+        envelope["response"] = {"ok": False, "board_id": board_id, "error": str(exc)}
+        print(f"Detection did not complete: {exc}", file=sys.stderr)
+    finally:
+        envelope["responses_2d"].sort(key=lambda item: int(item.get("piece_id") or 0))
+        envelope["timeline"] = [dict(item) for item in client.timeline[timeline_index:]
+                                if item["cmd"] in {"detect_2d_piece", "detect_3d_board", "detect_board"}]
+        entries = envelope["timeline"]
+        envelope["benchmark"] = {
+            "batch_wall_ms": (time.perf_counter() - started) * 1000,
+            "input_prepare_ms": input_prepare_ms,
+            "request_window_ms": (max(item["received_ms"] for item in entries)
+                                  - min(item["sent_ms"] for item in entries)) if entries else None,
+        }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run the existing Bridge Python service independently, save JSON, and generate an offline report.")
     parser.add_argument("--images-2d", type=Path, default=ROOT / "demodatasets/2D")
@@ -200,6 +310,8 @@ def main() -> int:
                         help="stream runs all configured single-piece 2D checks; board matches the current batch Demo")
     parser.add_argument("--parallel", action="store_true",
                         help="submit ten 2D pieces and the 3D board scan concurrently; stream mode only")
+    parser.add_argument("--repeat", type=int, default=1,
+                        help="Run N batches using the same images and ONE initialized service; N=2 compares first/reused inference")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--timeout", type=float, default=600, help="Per-request timeout in seconds")
     parser.add_argument("--score-mode", choices=("pool+top",), default=None)
@@ -216,6 +328,8 @@ def main() -> int:
         parser.error("--timeout must be positive")
     if args.parallel and args.mode != "stream":
         parser.error("--parallel only works with --mode stream")
+    if args.repeat < 1:
+        parser.error("--repeat must be positive")
     try:
         paths = image_files(args.images_2d.resolve())
         if len(paths) != 10:
@@ -254,14 +368,30 @@ def main() -> int:
                 "images_2d": [{"piece_id": i + 1, "path": str(p)} for i, p in enumerate(paths)],
                 "image_3d": str(depth), "responses_2d": [], "response": {}}
     client = None
+    startup = {"process_pid": None, "initialization_count": 0,
+               "profiling": {"log_enabled": os.environ.get("BRIDGE_TIMING_LOG", "1").lower() in {"1", "true", "yes", "on"},
+                             "cuda_sync_debug": os.environ.get("BRIDGE_TIMING_CUDA_SYNC", "0").lower() in {"1", "true", "yes", "on"}}}
+    batches = []
+    summary = {"requested_batches": args.repeat, "same_images": True,
+               "startup": startup, "batches": []}
+    startup_started = time.perf_counter()
     try:
         client = ProtocolClient(args.python.resolve(), ROOT / "python/transport/bridge_server.py", folder / "python.log")
+        startup["process_pid"] = client.process.pid
+        phase_start = time.perf_counter()
         response = client.request({"cmd": "init"}, args.timeout)
+        startup["protocol_response"] = response
+        startup["protocol_init_wall_ms"] = (time.perf_counter() - phase_start) * 1000
         if not response.get("ok"):
             envelope["response"] = response
             raise RuntimeError(response.get("error") or "Protocol init failed")
         print("Loading existing models (CUDA required)...", flush=True)
+        phase_start = time.perf_counter()
+        startup["initialization_count"] += 1
         response = client.request(init_req, args.timeout)
+        startup["algorithm_response"] = response
+        startup["algorithm_init_wall_ms"] = (time.perf_counter() - phase_start) * 1000
+        startup["startup_wall_ms"] = (time.perf_counter() - startup_started) * 1000
         envelope["response"] = response
         if args.silver_calibration is not None:
             envelope["calibration"] = {
@@ -270,85 +400,85 @@ def main() -> int:
             }
         if not response.get("ok"):
             raise RuntimeError(response.get("error") or "Algorithm initialization failed")
-        if args.mode == "stream":
-            if args.parallel:
-                print("Parallel stream: submit 10 2D pieces and 1 3D board scan...", flush=True)
-                with ExitStack() as stack, ThreadPoolExecutor(max_workers=11) as pool:
-                    descriptors = [mapped_file(stack, path, "2d", index)
-                                   for index, path in enumerate(paths, 1)]
-                    depth_descriptor = mapped_file(stack, depth, "3d")
-                    depth_future = pool.submit(
-                        client.request,
-                        {"cmd": "detect_3d_board", "stage": "3d",
-                         "board_id": board_id, **depth_descriptor},
-                        args.timeout)
-                    piece_futures = [pool.submit(
-                        client.request,
-                        {"cmd": "detect_2d_piece", "stage": "2d",
-                         "board_id": board_id, **threshold_request(args.threshold), **descriptor},
-                        args.timeout)
-                        for descriptor in descriptors]
-                    piece_responses = [future.result() for future in piece_futures]
-                    failures = [item for item in piece_responses if not item.get("ok")]
-                    if failures:
-                        # Release the pending 3D future immediately instead of waiting
-                        # for the board TTL when one camera result cannot be produced.
-                        client.request({"cmd": "release_board", "board_id": board_id}, args.timeout)
-                    response = depth_future.result()
-                    if failures:
-                        response = {
-                            "ok": False, "cmd": "detect_3d_board", "board_id": board_id,
-                            "error": "2d_piece_failed",
-                            "message": "; ".join(
-                                f"piece {item.get('piece_id')}: {item.get('message') or item.get('error')}"
-                                for item in failures),
-                        }
-                envelope["responses_2d"] = sorted(
-                    piece_responses, key=lambda item: int(item.get("piece_id") or 0))
-            else:
-                for index, path in enumerate(paths, 1):
-                    print(f"2D piece {index}/10: {path.name}", flush=True)
-                    with ExitStack() as stack:
-                        descriptor = mapped_file(stack, path, "2d", index)
-                        piece_response = client.request({"cmd": "detect_2d_piece", "stage": "2d", "board_id": board_id,
-                                                         **threshold_request(args.threshold), **descriptor}, args.timeout)
-                    envelope["responses_2d"].append(piece_response)
-                    if not piece_response.get("ok"):
-                        raise RuntimeError(piece_response.get("error") or f"2D piece {index} failed")
-                print("3D board: segmentation, registration and height measurement...", flush=True)
-                with ExitStack() as stack:
-                    response = client.request({"cmd": "detect_3d_board", "stage": "3d", "board_id": board_id,
-                                               **mapped_file(stack, depth, "3d")}, args.timeout)
-        else:
-            print("Batch board detection (same algorithm path as Bridge.Demo)...", flush=True)
-            with ExitStack() as stack:
-                response = client.request({"cmd": "detect_board", "stage": "board", "batch_id": board_id,
-                                           "images_2d": [mapped_file(stack, p, "2d", i + 1) for i, p in enumerate(paths)],
-                                           "image_3d": mapped_file(stack, depth, "3d")}, args.timeout)
-        envelope["response"] = response
+        print(f"Service PID={client.process.pid}; initialized once in "
+              f"{startup['startup_wall_ms'] / 1000:.3f}s. Running {args.repeat} batch(es).", flush=True)
+        (folder / "startup.json").write_text(json.dumps(startup, ensure_ascii=False, indent=2), encoding="utf-8")
+        for index in range(1, args.repeat + 1):
+            current_id = board_id if args.repeat == 1 else f"{board_id}-run-{index:02d}"
+            batch_folder = folder if args.repeat == 1 else folder / f"batch-{index:02d}"
+            if args.repeat > 1:
+                batch_folder.mkdir(exist_ok=False)
+            envelope = {"viewer_version": 1, "mode": args.mode, "board_id": current_id,
+                        "images_2d": [{"piece_id": i + 1, "path": str(p)} for i, p in enumerate(paths)],
+                        "image_3d": str(depth), "responses_2d": [], "response": {}}
+            if args.silver_calibration is not None:
+                envelope["calibration"] = {"silver_boundary": str(args.silver_calibration.resolve()),
+                                           "method": "sift_ransac"}
+            print(f"\nBatch {index}/{args.repeat}: {current_id} | "
+                  f"{'first inference' if index == 1 else 'reuse loaded models, NO initialization'}", flush=True)
+            detect_batch(client, args, paths, depth, envelope)
+            benchmark = envelope["benchmark"]
+            benchmark.update(batch_index=index, process_pid=client.process.pid,
+                             model_reused=index > 1,
+                             startup_charged_ms=startup["startup_wall_ms"] if index == 1 else 0.0)
+            benchmark["total_with_startup_ms"] = benchmark["batch_wall_ms"] + benchmark["startup_charged_ms"]
+            if args.repeat > 1:
+                envelope["title"] = f"连续检测第 {index}/{args.repeat} 批 · {'首次推理' if index == 1 else '复用模型推理'}"
+                envelope["warnings"] = [
+                    f"同一服务 PID={client.process.pid}；模型初始化仅一次。本批检测（含输入准备）"
+                    f" {benchmark['batch_wall_ms'] / 1000:.3f} 秒；"
+                    f"本批计入初始化 {benchmark['startup_charged_ms'] / 1000:.3f} 秒；"
+                    f"合计 {benchmark['total_with_startup_ms'] / 1000:.3f} 秒。"
+                    "顶部算法整板耗时不含服务初始化或报告生成。"]
+            summary["batches"].append({**benchmark, "board_id": current_id,
+                "request_ok": bool(envelope["response"].get("ok")),
+                "product_is_ok": envelope["response"].get("results_board", {}).get("is_ok"),
+                "result_path": str(batch_folder / "result.json"),
+                "report_path": str(batch_folder / "report.html")})
+            batches.append((batch_folder, envelope))
+            (batch_folder / "result.json").write_text(json.dumps(envelope, ensure_ascii=False, indent=2), encoding="utf-8")
+            save_timing_csv(envelope, batch_folder / "timings.csv")
+            print(f"Batch {index}: detection incl. input preparation={benchmark['batch_wall_ms'] / 1000:.3f}s; "
+                  f"incl. charged startup={benchmark['total_with_startup_ms'] / 1000:.3f}s", flush=True)
+            if not envelope["response"].get("ok"):
+                print("Stopping remaining batches after a request failure; saved partial results.", file=sys.stderr)
+                break
     except (OSError, ValueError, RuntimeError, TimeoutError) as exc:
         print(f"Detection did not complete: {exc}", file=sys.stderr)
+        summary["error"] = str(exc)
         if envelope["response"].get("ok") or not envelope["response"]:
             envelope["response"] = {"ok": False, "board_id": board_id, "error": str(exc)}
     finally:
         if client is not None:
-            client.close()
-            envelope["timeline"] = [item for item in client.timeline
-                                    if item["cmd"] in {"detect_2d_piece", "detect_3d_board"}]
-    (folder / "result.json").write_text(json.dumps(envelope, ensure_ascii=False, indent=2), encoding="utf-8")
-    try:
-        report = render_report(envelope, folder / "report.html", base_dir=folder)
-        print(f"JSON: {folder / 'result.json'}\nReport: {report}\nLog: {folder / 'python.log'}")
-        if args.parallel:
-            completed = sum(item.get("ok") is True for item in envelope["responses_2d"])
-            print(f"Parallel summary: {completed}/10 2D replies OK; 3D reply OK={bool(envelope['response'].get('ok'))}. ")
-            print("Open the request timeline in report.html to confirm 2D/3D overlap.")
-        if args.open:
-            webbrowser.open(report.as_uri())
-    except (OSError, ValueError, TypeError, KeyError) as exc:
-        print(f"Saved JSON, but report generation failed: {exc}", file=sys.stderr)
-        return 1
-    return 0 if envelope["response"].get("ok") else 1
+            try:
+                client.close()  # Release models only AFTER all requested batches.
+            except (OSError, RuntimeError, TimeoutError, subprocess.TimeoutExpired) as exc:
+                summary["cleanup_error"] = str(exc)
+                print(f"Service cleanup failed: {exc}", file=sys.stderr)
+    if not batches:
+        batches.append((folder, envelope))
+        (folder / "result.json").write_text(json.dumps(envelope, ensure_ascii=False, indent=2), encoding="utf-8")
+        save_timing_csv(envelope, folder / "timings.csv")
+    (folder / "startup.json").write_text(json.dumps(startup, ensure_ascii=False, indent=2), encoding="utf-8")
+    summary["completed_batches"] = len(summary["batches"])
+    summary["success"] = (len(summary["batches"]) == args.repeat
+                          and all(item["request_ok"] for item in summary["batches"])
+                          and "error" not in summary
+                          and "cleanup_error" not in summary)
+    (folder / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\nTiming summary: {folder / 'summary.json'}\nService log: {folder / 'python.log'}", flush=True)
+    reports_ok = True
+    # Generate previews after inference, so report CPU/IO never pollutes the next batch.
+    for batch_folder, envelope in batches:
+        try:
+            report = render_report(envelope, batch_folder / "report.html", base_dir=batch_folder)
+            print(f"Report: {report}", flush=True)
+            if args.open:
+                webbrowser.open(report.as_uri())
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            reports_ok = False
+            print(f"Saved JSON, but report generation failed: {exc}", file=sys.stderr)
+    return 0 if summary["success"] and reports_ok else 1
 
 
 if __name__ == "__main__":
