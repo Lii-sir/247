@@ -9,10 +9,13 @@ defined in original-image or circle-relative coordinates.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
 import json
 import hashlib
+import os
 from pathlib import Path
+import threading
 from typing import Any, Iterable, Mapping, Sequence
 
 import cv2
@@ -21,10 +24,27 @@ from algorithm.timing import timed_call, note
 
 
 EPSILON = 1e-6
+# Bound retained full-resolution gray images across calibration/parameter edits.
+_TEMPLATE_FEATURE_CACHE_MAX_ENTRIES = 4
+_template_feature_cache: OrderedDict[tuple[str, str, int, int], "_TemplateFeatureCacheEntry"] = OrderedDict()
+_template_feature_cache_lock = threading.RLock()
 
 
 class CalibrationNotConfiguredError(ValueError):
     """Missing real calibration is not a passing inspection or a fallback boundary."""
+
+
+@dataclass
+class _TemplateFeatureCacheEntry:
+    """Shared arrays are read-only; lazy feature initialization is lock-protected."""
+
+    gray: np.ndarray
+    width: int
+    height: int
+    sha256: str
+    max_side: int
+    max_features: int
+    features: tuple[np.ndarray, np.ndarray | None] | None = None
 
 
 def _key(name: str) -> str:
@@ -655,12 +675,114 @@ def _points_from_config(
     return [tuple(map(float, point)) for point in converted]
 
 
-def _read_image(path: str | Path) -> np.ndarray:
-    data = np.fromfile(str(Path(path)), dtype=np.uint8)
-    image = cv2.imdecode(data, cv2.IMREAD_COLOR) if data.size else None
+def _decode_image(data: bytes, path: str | Path) -> np.ndarray:
+    encoded = np.frombuffer(data, dtype=np.uint8)
+    image = cv2.imdecode(encoded, cv2.IMREAD_COLOR) if encoded.size else None
     if image is None:
         raise ValueError(f"unable to read silver boundary template: {path}")
     return image
+
+
+def _extract_sift_features(
+    gray: np.ndarray,
+    max_side: int,
+    max_features: int,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    height, width = gray.shape[:2]
+    scale = min(1.0, max_side / max(width, height))
+    resized = cv2.resize(
+        gray,
+        (max(1, round(width * scale)), max(1, round(height * scale))),
+        interpolation=cv2.INTER_AREA,
+    ) if scale < 1 else gray
+    detector = cv2.SIFT_create(nfeatures=max_features)
+    keypoints, descriptors = detector.detectAndCompute(resized, None)
+    coordinates = np.asarray(
+        [keypoint.pt for keypoint in keypoints], dtype=np.float64
+    ).reshape(-1, 2)
+    coordinates *= [width / resized.shape[1], height / resized.shape[0]]
+    return coordinates, descriptors
+
+
+def _validate_template_size(boundary: Mapping[str, Any], width: int, height: int) -> None:
+    calibrated_size = boundary.get("template_size")
+    if calibrated_size is not None and list(map(int, calibrated_size)) != [width, height]:
+        raise ValueError("silver boundary template dimensions changed after calibration")
+
+
+def _get_template(
+    template_path: str | Path,
+    boundary: Mapping[str, Any],
+) -> _TemplateFeatureCacheEntry:
+    """Validate the current bytes and reuse the decoded template for this cache key."""
+    path = Path(template_path).expanduser().resolve()
+    max_side = int(boundary.get("max_image_side", 2400))
+    max_features = int(boundary.get("max_features", 10000))
+    expected_digest = boundary.get("template_sha256")
+
+    # Keep hashing on every use so a cached entry never bypasses calibration
+    # integrity checks, including edits that preserve the file's timestamp.
+    # Do I/O and hashing before the lock so a slow read cannot block all callers.
+    encoded = timed_call("silver_template_read_ms", path.read_bytes)
+    digest = timed_call(
+        "silver_template_hash_ms", lambda: hashlib.sha256(encoded).hexdigest()
+    )
+    key = (os.path.normcase(str(path)), digest, max_side, max_features)
+    with _template_feature_cache_lock:
+        cached = timed_call(
+            "silver_template_cache_lookup_ms", _template_feature_cache.get, key
+        )
+        if cached is not None:
+            _validate_template_size(boundary, cached.width, cached.height)
+            if expected_digest is not None and digest != str(expected_digest):
+                raise ValueError("silver boundary template image changed after calibration")
+            _template_feature_cache.move_to_end(key)
+            return cached
+
+        template = timed_call("silver_template_decode_ms", _decode_image, encoded, path)
+        height, width = template.shape[:2]
+        _validate_template_size(boundary, width, height)
+        if expected_digest is not None and digest != str(expected_digest):
+            raise ValueError("silver boundary template image changed after calibration")
+
+        gray = timed_call("silver_template_gray_ms", cv2.cvtColor,
+                          template, cv2.COLOR_BGR2GRAY)
+        gray.setflags(write=False)
+        entry = _TemplateFeatureCacheEntry(
+            gray=gray,
+            width=width,
+            height=height,
+            sha256=digest,
+            max_side=max_side,
+            max_features=max_features,
+        )
+        _template_feature_cache[key] = entry
+        _template_feature_cache.move_to_end(key)
+        while len(_template_feature_cache) > _TEMPLATE_FEATURE_CACHE_MAX_ENTRIES:
+            _template_feature_cache.popitem(last=False)
+        return entry
+
+
+def _get_template_features(
+    template: _TemplateFeatureCacheEntry,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    # Delaying extraction until matching preserves the existing fallback for
+    # SIFT errors without allowing invalid calibration to enter that fallback.
+    with _template_feature_cache_lock:
+        cache_hit = template.features is not None
+        if not cache_hit:
+            coordinates, descriptors = timed_call(
+                "silver_template_sift_ms", _extract_sift_features,
+                template.gray, template.max_side, template.max_features,
+            )
+            coordinates.setflags(write=False)
+            if descriptors is not None:
+                descriptors.setflags(write=False)
+            template.features = coordinates, descriptors
+        note("silver_template_cache", hit=cache_hit,
+             max_image_side=template.max_side, max_features=template.max_features,
+             template_features=len(template.features[0]))
+        return template.features
 
 
 def _registered_template_points(
@@ -674,18 +796,14 @@ def _registered_template_points(
     points = boundary.get("template_points", boundary.get("points"))
     if not template_path or not isinstance(points, (list, tuple)) or len(points) < 3:
         raise CalibrationNotConfiguredError("银浆边界尚未标定：需要模板图和至少三个按顺序标定的边界点")
-    template = timed_call("silver_template_read_decode_ms", _read_image, template_path)
-    template_size = [int(template.shape[1]), int(template.shape[0])]
-    calibrated_size = boundary.get("template_size")
-    if calibrated_size is not None and list(map(int, calibrated_size)) != template_size:
-        raise ValueError("silver boundary template dimensions changed after calibration")
+    template_features = timed_call(
+        "silver_template_prepare_ms", _get_template, template_path, boundary
+    )
+    template_size = [template_features.width, template_features.height]
     template_digest = boundary.get("template_sha256")
-    if template_digest is not None and timed_call("silver_template_hash_ms",
-            lambda: hashlib.sha256(Path(template_path).read_bytes()).hexdigest()) != str(template_digest):
-        raise ValueError("silver boundary template image changed after calibration")
     calibrated = Boundary(tuple(tuple(point) for point in points),
                           str(boundary.get("mode", "polygon")))
-    calibrated.validate_image(template.shape[:2])
+    calibrated.validate_image(template_features.gray.shape[:2])
     registration = {
         "method": "sift_ransac", "status": "ok", "is_valid": True,
         "fallback_used": False, "matches": 0, "inliers": 0, "inlier_ratio": 0.0,
@@ -693,7 +811,9 @@ def _registered_template_points(
         "template_sha256": template_digest,
     }
     try:
-        result = _match_template_points(image, template, boundary, registration)
+        result = _match_template_points(
+            image, template_features, boundary, registration
+        )
         Boundary(tuple(result), calibrated.mode).validate_image(image.shape[:2])
     except (ValueError, cv2.error) as exc:
         if not boundary.get("fallback_to_template_points", False):
@@ -725,32 +845,21 @@ def _fallback_template_points(
 
 def _match_template_points(
     image: np.ndarray,
-    template: np.ndarray,
+    template_features: _TemplateFeatureCacheEntry,
     boundary: Mapping[str, Any],
     registration: dict[str, Any],
 ) -> list[tuple[float, float]]:
     """Estimate a fresh transform and preserve matching statistics on failure."""
     points = boundary.get("template_points", boundary.get("points"))
-    template_gray = timed_call("silver_template_gray_ms", cv2.cvtColor, template, cv2.COLOR_BGR2GRAY)
+    template_points_features, template_descriptors = timed_call(
+        "silver_template_features_ms", _get_template_features, template_features
+    )
     target_gray = timed_call("silver_target_gray_ms", cv2.cvtColor, image, cv2.COLOR_BGR2GRAY)
     max_side = int(boundary.get("max_image_side", 2400))
-
-    def features(gray: np.ndarray):
-        height, width = gray.shape[:2]
-        scale = min(1.0, max_side / max(width, height))
-        resized = cv2.resize(
-            gray,
-            (max(1, round(width * scale)), max(1, round(height * scale))),
-            interpolation=cv2.INTER_AREA,
-        ) if scale < 1 else gray
-        detector = cv2.SIFT_create(nfeatures=int(boundary.get("max_features", 10000)))
-        keypoints, descriptors = detector.detectAndCompute(resized, None)
-        coordinates = np.asarray([keypoint.pt for keypoint in keypoints], dtype=np.float64).reshape(-1, 2)
-        coordinates *= [width / resized.shape[1], height / resized.shape[0]]
-        return coordinates, descriptors
-
-    template_points_features, template_descriptors = timed_call("silver_template_sift_ms", features, template_gray)
-    target_points_features, target_descriptors = timed_call("silver_target_sift_ms", features, target_gray)
+    target_points_features, target_descriptors = timed_call(
+        "silver_target_sift_ms", _extract_sift_features,
+        target_gray, max_side, int(boundary.get("max_features", 10000)),
+    )
     note("silver_features", template_features=len(template_points_features),
          target_features=len(target_points_features), max_image_side=max_side)
     if template_descriptors is None or target_descriptors is None:

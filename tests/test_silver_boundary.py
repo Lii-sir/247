@@ -2,10 +2,14 @@
 import hashlib
 import importlib
 import json
+from concurrent.futures import ThreadPoolExecutor
+import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -15,6 +19,7 @@ sys.path.insert(0, str(ROOT / "python"))
 sys.path.insert(0, str(ROOT / "visualization"))
 silver = importlib.import_module("algorithm.2D.silver_inspection")
 calibrator = importlib.import_module("calibrate_silver_boundary")
+from algorithm.timing import timing_context
 
 
 class SilverBoundaryTests(unittest.TestCase):
@@ -148,14 +153,153 @@ class SilverBoundaryTests(unittest.TestCase):
     def test_shared_calibration_maps_each_target_independently(self):
         self.enable_fallback()
         original = self.json_path.read_bytes()
-        for dx, dy in [(12, 8), (-15, 10)]:
-            target = cv2.warpPerspective(self.template, np.array(
-                [[1, 0, dx], [0, 1, dy], [0, 0, 1]], np.float64), (480, 360))
-            boundary = self.build(target)
-            np.testing.assert_allclose(boundary.points, np.asarray(self.points) + [dx, dy], atol=1.5)
-            self.assertFalse(boundary.registration["fallback_used"])
-            self.assertTrue(boundary.registration["is_valid"])
+        with patch.object(silver, "_extract_sift_features",
+                          wraps=silver._extract_sift_features) as extract, \
+                patch.object(silver, "_decode_image", wraps=silver._decode_image) as decode:
+            for dx, dy in [(12, 8), (-15, 10)]:
+                target = cv2.warpPerspective(self.template, np.array(
+                    [[1, 0, dx], [0, 1, dy], [0, 0, 1]], np.float64), (480, 360))
+                boundary = self.build(target)
+                np.testing.assert_allclose(boundary.points,
+                                           np.asarray(self.points) + [dx, dy], atol=1.5)
+                self.assertFalse(boundary.registration["fallback_used"])
+                self.assertTrue(boundary.registration["is_valid"])
+        # One template extraction, plus a fresh extraction for each target.
+        self.assertEqual(extract.call_count, 3)
+        self.assertEqual(decode.call_count, 1)
         self.assertEqual(self.json_path.read_bytes(), original)
+
+    def test_template_feature_cache_is_keyed_by_sift_parameters(self):
+        with patch.object(silver, "_extract_sift_features",
+                          wraps=silver._extract_sift_features) as extract:
+            first_template = silver._get_template(self.path, self.calibration)
+            first = silver._get_template_features(first_template)
+            cached_template = silver._get_template(self.path, self.calibration)
+            cached = silver._get_template_features(cached_template)
+            resized_template = silver._get_template(
+                self.path, {**self.calibration, "max_image_side": 240}
+            )
+            resized = silver._get_template_features(resized_template)
+            fewer_template = silver._get_template(
+                self.path, {**self.calibration, "max_features": 500}
+            )
+            silver._get_template_features(fewer_template)
+        self.assertIs(first_template, cached_template)
+        self.assertIs(first[0], cached[0])
+        self.assertIsNot(first_template, resized_template)
+        self.assertIsNot(first[0], resized[0])
+        self.assertIsNot(first_template, fewer_template)
+        self.assertEqual(extract.call_count, 3)
+
+    def test_concurrent_template_cache_miss_builds_features_once(self):
+        original_extract = silver._extract_sift_features
+
+        def delayed_extract(gray, max_side, max_features):
+            time.sleep(0.05)
+            return original_extract(gray, max_side, max_features)
+
+        with patch.object(silver, "_extract_sift_features", side_effect=delayed_extract) as extract:
+            def load_features(_):
+                template = silver._get_template(self.path, self.calibration)
+                return silver._get_template_features(template)
+
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                results = list(pool.map(
+                    load_features,
+                    range(8),
+                ))
+        self.assertEqual(extract.call_count, 1)
+        self.assertTrue(all(features[0] is results[0][0] for features in results))
+        self.assertFalse(results[0][0].flags.writeable)
+        self.assertFalse(results[0][1].flags.writeable)
+
+    def test_template_feature_errors_still_use_fallback_and_can_retry(self):
+        self.enable_fallback()
+        for error in (ValueError("template SIFT failed"), cv2.error("template SIFT failed")):
+            with self.subTest(error=type(error).__name__):
+                with patch.object(silver, "_extract_sift_features", side_effect=error):
+                    boundary = self.build()
+                self.assertTrue(boundary.registration["fallback_used"])
+                self.assertIn("template SIFT failed", boundary.registration["message"])
+                self.assertIsNone(silver._get_template(self.path, self.calibration).features)
+        boundary = self.build()
+        self.assertTrue(boundary.registration["is_valid"])
+        self.assertFalse(boundary.registration["fallback_used"])
+
+    def test_warm_cache_checks_modified_bytes_even_if_size_and_timestamp_match(self):
+        # BMP pixels can change without changing the encoded file size.
+        encoded = cv2.imencode(".bmp", self.template)[1].tobytes()
+        self.path.write_bytes(encoded)
+        self.enable_fallback(template_sha256=hashlib.sha256(encoded).hexdigest())
+        self.build()
+        original_stat = self.path.stat()
+        self.path.write_bytes(encoded[:-1] + bytes([encoded[-1] ^ 1]))
+        os.utime(self.path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+        self.assertEqual(self.path.stat().st_size, original_stat.st_size)
+        self.assertEqual(self.path.stat().st_mtime_ns, original_stat.st_mtime_ns)
+        with self.assertRaisesRegex(ValueError, "changed after calibration"):
+            self.build(np.zeros_like(self.template))
+
+    def test_warm_cache_never_falls_back_for_invalid_calibration(self):
+        self.enable_fallback()
+        self.build()
+        self.enable_fallback(template_size=[100, 100])
+        with self.assertRaisesRegex(ValueError, "dimensions changed"):
+            self.build(np.zeros_like(self.template))
+        self.enable_fallback(template_size=[480, 360], template_points=[
+            [80, 90], [340, 270], [340, 90], [80, 270]
+        ])
+        with self.assertRaisesRegex(ValueError, "silver boundary"):
+            self.build(np.zeros_like(self.template))
+
+    def test_warm_cache_timings_only_recompute_target_features(self):
+        cold, warm = {}, {}
+        with timing_context(cold, phase="test"):
+            self.build()
+        with timing_context(warm, phase="test"):
+            self.build()
+        for stage in ("silver_template_decode_ms", "silver_template_gray_ms",
+                      "silver_template_sift_ms"):
+            self.assertIn(stage, cold)
+            self.assertNotIn(stage, warm)
+        self.assertIn("silver_target_sift_ms", warm)
+        self.assertIn("silver_template_hash_ms", warm)
+
+    def test_template_cache_is_bounded_and_can_rebuild_evicted_features(self):
+        with patch.object(silver, "_TEMPLATE_FEATURE_CACHE_MAX_ENTRIES", 2):
+            first = silver._get_template(self.path, self.calibration)
+            silver._get_template_features(first)
+            for features in (300, 400):
+                silver._get_template(self.path, {**self.calibration, "max_features": features})
+            self.assertLessEqual(len(silver._template_feature_cache), 2)
+            rebuilt = silver._get_template(self.path, self.calibration)
+            self.assertIsNot(first, rebuilt)
+            np.testing.assert_array_equal(silver._get_template_features(first)[0],
+                                          silver._get_template_features(rebuilt)[0])
+
+    def test_cached_template_still_checks_hash_and_dimensions(self):
+        silver._get_template(self.path, self.calibration)
+        with self.assertRaisesRegex(ValueError, "changed after calibration"):
+            silver._get_template(
+                self.path, {**self.calibration, "template_sha256": "wrong"}
+            )
+        with self.assertRaisesRegex(ValueError, "dimensions changed"):
+            silver._get_template(
+                self.path, {**self.calibration, "template_size": [100, 100]}
+            )
+
+    def test_template_content_change_uses_a_new_cache_entry(self):
+        calibration = {key: value for key, value in self.calibration.items()
+                       if key != "template_sha256"}
+        first = silver._get_template(self.path, calibration)
+        changed = self.template.copy()
+        cv2.circle(changed, (240, 180), 24, (0, 0, 255), -1)
+        ok, encoded = cv2.imencode(".png", changed)
+        self.assertTrue(ok)
+        self.path.write_bytes(encoded.tobytes())
+        second = silver._get_template(self.path, calibration)
+        self.assertIsNot(first, second)
+        self.assertNotEqual(first.sha256, second.sha256)
 
     def test_template_hash_and_size_are_checked(self):
         self.calibration["template_sha256"] = "bad-hash"
