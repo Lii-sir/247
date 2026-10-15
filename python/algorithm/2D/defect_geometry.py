@@ -83,6 +83,23 @@ def clean_mask(mask: np.ndarray, min_area: int = 500, kernel_size: int = 5) -> n
     return labels == components[0][1]
 
 
+def clean_mask_crop(mask: np.ndarray, min_area: int = 500,
+                    kernel_size: int = 5) -> tuple[np.ndarray, tuple[int, int]]:
+    """Clean the entire instance within its bounds, retaining its crop offset."""
+    binary = (np.asarray(mask) > 0).astype(np.uint8)
+    x, y, width, height = cv2.boundingRect(binary)
+    if width == 0 or height == 0:
+        return np.zeros((1, 1), dtype=bool), (0, 0)
+    # Closing followed by opening has four primitive operations. Keep enough
+    # zero context for their full dependency radius, or the original image edge.
+    padding = 4 * (kernel_size // 2)
+    x0, y0 = max(0, x - padding), max(0, y - padding)
+    x1 = min(binary.shape[1], x + width + padding)
+    y1 = min(binary.shape[0], y + height + padding)
+    cleaned = clean_mask(binary[y0:y1, x0:x1], min_area, kernel_size)
+    return cleaned, (x0, y0)
+
+
 def constrained_rectangle(mask: np.ndarray, roi_boxes: list[tuple[int, int, int, int]],
                            min_ratio: float = 0.75, mask_offset: tuple[int, int] = (0, 0),
                            coarse_steps: int = 21, fine_steps: int = 11):

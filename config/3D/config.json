@@ -4,6 +4,10 @@
     "parameters": {
       "input": {
         "piece_count": 10
+      },
+      "threading": {
+        "worker_budget": 14,
+        "cpu_workers": 7
       }
     }
   },

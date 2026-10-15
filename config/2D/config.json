@@ -62,6 +62,10 @@
         "max_det": 50,
         "device": "0",
         "end2end": true
+      },
+      "threading": {
+        "postprocess_workers": 5,
+        "gpu_workers": 2
       }
     }
   },

@@ -14,6 +14,7 @@ if str(PYTHON_ROOT) not in sys.path:
     sys.path.insert(0, str(PYTHON_ROOT))
 
 from algorithm.timing import timing_context, timed_call, record_duration
+from algorithm.config import load_runtime_config
 
 
 def configure_native_threads():
@@ -32,33 +33,14 @@ class AlgorithmServer:
         # Keep the legacy modules loadable while callers migrate to detect_board.
         self.two_d = None
         self.three_d = None
-        workers = int(os.environ.get("BRIDGE_MAX_WORKERS", "13"))
-        if not 2 <= workers <= 13:
-            raise ValueError("BRIDGE_MAX_WORKERS must be between 2 and 13")
-        max_postprocess_workers = max(1, workers - 2)
-        postprocess_workers = int(os.environ.get(
-            "BRIDGE_POSTPROCESS_WORKERS", str(min(3, max_postprocess_workers))))
-        if not 1 <= postprocess_workers <= max_postprocess_workers:
-            raise ValueError("BRIDGE_POSTPROCESS_WORKERS must be between 1 and max(1, BRIDGE_MAX_WORKERS - 2)")
-        # Reserve workers for preparation/depth/joint work so heavy SIFT jobs
-        # cannot occupy every CPU slot. At the minimum budget share one pool.
-        dedicated_postprocess = min(postprocess_workers, workers - 2)
-        self.cpu_pool = ThreadPoolExecutor(
-            max_workers=workers - 1 - dedicated_postprocess, thread_name_prefix="bridge-cpu")
-        self.postprocess_pool = (
-            ThreadPoolExecutor(max_workers=dedicated_postprocess, thread_name_prefix="bridge-postprocess")
-            if dedicated_postprocess else self.cpu_pool
-        )
-        self.gpu_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bridge-gpu")
-        self.threading_info = {
-            "cpu_workers": workers - 1 - dedicated_postprocess,
-            "postprocess_workers": postprocess_workers,
-            "postprocess_pool_shared": self.postprocess_pool is self.cpu_pool,
-            "gpu_workers": 1,
-            "native_threads": {key: os.environ.get(key) for key in (
-                "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS")},
-        }
+        self.cpu_pool = None
+        self.postprocess_pool = None
+        self.gpu_pool = None
         self.pipeline = None
+        self.threading_info = {}
+        self._configure_thread_pools(
+            self._thread_settings({}), source="environment_default"
+        )
         self._write_lock = threading.Lock()
         self._pending_lock = threading.Lock()
         self._pending = set()
@@ -85,22 +67,172 @@ class AlgorithmServer:
 
     def handle_init_algorithm(self, req: Dict[str, Any]) -> Dict[str, Any]:
         stage = str(req.get("stage", "")).lower()
+        try:
+            config = load_runtime_config(
+                str(req.get("config_text") or ""),
+                str(req.get("config_path") or "") or None,
+            )
+            settings = self._thread_settings(config)
+            if stage == "board":
+                board = timed_call("init_board_import_and_construct_ms", self.get_board)
+                configure_gpu_workers = getattr(board, "configure_gpu_worker_count", None)
+                if callable(configure_gpu_workers):
+                    configure_gpu_workers(settings["gpu_workers"])
+                elif settings["gpu_workers"] > 1:
+                    raise ValueError("multiple GPU workers are supported only by the unified board detector")
+                response = board.handle_init(req)
+                if response.get("ok"):
+                    self._configure_thread_pools(settings, source="stage_config")
+                    response["threading"] = self.threading_info
+            elif stage == "2d":
+                if settings["gpu_workers"] > 1:
+                    raise ValueError("multiple GPU workers are supported only by the unified board detector")
+                response = self.get_two_d().handle_init(req)
+            elif stage == "3d":
+                if settings["gpu_workers"] > 1:
+                    raise ValueError("multiple GPU workers are supported only by the unified board detector")
+                response = self.get_three_d().handle_init(req)
+            else:
+                return {
+                    "ok": False,
+                    "cmd": "init_algorithm",
+                    "stage": stage,
+                    "error": f"unsupported algorithm init stage: {stage or '<empty>'}",
+                }
+            if response.get("ok") and stage != "board":
+                self._configure_thread_pools(settings, source="stage_config")
+                response["threading"] = self.threading_info
+            return response
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            return {
+                "ok": False,
+                "cmd": "init_algorithm",
+                "stage": stage,
+                "error": str(exc),
+            }
 
-        if stage == "board":
-            board = timed_call("init_board_import_and_construct_ms", self.get_board)
-            return board.handle_init(req)
+    @staticmethod
+    def _threading_parameters(config: Dict[str, Any], stage_name: str) -> Dict[str, Any]:
+        stage = config.get(stage_name, {})
+        if not isinstance(stage, dict):
+            raise ValueError(f"{stage_name} must be an object")
+        parameters = stage.get("parameters", {})
+        if not isinstance(parameters, dict):
+            raise ValueError(f"{stage_name}.parameters must be an object")
+        values = parameters.get("threading", {})
+        if not isinstance(values, dict):
+            raise ValueError(f"{stage_name}.parameters.threading must be an object")
+        return values
 
-        if stage == "2d":
-            return self.get_two_d().handle_init(req)
+    @staticmethod
+    def _thread_count(name: str, value: Any) -> int:
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be a positive integer")
+        if isinstance(value, int):
+            count = value
+        elif isinstance(value, str) and value.strip().isdecimal():
+            count = int(value.strip())
+        else:
+            raise ValueError(f"{name} must be a positive integer")
+        if count < 1:
+            raise ValueError(f"{name} must be a positive integer")
+        return count
 
-        if stage == "3d":
-            return self.get_three_d().handle_init(req)
-
+    def _thread_settings(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        values_2d = self._threading_parameters(config, "common_2d")
+        values_3d = self._threading_parameters(config, "common_3d")
+        budget = self._thread_count(
+            "worker_budget",
+            values_3d.get("worker_budget", os.environ.get("BRIDGE_MAX_WORKERS", 13)),
+        )
+        if budget < 2:
+            raise ValueError("worker_budget/BRIDGE_MAX_WORKERS must be at least 2")
+        gpu = self._thread_count(
+            "gpu_workers",
+            values_2d.get("gpu_workers", os.environ.get("BRIDGE_GPU_WORKERS", 1)),
+        )
+        postprocess = self._thread_count(
+            "postprocess_workers",
+            values_2d.get(
+                "postprocess_workers",
+                os.environ.get("BRIDGE_POSTPROCESS_WORKERS", min(5, max(1, budget - gpu - 1))),
+            ),
+        )
+        cpu = self._thread_count(
+            "cpu_workers",
+            values_3d.get(
+                "cpu_workers",
+                os.environ.get("BRIDGE_CPU_WORKERS", max(1, budget - postprocess - gpu)),
+            ),
+        )
+        shared_cpu_pool = budget == 2 and cpu == 1 and postprocess == 1 and gpu == 1
+        effective_total = cpu + gpu + (0 if shared_cpu_pool else postprocess)
+        if effective_total > budget:
+            raise ValueError(
+                "threading configuration exceeds worker_budget: "
+                f"cpu_workers={cpu}, postprocess_workers={postprocess}, "
+                f"gpu_workers={gpu}, worker_budget={budget}"
+            )
         return {
-            "ok": False,
-            "cmd": "init_algorithm",
-            "stage": stage,
-            "error": f"unsupported algorithm init stage: {stage or '<empty>'}",
+            "worker_budget": budget,
+            "cpu_workers": cpu,
+            "postprocess_workers": postprocess,
+            "gpu_workers": gpu,
+            "postprocess_pool_shared": shared_cpu_pool,
+        }
+
+    def _configure_thread_pools(self, settings: Dict[str, Any], *, source: str) -> None:
+        if self.pipeline is not None and self.pipeline.has_pending:
+            raise RuntimeError("worker thread pools can only be changed while the detector is idle")
+        same_budget = (
+            self.threading_info.get("worker_budget") == settings["worker_budget"]
+            and self.threading_info.get("cpu_workers") == settings["cpu_workers"]
+            and self.threading_info.get("postprocess_workers") == settings["postprocess_workers"]
+            and self.threading_info.get("postprocess_pool_shared")
+            == settings["postprocess_pool_shared"]
+            and self.threading_info.get("gpu_workers") == settings["gpu_workers"]
+        )
+        if not same_budget:
+            old_pools = {
+                id(pool): pool
+                for pool in (self.cpu_pool, self.postprocess_pool)
+                if pool is not None
+            }
+            cpu_pool = ThreadPoolExecutor(
+                max_workers=settings["cpu_workers"],
+                thread_name_prefix="bridge-cpu",
+            )
+            gpu_pool = ThreadPoolExecutor(
+                max_workers=settings["gpu_workers"],
+                thread_name_prefix="bridge-gpu",
+            )
+            postprocess_pool = (
+                cpu_pool
+                if settings["postprocess_pool_shared"]
+                else ThreadPoolExecutor(
+                    max_workers=settings["postprocess_workers"],
+                    thread_name_prefix="bridge-postprocess",
+                )
+            )
+            self.cpu_pool = cpu_pool
+            self.postprocess_pool = postprocess_pool
+            old_gpu_pool = self.gpu_pool
+            self.gpu_pool = gpu_pool
+            if self.pipeline is not None:
+                self.pipeline.cpu_pool = cpu_pool
+                self.pipeline.postprocess_pool = postprocess_pool
+                self.pipeline.gpu_pool = gpu_pool
+            for pool in old_pools.values():
+                pool.shutdown(wait=True)
+            if old_gpu_pool is not None:
+                old_gpu_pool.shutdown(wait=True)
+        self.threading_info = {
+            **settings,
+            "native_threads": {
+                key: os.environ.get(key)
+                for key in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS")
+            },
+            "source": source,
         }
 
     def handle_detect(self, req: Dict[str, Any]) -> Dict[str, Any]:

@@ -491,27 +491,34 @@ def _measure_chip_component(
     # hundred MB for every piece in a streaming pipeline.
     local_slice = np.s_[outer_y1:outer_y2, outer_x1:outer_x2]
     local_ring = ring[local_slice]
-    local_valid = valid[local_slice]
     local_silver = silver_ring[local_slice]
     local_covered = covered_mask[local_slice]
     local_occlusion = effective_occlusion[local_slice]
-    yy, xx = np.indices(local_ring.shape, dtype=np.float64)
-    yy += outer_y1
-    xx += outer_x1
+    # Only ring pixels contribute. Count their sectors once instead of
+    # allocating and scanning five masks per sector (normally 72 times).
+    ring_y, ring_x = np.nonzero(local_ring)
+    yy = ring_y.astype(np.float64) + outer_y1
+    xx = ring_x.astype(np.float64) + outer_x1
     angles = (np.arctan2(yy - center[1], xx - center[0]) + 2 * np.pi) % (2 * np.pi)
     indices = np.floor(angles / (2 * np.pi) * settings.sector_count).astype(np.int32)
+    ring_counts = np.bincount(indices, minlength=settings.sector_count)
+    silver_counts = np.bincount(
+        indices[local_silver[ring_y, ring_x]], minlength=settings.sector_count
+    )
+    covered_counts = np.bincount(
+        indices[local_covered[ring_y, ring_x]], minlength=settings.sector_count
+    )
+    occluded_counts = np.bincount(
+        indices[local_occlusion[ring_y, ring_x]], minlength=settings.sector_count
+    )
+    missing_sectors = np.zeros(len(ring_counts), dtype=bool)
     sectors: list[dict[str, Any]] = []
     local_missing_mask = np.zeros(local_ring.shape, dtype=bool)
     covered_count = valid_count = ignored_count = missing_count = 0
     for index in range(settings.sector_count):
-        sector = local_ring & (indices == index)
-        valid_sector = local_valid & (indices == index)
-        silver_sector = local_silver & (indices == index)
-        covered_sector = local_covered & (indices == index)
-        occluded_sector = local_occlusion & (indices == index)
-        ring_px, valid_px = int(sector.sum()), int(valid_sector.sum())
-        silver_px, occluded_px = int(silver_sector.sum()), int(occluded_sector.sum())
-        covered_px = int(covered_sector.sum())
+        ring_px = valid_px = int(ring_counts[index])
+        silver_px, occluded_px = int(silver_counts[index]), int(occluded_counts[index])
+        covered_px = int(covered_counts[index])
         coverage = covered_px / valid_px if valid_px else None
         visible_ratio = valid_px / ring_px if ring_px else 0.0
         if valid_px < settings.min_valid_sector_px:
@@ -527,7 +534,7 @@ def _measure_chip_component(
                 covered_count += 1
             else:
                 missing_count += 1
-                local_missing_mask |= valid_sector & ~covered_sector
+                missing_sectors[index] = True
         sectors.append(
             {
                 "chip_index": chip_index,
@@ -544,6 +551,9 @@ def _measure_chip_component(
                 "status": status,
             }
         )
+    local_missing_mask[ring_y, ring_x] = (
+        missing_sectors[indices] & ~local_covered[ring_y, ring_x]
+    )
     missing_mask = np.zeros(component.shape, dtype=bool)
     missing_mask[local_slice] = local_missing_mask
     return {

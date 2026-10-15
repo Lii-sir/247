@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import gc
 import io
+import queue
 import threading
 import time
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Dict, Sequence
@@ -64,6 +65,10 @@ class DetectBoard:
         self.log = log
         self.model = None
         self.model_path = None
+        self.model_paths: Dict[str, str] = {}
+        self.gpu_worker_count = 1
+        self._gpu_worker_resources = []
+        self._gpu_worker_slots = queue.Queue()
         self.config_path: str | None = None
         self.config: Dict[str, Any] = {}
         self.expected_piece_count = 10
@@ -94,9 +99,12 @@ class DetectBoard:
 
     def handle_init(self, req: Dict[str, Any]) -> Dict[str, Any]:
         start = time.perf_counter()
+        if self.model is not None or self.chip_anomaly_inspector is not None:
+            self.release()
         self.config_path = str(req.get("config_path") or "") or None
         raw_model_paths = req.get("model_path")
         model_paths = raw_model_paths if isinstance(raw_model_paths, dict) else {}
+        self.model_paths = {str(name): str(path) for name, path in model_paths.items()}
         self.model_path = str(model_paths.get("YOLO") or "") or None
         try:
             timed_call("init_config_ms", self._load_config, str(req.get("config_text") or ""))
@@ -111,12 +119,14 @@ class DetectBoard:
             model_load_ms = self.elapsed_ms(load_start)
             self.chip_anomaly_inspector = _chip_anomaly.ChipAnomalyInspector(
                 self.chip_anomaly_config,
-                {str(name): str(path) for name, path in model_paths.items()},
+                self.model_paths,
             )
             anomaly_load_timings = timed_call("init_efficientad_load_ms", self.chip_anomaly_inspector.load)
+            gpu_worker_load_timings = timed_call(
+                "init_gpu_worker_replicas_ms", self._load_gpu_worker_replicas
+            )
         except Exception as exc:
-            self.model = None
-            self.chip_anomaly_inspector = None
+            self.release()
             return {
                 "ok": False,
                 "cmd": "init_algorithm",
@@ -131,8 +141,104 @@ class DetectBoard:
             "stage": "board",
             "message": "unified board detector ready",
             "timings": {"total_init_ms": self.elapsed_ms(start)},
-            "model_load_timings": {"YOLO": model_load_ms, **anomaly_load_timings},
+            "model_load_timings": {
+                "YOLO": model_load_ms,
+                **anomaly_load_timings,
+                **gpu_worker_load_timings,
+            },
         }
+
+    def configure_gpu_worker_count(self, count: int) -> None:
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise ValueError("gpu_workers must be a positive integer")
+        self.gpu_worker_count = count
+
+    def _gpu_worker_resource(self, model, inspector, lock) -> Dict[str, Any]:
+        stream = None
+        # YOLO chooses its prediction device lazily, so its model can still be
+        # on CPU here. Prefer the configured inference device, then either
+        # loaded model's device (EfficientAD may run on GPU independently).
+        device = None
+        candidates = (
+            self.yolo_parameters.get("device"),
+            getattr(model, "device", None),
+            getattr(inspector, "device", None),
+        )
+        for candidate in candidates:
+            if isinstance(candidate, torch.device):
+                candidate_device = candidate
+            elif candidate is not None and str(candidate).strip().lower() not in {"", "auto"}:
+                device_text = str(candidate).strip().lower().split(",", 1)[0].strip()
+                if device_text.isdecimal():
+                    device_text = f"cuda:{device_text}"
+                try:
+                    candidate_device = torch.device(device_text)
+                except (RuntimeError, ValueError):
+                    continue
+            else:
+                continue
+            if candidate_device.type == "cuda":
+                device = candidate_device
+                break
+        if (
+            device is None
+            and self.gpu_worker_count > 1
+            and torch.cuda.is_available()
+        ):
+            device = torch.device("cuda", torch.cuda.current_device())
+        if self.gpu_worker_count > 1 and isinstance(device, torch.device) and device.type == "cuda":
+            stream = torch.cuda.Stream(device=device)
+            # Inspector weights were loaded on the initializing thread's stream.
+            stream.wait_stream(torch.cuda.current_stream(device))
+        return {"model": model, "inspector": inspector, "lock": lock, "stream": stream}
+
+    def _load_gpu_worker_replicas(self) -> Dict[str, float]:
+        if self.model is None or self.chip_anomaly_inspector is None:
+            raise RuntimeError("load the primary GPU models before creating worker replicas")
+        from ultralytics import YOLO
+
+        resources = [self._gpu_worker_resource(
+            self.model, self.chip_anomaly_inspector, self._inference_lock
+        )]
+        timings: Dict[str, float] = {}
+        try:
+            for worker_index in range(2, self.gpu_worker_count + 1):
+                started = time.perf_counter()
+                with redirect_stdout(io.StringIO()):
+                    model = YOLO(self.model_path)
+                timings[f"YOLO_worker_{worker_index}"] = self.elapsed_ms(started)
+
+                inspector = _chip_anomaly.ChipAnomalyInspector(
+                    self.chip_anomaly_config, self.model_paths
+                )
+                try:
+                    loaded = timed_call(
+                        f"init_efficientad_worker_{worker_index}_ms", inspector.load
+                    )
+                except Exception:
+                    inspector.release()
+                    raise
+                timings.update({f"{name}_worker_{worker_index}": value
+                                for name, value in loaded.items()})
+                try:
+                    resource = self._gpu_worker_resource(
+                        model, inspector, threading.RLock()
+                    )
+                except Exception:
+                    inspector.release()
+                    raise
+                resources.append(resource)
+        except Exception:
+            for resource in resources[1:]:
+                resource["inspector"].release()
+            raise
+
+        slots = queue.Queue()
+        for resource in resources:
+            slots.put(resource)
+        self._gpu_worker_resources = resources
+        self._gpu_worker_slots = slots
+        return timings
 
     def _load_config(self, text: str) -> None:
         config = load_runtime_config(text, self.config_path)
@@ -296,44 +402,80 @@ class DetectBoard:
             owner.close()
 
     def infer_2d_piece(self, prepared: Dict[str, Any]) -> None:
-        """Serialized GPU phase; CPU workers never wait for a model lock."""
+        """Run one piece on an independently owned GPU model replica."""
         crop = prepared["crop"]
         image, crop_box = prepared["image"], prepared["crop_box"]
         note("input_shape", image_shape=list(image.shape), roi_shape=list(crop.shape),
              imgsz=self.yolo_parameters.get("imgsz"))
-        lock_start = time.perf_counter()
-        with self._inference_lock:
-            record_duration("model_lock_wait_ms", self.elapsed_ms(lock_start))
-            if self.model is None:
-                raise RuntimeError("board/stream 2D model is not initialized")
-            inference_start = time.perf_counter()
-            timed_call("cuda_before_yolo_ms", self._synchronize_model)
-            predictions = timed_call("yolo_predict_wall_ms", self._predict_batch, [crop])
-            timed_call("cuda_after_yolo_ms", self._synchronize_model)
-            inference_ms = self.elapsed_ms(inference_start)
-            if len(predictions) != 1:
-                raise RuntimeError(
-                    f"YOLO returned {len(predictions)} results for one 2D image"
+        return_resource = bool(self._gpu_worker_resources)
+        slot_started = time.perf_counter()
+        if return_resource:
+            resource = self._gpu_worker_slots.get()
+        else:
+            # Keep the direct/synchronous compatibility path usable in CPU-only
+            # tests and legacy callers that set the primary model directly.
+            if (self.model is None or self.chip_anomaly_inspector is None
+                    or self.gpu_worker_count != 1):
+                raise RuntimeError("GPU model resources are not initialized")
+            resource = {
+                "model": self.model,
+                "inspector": self.chip_anomaly_inspector,
+                "lock": self._inference_lock,
+            }
+        record_duration("gpu_model_slot_wait_ms", self.elapsed_ms(slot_started))
+        model, inspector, model_lock = (
+            resource["model"], resource["inspector"], resource["lock"]
+        )
+        stream = resource.get("stream")
+        try:
+            lock_start = time.perf_counter()
+            with model_lock, (torch.cuda.stream(stream) if stream is not None else nullcontext()):
+                record_duration("model_lock_wait_ms", self.elapsed_ms(lock_start))
+                if model is None or inspector is None:
+                    raise RuntimeError("GPU model resources are not initialized")
+                inference_start = time.perf_counter()
+                timed_call("cuda_before_yolo_ms", self._synchronize_model, model, stream)
+                predictions = timed_call(
+                    "yolo_predict_wall_ms", self._predict_batch,
+                    [crop], model, model_lock,
                 )
-            speed = getattr(predictions[0], "speed", None)
-            if isinstance(speed, dict):
-                for stage in ("preprocess", "inference", "postprocess"):
-                    value = speed.get(stage)
-                    if isinstance(value, (int, float)) and np.isfinite(value):
-                        record_duration(f"yolo_reported_{stage}_ms", float(value))
+                timed_call("cuda_after_yolo_ms", self._synchronize_model, model, stream)
+                inference_ms = self.elapsed_ms(inference_start)
+                if len(predictions) != 1:
+                    raise RuntimeError(
+                        f"YOLO returned {len(predictions)} results for one 2D image"
+                    )
+                speed = getattr(predictions[0], "speed", None)
+                if isinstance(speed, dict):
+                    for stage in ("preprocess", "inference", "postprocess"):
+                        value = speed.get(stage)
+                        if isinstance(value, (int, float)) and np.isfinite(value):
+                            record_duration(f"yolo_reported_{stage}_ms", float(value))
 
-            instances = timed_call("mask_extract_to_cpu_ms", self._extract_instances, predictions[0], crop.shape[:2])
-            if self.chip_anomaly_inspector is None:
-                raise RuntimeError("chip anomaly inspector is not initialized")
-            chip_anomaly_diagnostics = timed_call("efficientad_total_ms", self.chip_anomaly_inspector.inspect,
-                image, instances, crop_box, threshold=prepared.get("threshold")
-            )
-            device = getattr(self.model, "device", None)
-            if isinstance(device, torch.device) and device.type == "cuda":
-                note("gpu_memory", allocated_mb=round(torch.cuda.memory_allocated(device) / 1048576, 2),
-                     reserved_mb=round(torch.cuda.memory_reserved(device) / 1048576, 2), instances=len(instances))
-        prepared.update(instances=instances, inference_ms=inference_ms,
-                        chip_anomaly_diagnostics=chip_anomaly_diagnostics)
+                instances = timed_call(
+                    "mask_extract_to_cpu_ms", self._extract_instances,
+                    predictions[0], crop.shape[:2],
+                )
+                chip_anomaly_diagnostics = timed_call(
+                    "efficientad_total_ms", inspector.inspect,
+                    image, instances, crop_box, threshold=prepared.get("threshold"),
+                )
+                device = getattr(model, "device", None)
+                if isinstance(device, torch.device) and device.type == "cuda":
+                    note("gpu_memory", allocated_mb=round(torch.cuda.memory_allocated(device) / 1048576, 2),
+                         reserved_mb=round(torch.cuda.memory_reserved(device) / 1048576, 2),
+                         instances=len(instances), gpu_worker_count=self.gpu_worker_count)
+            prepared.update(instances=instances, inference_ms=inference_ms,
+                            chip_anomaly_diagnostics=chip_anomaly_diagnostics)
+        finally:
+            try:
+                if stream is not None:
+                    sync_started = time.perf_counter()
+                    stream.synchronize()
+                    record_duration("gpu_worker_stream_sync_ms", self.elapsed_ms(sync_started))
+            finally:
+                if return_resource:
+                    self._gpu_worker_slots.put(resource)
 
     def finish_2d_piece(self, prepared: Dict[str, Any], *, publish_cache: bool = True):
         """CPU postprocessing. A concurrent pipeline owns publication when False."""
@@ -962,13 +1104,19 @@ class DetectBoard:
             )
         return crop, box, circle, roi_boxes
 
-    def _predict_batch(self, crops: Sequence[np.ndarray]):
+    def _predict_batch(self, crops: Sequence[np.ndarray], model=None, lock=None):
         parameters = {**self.yolo_parameters, "verbose": False, "retina_masks": True}
-        with self._inference_lock:
-            return list(self.model.predict(source=list(crops), **parameters))
+        model = model if model is not None else self.model
+        lock = lock if lock is not None else self._inference_lock
+        with lock:
+            return list(model.predict(source=list(crops), **parameters))
 
-    def _synchronize_model(self) -> None:
-        device = getattr(self.model, "device", None)
+    def _synchronize_model(self, model=None, stream=None) -> None:
+        if stream is not None:
+            stream.synchronize()
+            return
+        model = model if model is not None else self.model
+        device = getattr(model, "device", None)
         if isinstance(device, torch.device) and device.type == "cuda":
             torch.cuda.synchronize(device)
 
@@ -1030,11 +1178,12 @@ class DetectBoard:
                     "is_valid": False, "is_ok": False, "mask_ratio": 0.0, "rectangle": []
                 }
                 continue
-            cleaned = _geometry.clean_mask(
+            cleaned, mask_offset = _geometry.clean_mask_crop(
                 mask, min_area=self.min_component_area, kernel_size=5
             )
             rectangle = _geometry.constrained_rectangle(
-                cleaned, roi_boxes, min_ratio=self.rectangle_ratio_threshold
+                cleaned, roi_boxes, min_ratio=self.rectangle_ratio_threshold,
+                mask_offset=mask_offset,
             ) if np.any(cleaned) else None
             if rectangle is None:
                 bending = {
@@ -1060,7 +1209,9 @@ class DetectBoard:
                     "region_id": len(output) + 1,
                     "instance_id": int(instance["instance_id"]),
                     "class_name": str(instance["class_name"]),
-                    "mask_2d": _mask_geometry(cleaned, offset=crop_box[:2], epsilon=2.0),
+                    "mask_2d": _mask_geometry(
+                        cleaned, offset=offset + mask_offset, epsilon=2.0
+                    ),
                     "bending_2d": bending,
                 }
             )
@@ -1539,8 +1690,13 @@ class DetectBoard:
         }
 
     def release(self) -> None:
+        for resource in self._gpu_worker_resources[1:]:
+            resource["inspector"].release()
+        self._gpu_worker_resources = []
+        self._gpu_worker_slots = queue.Queue()
         self.model = None
         self.model_path = None
+        self.model_paths = {}
         self.config_path = None
         self.config = {}
         self.circle_crop_config = None
@@ -1572,9 +1728,12 @@ def _mask_geometry(
     area = int(np.count_nonzero(binary))
     if area == 0:
         return {"area_px": 0, "bounding_box": [], "contours": []}
-    ys, xs = np.nonzero(binary)
+    x, y, width, height = cv2.boundingRect(binary)
     ox, oy = int(offset[0]), int(offset[1])
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(
+        binary[y:y + height, x:x + width], cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE, offset=(x, y),
+    )
     serialized = []
     for contour in contours:
         approximate = cv2.approxPolyDP(contour, epsilon, closed=True).reshape(-1, 2)
@@ -1585,10 +1744,10 @@ def _mask_geometry(
     return {
         "area_px": area,
         "bounding_box": [
-            int(xs.min()) + ox,
-            int(ys.min()) + oy,
-            int(xs.max()) + 1 + ox,
-            int(ys.max()) + 1 + oy,
+            x + ox,
+            y + oy,
+            x + width + ox,
+            y + height + oy,
         ],
         "contours": serialized,
     }

@@ -117,18 +117,26 @@ $env:BRIDGE_BOARD_TIMEOUT_SECONDS = "900"
 ### 流式并发的线程预算
 
 服务将 CPU 后处理（含银浆 SIFT）放到独立线程池，输入准备、深度解码和联合 3D
-计算使用另一个 CPU 线程池。GPU 仍只有一个工作线程。后处理任务在线程池队列中
-等待，不用信号量占住准备/3D 工作线程；排队时间记录为 `cpu_postprocess_queue_ms`。
+计算使用另一个 CPU 线程池。GPU 推理工作线程数可配置；统一板级检测为每个工作线程
+加载独立 YOLO 与 EfficientAD 模型副本。后处理任务在线程池队列中等待，不用信号量占住
+准备/3D 工作线程；排队时间记录为 `cpu_postprocess_queue_ms`。
 
-| 环境变量 | 默认值 | 用途 |
+| 配置项 / 环境变量 | 默认值 | 用途 |
 | --- | --- | --- |
-| `BRIDGE_MAX_WORKERS` | `13` | 三个工作线程池的总预算，范围 2～13；不含协议、过期检查和库内部线程 |
-| `BRIDGE_POSTPROCESS_WORKERS` | `min(3, max(1, BRIDGE_MAX_WORKERS - 2))` | 重型 CPU 后处理并发数；至少为准备/联合 3D 保留一个线程 |
+| 配置 `config/3D/config.json` 的 `common_3d.parameters.threading.worker_budget` | 14 | 当前配置的工作线程池总预算；最小为 2，代码不设硬编码上限 |
+| 配置 config/3D/config.json 的 common_3d.parameters.threading.cpu_workers | 7 | 输入准备、深度处理和联合 3D 共用 CPU 线程数 |
+| 配置 config/2D/config.json 的 common_2d.parameters.threading.postprocess_workers | 5 | 重型 CPU 后处理并发数 |
+| 配置 `config/2D/config.json` 的 `common_2d.parameters.threading.gpu_workers` | 2 | GPU 推理工作线程数；统一板级检测中每个线程使用独立模型副本 |
+| `BRIDGE_MAX_WORKERS` / `BRIDGE_CPU_WORKERS` / `BRIDGE_POSTPROCESS_WORKERS` / `BRIDGE_GPU_WORKERS` | 对应配置或回退值 | 临时覆盖项；阶段配置优先，线程池总数仍须满足 `worker_budget` |
 | `BRIDGE_NATIVE_THREADS` | `1` | 服务启动、导入数值库之前，为 OpenBLAS/OpenMP/MKL 设置默认线程数 |
 
-总预算为 13 时默认分配为 **9 个准备/联合 3D + 3 个后处理 + 1 个 GPU** 工作线程。
-总预算为 2 时，准备/3D 与后处理共享一个 CPU 工作线程，另一个用于 GPU。
-`BRIDGE_POSTPROCESS_WORKERS` 必须介于 1 和 `max(1, BRIDGE_MAX_WORKERS - 2)` 之间。
+增加 GPU 推理并发时，同时修改 2D 配置的 `common_2d.parameters.threading.gpu_workers` 和 3D 配置的 `common_3d.parameters.threading.worker_budget`。例如 2 路 GPU、7 路 CPU、5 路后处理时，`worker_budget` 需设为 14。多个 GPU 工作线程仅适用于统一板级检测；独立 2D/3D 旧接口仍限制为 1 路。
+
+当前阶段配置分配为 **7 个准备/联合 3D + 5 个后处理 + 2 个 GPU** 工作线程（总预算 14）。
+CPU 线程数由 3D 配置控制，因为同一个 CPU 池同时执行 2D 准备、3D 深度读取和联合测量；
+后处理和 GPU 线程数由 2D 配置控制。各线程池大小之和不能超过 `worker_budget`；代码不对该预算设置 13 的上限。
+预算为 2 且各池采用最小分配时，准备/3D 与后处理共享一个 CPU 工作线程，另一个用于 GPU。
+环境变量只在对应阶段配置缺省时作为回退值；阶段配置优先。GPU 工作线程数每增加一路，服务会额外加载一份 YOLO 与 EfficientAD 模型副本。
 检测分辨率、SIFT 特征数量及匹配质量阈值不随线程预算变化。
 
 已有 `OPENBLAS_NUM_THREADS`、`OMP_NUM_THREADS`、`MKL_NUM_THREADS` 配置优先于
@@ -143,7 +151,7 @@ $env:BRIDGE_BOARD_TIMEOUT_SECONDS = "900"
 | 原版：12 个 CPU 工作线程共享全部阶段 | 78.101 s | 42.427 s |
 | 独立后处理 2 路，库内部默认 1 线程 | 43.610 s | 39.131 s |
 | 独立后处理 4 路，库内部默认 1 线程 | 40.270 s | 38.216 s |
-| 独立后处理 3 路（默认），库内部默认 1 线程 | 39.505 s | 37.439 s、37.036 s |
+| 独立后处理 3 路（之前的默认值），库内部默认 1 线程 | 39.505 s | 37.439 s、37.036 s |
 
 原始日志分别保存在 `output/thread-baseline-20261014`、
 `output/thread-optimized-p2-20261015`、`output/thread-optimized-p4-20261015` 和
@@ -152,6 +160,29 @@ $env:BRIDGE_BOARD_TIMEOUT_SECONDS = "900"
 按片号对齐后，对比 `is_ok`、`is_valid`、配准有效性、状态和缺陷面积等 9340 个字段，
 变化仅出现在银浆配准的回退状态。原版两批的回退片数为 2、5，默认配置三批均为 3；
 缺陷判定及缺陷面积一致。SIFT/FLANN/RANSAC 仍存在运行间波动，不能据此认定边界精度完全等价。
+
+### CPU 后处理降排队与局部计算优化
+
+为减少后处理工作线程占用时间，本地实现了三项不改检测阈值的优化：
+
+- 连续性扇区统计由每个扇区多次扫描/分配整块掩码，改为一次计算扇区索引后用 `bincount` 聚合。
+- 引线形态学与连通域判断仅处理实例包围框加足够形态学边界的局部图块；坐标恢复后轮廓、弯曲率和 ROI 分配与整图路径一致。
+- 几何包围框使用 OpenCV 直接求取，轮廓也只在前景包围框内提取。
+
+共 67 项单元测试通过；另与改动前算法做了 50 组连续性统计逐字段/掩码对照。相同样本逐片比较引线、ROI、芯片旋转、银浆连续性/溢出和 `is_ok`，未发现输出变化。
+
+线程池对照在相同 10 片、模型已加载条件下：
+
+| 配置 | 热运行整批 | CPU 后处理排队平均/最大 | CPU 后处理执行平均 |
+| --- | ---: | ---: | ---: |
+| 改动前，后处理 3 路 | 36.152 s | 6.698 / 18.879 s | 7.249 s/片 |
+| 计算优化，后处理 3 路 | 33.129 s | 5.116 / 14.507 s | 6.241 s/片 |
+| 计算优化，后处理 4 路 | 31.957 s | 3.485 / 9.886 s | 7.189 s/片 |
+| 计算优化，后处理 5 路（当前默认） | 30.759 s、28.877 s | 1.826 / 4.582 s；1.892 / 4.170 s | 7.499 s/片；7.879 s/片 |
+
+5 路使尾部排队显著下降，但并未使每片 CPU 执行时间随线程增加而下降；多线程争用和目标图 SIFT 波动仍影响执行时间。该 CPU 后处理设置针对本机 12 核 CPU 和这批样本，不保证其他机器最优，可在两份阶段配置中调整，或用环境变量临时覆盖。上表的后处理实测是在 13 线程总预算下完成；当前配置预算为 14。
+基线及结果日志保存在 `output/cpu-postprocess-baseline-20261015`、
+`output/cpu-postprocess-optimized-20261015` 和 `output/cpu-postprocess-final-p5-20261015`。
 
 ### 详细耗时日志：定位排队、GPU 等待和 CPU 后处理
 
@@ -184,7 +215,7 @@ HTML 中展开“配准、参考平面与阶段耗时”可查看选中片的 2D
 
 | 阶段 | 字段 |
 | --- | --- |
-| 线程池排队 | `cpu_prepare_queue_ms`, `gpu_queue_ms`, `cpu_postprocess_queue_ms`, `joint_queue_ms` |
+| 线程池排队 | `cpu_prepare_queue_ms`, `gpu_queue_ms`, `gpu_model_slot_wait_ms`, `cpu_postprocess_queue_ms`, `joint_queue_ms` |
 | 2D 输入与 ROI | `input_shared_memory_read_ms`, `input_image_decode_ms`, `circle_find_ms`, `roi_copy_ms` |
 | YOLO | `cuda_before_yolo_ms`, `yolo_predict_wall_ms`, `cuda_after_yolo_ms`, `mask_extract_to_cpu_ms`，以及框架返回的 `yolo_reported_preprocess_ms`, `yolo_reported_inference_ms`, `yolo_reported_postprocess_ms` |
 | 芯片外观 | `efficientad_chip_rectify_ms`, `efficientad_preprocess_ms`, `efficientad_forward_enqueue_ms`, `efficientad_cuda_after_ms`, `efficientad_score_and_response_ms` |
