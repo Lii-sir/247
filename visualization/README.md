@@ -114,6 +114,45 @@ $env:BRIDGE_BOARD_TIMEOUT_SECONDS = "900"
 产品 NG 不阻止下一批；协议/检测请求失败则保留已有结果并停止后续批次。
 不指定 `--repeat` 时仍只运行一次，保留原有 `result.json`、`report.html` 输出路径。
 
+### 流式并发的线程预算
+
+服务将 CPU 后处理（含银浆 SIFT）放到独立线程池，输入准备、深度解码和联合 3D
+计算使用另一个 CPU 线程池。GPU 仍只有一个工作线程。后处理任务在线程池队列中
+等待，不用信号量占住准备/3D 工作线程；排队时间记录为 `cpu_postprocess_queue_ms`。
+
+| 环境变量 | 默认值 | 用途 |
+| --- | --- | --- |
+| `BRIDGE_MAX_WORKERS` | `13` | 三个工作线程池的总预算，范围 2～13；不含协议、过期检查和库内部线程 |
+| `BRIDGE_POSTPROCESS_WORKERS` | `min(3, max(1, BRIDGE_MAX_WORKERS - 2))` | 重型 CPU 后处理并发数；至少为准备/联合 3D 保留一个线程 |
+| `BRIDGE_NATIVE_THREADS` | `1` | 服务启动、导入数值库之前，为 OpenBLAS/OpenMP/MKL 设置默认线程数 |
+
+总预算为 13 时默认分配为 **9 个准备/联合 3D + 3 个后处理 + 1 个 GPU** 工作线程。
+总预算为 2 时，准备/3D 与后处理共享一个 CPU 工作线程，另一个用于 GPU。
+`BRIDGE_POSTPROCESS_WORKERS` 必须介于 1 和 `max(1, BRIDGE_MAX_WORKERS - 2)` 之间。
+检测分辨率、SIFT 特征数量及匹配质量阈值不随线程预算变化。
+
+已有 `OPENBLAS_NUM_THREADS`、`OMP_NUM_THREADS`、`MKL_NUM_THREADS` 配置优先于
+`BRIDGE_NATIVE_THREADS`；这些设置在服务进程启动时生效。`init` 响应的 `threading`
+字段包含线程池分配和这三个环境变量值，保存在 `startup.json` 中。变量值不是对
+已加载库实际线程数的运行时采样。OpenCV 沿用 YOLO 初始化后的单线程设置。
+
+本机 i7-12700KF、约 16 GB 内存、相同 10 片样本的对照（均启用模板特征缓存）：
+
+| 调度方式 | 首批检测，含输入准备、不含初始化 | 复用模型后的检测 |
+| --- | --- | --- |
+| 原版：12 个 CPU 工作线程共享全部阶段 | 78.101 s | 42.427 s |
+| 独立后处理 2 路，库内部默认 1 线程 | 43.610 s | 39.131 s |
+| 独立后处理 4 路，库内部默认 1 线程 | 40.270 s | 38.216 s |
+| 独立后处理 3 路（默认），库内部默认 1 线程 | 39.505 s | 37.439 s、37.036 s |
+
+原始日志分别保存在 `output/thread-baseline-20261014`、
+`output/thread-optimized-p2-20261015`、`output/thread-optimized-p4-20261015` 和
+`output/thread-optimized-p3-20261015`，汇总为 `output/thread-comparison-20261015.json`。
+这是少量连续样本对照，首次推理、系统缓存及负载会影响耗时，不能当作稳定的收益比例。
+按片号对齐后，对比 `is_ok`、`is_valid`、配准有效性、状态和缺陷面积等 9340 个字段，
+变化仅出现在银浆配准的回退状态。原版两批的回退片数为 2、5，默认配置三批均为 3；
+缺陷判定及缺陷面积一致。SIFT/FLANN/RANSAC 仍存在运行间波动，不能据此认定边界精度完全等价。
+
 ### 详细耗时日志：定位排队、GPU 等待和 CPU 后处理
 
 ```powershell

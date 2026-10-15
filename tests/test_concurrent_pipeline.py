@@ -8,12 +8,13 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
 sys.path.insert(0, str(ROOT / "tests"))
 from algorithm.board_pipeline import BoardPipeline
-from transport.bridge_server import AlgorithmServer
+from transport.bridge_server import AlgorithmServer, configure_native_threads
 from transport.shared_memory import SharedImage
 from pipeline_fakes import FakeDetector
 
@@ -21,14 +22,17 @@ from pipeline_fakes import FakeDetector
 class PipelineTests(unittest.TestCase):
     def setUp(self):
         self.cpu = ThreadPoolExecutor(max_workers=12)
+        self.postprocess = ThreadPoolExecutor(max_workers=2)
         self.gpu = ThreadPoolExecutor(max_workers=1)
         self.detector = FakeDetector()
-        self.pipeline = BoardPipeline(self.detector, self.cpu, self.gpu, timeout_seconds=1)
+        self.pipeline = BoardPipeline(self.detector, self.cpu, self.gpu, timeout_seconds=1,
+                                      postprocess_pool=self.postprocess)
 
     def tearDown(self):
         self.detector.gpu_gate.set()
         self.pipeline.close()
         self.gpu.shutdown(wait=True)
+        self.postprocess.shutdown(wait=True)
         self.cpu.shutdown(wait=True)
 
     def pieces(self, board="A", **kwargs):
@@ -71,6 +75,66 @@ class PipelineTests(unittest.TestCase):
         self.detector.gpu_gate.set()
         self.assertTrue(all(f.result(3)["ok"] for f in requests))
         self.assertTrue(board.result(3)["ok"])
+
+    def test_heavy_postprocessing_is_bounded_without_blocking_gpu_or_depth(self):
+        gate = threading.Event()
+        occupied = threading.Event()
+        all_inferred = threading.Event()
+        counters_lock = threading.Lock()
+        active = peak = inferred = 0
+        original_finish = self.detector.finish_2d_piece
+        original_infer = self.detector.infer_2d_piece
+
+        def finish(prepared, **kwargs):
+            nonlocal active, peak
+            with counters_lock:
+                active += 1
+                peak = max(peak, active)
+                if active == 2:
+                    occupied.set()
+            try:
+                if not gate.wait(3):
+                    raise TimeoutError("test postprocess gate not opened")
+                return original_finish(prepared, **kwargs)
+            finally:
+                with counters_lock:
+                    active -= 1
+
+        def infer(prepared):
+            nonlocal inferred
+            original_infer(prepared)
+            with counters_lock:
+                inferred += 1
+                if inferred == 10:
+                    all_inferred.set()
+
+        with patch.object(self.detector, "finish_2d_piece", side_effect=finish), \
+                patch.object(self.detector, "infer_2d_piece", side_effect=infer):
+            try:
+                requests = self.pieces()
+                self.assertTrue(occupied.wait(1))
+                # GPU work and depth preparation continue while both heavy
+                # workers are busy; excess work stays in the executor queue.
+                self.assertTrue(all_inferred.wait(1))
+                board = self.pipeline.submit_3d(dict(board_id="A"))
+                self.assertTrue(self.detector.depth_started.wait(1))
+                self.assertFalse(board.done())
+            finally:
+                gate.set()
+            self.assertTrue(all(f.result(3)["ok"] for f in requests))
+            self.assertTrue(board.result(3)["ok"])
+        self.assertEqual(peak, 2)
+        self.assertEqual(self.detector.max_gpu_active, 1)
+        self.assertEqual(self.detector.closed_inputs, 10)
+
+    def test_postprocessing_failure_releases_input_and_allows_retry(self):
+        with patch.object(self.detector, "finish_2d_piece", side_effect=ValueError("postprocess failed")):
+            response = self.pipeline.submit_2d(dict(board_id="A", piece_id=1)).result(2)
+        self.assertFalse(response["ok"])
+        self.assertEqual(self.detector.closed_inputs, 1)
+        response = self.pipeline.submit_2d(dict(board_id="A", piece_id=1)).result(2)
+        self.assertTrue(response["ok"])
+        self.assertEqual(self.detector.closed_inputs, 2)
 
     def test_cross_board_results_never_mix(self):
         boards = [self.pipeline.submit_3d(dict(board_id=name)) for name in ("A", "B")]
@@ -142,6 +206,76 @@ class PipelineTests(unittest.TestCase):
         board = self.pipeline.submit_3d(dict(board_id="B"))
         self.pipeline.submit_2d(dict(board_id="B", piece_id=1, fail_joint=True)).result(2)
         self.assertEqual(board.result(2)["error"], "joint_detection_failed")
+
+
+class ThreadBudgetTests(unittest.TestCase):
+    def test_native_defaults_respect_explicit_library_settings(self):
+        with patch.dict(os.environ, {"BRIDGE_NATIVE_THREADS": "2", "OMP_NUM_THREADS": "3"}, clear=True):
+            configure_native_threads()
+            self.assertEqual(os.environ["OMP_NUM_THREADS"], "3")
+            self.assertEqual(os.environ["OPENBLAS_NUM_THREADS"], "2")
+            self.assertEqual(os.environ["MKL_NUM_THREADS"], "2")
+
+    def test_default_native_threads_and_invalid_values(self):
+        with patch.dict(os.environ, {}, clear=True):
+            configure_native_threads()
+            self.assertEqual(os.environ["OPENBLAS_NUM_THREADS"], "1")
+        for value in ("0", "-1", "not-an-int"):
+            with self.subTest(value=value), patch.dict(os.environ, {"BRIDGE_NATIVE_THREADS": value}):
+                with self.assertRaises(ValueError):
+                    configure_native_threads()
+
+    def test_thread_budget_and_minimum_shared_pool(self):
+        for workers in (2, 3, 13):
+            with self.subTest(workers=workers), patch.dict(os.environ, {
+                "BRIDGE_MAX_WORKERS": str(workers),
+            }, clear=True):
+                server = AlgorithmServer()
+                try:
+                    info = server.handle_init({})["threading"]
+                    total = info["gpu_workers"] + info["cpu_workers"]
+                    if not info["postprocess_pool_shared"]:
+                        total += info["postprocess_workers"]
+                    self.assertEqual(total, workers)
+                    self.assertEqual(info["gpu_workers"], 1)
+                    self.assertIs(server.postprocess_pool is server.cpu_pool, workers == 2)
+                finally:
+                    server.close()
+
+    def test_small_budgets_complete_the_entire_pipeline(self):
+        for workers in (2, 3):
+            with self.subTest(workers=workers), patch.dict(os.environ, {
+                "BRIDGE_MAX_WORKERS": str(workers),
+            }, clear=True):
+                server = AlgorithmServer()
+                server.board = FakeDetector()
+                try:
+                    pipeline = server.get_pipeline()
+                    board = pipeline.submit_3d(dict(board_id="small"))
+                    requests = [pipeline.submit_2d(dict(board_id="small", piece_id=pid))
+                                for pid in range(1, 11)]
+                    self.assertTrue(all(f.result(3)["ok"] for f in requests))
+                    self.assertTrue(board.result(3)["ok"])
+                    self.assertEqual(server.board.closed_inputs, 10)
+                finally:
+                    server.close()
+
+    def test_configurable_postprocessing_count_and_invalid_budget(self):
+        with patch.dict(os.environ, {"BRIDGE_MAX_WORKERS": "13", "BRIDGE_POSTPROCESS_WORKERS": "4"}):
+            server = AlgorithmServer()
+            try:
+                self.assertEqual(server.threading_info["cpu_workers"], 8)
+                self.assertEqual(server.threading_info["postprocess_workers"], 4)
+                server.board = FakeDetector()
+                self.assertIs(server.get_pipeline().postprocess_pool, server.postprocess_pool)
+            finally:
+                server.close()
+        for value in ("0", "-1", "12", "bad"):
+            with self.subTest(value=value), patch.dict(os.environ, {
+                "BRIDGE_MAX_WORKERS": "13", "BRIDGE_POSTPROCESS_WORKERS": value,
+            }):
+                with self.assertRaises(ValueError):
+                    AlgorithmServer()
 
 
 class ProtocolTests(unittest.TestCase):

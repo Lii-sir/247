@@ -29,8 +29,9 @@ class _Board:
 
 class BoardPipeline:
     def __init__(self, detector, cpu_pool, gpu_pool, *, timeout_seconds=90.0,
-                 max_pending_boards=16):
+                 max_pending_boards=16, postprocess_pool=None):
         self.detector, self.cpu_pool, self.gpu_pool = detector, cpu_pool, gpu_pool
+        self.postprocess_pool = postprocess_pool if postprocess_pool is not None else cpu_pool
         self.timeout_seconds = timeout_seconds
         self.max_pending_boards = max_pending_boards
         self._lock = threading.RLock()
@@ -136,7 +137,7 @@ class BoardPipeline:
                         return self.detector.finish_2d_piece(prepared, publish_cache=False)
                     finally:
                         self.detector.release_prepared_2d(prepared)
-                self._submit_timed(self.cpu_pool, "cpu_postprocess", detail_timings, board_id,
+                self._submit_timed(self.postprocess_pool, "cpu_postprocess", detail_timings, board_id,
                                    piece_id, req.get("request_id"), finish).add_done_callback(postprocessed)
             except Exception as exc:
                 self.detector.release_prepared_2d(prepared)

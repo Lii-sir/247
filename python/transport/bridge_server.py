@@ -16,6 +16,15 @@ if str(PYTHON_ROOT) not in sys.path:
 from algorithm.timing import timing_context, timed_call, record_duration
 
 
+def configure_native_threads():
+    """Set library defaults before loading NumPy/SciPy/PyTorch in the service process."""
+    threads = int(os.environ.get("BRIDGE_NATIVE_THREADS", "1"))
+    if threads < 1:
+        raise ValueError("BRIDGE_NATIVE_THREADS must be positive")
+    for name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ.setdefault(name, str(threads))
+
+
 class AlgorithmServer:
     def __init__(self):
         # Unified board algorithm is loaded only when it is initialized or used.
@@ -26,8 +35,29 @@ class AlgorithmServer:
         workers = int(os.environ.get("BRIDGE_MAX_WORKERS", "13"))
         if not 2 <= workers <= 13:
             raise ValueError("BRIDGE_MAX_WORKERS must be between 2 and 13")
-        self.cpu_pool = ThreadPoolExecutor(max_workers=workers - 1, thread_name_prefix="bridge-cpu")
+        max_postprocess_workers = max(1, workers - 2)
+        postprocess_workers = int(os.environ.get(
+            "BRIDGE_POSTPROCESS_WORKERS", str(min(3, max_postprocess_workers))))
+        if not 1 <= postprocess_workers <= max_postprocess_workers:
+            raise ValueError("BRIDGE_POSTPROCESS_WORKERS must be between 1 and max(1, BRIDGE_MAX_WORKERS - 2)")
+        # Reserve workers for preparation/depth/joint work so heavy SIFT jobs
+        # cannot occupy every CPU slot. At the minimum budget share one pool.
+        dedicated_postprocess = min(postprocess_workers, workers - 2)
+        self.cpu_pool = ThreadPoolExecutor(
+            max_workers=workers - 1 - dedicated_postprocess, thread_name_prefix="bridge-cpu")
+        self.postprocess_pool = (
+            ThreadPoolExecutor(max_workers=dedicated_postprocess, thread_name_prefix="bridge-postprocess")
+            if dedicated_postprocess else self.cpu_pool
+        )
         self.gpu_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bridge-gpu")
+        self.threading_info = {
+            "cpu_workers": workers - 1 - dedicated_postprocess,
+            "postprocess_workers": postprocess_workers,
+            "postprocess_pool_shared": self.postprocess_pool is self.cpu_pool,
+            "gpu_workers": 1,
+            "native_threads": {key: os.environ.get(key) for key in (
+                "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS")},
+        }
         self.pipeline = None
         self._write_lock = threading.Lock()
         self._pending_lock = threading.Lock()
@@ -46,6 +76,7 @@ class AlgorithmServer:
             "ok": True,
             "cmd": "init",
             "message": "bridge protocol server ready",
+            "threading": self.threading_info,
             "timings": {
                 "total_init_ms": self.elapsed_ms(init_start),
             },
@@ -184,6 +215,7 @@ class AlgorithmServer:
             from algorithm.board_pipeline import BoardPipeline
             self.pipeline = BoardPipeline(
                 self.get_board(), self.cpu_pool, self.gpu_pool,
+                postprocess_pool=self.postprocess_pool,
                 timeout_seconds=float(os.environ.get("BRIDGE_BOARD_TIMEOUT_SECONDS", "90")),
                 max_pending_boards=int(os.environ.get("BRIDGE_MAX_PENDING_BOARDS", "4")))
         return self.pipeline
@@ -272,6 +304,8 @@ class AlgorithmServer:
         if pending:
             wait(pending)
         self.gpu_pool.shutdown(wait=True)
+        if self.postprocess_pool is not self.cpu_pool:
+            self.postprocess_pool.shutdown(wait=True)
         self.cpu_pool.shutdown(wait=True)
 
     def run(self):
@@ -333,4 +367,5 @@ class AlgorithmServer:
 
 
 if __name__ == "__main__":
+    configure_native_threads()
     AlgorithmServer().run()
