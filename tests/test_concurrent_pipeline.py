@@ -398,10 +398,12 @@ class ThreadBudgetTests(unittest.TestCase):
             server = AlgorithmServer()
             try:
                 settings = server._thread_settings(config)
-                self.assertEqual(settings["worker_budget"], 14)
-                self.assertEqual(settings["cpu_workers"], 7)
-                self.assertEqual(settings["postprocess_workers"], 5)
-                self.assertEqual(settings["gpu_workers"], 2)
+                expected_2d = config["common_2d"]["parameters"]["threading"]
+                expected_3d = config["common_3d"]["parameters"]["threading"]
+                self.assertEqual(settings["worker_budget"], expected_3d["worker_budget"])
+                self.assertEqual(settings["cpu_workers"], expected_3d["cpu_workers"])
+                self.assertEqual(settings["postprocess_workers"], expected_2d["postprocess_workers"])
+                self.assertEqual(settings["gpu_workers"], expected_2d["gpu_workers"])
             finally:
                 server.close()
 

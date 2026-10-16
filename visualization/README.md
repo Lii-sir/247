@@ -116,28 +116,41 @@ $env:BRIDGE_BOARD_TIMEOUT_SECONDS = "900"
 
 ### 流式并发的线程预算
 
-服务将 CPU 后处理（含银浆 SIFT）放到独立线程池，输入准备、深度解码和联合 3D
-计算使用另一个 CPU 线程池。GPU 推理工作线程数可配置；统一板级检测为每个工作线程
-加载独立 YOLO 与 EfficientAD 模型副本。后处理任务在线程池队列中等待，不用信号量占住
-准备/3D 工作线程；排队时间记录为 `cpu_postprocess_queue_ms`。
+流式检测现在可使用五个独立线程池：输入准备、GPU 推理、银浆边界配准、2D 后处理、联合 3D。
+银浆 SIFT/匹配不再占用 2D 后处理线程，配准/掩码映射/测高不再占用输入准备线程。
+各分支通过完成回调衔接，不占住工作线程等待另一个分支；同片完整 2D 后处理仍需等待推理和边界准备。
+GPU 每个工作槽使用独立 YOLO 与 EfficientAD 模型副本；两个新增 CPU 池不额外复制 GPU 模型。
 
-| 配置项 / 环境变量 | 默认值 | 用途 |
+| 配置项 / 环境变量 | 当前配置 / 缺省规则 | 用途 |
 | --- | --- | --- |
-| 配置 `config/3D/config.json` 的 `common_3d.parameters.threading.worker_budget` | 14 | 当前配置的工作线程池总预算；最小为 2，代码不设硬编码上限 |
-| 配置 config/3D/config.json 的 common_3d.parameters.threading.cpu_workers | 7 | 输入准备、深度处理和联合 3D 共用 CPU 线程数 |
-| 配置 config/2D/config.json 的 common_2d.parameters.threading.postprocess_workers | 5 | 重型 CPU 后处理并发数 |
-| 配置 `config/2D/config.json` 的 `common_2d.parameters.threading.gpu_workers` | 2 | GPU 推理工作线程数；统一板级检测中每个线程使用独立模型副本 |
-| `BRIDGE_MAX_WORKERS` / `BRIDGE_CPU_WORKERS` / `BRIDGE_POSTPROCESS_WORKERS` / `BRIDGE_GPU_WORKERS` | 对应配置或回退值 | 临时覆盖项；阶段配置优先，线程池总数仍须满足 `worker_budget` |
+| 配置 `config/3D/config.json` 的 `common_3d.parameters.threading.worker_budget` | 50 | 当前配置的工作线程池总预算；最小为 2，代码不设硬编码上限 |
+| `common_3d.parameters.threading.cpu_workers`（3D 配置） | 5 | `bridge-cpu`：2D 输入读取/解码/ROI 准备、推理后联合几何准备、整板深度读取/分片 |
+| `common_3d.parameters.threading.joint_workers`（3D 配置，新增） | 5 | `bridge-joint`：单片粗配准、仿射/透视配准、掩码映射、测高 |
+| `common_2d.parameters.threading.postprocess_workers`（2D 配置） | 5 | `bridge-postprocess`：完整 2D 诊断、银浆溢出/连续性判断、结果整理；不含提前计算的边界配准 |
+| `common_2d.parameters.threading.silver_workers`（2D 配置，新增） | 5 | `bridge-silver`：银浆边界 SIFT 特征提取、匹配、RANSAC、模板点映射/回退 |
+| 配置 `config/2D/config.json` 的 `common_2d.parameters.threading.gpu_workers` | 3 | GPU 推理工作线程数；统一板级检测中每个线程使用独立模型副本 |
+| `common_3d.parameters.threading.early_joint_workers` | 省略，等于 `joint_workers` | 每板 2D 诊断未全部完成时，允许提前提交且尚未完成的联合 3D 任务上限；正整数且不超过 `joint_workers`；不是第六个线程池 |
+| `BRIDGE_MAX_WORKERS` / `BRIDGE_CPU_WORKERS` / `BRIDGE_POSTPROCESS_WORKERS` / `BRIDGE_GPU_WORKERS` | 对应配置缺省时回退 | JSON 配置优先，环境变量不覆盖已有 JSON 值 |
+| `BRIDGE_SILVER_WORKERS` / `BRIDGE_JOINT_WORKERS`（新增） | 对应配置缺省时回退 | 显式设置会启用独立银浆/联合 3D 池，并计入线程预算 |
 | `BRIDGE_NATIVE_THREADS` | `1` | 服务启动、导入数值库之前，为 OpenBLAS/OpenMP/MKL 设置默认线程数 |
 
-增加 GPU 推理并发时，同时修改 2D 配置的 `common_2d.parameters.threading.gpu_workers` 和 3D 配置的 `common_3d.parameters.threading.worker_budget`。例如 2 路 GPU、7 路 CPU、5 路后处理时，`worker_budget` 需设为 14。多个 GPU 工作线程仅适用于统一板级检测；独立 2D/3D 旧接口仍限制为 1 路。
+当前配置是 **5 准备 + 3 GPU + 5 银浆边界 + 5 后处理 + 5 联合 3D = 23 个工作槽**，上限预算保留为 50。
+`worker_budget` 是校验上限，不会自动创建 50 个工作线程，也不包括数值库内部线程和服务辅助线程。
+五池独立时须满足 `cpu_workers + gpu_workers + silver_workers + postprocess_workers + joint_workers <= worker_budget`。
+全部计数必须为正整数；多路 GPU 只适用于统一板级检测，旧版独立 2D/3D 接口仍限 1 路。
 
-当前阶段配置分配为 **7 个准备/联合 3D + 5 个后处理 + 2 个 GPU** 工作线程（总预算 14）。
-CPU 线程数由 3D 配置控制，因为同一个 CPU 池同时执行 2D 准备、3D 深度读取和联合测量；
-后处理和 GPU 线程数由 2D 配置控制。各线程池大小之和不能超过 `worker_budget`；代码不对该预算设置 13 的上限。
-预算为 2 且各池采用最小分配时，准备/3D 与后处理共享一个 CPU 工作线程，另一个用于 GPU。
-环境变量只在对应阶段配置缺省时作为回退值；阶段配置优先。GPU 工作线程数每增加一路，服务会额外加载一份 YOLO 与 EfficientAD 模型副本。
-检测分辨率、SIFT 特征数量及匹配质量阈值不随线程预算变化。
+兼容旧配置：某个新增键及其环境变量都缺省时，该池不单独创建；银浆复用后处理池，联合 3D 复用准备池，预算只统计唯一的池。
+旧配置预算为 2 时仍支持准备/后处理共享 1 线程、GPU 1 线程。显式启用独立池则必须提供足够预算。
+未显式配置准备/后处理数量时，自动分配先预留新增独立池的预算，再分配剩余容量。
+
+修改后应重启 Python 服务并初始化 board，或在服务空闲且没有缓存待配对板时重新执行初始化；不支持文件自动热重载。
+以 `init_algorithm` 返回的 `threading` 为最终生效值；`init` 只反映调用时的设置（首次初始化前是环境变量/内置缺省值）。
+`silver_pool_shared=false`、`joint_pool_shared=false` 表示启用独立池。
+日志中可检查线程名前缀 `bridge-silver_*`、`bridge-joint_*`；阶段名仍为 `silver_prepare`、`joint`、`cpu_postprocess`，
+排队耗时分别为 `silver_prepare_queue_ms`、`joint_queue_ms`、`cpu_postprocess_queue_ms`。
+整板响应仍等待全部 2D 诊断与联合 3D 结果完成；共享图像保持到读图分支全部结束再释放。
+仅拆分调度资源，不更改检测分辨率、SIFT 特征数、匹配阈值、回退边界、判定逻辑或对外接口。
+5/5 是可调整的初始设置，不保证为任意 CPU/32GB 内存/32GB 显存组合的最优值，须根据吞吐、排队及内存峰值测试调整。
 
 已有 `OPENBLAS_NUM_THREADS`、`OMP_NUM_THREADS`、`MKL_NUM_THREADS` 配置优先于
 `BRIDGE_NATIVE_THREADS`；这些设置在服务进程启动时生效。`init` 响应的 `threading`
@@ -219,13 +232,13 @@ HTML 中展开“配准、参考平面与阶段耗时”可查看选中片的 2D
 | 2D 输入与 ROI | `input_shared_memory_read_ms`, `input_image_decode_ms`, `circle_find_ms`, `roi_copy_ms` |
 | YOLO | `cuda_before_yolo_ms`, `yolo_predict_wall_ms`, `cuda_after_yolo_ms`, `mask_extract_to_cpu_ms`，以及框架返回的 `yolo_reported_preprocess_ms`, `yolo_reported_inference_ms`, `yolo_reported_postprocess_ms` |
 | 芯片外观 | `efficientad_chip_rectify_ms`, `efficientad_preprocess_ms`, `efficientad_forward_enqueue_ms`, `efficientad_cuda_after_ms`, `efficientad_score_and_response_ms` |
-| 银浆边界 | `silver_template_read_decode_ms`, `silver_template_hash_ms`, `silver_template_sift_ms`, `silver_target_sift_ms`, `silver_flann_match_ms`, `silver_ransac_ms` |
+| 银浆边界 | `silver_prepare_phase_ms`, `silver_boundary_build_ms`, `silver_template_read_decode_ms`, `silver_template_hash_ms`, `silver_template_sift_ms`, `silver_target_sift_ms`, `silver_flann_match_ms`, `silver_ransac_ms` |
 | 银浆检测 | `silver_overflow_measure_ms`, `silver_continuity_measure_ms` |
 | 联合 3D | `coarse_registration_ms`, `affine_registration_ms`, `perspective_registration_ms`, `mask_alignment_ms`, `height_measurement_ms` |
 | 高度子步骤 | `height_fit_platform_plane_ms`, `height_fit_chip_plane_ms`, `height_wire_regions_ms`, `height_solder_ms` |
 | 协议输出，仅日志 | `response_json_encode_ms`, `response_write_lock_wait_ms`, `response_pipe_write_ms` |
 
-`matching_input_wait_ms` 表示一方数据已就绪后等待另一方的时间，不占用工作线程。
+`matching_input_wait_ms` 表示一方数据已就绪后等待另一方的时间，不占用工作线程。`silver_prepare_phase_ms` 是与 GPU 推理并行的图像边界准备分支；`silver_total_ms` 是银浆边界准备与掩码判断工作的累计值，不是单独的后处理墙钟时间。
 `shared_memory_read_decode_ms` 现在仅统计实际输入读取/解码，不再把 ROI/平台掩码算入其中。
 所有计时单位为毫秒；父阶段包含子阶段、多片可能重叠，不能将全部字段相加。
 YOLO 框架返回的三项耗时不一定覆盖首次 warmup/初始化等整个 `predict()` 调用开销；

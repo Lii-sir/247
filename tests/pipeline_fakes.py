@@ -65,12 +65,26 @@ class FakeDetector:
             with self.lock:
                 self.gpu_active -= 1
 
-    def finish_2d_piece(self, prepared, *, publish_cache):
+    def finish_2d_piece(self, prepared, *, publish_cache, on_joint_ready=None):
         assert not publish_cache
+        if on_joint_ready is not None:
+            on_joint_ready(dict(prepared))
         response = dict(ok=True, cmd="detect_2d_piece", stage="2d",
                         board_id=prepared["board_id"], piece_id=prepared["piece_id"],
                         results_2d=dict(is_ok=True), marker=prepared.get("marker"))
         return response, dict(prepared)
+
+    @staticmethod
+    def prepare_silver_boundary(prepared):
+        return None
+
+    @staticmethod
+    def prepare_joint_piece(prepared):
+        return dict(prepared)
+
+    @staticmethod
+    def finalize_joint_piece(piece, entry):
+        return piece
 
     def release_prepared_2d(self, prepared):
         with self.lock:

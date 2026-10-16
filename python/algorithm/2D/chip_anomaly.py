@@ -177,8 +177,14 @@ def rectified_chip_crop(
 
 
 def _chip_contour_points(mask: np.ndarray, offset: Sequence[int]) -> np.ndarray:
-    binary = (np.asarray(mask) > 0).astype(np.uint8)
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    source = np.asarray(mask)
+    binary = source if source.dtype == np.uint8 else (source > 0).astype(np.uint8)
+    x, y, width, height = cv2.boundingRect(binary)
+    if not width or not height:
+        raise ValueError("chip mask has fewer than three contour points")
+    contours, _ = cv2.findContours(
+        binary[y:y + height, x:x + width], cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_NONE, offset=(x, y))
     contours = [contour for contour in contours if len(contour) >= 3]
     if not contours:
         raise ValueError("chip mask has fewer than three contour points")

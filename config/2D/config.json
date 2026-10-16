@@ -65,7 +65,8 @@
       },
       "threading": {
         "postprocess_workers": 5,
-        "gpu_workers": 2
+        "silver_workers": 5,
+        "gpu_workers": 3
       }
     }
   },

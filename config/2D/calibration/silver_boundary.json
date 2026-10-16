@@ -1,7 +1,7 @@
 {
   "mode": "polygon",
   "coordinate_system": "template",
-  "template_path": "D:\\python_programs\\LXD_project\\247-likai\\config\\2D\\calibration\\silver_boundary_template.png",
+  "template_path": "silver_boundary_template.png",
   "template_size": [
     5320,
     3032

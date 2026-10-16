@@ -459,6 +459,8 @@ def _measure_chip_component(
     occlusion: np.ndarray,
     settings: ContinuitySettings,
     chip_index: int,
+    *,
+    compact_masks: bool = False,
 ) -> dict[str, Any]:
     height, width = component.shape
     ys, xs = np.nonzero(component)
@@ -470,30 +472,23 @@ def _measure_chip_component(
     outer_x1, outer_x2 = max(0, x1 - distance), min(width, x2 + distance)
     outer_y1, outer_y2 = max(0, y1 - distance), min(height, y2 + distance)
 
-    inner_rectangle = np.zeros_like(component, dtype=bool)
-    inner_rectangle[y1:y2, x1:x2] = True
-    outer_rectangle = np.zeros_like(component, dtype=bool)
-    outer_rectangle[outer_y1:outer_y2, outer_x1:outer_x2] = True
-    ring = outer_rectangle & ~inner_rectangle & ~chip_union
-    if not ring.any():
+    local_slice = np.s_[outer_y1:outer_y2, outer_x1:outer_x2]
+    local_ring = np.ones((outer_y2 - outer_y1, outer_x2 - outer_x1), dtype=bool)
+    local_ring[y1 - outer_y1:y2 - outer_y1, x1 - outer_x1:x2 - outer_x1] = False
+    local_ring &= ~chip_union[local_slice]
+    if not local_ring.any():
         raise ValueError(f"chip component {chip_index} has no valid outer ring")
 
     center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
-    effective_occlusion = ring & occlusion
-    silver_ring = ring & silver
+    local_occlusion = local_ring & occlusion[local_slice]
+    local_silver = local_ring & silver[local_slice]
     # Silver hidden by a configured wire/bond/thin mask still counts as
     # present. Only pixels with neither silver nor an occlusion mask are
     # missing continuity coverage.
-    covered_mask = ring & (silver | occlusion)
-    valid = ring
+    local_covered = local_ring & (silver[local_slice] | occlusion[local_slice])
     # Sector angles are only needed inside this chip's expanded rectangle.
     # Computing them for the whole 5MP camera frame would allocate several
     # hundred MB for every piece in a streaming pipeline.
-    local_slice = np.s_[outer_y1:outer_y2, outer_x1:outer_x2]
-    local_ring = ring[local_slice]
-    local_silver = silver_ring[local_slice]
-    local_covered = covered_mask[local_slice]
-    local_occlusion = effective_occlusion[local_slice]
     # Only ring pixels contribute. Count their sectors once instead of
     # allocating and scanning five masks per sector (normally 72 times).
     ring_y, ring_x = np.nonzero(local_ring)
@@ -554,22 +549,32 @@ def _measure_chip_component(
     local_missing_mask[ring_y, ring_x] = (
         missing_sectors[indices] & ~local_covered[ring_y, ring_x]
     )
-    missing_mask = np.zeros(component.shape, dtype=bool)
-    missing_mask[local_slice] = local_missing_mask
+    masks = {
+        "chip_mask": component[local_slice].copy(),
+        "ring_mask": local_ring,
+        "silver_mask": local_silver,
+        "occlusion_mask": local_occlusion,
+        "missing_mask": local_missing_mask,
+    }
+    if compact_masks:
+        masks["_mask_origin"] = (outer_x1, outer_y1)
+    else:
+        # Preserve the direct helper's existing full-image mask contract.
+        for name, local in list(masks.items()):
+            full = np.zeros(component.shape, dtype=bool)
+            full[local_slice] = local
+            masks[name] = full
+        masks["chip_mask"] = component
     return {
-        "chip_mask": component,
-        "ring_mask": ring,
-        "silver_mask": silver_ring,
-        "occlusion_mask": effective_occlusion,
-        "missing_mask": missing_mask,
+        **masks,
         "center_xy": center,
         "chip_area_px": int(component.sum()),
         "bbox_xyxy": [x1, y1, x2, y2],
         "outer_bbox_xyxy": [outer_x1, outer_y1, outer_x2, outer_y2],
-        "ring_area_px": int(ring.sum()),
-        "silver_area_px": int(silver_ring.sum()),
-        "occluded_area_px": int(effective_occlusion.sum()),
-        "valid_area_px": int(valid.sum()),
+        "ring_area_px": int(local_ring.sum()),
+        "silver_area_px": int(local_silver.sum()),
+        "occluded_area_px": int(local_occlusion.sum()),
+        "valid_area_px": int(local_ring.sum()),
         "covered_sector_count": covered_count,
         "valid_sector_count": valid_count,
         "ignored_sector_count": ignored_count,
@@ -610,15 +615,22 @@ def measure_continuity(
                 occlusion,
                 settings,
                 len(components) + 1,
+                compact_masks=True,
             )
         )
     if not components:
         raise ValueError("no chip component reached min_chip_area_px")
-    chip_mask = np.logical_or.reduce([item["chip_mask"] for item in components])
-    ring_mask = np.logical_or.reduce([item["ring_mask"] for item in components])
-    silver_mask = np.logical_or.reduce([item["silver_mask"] for item in components])
-    occlusion_mask = np.logical_or.reduce([item["occlusion_mask"] for item in components])
-    missing_mask = np.logical_or.reduce([item["missing_mask"] for item in components])
+    # Allocate each public aggregate once instead of retaining five full-frame
+    # intermediates per chip and stacking all of them for logical_or.reduce.
+    mask_names = ("chip_mask", "ring_mask", "silver_mask", "occlusion_mask", "missing_mask")
+    merged = {name: np.zeros(shape, dtype=bool) for name in mask_names}
+    for item in components:
+        x, y = item["_mask_origin"]
+        height, width = item["ring_mask"].shape
+        for name in mask_names:
+            merged[name][y:y + height, x:x + width] |= item[name]
+    chip_mask, ring_mask, silver_mask, occlusion_mask, missing_mask = (
+        merged[name] for name in mask_names)
     centers = np.asarray([item["center_xy"] for item in components], dtype=float)
     weights = np.asarray([item["chip_area_px"] for item in components], dtype=float)
     center = tuple(map(float, np.average(centers, axis=0, weights=weights)))
@@ -627,7 +639,7 @@ def measure_continuity(
             key: value
             for key, value in item.items()
             if key
-            not in {"chip_mask", "ring_mask", "silver_mask", "occlusion_mask", "missing_mask"}
+            not in {"chip_mask", "ring_mask", "silver_mask", "occlusion_mask", "missing_mask", "_mask_origin"}
         }
         for item in components
     ]
@@ -800,6 +812,7 @@ def _registered_template_points(
     boundary: Mapping[str, Any],
     *,
     return_registration: bool = False,
+    target_gray: np.ndarray | None = None,
 ):
     """Map template points per image, optionally using unchanged points on failure."""
     template_path = boundary.get("template_path")
@@ -822,7 +835,8 @@ def _registered_template_points(
     }
     try:
         result = _match_template_points(
-            image, template_features, boundary, registration
+            image, template_features, boundary, registration,
+            target_gray=target_gray,
         )
         Boundary(tuple(result), calibrated.mode).validate_image(image.shape[:2])
     except (ValueError, cv2.error) as exc:
@@ -858,13 +872,18 @@ def _match_template_points(
     template_features: _TemplateFeatureCacheEntry,
     boundary: Mapping[str, Any],
     registration: dict[str, Any],
+    *,
+    target_gray: np.ndarray | None = None,
 ) -> list[tuple[float, float]]:
     """Estimate a fresh transform and preserve matching statistics on failure."""
     points = boundary.get("template_points", boundary.get("points"))
     template_points_features, template_descriptors = timed_call(
         "silver_template_features_ms", _get_template_features, template_features
     )
-    target_gray = timed_call("silver_target_gray_ms", cv2.cvtColor, image, cv2.COLOR_BGR2GRAY)
+    if target_gray is None:
+        target_gray = timed_call("silver_target_gray_ms", cv2.cvtColor, image, cv2.COLOR_BGR2GRAY)
+    elif target_gray.ndim != 2 or target_gray.shape != image.shape[:2]:
+        raise ValueError("precomputed silver target grayscale does not match the source image")
     max_side = int(boundary.get("max_image_side", 2400))
     target_points_features, target_descriptors = timed_call(
         "silver_target_sift_ms", _extract_sift_features,
@@ -938,6 +957,7 @@ def build_boundary(
     circle: Sequence[int] | None,
     image_shape: Sequence[int],
     image: np.ndarray | None = None,
+    target_gray: np.ndarray | None = None,
     base_dir: str | Path | None = None,
 ) -> Boundary | None:
     raw = config.get("boundary") if isinstance(config, Mapping) else None
@@ -966,7 +986,8 @@ def build_boundary(
         if image is None:
             raise ValueError("silver boundary template registration needs the source image")
         mapped, registration = timed_call("silver_template_registration_ms", _registered_template_points,
-                                           image, calibration, return_registration=True)
+                                           image, calibration, return_registration=True,
+                                           target_gray=target_gray)
         points = [
             (float(point[0]) - float(crop_box[0]), float(point[1]) - float(crop_box[1]))
             for point in mapped
@@ -1024,6 +1045,44 @@ def continuity_settings(config: Mapping[str, Any]) -> ContinuitySettings:
     )
 
 
+@dataclass(frozen=True)
+class PreparedBoundary:
+    """Image-only boundary work, safe to compute before YOLO masks exist."""
+    boundary: Boundary | None
+    error: str | None = None
+    calibration_missing: bool = False
+
+
+def prepare_boundary(
+    config: Mapping[str, Any] | None,
+    *,
+    crop_box: Sequence[int],
+    circle: Sequence[float] | None,
+    image_shape: Sequence[int],
+    image: np.ndarray | None = None,
+    target_gray: np.ndarray | None = None,
+    base_dir: str | Path | None = None,
+) -> PreparedBoundary:
+    settings = dict(config or {})
+    overflow = settings.get("overflow")
+    if not isinstance(overflow, Mapping) and not isinstance(settings.get("continuity"), Mapping):
+        return PreparedBoundary(None)
+    overflow = dict(overflow or {})
+    raw = overflow.get("boundary")
+    if isinstance(raw, Mapping) and str(raw.get("mode", "")).strip().casefold() in {
+        "chip_expansion", "chip_expand", "chip"
+    }:
+        return PreparedBoundary(None)
+    try:
+        boundary = timed_call("silver_boundary_build_ms", build_boundary,
+                              overflow, crop_box=crop_box, circle=circle,
+                              image_shape=image_shape, image=image,
+                              target_gray=target_gray, base_dir=base_dir)
+        return PreparedBoundary(boundary)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError, cv2.error) as exc:
+        return PreparedBoundary(None, str(exc), isinstance(exc, CalibrationNotConfiguredError))
+
+
 def inspect_masks(
     instances: Iterable[Mapping[str, Any]],
     image_shape: Sequence[int],
@@ -1032,7 +1091,9 @@ def inspect_masks(
     crop_box: Sequence[int] = (0, 0, 0, 0),
     circle: Sequence[int] | None = None,
     image: np.ndarray | None = None,
+    target_gray: np.ndarray | None = None,
     base_dir: str | Path | None = None,
+    prepared_boundary: PreparedBoundary | None = None,
 ) -> dict[str, Any]:
     """Run overflow and continuity checks on one YOLO result.
 
@@ -1053,8 +1114,6 @@ def inspect_masks(
         }
 
     shape = (int(image_shape[0]), int(image_shape[1]))
-    boundary_error = None
-    calibration_missing = False
     overflow_config = dict(overflow_config or {})
     continuity_config = dict(continuity_config or {})
     raw_boundary = overflow_config.get("boundary")
@@ -1063,22 +1122,13 @@ def inspect_masks(
         and str(raw_boundary.get("mode", "")).strip().casefold()
         in {"chip_expansion", "chip_expand", "chip"}
     )
-    if chip_expansion:
-        boundary = None
-    else:
-        try:
-            boundary = timed_call("silver_boundary_build_ms", build_boundary,
-                overflow_config,
-                crop_box=crop_box,
-                circle=circle,
-                image_shape=shape,
-                image=image,
-                base_dir=base_dir,
-            )
-        except (OSError, ValueError, TypeError, json.JSONDecodeError, cv2.error) as exc:
-            boundary = None
-            boundary_error = str(exc)
-            calibration_missing = isinstance(exc, CalibrationNotConfiguredError)
+    if prepared_boundary is None:
+        prepared_boundary = prepare_boundary(
+            settings, crop_box=crop_box, circle=circle, image_shape=shape,
+            image=image, target_gray=target_gray, base_dir=base_dir)
+    boundary = prepared_boundary.boundary
+    boundary_error = prepared_boundary.error
+    calibration_missing = prepared_boundary.calibration_missing
     boundary_within_crop = None
     if boundary is not None:
         try:

@@ -43,7 +43,7 @@ from algorithm.registration import (
 )
 from algorithm.perspective_registration import estimate_perspective
 from transport.shared_memory import read_shared_memory, SharedImage
-from algorithm.timing import timed_call, measure, note, record_duration
+from algorithm.timing import timed_call, measure, note, record_duration, current_timings
 
 
 _segment = import_module("algorithm.3D.segment")
@@ -392,7 +392,7 @@ class DetectBoard:
                     image=image, crop=crop, crop_box=crop_box, circle=circle,
                     roi_boxes=roi_boxes, registration_mask=registration_mask,
                     read_decode_ms=read_decode_ms, circle_crop_ms=circle_crop_ms, image_owner=owner,
-                    threshold=req.get("threshold"))
+                    threshold=req.get("threshold"), gray_lock=threading.Lock())
 
     @staticmethod
     def release_prepared_2d(prepared):
@@ -477,17 +477,41 @@ class DetectBoard:
                 if return_resource:
                     self._gpu_worker_slots.put(resource)
 
-    def finish_2d_piece(self, prepared: Dict[str, Any], *, publish_cache: bool = True):
-        """CPU postprocessing. A concurrent pipeline owns publication when False."""
-        start, board_id, piece_id = (prepared[key] for key in ("start", "board_id", "piece_id"))
+    def prepare_silver_boundary(self, prepared: Dict[str, Any]):
+        """Image-only registration can overlap inference on the same source."""
+        return _silver_inspection.prepare_boundary(
+            self.silver_config, crop_box=prepared["crop_box"], circle=prepared["circle"],
+            image_shape=prepared["crop"].shape[:2], image=prepared["image"],
+            target_gray=self._prepared_gray_image(prepared),
+            base_dir=self._silver_config_base_dir())
+
+    @staticmethod
+    def _prepared_gray_image(prepared: Dict[str, Any]) -> np.ndarray:
+        # Silver SIFT and later 3D registration consume the same source gray.
+        # Compute it once regardless of which parallel branch reaches it first.
+        image = prepared.get("gray_image")
+        if image is not None:
+            return image
+        lock = prepared.get("gray_lock")
+        if lock is None:
+            image = prepared["gray_image"] = cv2.cvtColor(prepared["image"], cv2.COLOR_BGR2GRAY)
+            return image
+        with lock:
+            image = prepared.get("gray_image")
+            if image is None:
+                image = timed_call("cache_gray_image_ms", cv2.cvtColor,
+                                   prepared["image"], cv2.COLOR_BGR2GRAY)
+                prepared["gray_image"] = image
+            return image
+
+    def prepare_joint_piece(self, prepared: Dict[str, Any]) -> Dict[str, Any]:
+        """Build immutable joint inputs after inference, before heavy diagnostics."""
+        piece_id = prepared["piece_id"]
         image, crop, crop_box, circle, roi_boxes = (
             prepared[key] for key in ("image", "crop", "crop_box", "circle", "roi_boxes"))
         registration_mask = prepared["registration_mask"]
-        read_decode_ms, circle_crop_ms, inference_ms = (
-            prepared[key] for key in ("read_decode_ms", "circle_crop_ms", "inference_ms"))
         instances = prepared["instances"]
         chip_anomaly_diagnostics = prepared["chip_anomaly_diagnostics"]
-        postprocess_start = time.perf_counter()
         wire_measurements = timed_call("wire_bending_ms", self._measure_2d_wire_instances,
             instances, roi_boxes, crop_box
         )
@@ -497,23 +521,9 @@ class DetectBoard:
         chip_diagnostics = timed_call("chip_rotation_ms", _chip_alignment.measure_chip_alignment,
             instances, self.chip_alignment_config, crop_box[:2]
         )
-        diagnostics = timed_call("silver_total_ms", _silver_inspection.inspect_masks,
-            instances,
-            crop.shape[:2],
-            self.silver_config,
-            crop_box=crop_box,
-            circle=circle,
-            image=image,
-            base_dir=self._silver_config_base_dir(),
-        )
-        diagnostics = timed_call("silver_geometry_offset_ms", _silver_inspection.offset_geometry, diagnostics, crop_box[:2])
-        postprocess_ms = self.elapsed_ms(postprocess_start)
-
         entry = {
             "piece_id": piece_id,
-            # Retain only grayscale pixels needed for perspective fitting;
-            # dropping the original BGR image avoids ~32 MB per piece.
-            "gray_image": timed_call("cache_gray_image_ms", cv2.cvtColor, image, cv2.COLOR_BGR2GRAY),
+            "gray_image": self._prepared_gray_image(prepared),
             "image_shape": [int(image.shape[1]), int(image.shape[0])],
             "crop_box": tuple(int(value) for value in crop_box),
             "circle": circle,
@@ -524,10 +534,48 @@ class DetectBoard:
             "wire_roi_checks": wire_roi_checks,
             "chip_rotation_2d": chip_diagnostics,
             "chip_anomaly_2d": chip_anomaly_diagnostics,
-            "silver_overflow_2d": diagnostics["silver_overflow"],
-            "silver_continuity_2d": diagnostics["disconnection"],
             "received_at": time.time(),
         }
+        prepared["joint_entry"] = entry
+        return {**entry, "instances": [dict(item) for item in instances]}
+
+    def finish_2d_piece(self, prepared: Dict[str, Any], *, publish_cache: bool = True,
+                        on_joint_ready=None):
+        """Publish full 2D results only after all independent branches finish."""
+        start, board_id, piece_id = (prepared[key] for key in ("start", "board_id", "piece_id"))
+        image, crop, crop_box, circle, roi_boxes = (
+            prepared[key] for key in ("image", "crop", "crop_box", "circle", "roi_boxes"))
+        read_decode_ms, circle_crop_ms, inference_ms = (
+            prepared[key] for key in ("read_decode_ms", "circle_crop_ms", "inference_ms"))
+        postprocess_start = time.perf_counter()
+        if "joint_entry" not in prepared:
+            self.prepare_joint_piece(prepared)
+        entry = prepared["joint_entry"]
+        instances = entry["instances"]
+        wire_measurements, wire_roi_checks = entry["wire_measurements"], entry["wire_roi_checks"]
+        chip_diagnostics, chip_anomaly_diagnostics = entry["chip_rotation_2d"], entry["chip_anomaly_2d"]
+        if on_joint_ready is not None:
+            on_joint_ready({**entry, "instances": [dict(item) for item in instances]})
+        diagnostics = timed_call("silver_mask_checks_ms", _silver_inspection.inspect_masks,
+            instances,
+            crop.shape[:2],
+            self.silver_config,
+            crop_box=crop_box,
+            circle=circle,
+            image=image,
+            base_dir=self._silver_config_base_dir(),
+            prepared_boundary=prepared.get("silver_boundary"),
+        )
+        # Preserve total silver *work* despite registration moving to another
+        # branch. This aggregate is not the postprocess wall time or a new wait.
+        silver_timings = current_timings()
+        record_duration("silver_total_ms", silver_timings.get("silver_mask_checks_ms", 0.0)
+                        + silver_timings.get("silver_prepare_phase_ms", 0.0))
+        diagnostics = timed_call("silver_geometry_offset_ms", _silver_inspection.offset_geometry, diagnostics, crop_box[:2])
+        postprocess_ms = self.elapsed_ms(postprocess_start)
+
+        entry.update(silver_overflow_2d=diagnostics["silver_overflow"],
+                     silver_continuity_2d=diagnostics["disconnection"])
         replaced = False
         cache_state = {}
         if publish_cache:
@@ -730,6 +778,30 @@ class DetectBoard:
             crop_box=entry.get("crop_box", self.crop_roi),
             circle=entry.get("circle"),
         )
+        public_masks = timed_call("public_3d_geometry_ms", lambda: [self._public_instance(item) for item in aligned_masks])
+        result = timed_call("height_points_to_board_ms", height_points_to_board, {
+            "piece_id": piece_id,
+            "image_2d_size": entry["image_shape"],
+            "crop_2d": list(entry.get("crop_box", self.crop_roi)),
+            "wire_rois_2d": [list(roi) for roi in entry.get("roi_boxes", self.wire_rois)],
+            "wire_roi_checks": entry.get("wire_roi_checks", []),
+            "depth_start_row": y1,
+            "depth_end_row": y2,
+            "registration": registration,
+            "is_ok": bool(
+                measurement["is_ok"]
+                and all(item.get("is_ok") is True for item in entry.get("wire_roi_checks", []))
+            ),
+            "reference_planes": measurement["reference_planes"],
+            "wire_measurements": measurement["wire_measurements"],
+            "solder_measurements": measurement["solder_measurements"],
+            "masks": public_masks,
+        })
+        return self.finalize_joint_piece(result, entry)
+
+    @staticmethod
+    def finalize_joint_piece(piece: Dict[str, Any], entry: Dict[str, Any]) -> Dict[str, Any]:
+        """Join completed diagnostics without mutating an in-flight 3D result."""
         diagnostics_ok = all(
             check.get("is_ok") is True
             for check in (
@@ -750,29 +822,13 @@ class DetectBoard:
             )
             if isinstance(check, dict)
         )
-        public_masks = timed_call("public_3d_geometry_ms", lambda: [self._public_instance(item) for item in aligned_masks])
-        return timed_call("height_points_to_board_ms", height_points_to_board, {
-            "piece_id": piece_id,
-            "image_2d_size": entry["image_shape"],
-            "crop_2d": list(entry.get("crop_box", self.crop_roi)),
-            "wire_rois_2d": [list(roi) for roi in entry.get("roi_boxes", self.wire_rois)],
-            "wire_roi_checks": entry.get("wire_roi_checks", []),
-            "depth_start_row": y1,
-            "depth_end_row": y2,
-            "registration": registration,
-            "is_ok": bool(
-                measurement["is_ok"]
-                and all(item.get("is_ok") is True for item in entry.get("wire_roi_checks", []))
-                and (not diagnostics_present or diagnostics_ok)
-            ),
-            "reference_planes": measurement["reference_planes"],
-            "wire_measurements": measurement["wire_measurements"],
-            "solder_measurements": measurement["solder_measurements"],
+        return {
+            **piece,
+            "is_ok": bool(piece["is_ok"] and (not diagnostics_present or diagnostics_ok)),
             "chip_anomaly_2d": entry.get("chip_anomaly_2d", {"status": "disabled", "is_ok": None}),
             "silver_overflow_2d": entry.get("silver_overflow_2d", {"status": "disabled", "is_ok": None}),
             "silver_continuity_2d": entry.get("silver_continuity_2d", {"status": "disabled", "is_ok": None}),
-            "masks": public_masks,
-        })
+        }
 
     def handle_release_board(self, req: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -1637,9 +1693,17 @@ class DetectBoard:
         best_chip = None
         best_area = None
         for chip in chips:
-            chip_region = _filled_external_region(chip["_mask_2d_array"])
+            # Aligned chip dicts belong to one measurement task. Multiple
+            # bond/thin endpoints reuse this unchanged external region.
+            chip_region = chip.get("_filled_chip_region_2d")
+            if chip_region is None:
+                chip_region = _filled_external_region(chip["_mask_2d_array"])
+                chip["_filled_chip_region_2d"] = chip_region
             if chip_region[center_y, center_x]:
-                area = int(np.count_nonzero(chip_region))
+                area = chip.get("_filled_chip_area_2d")
+                if area is None:
+                    area = int(np.count_nonzero(chip_region))
+                    chip["_filled_chip_area_2d"] = area
                 if best_area is None or area < best_area:
                     best_chip, best_area = chip, area
         return best_chip, best_chip is not None
@@ -1724,8 +1788,11 @@ def _mask_geometry(
     offset: Sequence[int],
     epsilon: float,
 ) -> Dict[str, Any]:
-    binary = (np.asarray(mask) > 0).astype(np.uint8) * 255
-    area = int(np.count_nonzero(binary))
+    source = np.asarray(mask)
+    # YOLO/aligned uint8 masks already encode foreground by nonzero values.
+    # Contouring is read-only; avoid another full-frame normalization copy.
+    binary = source if source.dtype == np.uint8 else (source > 0).astype(np.uint8)
+    area = int(cv2.countNonZero(binary))
     if area == 0:
         return {"area_px": 0, "bounding_box": [], "contours": []}
     x, y, width, height = cv2.boundingRect(binary)

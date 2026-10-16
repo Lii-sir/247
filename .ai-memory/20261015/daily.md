@@ -23,3 +23,7 @@ Split CPU postprocessing into a bounded independent pool; default 9 preparation/
 - 实现：统一板级检测按 GPU 工作线程加载独立 YOLO / EfficientAD 副本；流按 YOLO 配置设备创建，兼容模型首次推理前仍在 CPU 的延迟设备迁移。同步更新配置说明和流程页；独立 2D/3D 旧接口仍限 1 路 GPU。
 - 验证：Python `unittest discover` 75 项通过，包含模拟 GPU 模型副本隔离、并发、显式/auto 设备流选择和 13 以上线程预算测试；未运行真实样本、GPU 推理或硬件压测。
 - 风险：多副本峰值显存、硬件吞吐和检测一致性尚未实机验证。
+## [23:50] 动作: Python 并行优化第一阶段
+- 文件/决策: board_pipeline.py 增加 2D 诊断与 3D 联合计算分支；silver_inspection.py 增加边界预处理；height_measurement.py 使用局部参考面区域；detect_board.py 合并最终诊断结论并缓存芯片区域；线程配置新增 early_joint_workers 读取。
+- 验证: Python tests 91 项通过，visualization tests 26 项通过；最终 4 批真实流式测试成功，批次墙钟 25.402/27.577/31.378/26.334 秒，10/10 片、配准有效。
+- 限制: 真实样本存在运行波动，未宣称固定加速比例；上位机未改；下一步按受控线程配比继续基准。

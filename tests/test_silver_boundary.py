@@ -66,6 +66,30 @@ class SilverBoundaryTests(unittest.TestCase):
         self.assertGreaterEqual(registration["inliers"], 8)
         self.assertLess(registration["reprojection_error_px"], 1.5)
 
+    def test_prepared_boundary_is_reused_with_identical_diagnostics(self):
+        kwargs = dict(crop_box=(0, 0, 480, 360), circle=None,
+                      image_shape=(360, 480), image=self.template, base_dir=self.root)
+        config = dict(overflow=self.config)
+        prepared = silver.prepare_boundary(config, **kwargs)
+        masks = [dict(class_name="silver", mask=np.ones((360, 480), np.uint8))]
+        expected = silver.inspect_masks(masks, (360, 480), config,
+                                       **{k: v for k, v in kwargs.items() if k != "image_shape"})
+        with patch.object(silver, "build_boundary", side_effect=AssertionError("boundary recomputed")):
+            actual = silver.inspect_masks(masks, (360, 480), config,
+                                          prepared_boundary=prepared,
+                                          **{k: v for k, v in kwargs.items() if k != "image_shape"})
+        self.assertEqual(actual, expected)
+
+    def test_prepared_missing_calibration_preserves_not_configured_status(self):
+        self.json_path.unlink()
+        prepared = silver.prepare_boundary(dict(overflow=self.config),
+            crop_box=(0, 0, 480, 360), circle=None, image_shape=(360, 480),
+            image=self.template, base_dir=self.root)
+        result = silver.inspect_masks([], (360, 480), dict(overflow=self.config),
+                                      prepared_boundary=prepared)
+        self.assertEqual(result["silver_overflow"]["status"], "not_configured")
+        self.assertIsNone(result["silver_overflow"]["is_ok"])
+
     def test_uncalibrated_does_not_pass_or_use_chip_expansion(self):
         self.calibration["template_points"] = []
         self.json_path.write_text(json.dumps(self.calibration), encoding="utf-8")

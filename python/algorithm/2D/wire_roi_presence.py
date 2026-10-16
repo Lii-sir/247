@@ -19,6 +19,7 @@ def check_wire_roi_presence(
     ]
     ox, oy = int(offset[0]), int(offset[1])
     output = []
+    by_id = {int(item.get("instance_id", 0)): item for item in candidates}
     roi_pixel_counts: list[list[tuple[int, int]]] = [[] for _ in roi_boxes]
     roi_instance_ids: list[list[int]] = [[] for _ in roi_boxes]
     for item in candidates:
@@ -43,7 +44,6 @@ def check_wire_roi_presence(
         x1, y1, x2, y2 = (int(value) for value in raw_box)
         assigned = roi_instance_ids[index - 1]
         mask_pixels = sum(count for _, count in roi_pixel_counts[index - 1])
-        by_id = {int(item.get("instance_id", 0)): item for item in candidates}
         bending_checks = []
         for instance_id in assigned:
             bending = by_id[instance_id].get("bending_2d") or {}

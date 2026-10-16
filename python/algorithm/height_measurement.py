@@ -193,18 +193,26 @@ def fit_local_platform_plane(
     exclusion = np.asarray(exclude_mask)
     if exclusion.shape != depth.shape:
         raise ValueError("exclude_mask must have the same shape as depth")
-    if not np.any(target) or config.platform_local_ring_px <= 0:
+    x, y, width, height = cv2.boundingRect(target)
+    if width == 0 or config.platform_local_ring_px <= 0:
         return None
     radius = int(config.platform_local_ring_px)
-    outer = cv2.dilate(target, _ellipse_kernel(radius)) > 0
     inner_radius = max(1, int(config.semantic_exclusion_dilation_px))
-    inner = cv2.dilate(target, _ellipse_kernel(inner_radius)) > 0
-    ring = outer & ~inner & (exclusion == 0) & _valid_depth(depth, config)
+    # Retain the complete morphology halo, including image-edge clipping.
+    # Fitting still uses original piece coordinates and original row order.
+    margin = max(radius, inner_radius)
+    x0, y0 = max(0, x - margin), max(0, y - margin)
+    x1, y1 = min(depth.shape[1], x + width + margin), min(depth.shape[0], y + height + margin)
+    local_target = target[y0:y1, x0:x1]
+    outer = cv2.dilate(local_target, _ellipse_kernel(radius)) > 0
+    inner = cv2.dilate(local_target, _ellipse_kernel(inner_radius)) > 0
+    ring = (outer & ~inner & (exclusion[y0:y1, x0:x1] == 0)
+            & _valid_depth(depth[y0:y1, x0:x1], config))
     ys, xs = np.nonzero(ring)
     if len(xs) < config.plane_min_valid_points:
         return None
     try:
-        return _fit_plane_points(depth, xs, ys, config, "local_wire_platform")
+        return _fit_plane_points(depth, xs + x0, ys + y0, config, "local_wire_platform")
     except ValueError:
         return None
 
@@ -253,8 +261,9 @@ def measure_mask_height(
     max_height_mm: float | None = None,
 ) -> Dict[str, Any]:
     """Measure the high percentile depth point above a fitted reference plane."""
-    valid = (np.asarray(mask) > 0) & _valid_depth(depth, config)
-    ys, xs = np.nonzero(valid)
+    ys, xs = np.nonzero(np.asarray(mask) > 0)
+    valid = _valid_depth(depth[ys, xs], config)
+    ys, xs = ys[valid], xs[valid]
     if len(xs) == 0:
         return {
             "reference": reference,

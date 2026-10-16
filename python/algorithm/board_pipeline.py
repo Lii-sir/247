@@ -14,6 +14,7 @@ class _Board:
     board_id: str
     touched: float = field(default_factory=time.monotonic)
     entries: dict = field(default_factory=dict)
+    joint_entries: dict = field(default_factory=dict)
     inflight: set = field(default_factory=set)
     claimed: set = field(default_factory=set)
     results: dict = field(default_factory=dict)
@@ -29,11 +30,17 @@ class _Board:
 
 class BoardPipeline:
     def __init__(self, detector, cpu_pool, gpu_pool, *, timeout_seconds=90.0,
-                 max_pending_boards=16, postprocess_pool=None):
+                 max_pending_boards=16, postprocess_pool=None,
+                 silver_pool=None, joint_pool=None, early_joint_workers=1):
         self.detector, self.cpu_pool, self.gpu_pool = detector, cpu_pool, gpu_pool
         self.postprocess_pool = postprocess_pool if postprocess_pool is not None else cpu_pool
+        self.silver_pool = silver_pool if silver_pool is not None else self.postprocess_pool
+        self.joint_pool = joint_pool if joint_pool is not None else cpu_pool
         self.timeout_seconds = timeout_seconds
         self.max_pending_boards = max_pending_boards
+        if isinstance(early_joint_workers, bool) or not isinstance(early_joint_workers, int) or early_joint_workers < 1:
+            raise ValueError("early_joint_workers must be a positive integer")
+        self.early_joint_workers = early_joint_workers
         self._lock = threading.RLock()
         self._boards: dict[str, _Board] = {}
 
@@ -98,6 +105,10 @@ class BoardPipeline:
                 state = self._board(board_id)
                 if piece_id in state.inflight or piece_id in state.claimed:
                     raise ValueError("piece is already being processed; use a new board_id for a new scan")
+                # A completed, unclaimed piece can be replaced. Do not pair a
+                # new 3D scan with its previous generation while reprocessing.
+                state.entries.pop(piece_id, None)
+                state.joint_entries.pop(piece_id, None)
                 state.inflight.add(piece_id)
         except (ValueError, TypeError) as exc:
             return self._completed(self._failure(board_id, "invalid_piece", str(exc), piece_id))
@@ -109,6 +120,10 @@ class BoardPipeline:
             with self._lock:
                 if self._current(state):
                     state.inflight.discard(piece_id)
+                    state.joint_entries.pop(piece_id, None)
+                    if piece_id in state.claimed:
+                        self._terminate(state, self._failure(
+                            board_id, "2d_piece_failed", f"piece {piece_id}: {exc}"))
             response = self._failure(board_id, "2d_piece_failed", str(exc), piece_id)
             response["timings"] = dict(detail_timings)
             output.set_result(response)
@@ -125,35 +140,93 @@ class BoardPipeline:
                     state.touched = time.monotonic()
                     response["cache_state"] = self._cache_state(state)
                     self._schedule_ready(state)
+                    self._complete_if_ready(state)
                 output.set_result(response)
             except Exception as exc:
-                failed(exc)
-
-        def inferred(future, prepared):
-            try:
-                future.result()
-                def finish():
-                    try:
-                        return self.detector.finish_2d_piece(prepared, publish_cache=False)
-                    finally:
-                        self.detector.release_prepared_2d(prepared)
-                self._submit_timed(self.postprocess_pool, "cpu_postprocess", detail_timings, board_id,
-                                   piece_id, req.get("request_id"), finish).add_done_callback(postprocessed)
-            except Exception as exc:
-                self.detector.release_prepared_2d(prepared)
                 failed(exc)
 
         def prepared(future):
             value = None
             try:
                 value = future.result()
-                self._submit_timed(self.gpu_pool, "gpu", detail_timings, board_id, piece_id,
-                                   req.get("request_id"), self.detector.infer_2d_piece, value).add_done_callback(
-                    lambda result: inferred(result, value))
             except Exception as exc:
-                if value is not None:
-                    self.detector.release_prepared_2d(value)
                 failed(exc)
+                return
+
+            # No executor worker waits on sibling futures. The launch guard
+            # keeps an immediately completed branch from releasing the source
+            # before its sibling has even been submitted.
+            branch_lock = threading.Lock()
+            remaining = 1
+            errors = []
+            branch_timings = {}
+
+            def branch_finished():
+                nonlocal remaining
+                with branch_lock:
+                    remaining -= 1
+                    ready = remaining == 0
+                if not ready:
+                    return
+                for timings in branch_timings.values():
+                    detail_timings.update(timings)
+                if errors:
+                    try:
+                        self.detector.release_prepared_2d(value)
+                    finally:
+                        failed(errors[0])
+                    return
+
+                def finish():
+                    try:
+                        return self.detector.finish_2d_piece(value, publish_cache=False)
+                    finally:
+                        self.detector.release_prepared_2d(value)
+
+                try:
+                    self._submit_timed(self.postprocess_pool, "cpu_postprocess", detail_timings,
+                                       board_id, piece_id, req.get("request_id"), finish
+                                       ).add_done_callback(postprocessed)
+                except Exception as exc:
+                    self.detector.release_prepared_2d(value)
+                    failed(exc)
+
+            def completed_branch(phase, result):
+                try:
+                    data = result.result()
+                    if phase == "gpu":
+                        launch("geometry", self.cpu_pool, self.detector.prepare_joint_piece)
+                    elif phase == "silver_prepare":
+                        value["silver_boundary"] = data
+                    elif phase == "geometry":
+                        with self._lock:
+                            if not self._current(state):
+                                raise RuntimeError("board was released or expired during 2D processing")
+                            data["_2d_ready_at"] = time.perf_counter()
+                            state.joint_entries[piece_id] = data
+                            self._schedule_ready(state)
+                except Exception as exc:
+                    with branch_lock:
+                        errors.append(exc)
+                finally:
+                    branch_finished()
+
+            def launch(phase, pool, function):
+                nonlocal remaining
+                with branch_lock:
+                    remaining += 1
+                    timings = branch_timings[phase] = {}
+                try:
+                    job = self._submit_timed(pool, phase, timings, board_id, piece_id,
+                                             req.get("request_id"), function, value)
+                except Exception as exc:
+                    job = Future()
+                    job.set_exception(exc)
+                job.add_done_callback(lambda result: completed_branch(phase, result))
+
+            launch("silver_prepare", self.silver_pool, self.detector.prepare_silver_boundary)
+            launch("gpu", self.gpu_pool, self.detector.infer_2d_piece)
+            branch_finished()
 
         self._submit_timed(self.cpu_pool, "cpu_prepare", detail_timings, board_id, piece_id,
                            req.get("request_id"), self.detector.prepare_2d_piece, req).add_done_callback(prepared)
@@ -214,13 +287,18 @@ class BoardPipeline:
             return
         for piece in state.pieces:
             piece_id = int(piece["piece_id"])
-            if piece_id not in state.entries or piece_id in state.claimed:
+            if piece_id not in state.joint_entries or piece_id in state.claimed:
                 continue
+            # Keep heavy 3D from overwhelming still-running 2D diagnostics.
+            # Once every 2D entry is complete, use the full joint executor.
+            if (len(state.entries) < self.detector.expected_piece_count
+                    and len(state.claimed) - len(state.results) >= self.early_joint_workers):
+                break
             state.claimed.add(piece_id)
-            entry = state.entries[piece_id]
+            entry = state.joint_entries[piece_id]
             pair_wait = abs(state.depth_ready_at - entry.get("_2d_ready_at", state.depth_ready_at)) * 1000
             timings = {"matching_input_wait_ms": pair_wait}
-            future = self._submit_timed(self.cpu_pool, "joint", timings, state.board_id, piece_id,
+            future = self._submit_timed(self.joint_pool, "joint", timings, state.board_id, piece_id,
                                        state.request_id, self.detector.measure_prepared_piece,
                                        piece_id, entry, state.depth, piece)
             future.add_done_callback(lambda result, pid=piece_id: self._measured(state, pid, result))
@@ -233,24 +311,33 @@ class BoardPipeline:
                     return
                 state.results[piece_id] = piece
                 state.touched = time.monotonic()
-                if len(state.results) == self.detector.expected_piece_count:
-                    results = [state.results[pid] for pid in sorted(state.results)]
-                    elapsed = (time.perf_counter() - state.started) * 1000
-                    response = dict(ok=True, cmd="detect_3d_board", stage="3d",
-                                    board_id=state.board_id, batch_id=state.board_id,
-                                    results_board=dict(
-                                        registration_ok=all(p["registration"]["is_valid"] for p in results),
-                                        is_ok=all(p["registration"]["is_valid"] and p["is_ok"] for p in results),
-                                        pieces=results),
-                                    released=dict(board_id=state.board_id,
-                                                  released_2d_count=len(state.entries), released_3d=True),
-                                    elapsed_ms=elapsed,
-                                    timings={**state.timings, "total_detect_ms": elapsed},
-                                    message="concurrent board assembly complete")
-                    self._terminate(state, response)
+                self._schedule_ready(state)
+                self._complete_if_ready(state)
         except Exception as exc:
             with self._lock:
                 self._terminate(state, self._failure(state.board_id, "joint_detection_failed", str(exc)))
+
+    def _complete_if_ready(self, state):
+        # Called under the state lock. A measurement may finish before heavy
+        # 2D diagnostics, but neither partial results nor partial OKs are public.
+        count = self.detector.expected_piece_count
+        if len(state.results) != count or len(state.entries) != count or state.inflight:
+            return
+        results = [self.detector.finalize_joint_piece(state.results[pid], state.entries[pid])
+                   for pid in sorted(state.results)]
+        elapsed = (time.perf_counter() - state.started) * 1000
+        response = dict(ok=True, cmd="detect_3d_board", stage="3d",
+                        board_id=state.board_id, batch_id=state.board_id,
+                        results_board=dict(
+                            registration_ok=all(p["registration"]["is_valid"] for p in results),
+                            is_ok=all(p["registration"]["is_valid"] and p["is_ok"] for p in results),
+                            pieces=results),
+                        released=dict(board_id=state.board_id,
+                                      released_2d_count=len(state.entries), released_3d=True),
+                        elapsed_ms=elapsed,
+                        timings={**state.timings, "total_detect_ms": elapsed},
+                        message="concurrent board assembly complete")
+        self._terminate(state, response)
 
     def _terminate(self, state, response):
         if not self._current(state):

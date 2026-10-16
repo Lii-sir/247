@@ -31,8 +31,11 @@ def measure_chip_alignment(
         mask = np.asarray(instance.get("mask"), dtype=np.uint8)
         if mask.ndim != 2 or cv2.countNonZero(mask) < min_area:
             continue
-        binary = (mask > 0).astype(np.uint8) * 255
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        binary = mask if mask.dtype == np.uint8 else (mask > 0).astype(np.uint8)
+        x, y, box_width, box_height = cv2.boundingRect(binary)
+        contours, _ = cv2.findContours(
+            binary[y:y + box_height, x:x + box_width],
+            cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE, offset=(x, y))
         contours = [contour for contour in contours if cv2.contourArea(contour) > 0]
         if not contours:
             continue
