@@ -6,10 +6,18 @@
 - `common_2d.parameters`：圆搜索、检测裁剪、板级 2D 兜底裁剪/引线 ROI、
   竖向分割、掩码和 YOLO 参数。
 - `wire_bending_2d.parameters`：引线/细线 ROI 和弯曲度阈值。
+
 - `silver_continuity_2d.parameters`：银浆断连/联通参数。
 - `silver_overflow_2d.parameters`：预标定多边形经 SIFT/RANSAC 配准后的银浆允许边界、容差和最小缺陷面积。
 - `chip_rotation_2d.parameters`：芯片外接矩形角度阈值。
 - `chip_anomaly_2d.parameters`：芯片外观异常和 EfficientAD 模型区间映射。
+
+引线弯曲使用清理后的单个 `wire/thin` 实例，在重叠像素最多的 ROI 中寻找两端与边界的接触区间，
+各取两个端点连接成评估四边形。ROI 为 `[x1,x2) × [y1,y2)`，右/下边界像素为 `x2-1/y2-1`。
+覆盖率为 `该实例在 ROI 和四边形交集内的像素数 / 该实例在 ROI 内的像素数`；
+`rectangle_ratio_threshold` 仍为通过下限（含等号），保留当前 0.75 作为初值，需按样本重新校准。
+`rectangle` 字段兼容保留，实际为四边形四个有序顶点。交点不足、多个端口或四点退化时直接判无效/NG，
+不回退旋转矩形。每个 ROI 必须有引线且其全部实例合格，整体才合格。
 
 芯片长宽比定义为 `long_side / short_side`。`aspect_ratio_models` 使用明确的
 数组对象，例如 `{"range": [0.9, 1.1], "model": "chip_short"}`。区间不能

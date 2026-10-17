@@ -48,3 +48,9 @@
 - Evidence: 119 Python tests including 24 split-pool cases; 26 visualization tests; AST/JSON and git diff --check pass. Real 2D raw BGR: 30/30 requests, windows 17.301/12.940/11.931s. Real 2D+3D: 3 batches with 10 pieces and valid registration each, input-inclusive times 26.731/23.206/22.909s. Logs show silver peak5, joint peak5, GPU software task peak3. Second-batch key 2D decisions/statuses match prior optimized output.
 - Files: python/algorithm/board_pipeline.py; python/transport/bridge_server.py; config/2D/config.json; config/3D/config.json; tests/test_split_stage_pools.py; visualization/README.md. Evidence at visualization/output/split-pools-2d-20261016-085649 and visualization/output/split-pools-joint-20261016-085811 (verification.json).
 - Remaining/blockers: none for the two requested pool separations. No controlled same-turn baseline, peak RAM/VRAM, or CUDA kernel concurrency proof; do not claim fixed speedup or target-machine optimality. Existing user changes and before-2d-optimization-20261016 stash preserved; DLL/C# untouched this task.
+
+## ROI four-intersection wire bending (2026-10-17)
+- Completed: shared quadrilateral construction, per-instance ROI denominator, diagnostics and consistent ROI assignment in both 2D entry points and joint height fallback; DTO source and parameter docs updated.
+- Evidence: 134 algorithm + 26 report tests passed; Bridge Debug/Release builds passed; real 10-piece sample completed, 72 2D ratios and 52 joint cached measurements verified. Artifacts: visualization/output/wire-bending-validation-20261017/.
+- Remaining: no implementation work; sample-label threshold calibration advised. Existing 0.75 threshold and user config/DLL edits preserved.
+- Limits: five silver SIFT allocation failures triggered configured fallback during the real batch. src/ remains ignored by existing repository rules; DTO edits are local and compiled under src/Bridge/bin, root DLL preserved.

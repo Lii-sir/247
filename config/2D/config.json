@@ -64,9 +64,9 @@
         "end2end": true
       },
       "threading": {
-        "postprocess_workers": 5,
-        "silver_workers": 5,
-        "gpu_workers": 3
+        "postprocess_workers": 10,
+        "silver_workers": 10,
+        "gpu_workers": 10
       }
     }
   },

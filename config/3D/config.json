@@ -6,9 +6,9 @@
         "piece_count": 10
       },
       "threading": {
-        "worker_budget": 50,
-        "cpu_workers": 5,
-        "joint_workers": 5
+        "worker_budget": 60,
+        "cpu_workers": 10,
+        "joint_workers": 10
       }
     }
   },

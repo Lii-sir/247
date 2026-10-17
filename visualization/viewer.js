@@ -5,6 +5,7 @@
   const state = {
     selected: Number(data.pieces?.[0]?.piece_id || 1),
     showMasks: true,
+    showBending: true,
     showRois: true,
     showPoints: true,
     showLabels: true,
@@ -36,6 +37,92 @@
     if (key === "silver") return "#c291e9";
     return "#a7b5c7";
   };
+
+  // Prefer all immediate 2D measurements; enrich them with matching heights.
+  // Joint measurements alone omit wires without a height region.
+  function wireMeasurements(piece) {
+    const two = result2dOfPiece(piece);
+    const merged = new Map();
+    for (const item of piece?.wire_measurements || []) merged.set(Number(item.instance_id), { ...item });
+    for (const source of [two.wire_bending_2d?.measurements, two.wire_measurements]) {
+      for (const item of source || []) {
+        const id = Number(item.instance_id);
+        merged.set(id, { ...merged.get(id), ...item });
+      }
+    }
+    for (const item of two.instances || []) {
+      if (!["wire", "thin"].includes(String(item.class_name).toLowerCase())) continue;
+      const id = Number(item.instance_id);
+      if (!merged.has(id)) merged.set(id, { ...item });
+    }
+    return [...merged.values()];
+  }
+
+  function bendingView(bend) {
+    if (!bend) return { text: "未提供", ok: null, color: "#97a6ba", reason: "未返回弯曲测量", ratio: "—" };
+    if (bend.status === "outside_rois") return { text: "ROI 外", ok: null, color: "#97a6ba", reason: "不参与弯曲判定", ratio: "—" };
+    const reasons = { empty_mask: "掩码清理失败", insufficient_intersections: "交点不足",
+      ambiguous_intersections: "交点存在歧义", degenerate_shape: "评估形状退化",
+      bending_out_of_range: "覆盖率低于阈值", ok: "覆盖率达标" };
+    const valid = bend.is_valid !== false;
+    const ok = valid ? bend.is_ok : false;
+    return { text: valid ? statusText(ok) : "NG · 无效", ok,
+      color: ok === true ? "#65d8b1" : ok === false ? "#ff6b7a" : "#97a6ba",
+      reason: reasons[bend.status] || (valid ? "—" : "测量无效"),
+      ratio: valid && bend.mask_ratio != null && Number.isFinite(Number(bend.mask_ratio)) ? `${number(bend.mask_ratio * 100, 1)}%` : "—" };
+  }
+
+  function focusWire(piece, item) {
+    state.highlight = { id: Number(item.instance_id), kind: "wire" };
+    const bounds = item.mask_2d?.bounding_box;
+    if (bounds?.length === 4 && piece?.overlay_2d_valid !== false) {
+      const [x1, y1, x2, y2] = bounds.map(Number);
+      const rect = $("canvas2d").getBoundingClientRect();
+      const scale = Math.max(.005, Math.min(rect.width / Math.max(x2-x1+160, 1), rect.height / Math.max(y2-y1+160, 1), 4));
+      Object.assign(state.views.canvas2d, { scale, x: rect.width/2-(x1+x2)*scale/2,
+        y: rect.height/2-(y1+y2)*scale/2, fitted: true });
+    }
+    renderAll();
+    $("canvas2d").scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+
+  function drawBending(ctx, piece) {
+    const labels = [];
+    for (const item of wireMeasurements(piece)) {
+      const view = bendingView(item.bending_2d);
+      const selected = state.highlight?.kind === "wire" && state.highlight.id === Number(item.instance_id);
+      drawGeometry(ctx, item.mask_2d, view.color, selected);
+      if (item.bending_2d?.is_valid !== false) {
+        polygon(ctx, item.bending_2d?.rectangle, view.color, selected ? 4 : 2.8, selected);
+      }
+      const bounds = item.mask_2d?.bounding_box;
+      const anchor = bounds?.length ? bounds : item.bending_2d?.rectangle?.[0];
+      if (anchor) labels.push({ x: Number(anchor[0]), y: Number(anchor[1]), color: view.color,
+        text: `${item.class_name || "wire"} #${item.instance_id} ${view.text}${view.ratio !== "—" ? ` · ${view.ratio}` : ""}` });
+    }
+    // Separate nearby labels while keeping leader lines attached to each wire.
+    const occupied = [];
+    const scale = ctx.viewerScale || 1;
+    for (const label of labels.sort((a, b) => a.y-b.y || a.x-b.x)) {
+      const x = label.x;
+      let y = label.y;
+      ctx.save(); ctx.font = "12px Segoe UI, Microsoft YaHei, sans-serif";
+      const width = (ctx.measureText(label.text).width + 8) / scale;
+      ctx.restore();
+      while (occupied.some((box) => x < box.x+box.w && x+width > box.x && y-15/scale < box.y+3/scale && y+3/scale > box.y-15/scale)) y += 21/scale;
+      occupied.push({ x, y, w: width });
+      if (state.showLabels && y !== label.y) {
+        ctx.beginPath(); ctx.moveTo(label.x, label.y); ctx.lineTo(x, y);
+        ctx.strokeStyle = label.color; ctx.lineWidth = 1/scale; ctx.stroke();
+      }
+      drawText(ctx, x, y, label.text, label.color);
+    }
+    for (const roi of piece?.wire_roi_checks || result2dOfPiece(piece).wire_bending_2d?.roi_checks || []) {
+      if (roi.status !== "wire_missing") continue;
+      box(ctx, roi.box, "#ff6b7a", 3);
+      drawText(ctx, roi.box?.[0] || 0, roi.box?.[1] || 0, `ROI #${roi.roi_id} NG · 缺线`, "#ff6b7a");
+    }
+  }
 
   function setText(id, value, className) {
     const node = $(id);
@@ -217,7 +304,7 @@
         drawGeometry(ctx, kind === "2d" ? item.mask_2d : item.mask_3d_local, color, selected);
         const geometry = kind === "2d" ? item.mask_2d : item.mask_3d_local;
         const point = geometry?.bounding_box;
-        if (point) drawText(ctx, point[0], point[1], `${name} #${id}`, color);
+        if (point && !(kind === "2d" && state.showBending && ["wire", "thin"].includes(String(name).toLowerCase()))) drawText(ctx, point[0], point[1], `${name} #${id}`, color);
       }
     }
     if (kind === "2d" && state.showRois && canOverlay) {
@@ -292,6 +379,7 @@
         });
       }
     }
+    if (kind === "2d" && canOverlay && state.showBending) drawBending(ctx, piece);
     if (kind === "3d" && state.showRois) {
       const platform = piece?.reference_planes?.platform_roi;
       for (const contour of platform?.polygons_3d_local || []) polygon(ctx, contour, "#79b3fb", 1.5);
@@ -363,32 +451,46 @@
 
   function renderMeasurements(piece) {
     const root = $("measurements"); root.replaceChildren();
-    const rows = [];
-    (piece?.wire_measurements || []).forEach((item) => rows.push({ id: Number(item.instance_id), type: "wire", location: "引线", bend: item.bending_2d, height: item.height_3d }));
+    const wires = wireMeasurements(piece);
+    const counts = { ok: 0, ng: 0, outside: 0, unknown: 0 };
+    for (const item of wires) {
+      const verdict = bendingView(item.bending_2d);
+      counts[verdict.ok === true ? "ok" : verdict.ok === false ? "ng" : item.bending_2d?.status === "outside_rois" ? "outside" : "unknown"]++;
+    }
+    const roiChecks = piece?.wire_roi_checks || result2dOfPiece(piece).wire_bending_2d?.roi_checks || [];
+    const missing = roiChecks.filter((roi) => roi.status === "wire_missing").length;
+    $("wire-bending-summary").textContent = `弯曲：OK ${counts.ok} · NG ${counts.ng} · ROI 外 ${counts.outside}${counts.unknown ? ` · 未提供 ${counts.unknown}` : ""}${missing ? ` · 缺线 ROI ${missing}` : ""}（点击编号定位）`;
+    const rows = wires.map((item) => ({ id: Number(item.instance_id), type: "wire", location: item.class_name || "引线", bend: item.bending_2d, height: item.height_3d, item }));
     (piece?.solder_measurements || []).forEach((item) => rows.push({ id: Number(item.source_instance_id), type: "solder", location: `${item.endpoint || "焊脚"} / ${item.location || "—"}`, bend: null, height: item.height_3d }));
-    if (!rows.length) { root.innerHTML = `<tr><td colspan="7" class="muted">没有返回引线或焊脚测量结果</td></tr>`; return; }
+    if (!rows.length) { root.innerHTML = `<tr><td colspan="8" class="muted">没有返回引线或焊脚测量结果</td></tr>`; return; }
     rows.forEach((row) => {
       const tr = document.createElement("tr");
+      const bend = bendingView(row.bend);
       const ok = row.height?.is_ok;
-      tr.className = state.highlight?.id === row.id && state.highlight.kind === row.type ? "selected" : "";
+      tr.dataset.instanceId = String(row.id);
+      tr.dataset.kind = row.type;
+      tr.className = `${row.type === "wire" ? `bending-${bend.ok === true ? "ok" : bend.ok === false ? "ng" : "unknown"}` : ""}${state.highlight?.id === row.id && state.highlight.kind === row.type ? " selected" : ""}`;
       const values = [
-        `#${row.id}`,
-        `${row.type} · ${row.location}`,
-        row.bend ? `${statusText(row.bend.is_ok)} / ${number(row.bend.mask_ratio * 100, 1)}%` : "—",
-        row.bend ? `${number(row.bend.mask_ratio * 100, 1)}%` : "—",
+        `#${row.id}`, row.location,
+        row.type === "wire" ? bend.text : "—",
+        row.type === "wire" ? bend.ratio : "—",
+        row.type === "wire" ? bend.reason : "—",
         row.height?.is_valid === false ? "无效" : number(row.height?.height_diff_mm, 4),
-        row.height?.reference || "—",
-        statusText(ok),
+        row.height?.reference || "—", statusText(ok),
       ];
       values.forEach((value, index) => {
         const cell = document.createElement("td");
         if (index === 0) {
           const button = document.createElement("button"); button.type = "button"; button.className = "row-button"; button.textContent = value;
-          button.addEventListener("click", () => { state.highlight = { id: row.id, kind: row.type }; renderAll(); });
+          button.addEventListener("click", () => {
+            if (row.type === "wire") focusWire(piece, row.item);
+            else { state.highlight = { id: row.id, kind: row.type }; renderAll(); }
+          });
           cell.appendChild(button);
         } else {
           cell.textContent = value;
-          if (index === 6) cell.className = statusClass(ok);
+          if (index === 2 || index === 3) cell.className = row.type === "wire" ? statusClass(bend.ok) : "";
+          if (index === 7) cell.className = statusClass(ok);
         }
         tr.appendChild(cell);
       });
@@ -495,7 +597,7 @@
     canvas.addEventListener("pointercancel", () => { state.views[canvas.id].drag = null; });
   }
 
-  const checkboxState = { "show-masks": "showMasks", "show-rois": "showRois", "show-points": "showPoints", "show-labels": "showLabels" };
+  const checkboxState = { "show-masks": "showMasks", "show-bending": "showBending", "show-rois": "showRois", "show-points": "showPoints", "show-labels": "showLabels" };
   Object.entries(checkboxState).forEach(([id, key]) => $(id).addEventListener("change", (event) => { state[key] = event.target.checked; renderAll(); }));
   $("fit-views").addEventListener("click", () => { state.views.canvas2d.fitted = false; state.views.canvas3d.fitted = false; renderAll(); });
   if (data.calibration?.enabled) {

@@ -1229,35 +1229,15 @@ class DetectBoard:
             if class_name not in {"wire", "thin"}:
                 continue
             mask = np.asarray(instance.get("mask"), dtype=np.uint8)
-            if not np.any(mask):
-                instance["bending_2d"] = {
-                    "is_valid": False, "is_ok": False, "mask_ratio": 0.0, "rectangle": []
-                }
-                continue
             cleaned, mask_offset = _geometry.clean_mask_crop(
                 mask, min_area=self.min_component_area, kernel_size=5
             )
-            rectangle = _geometry.constrained_rectangle(
+            bending = _geometry.measure_wire_bending(
                 cleaned, roi_boxes, min_ratio=self.rectangle_ratio_threshold,
-                mask_offset=mask_offset,
-            ) if np.any(cleaned) else None
-            if rectangle is None:
-                bending = {
-                    "is_valid": False,
-                    "is_ok": False,
-                    "mask_ratio": 0.0,
-                    "rectangle": [],
-                }
-            else:
-                corners, ratio, is_ok = rectangle
-                bending = {
-                    "is_valid": True,
-                    "is_ok": bool(is_ok),
-                    "mask_ratio": float(ratio),
-                    "rectangle": (corners + offset).astype(int).tolist(),
-                }
+                mask_offset=mask_offset, output_offset=offset,
+            )
             instance["bending_2d"] = bending
-            instance["is_ok"] = bool(is_ok) if rectangle is not None else False
+            instance["is_ok"] = bool(bending["is_ok"])
             instance["rectangle_ratio"] = float(bending["mask_ratio"])
             instance["rectangle"] = bending["rectangle"] or None
             output.append(
@@ -1628,26 +1608,16 @@ class DetectBoard:
             # is changed for the independent 3D wire-height measurement.
             bending = wire.get("bending_2d")
             if not isinstance(bending, dict):
-                rectangle = _geometry.constrained_rectangle(
-                    cleaned,
-                    [tuple(int(value) for value in roi) for roi in wire_rois],
-                    min_ratio=self.rectangle_ratio_threshold,
+                # Use the original full instance, before thin-end splitting and
+                # height-ROI clipping, just like the immediate 2D measurement.
+                bending_mask = _geometry.clean_mask(
+                    np.asarray(wire["_mask_2d_array"], dtype=np.uint8),
+                    min_area=self.min_component_area, kernel_size=5,
                 )
-                if rectangle is None:
-                    bending = {
-                        "is_valid": False,
-                        "is_ok": False,
-                        "mask_ratio": 0.0,
-                        "rectangle": [],
-                    }
-                else:
-                    corners, ratio, is_ok = rectangle
-                    bending = {
-                        "is_valid": True,
-                        "is_ok": bool(is_ok),
-                        "mask_ratio": float(ratio),
-                        "rectangle": (corners + offset).astype(int).tolist(),
-                    }
+                bending = _geometry.measure_wire_bending(
+                    bending_mask, wire_rois, self.rectangle_ratio_threshold,
+                    output_offset=offset,
+                )
             aligned = align_crop_mask_to_depth(
                 cleaned.astype(np.uint8) * 255,
                 crop_box,

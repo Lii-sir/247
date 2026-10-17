@@ -101,99 +101,88 @@ def clean_mask_crop(mask: np.ndarray, min_area: int = 500,
     return cleaned, (x0, y0)
 
 
+def measure_wire_bending(mask: np.ndarray, roi_boxes, min_ratio: float = 0.75,
+                         mask_offset=(0, 0), output_offset=(0, 0)) -> dict:
+    """Join the two boundary ports of one cleaned instance into a quadrilateral.
+
+    ROI boxes are half-open. Each port is a cyclic contiguous foreground run
+    on the ROI's pixel perimeter; its two endpoints are the edge intersections.
+    The denominator counts this instance inside the selected ROI, not polygon
+    area. No rotated-rectangle fallback is used for ambiguous intersections.
+    """
+    result = dict(is_valid=False, is_ok=False, mask_ratio=0.0, rectangle=[],
+                  status="empty_mask", roi_id=None, roi_mask_pixel_count=0,
+                  covered_mask_pixel_count=0)
+    binary = (np.asarray(mask) > 0).astype(np.uint8)
+    if not np.any(binary):
+        return result
+    mx, my = map(int, mask_offset)
+    height, width = binary.shape
+    overlaps = []
+    for raw_box in roi_boxes:
+        x1, y1, x2, y2 = map(int, raw_box)
+        left, top = max(x1, mx), max(y1, my)
+        right, bottom = min(x2, mx + width), min(y2, my + height)
+        overlaps.append(int(np.count_nonzero(binary[top-my:bottom-my, left-mx:right-mx]))
+                        if left < right and top < bottom else 0)
+    if not overlaps or max(overlaps) == 0:
+        result["status"] = "outside_rois"
+        return result
+    selected = int(np.argmax(overlaps))
+    x1, y1, x2, y2 = map(int, roi_boxes[selected])
+    result.update(roi_id=selected + 1, roi_mask_pixel_count=overlaps[selected])
+    if x2 - x1 < 2 or y2 - y1 < 2:
+        result["status"] = "degenerate_shape"
+        return result
+
+    # Rasterize only this instance in its ROI. Do not clip the ROI itself to
+    # the local mask bounds: doing so would invent boundary intersections.
+    roi_mask = np.zeros((y2-y1, x2-x1), np.uint8)
+    left, top = max(x1, mx), max(y1, my)
+    right, bottom = min(x2, mx + width), min(y2, my + height)
+    roi_mask[top-y1:bottom-y1, left-x1:right-x1] = binary[
+        top-my:bottom-my, left-mx:right-mx]
+    h, w = roi_mask.shape
+    # Clockwise perimeter, with each corner appearing exactly once.
+    perimeter = np.array(
+        [(x, 0) for x in range(w)] +
+        [(w-1, y) for y in range(1, h)] +
+        [(x, h-1) for x in range(w-2, -1, -1)] +
+        [(0, y) for y in range(h-2, 0, -1)], dtype=np.int32)
+    contact = roi_mask[perimeter[:, 1], perimeter[:, 0]] > 0
+    starts = np.flatnonzero(contact & ~np.roll(contact, 1))
+    if len(starts) != 2:
+        result["status"] = ("ambiguous_intersections" if len(starts) > 2 or np.all(contact)
+                            else "insufficient_intersections")
+        return result
+    endpoints = []
+    for start in starts:
+        end = int(start)
+        while contact[(end + 1) % len(contact)]:
+            end = (end + 1) % len(contact)
+        endpoints.extend((perimeter[start], perimeter[end]))
+    points = np.asarray(endpoints, np.int32)
+    hull = cv2.convexHull(points).reshape(-1, 2)
+    if len(hull) != 4 or cv2.contourArea(hull) <= 0:
+        result["status"] = "degenerate_shape"
+        return result
+    polygon = np.zeros_like(roi_mask)
+    cv2.fillPoly(polygon, [hull], 1)
+    covered = int(np.count_nonzero(roi_mask & polygon))
+    ratio = covered / overlaps[selected]
+    is_ok = bool(ratio >= min_ratio)
+    ox, oy = map(int, output_offset)
+    result.update(is_valid=True, is_ok=is_ok, mask_ratio=float(ratio),
+                  rectangle=(hull + np.array([x1+ox, y1+oy])).tolist(),
+                  covered_mask_pixel_count=covered,
+                  status="ok" if is_ok else "bending_out_of_range")
+    return result
+
+
 def constrained_rectangle(mask: np.ndarray, roi_boxes: list[tuple[int, int, int, int]],
-                           min_ratio: float = 0.75, mask_offset: tuple[int, int] = (0, 0),
-                           coarse_steps: int = 21, fine_steps: int = 11):
-    """Fit the longest rotated rectangle contained by the selected ROI."""
-    mask_u8 = (np.asarray(mask) > 0).astype(np.uint8) * 255
-    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
-    if not contours or not roi_boxes:
+                           min_ratio: float = 0.75, mask_offset: tuple[int, int] = (0, 0)):
+    """Compatibility tuple API; the four points now describe a quadrilateral."""
+    result = measure_wire_bending(mask, roi_boxes, min_ratio, mask_offset)
+    if not result["is_valid"]:
         return None
-    offset = np.asarray(mask_offset)
-    points = np.concatenate(contours) + offset
-    (cx, cy), (length, width), angle = cv2.minAreaRect(points)
-    if length < width:
-        length, width, angle = width, length, angle + 90
-    direction = np.array([np.cos(np.deg2rad(angle)), np.sin(np.deg2rad(angle))])
-    normal = np.array([-direction[1], direction[0]])
-    mask_x, mask_y = mask_offset
-    mask_height, mask_width = mask_u8.shape
-    mask_area = 0
-    selected = None
-    for roi in roi_boxes:
-        x1, y1, x2, y2 = roi
-        ix1, iy1 = max(x1, mask_x), max(y1, mask_y)
-        ix2, iy2 = min(x2 + 1, mask_x + mask_width), min(y2 + 1, mask_y + mask_height)
-        area = (cv2.countNonZero(mask_u8[iy1 - mask_y:iy2 - mask_y,
-                                             ix1 - mask_x:ix2 - mask_x])
-                if ix1 < ix2 and iy1 < iy2 else 0)
-        if area > mask_area:
-            mask_area, selected = area, roi
-    if selected is None:
-        return None
-    rx1, ry1, rx2, ry2 = selected
-    origin = np.array([cx, cy])
-    ranges = []
-    for coordinate, component, lower, upper, margin in zip(
-        origin, direction, (rx1, ry1), (rx2, ry2),
-        (width * abs(direction[1]) / 2, width * abs(direction[0]) / 2),
-    ):
-        if abs(component) < 1e-6:
-            if not lower + margin <= coordinate <= upper - margin:
-                return None
-        else:
-            ranges.append(((lower + margin - coordinate) / component,
-                           (upper - margin - coordinate) / component))
-    low = max(min(item) for item in ranges) if ranges else -length
-    high = min(max(item) for item in ranges) if ranges else length
-    if low > high:
-        return None
-
-    def evaluate(position):
-        center = origin + direction * position
-        max_x = (2 * min(center[0] - rx1, rx2 - center[0]) - width * abs(direction[1])) / max(abs(direction[0]), 1e-6)
-        max_y = (2 * min(center[1] - ry1, ry2 - center[1]) - width * abs(direction[0])) / max(abs(direction[1]), 1e-6)
-        current_length = min(length, max_x, max_y)
-        if current_length <= 0:
-            return None
-        corners = np.array([
-            center + direction * current_length / 2 + normal * width / 2,
-            center + direction * current_length / 2 - normal * width / 2,
-            center - direction * current_length / 2 - normal * width / 2,
-            center - direction * current_length / 2 + normal * width / 2,
-        ])
-        return current_length, corners
-
-    best = None
-    best_position = None
-    for position in np.linspace(low, high, coarse_steps):
-        candidate = evaluate(position)
-        if candidate is not None and (best is None or candidate[0] > best[0]):
-            best, best_position = candidate, position
-    if best is None:
-        return None
-
-    coarse_step = (high - low) / max(coarse_steps - 1, 1)
-    fine_low = max(low, best_position - coarse_step)
-    fine_high = min(high, best_position + coarse_step)
-    for position in np.linspace(fine_low, fine_high, fine_steps):
-        candidate = evaluate(position)
-        if candidate is not None and candidate[0] > best[0]:
-            best, best_position = candidate, position
-
-    _, corners = best
-    roi_height, roi_width = ry2 - ry1 + 1, rx2 - rx1 + 1
-    roi_mask = np.zeros((roi_height, roi_width), dtype=np.uint8)
-    ix1, iy1 = max(rx1, mask_x), max(ry1, mask_y)
-    ix2, iy2 = min(rx2 + 1, mask_x + mask_width), min(ry2 + 1, mask_y + mask_height)
-    if ix1 < ix2 and iy1 < iy2:
-        roi_mask[iy1 - ry1:iy2 - ry1, ix1 - rx1:ix2 - rx1] = mask_u8[
-            iy1 - mask_y:iy2 - mask_y, ix1 - mask_x:ix2 - mask_x
-        ]
-    rectangle = np.zeros_like(roi_mask)
-    local_corners = np.round(corners - np.array([rx1, ry1])).astype(np.int32)
-    cv2.fillPoly(rectangle, [local_corners], 255)
-    overlap = cv2.countNonZero(cv2.bitwise_and(rectangle, roi_mask))
-    ratio = overlap / max(cv2.countNonZero(rectangle), 1)
-    return corners.round().astype(np.int32), float(ratio), bool(ratio >= min_ratio)
+    return np.asarray(result["rectangle"], np.int32), result["mask_ratio"], result["is_ok"]

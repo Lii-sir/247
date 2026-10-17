@@ -333,9 +333,6 @@ class Detect2D:
     def _convert_predictions(self, predictions: Any, roi: np.ndarray, box, roi_boxes):
         output = []
         ox, oy = box[:2]
-        allowed = np.zeros(roi.shape[:2], dtype=np.uint8)
-        for x1, y1, x2, y2 in roi_boxes:
-            cv2.rectangle(allowed, (x1, y1), (x2 - 1, y2 - 1), 255, -1)
         for result in predictions or []:
             masks_obj = getattr(result, "masks", None)
             boxes = getattr(result, "boxes", None)
@@ -358,10 +355,8 @@ class Detect2D:
                 continue
             if masks_obj is None:
                 continue
-            # Keep all semantic masks (chip/silver included).  The old code
-            # applied the wire rectangle ROI to every class, which made the
-            # silver continuity/overflow checks impossible.  Only wire and
-            # thin are restricted to the bending ROIs below.
+            # Retain complete instances through morphology. ROI assignment
+            # and clipping belong to the shared bending measurement below.
             masks_data = masks_obj.data
             if not masks_data.is_cuda:
                 raise RuntimeError("2D mask post-processing requires a CUDA tensor")
@@ -369,15 +364,12 @@ class Detect2D:
                 masks_data = torch.nn.functional.interpolate(
                     masks_data.unsqueeze(1), size=roi.shape[:2], mode="nearest"
                 ).squeeze(1)
-            allowed_gpu = torch.as_tensor(allowed, device=masks_data.device, dtype=torch.bool)
             for index, mask_tensor in enumerate(masks_data):
                 cid = int(classes[index]) if index < len(classes) else -1
                 score = float(confs[index]) if index < len(confs) else 1.0
                 name = names.get(cid, names.get(str(cid), cid)) if isinstance(names, dict) else cid
                 class_name = str(name)
                 mask_tensor = mask_tensor > 0.5
-                if class_name.casefold() in {"wire", "thin"}:
-                    mask_tensor = torch.logical_and(mask_tensor, allowed_gpu)
                 transferred = geometry.transfer_mask_crops(
                     mask_tensor.unsqueeze(0), [0], self.mask_config["crop_padding"]
                 )
@@ -386,20 +378,12 @@ class Detect2D:
                 _, mask, mask_offset = transferred[0]
                 if cv2.countNonZero(mask) < self.mask_config["min_component_area"]:
                     continue
-                mask = geometry.clean_mask(mask, self.mask_config["min_component_area"])
-                if not np.any(mask):
-                    continue
-                rect = None
-                ratio = 1.0
-                is_ok = True
-                if class_name.casefold() in {"wire", "thin"}:
-                    rect = geometry.constrained_rectangle(
-                        mask, roi_boxes, self.mask_config["rectangle_ratio_threshold"], mask_offset
-                    )
-                    if rect is not None:
-                        corners, ratio, is_ok = rect
-                    else:
-                        ratio, is_ok = 0.0, False
+                if class_name.casefold() not in {"wire", "thin"}:
+                    mask = geometry.clean_mask(mask, self.mask_config["min_component_area"])
+                    if not np.any(mask):
+                        continue
+                # Wire instances are cleaned once by the measurement stage;
+                # retain rejected instances so their failure can be diagnosed.
                 ys, xs = np.where(mask)
                 mask_x, mask_y = mask_offset
                 full_mask = np.zeros(roi.shape[:2], dtype=np.uint8)
@@ -408,10 +392,8 @@ class Detect2D:
                                "class_id": cid, "class_name": class_name, "confidence": score,
                                "x1": float(xs.min() + mask_x + ox), "y1": float(ys.min() + mask_y + oy),
                                "x2": float(xs.max() + 1 + mask_x + ox), "y2": float(ys.max() + 1 + mask_y + oy),
-                               "mask_area_px": int(np.count_nonzero(mask)), "rectangle_ratio": ratio,
-                               "rectangle": ([[int(x + ox), int(y + oy)] for x, y in corners]
-                                             if rect is not None else None),
-                               "is_ok": bool(is_ok), "mask": full_mask})
+                               "mask_area_px": int(np.count_nonzero(mask)), "rectangle_ratio": 1.0,
+                               "rectangle": None, "is_ok": True, "mask": full_mask})
         return output
 
     def _measure_2d_wire_regions(self, instances, roi_boxes, crop_box):
@@ -421,21 +403,15 @@ class Detect2D:
         for instance in instances:
             if str(instance.get("class_name", "")).casefold() not in {"wire", "thin"}:
                 continue
-            mask = np.asarray(instance.get("mask"), dtype=np.uint8)
-            if not np.any(mask):
+            if not isinstance(instance.get("mask"), np.ndarray):
                 continue
-            cleaned = geometry.clean_mask(mask, min_area=self.mask_config["min_component_area"], kernel_size=5)
-            if not np.any(cleaned):
-                continue
-            rectangle = geometry.constrained_rectangle(
-                cleaned, roi_boxes, self.mask_config["rectangle_ratio_threshold"]
+            mask = np.asarray(instance["mask"], dtype=np.uint8)
+            cleaned = geometry.clean_mask(
+                mask, min_area=self.mask_config["min_component_area"], kernel_size=5)
+            bending = geometry.measure_wire_bending(
+                cleaned, roi_boxes, self.mask_config["rectangle_ratio_threshold"],
+                output_offset=offset,
             )
-            if rectangle is None:
-                bending = {"is_valid": False, "is_ok": False, "mask_ratio": 0.0, "rectangle": []}
-            else:
-                corners, ratio, is_ok = rectangle
-                bending = {"is_valid": True, "is_ok": bool(is_ok), "mask_ratio": float(ratio),
-                           "rectangle": (corners + offset).astype(int).tolist()}
             instance["bending_2d"] = bending
             instance["is_ok"] = bool(bending["is_ok"])
             instance["rectangle_ratio"] = float(bending["mask_ratio"])

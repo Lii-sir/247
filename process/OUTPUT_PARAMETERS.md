@@ -94,7 +94,7 @@ CSV、日志、时间线或可视化专用字段。JSON 名称与 C# 属性名�
 | `circle`               | `Circle`                   | 圆定位结果：`X/Y/Radius`，单位像素，使用完整 2D 原图坐标 |
 | `crop_box`             | `CropBox`                  | 检测 ROI，格式`[x1,y1,x2,y2]`，使用原图坐标              |
 | `wire_rois_2d`         | `WireRois2D`               | 引线 ROI 列表，坐标相对于检测 crop                         |
-| `rectangles`           | `Rectangles`               | 弯曲评估矩形列表：`Points/MaskRatio/IsOk`                |
+| `rectangles`           | `Rectangles`               | 弯曲评估四边形列表：`Points/MaskRatio/IsOk`                |
 | `instances`            | `Instances`                | 分割实例列表                                               |
 | `wire_bending_2d`      | `WireBending2D`            | 引线 ROI 和弯曲综合诊断                                    |
 | `silver_continuity_2d` | `SilverContinuity2D`       | 银浆连通诊断                                               |
@@ -110,7 +110,7 @@ CSV、日志、时间线或可视化专用字段。JSON 名称与 C# 属性名�
 | `class_id/class_name` | `ClassId/ClassName` | 模型类别编号/名称，常见名称为`chip/wire/thin/bond/silver` |
 | `confidence`          | `Confidence`        | 模型检测置信度，不是产品通过概率                            |
 | `mask_2d`             | `Mask2D`            | 分割掩码几何，使用完整 2D 原图坐标                          |
-| `rectangle`           | `Rectangle`         | 弯曲评估矩形顶点，不适用时可能为空                          |
+| `rectangle`           | `Rectangle`         | 弯曲评估四边形顶点，不适用时可能为空                          |
 | `rectangle_ratio`     | `RectangleRatio`    | 对应矩形掩码覆盖率；不适用实例可能保留默认值                |
 | `bending_2d`          | `Bending2D`         | 当前实例的弯曲结果                                          |
 | `chip_rotation_2d`    | `ChipRotation2D`    | 当前芯片实例旋转结果                                        |
@@ -142,8 +142,18 @@ CSV、日志、时间线或可视化专用字段。JSON 名称与 C# 属性名�
 | `Measurements[]`             | `RegionId/InstanceId/ClassName/Mask2D/Bending2D` 等逐实例测量    |
 | `Bending2D.IsValid`          | 是否成功得到有效弯曲测量                                           |
 | `Bending2D.IsOk`             | 是否满足弯曲条件                                                   |
-| `Bending2D.MaskRatio`        | 弯曲矩形的掩码覆盖率                                               |
-| `Bending2D.Rectangle`        | 原图矩形顶点                                                       |
+| `Bending2D.MaskRatio`        | 四边形内该实例像素数 / ROI 内该实例像素数                                               |
+| `Bending2D.Rectangle`        | 原图评估四边形的四个有序顶点                                                       |
+| `Bending2D.Status` | `ok/bending_out_of_range/empty_mask/outside_rois/insufficient_intersections/ambiguous_intersections/degenerate_shape` |
+| `Bending2D.RoiId` | 分配的配置 ROI 编号，从 1 开始；未分配为 null |
+| `Bending2D.RoiMaskPixelCount` | 清理后当前实例在分配 ROI 内的像素数（分母） |
+| `Bending2D.CoveredMaskPixelCount` | 其中落在评估四边形内的像素数（分子） |
+
+ROI 使用左闭右开坐标，边界交点取 ROI 像素周界上两个连续接触区间的四个端点。
+ROI 汇总复用实例测量的 ROI 分配与像素数；若掩码清理失败，使用原实例定位故障 ROI，
+该 ROI 的 `MaskPixelCount` 此时为原掩码像素数，状态为 `bending_unavailable`。
+`RoiChecks[].BendingChecks[].Status` 保留逐实例的测量原因。`Rectangle` 沿用字段名，形状不要求为矩形。
+
 
 ## 5. 银浆诊断：`Diagnostic2D`
 
@@ -557,7 +567,7 @@ if (silver?.Measurement is JsonElement measurement &&
 | 检测区域                | `two.CropBox`；或 `piece.Crop2D`                                                                                                       | 绘制检测 ROI 矩形                                        | 原图坐标                                                              |
 | 引线 ROI                | `two.WireRois2D`；或 `piece.WireRois2D`                                                                                                | 绘制各配置 ROI                                           | 相对于 crop；画到原图时加 crop 左上角偏移                             |
 | 已公开的引线 ROI 检查框 | `two.WireBending2D.RoiChecks[].Box`；或 `piece.WireRoiChecks[].Box`                                                                    | 按`IsOk/Status` 显示 ROI 状态                          | 已是原图坐标，不再加偏移                                              |
-| 引线弯曲评估矩形        | `two.Rectangles[].Points`、`two.WireBending2D.Measurements[].Bending2D.Rectangle`；或 `piece.WireMeasurements[].Bending2D.Rectangle` | 绘制矩形，旁边标注`MaskRatio/IsOk`                     | 原图坐标；无效或空矩形不绘制                                          |
+| 引线弯曲评估四边形        | `two.Rectangles[].Points`、`two.WireBending2D.Measurements[].Bending2D.Rectangle`；或 `piece.WireMeasurements[].Bending2D.Rectangle` | 绘制四边形，旁边标注`MaskRatio/IsOk`                     | 原图坐标；无效或空矩形不绘制                                          |
 | 芯片旋转矩形和中心      | `two.ChipRotation2D.Chips[].Rectangle/CenterXy`                                                                                          | 绘制矩形和中心点，标注`AxisDeviationDeg`               | 原图坐标；最终`BoardPieceResult` 没有强类型 `ChipRotation2D` 属性 |
 | 芯片外观检查范围        | `two.ChipAnomaly2D.Chips[].Rectangle`；或 `piece.ChipAnomaly2D.Chips[].Rectangle`                                                      | 绘制芯片检查矩形，标注`Score/Threshold/Prediction`     | 原图坐标                                                              |
 | 芯片外观缺陷区域        | 上述芯片的`AnomalyBoxes[].ImagePolygon`                                                                                                  | 绘制缺陷多边形，例如红色半透明区域                       | 原图坐标；不要把`CropXyxy` 直接画到原图                             |

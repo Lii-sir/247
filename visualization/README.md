@@ -5,6 +5,18 @@ Bridge DTO 说明通用响应、2D/联合3D结果、银浆回退、测高坐标�
 文档第 14 节专门列出上位机可视化图层对应的返回字段、坐标转换和当前不支持的图层。
 测试脚本、CSV 和日志的使用说明仍见本 README。
 
+## 引线弯曲 OK / NG 展示
+
+默认开启“引线弯曲 OK / NG”图层：绿色为 OK、红色为 NG、灰色为 ROI 外不参与判定。
+2D 图上绘制对应实例轮廓、评估四边形、实例编号和覆盖率；缺线 ROI 单独标红。
+下方表格使用完整 2D 实例测量，与联合 3D 高度按实例编号合并，显示弯曲结论、覆盖率和失败原因。
+无效测量显示“NG · 无效”，覆盖率留空；ROI 外实例显示“ROI 外”，不计入 NG 数。
+点击表格编号可放大并高亮该引线。独立 HTML 内嵌脚本，旧报告须用 `generate_report.py --force`
+从已保存的 `result.json` 重新生成，再重新打开或刷新页面，无需重新推理。
+
+查看器回归：`node --test visualization/tests/test_bending_viewer.cjs`；报告生成回归：
+`.venv/Scripts/python.exe -B -m unittest discover -s visualization/tests -p 'test_*.py'`。
+
 ## 银浆允许边界：模板标定 → SIFT 映射 → 查看黄色边界
 
 银浆溢出现在使用 `config/2D/calibration/silver_boundary.json` 中的预标定多边形。

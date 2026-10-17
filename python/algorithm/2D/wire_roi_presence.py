@@ -23,6 +23,21 @@ def check_wire_roi_presence(
     roi_pixel_counts: list[list[tuple[int, int]]] = [[] for _ in roi_boxes]
     roi_instance_ids: list[list[int]] = [[] for _ in roi_boxes]
     for item in candidates:
+        bending = item.get("bending_2d") or {}
+        if "roi_id" in bending:
+            # Reuse the cleaned-mask assignment and denominator of the actual
+            # measurement, including invalid intersection measurements.
+            roi_id = bending["roi_id"]
+            if roi_id is not None and 1 <= int(roi_id) <= len(roi_boxes):
+                selected = int(roi_id) - 1
+                roi_pixel_counts[selected].append((int(item.get("instance_id", 0)),
+                                                  int(bending["roi_mask_pixel_count"])))
+                roi_instance_ids[selected].append(int(item.get("instance_id", 0)))
+                continue
+            if bending.get("status") != "empty_mask":
+                continue
+            # A rejected/empty cleaned mask still reports an unavailable
+            # measurement in the ROI containing its original instance.
         mask = np.asarray(item["mask"]) > 0
         height, width = mask.shape
         overlaps = []
@@ -34,8 +49,8 @@ def check_wire_roi_presence(
             overlaps.append(count)
         if not overlaps or max(overlaps) <= 0:
             continue
-        # The bending-rectangle search assigns a mask to the ROI with its
-        # greatest pixel overlap. Use the same rule for the ROI-level result.
+        # Legacy/unmeasurable instances use greatest raw pixel overlap.
+        # Measured instances reuse the cleaned-mask assignment above.
         selected = int(np.argmax(overlaps))
         roi_pixel_counts[selected].append((int(item.get("instance_id", 0)), overlaps[selected]))
         roi_instance_ids[selected].append(int(item.get("instance_id", 0)))
@@ -50,6 +65,7 @@ def check_wire_roi_presence(
             bending_checks.append({
                 "instance_id": instance_id,
                 "mask_ratio": float(bending.get("mask_ratio", 0.0)),
+                "status": str(bending.get("status", "bending_unavailable")),
                 "is_valid": bool(bending.get("is_valid", False)),
                 "is_ok": bool(bending.get("is_valid", False) and bending.get("is_ok", False)),
             })
