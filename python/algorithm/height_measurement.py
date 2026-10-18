@@ -28,6 +28,8 @@ class HeightConfig:
     semantic_exclusion_dilation_px: int = 3
     wire_measurement_erode_px: int = 0
     thin_measurement_erode_px: int = 0
+    bond_measurement_erode_px: int = 0
+    thin_solder_measurement_erode_px: int = 0
 
     @classmethod
     def from_dict(cls, values: Dict[str, Any] | None) -> "HeightConfig":
@@ -77,12 +79,17 @@ class HeightConfig:
                 "wire_measurement_erode_px", cls.wire_measurement_erode_px),
             thin_measurement_erode_px=values.get(
                 "thin_measurement_erode_px", cls.thin_measurement_erode_px),
+            bond_measurement_erode_px=values.get(
+                "bond_measurement_erode_px", cls.bond_measurement_erode_px),
+            thin_solder_measurement_erode_px=values.get(
+                "thin_solder_measurement_erode_px", cls.thin_solder_measurement_erode_px),
         )
         config.validate()
         return config
 
     def validate(self) -> None:
-        for name in ("wire_measurement_erode_px", "thin_measurement_erode_px"):
+        for name in ("wire_measurement_erode_px", "thin_measurement_erode_px",
+                     "bond_measurement_erode_px", "thin_solder_measurement_erode_px"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"height_measurement_3d.{name} must be a non-negative integer")
@@ -286,6 +293,21 @@ def erode_wire_mask_in_place(mask: np.ndarray, radius_px: int) -> np.ndarray:
     return mask
 
 
+def erode_measurement_mask_crop(mask: np.ndarray, radius_px: int) -> tuple[np.ndarray, tuple[int, int]]:
+    """Return an eroded uint8 bbox and its piece offset, leaving shared masks intact."""
+    if radius_px == 0:
+        return mask, (0, 0)
+    if radius_px < 0:
+        raise ValueError("measurement erosion radius must be non-negative")
+    x, y, width, height = cv2.boundingRect(mask)
+    if width == 0 or min(width, height) <= 2 * radius_px:
+        return np.zeros((1, 1), dtype=np.uint8), (x, y)
+    # cv2.erode returns a fresh local array; no full-depth mask copy or paste.
+    eroded = cv2.erode(mask[y:y+height, x:x+width], _ellipse_kernel(radius_px),
+                        borderType=cv2.BORDER_CONSTANT, borderValue=0)
+    return eroded, (x, y)
+
+
 def measure_mask_height(
     depth: np.ndarray,
     mask: np.ndarray,
@@ -293,8 +315,10 @@ def measure_mask_height(
     config: HeightConfig,
     reference: str,
     max_height_mm: float | None = None,
+    *,
+    mask_offset: tuple[int, int] = (0, 0),
 ) -> Dict[str, Any]:
-    """Measure the high percentile depth point above a fitted reference plane."""
+    """Measure a depth-percentile point; optional bbox masks retain piece coordinates."""
     source = np.asarray(mask)
     if source.dtype == np.uint8:
         # Warp output is uint8. Find its bounds in OpenCV, then enumerate only
@@ -305,6 +329,9 @@ def measure_mask_height(
         ys, xs = ys + top, xs + left
     else:
         ys, xs = np.nonzero(source > 0)
+    ox, oy = mask_offset
+    if ox or oy:
+        xs, ys = xs + ox, ys + oy
     valid = _valid_depth(depth[ys, xs], config)
     ys, xs = ys[valid], xs[valid]
     if len(xs) == 0:

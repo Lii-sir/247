@@ -134,6 +134,8 @@
       "max_solder_chip_height_mm": 0.8,
       "thin_solder_end_ratio": 0.02,
       "thin_solder_search_dilation_px": 6,
+      "bond_measurement_erode_px": 1,
+      "thin_solder_measurement_erode_px": 1,
       "platform_local_ring_px": 24,
       "semantic_exclusion_dilation_px": 3
     }

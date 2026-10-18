@@ -66,3 +66,9 @@
 - Files: silver_inspection.py, detect_board.py, config/2D/config.json + README, output parameter docs, viewer.js/html/README, Python ROI tests and frontend tests.
 - Evidence: 153 algorithm + 26 report + 8 frontend tests passed. Real 10-piece 2D + board3D batch completed in 19.147s (startup excluded), all ROI boundary coordinates and joint metadata checked; no template-stage logs. Ten-mask equal-geometry overflow-core replay median 1409.952 -> 602.805ms; boundary build median0.08465ms, not an end-to-end speed guarantee.
 - Remaining: no implementation blockers; production inset calibration and rotation limitations remain. C# fields unchanged but mode/method now roi_inset. Report: visualization/output/silver-roi-inset-20261018/live-report/report.html.
+
+## Solder height edge removal (2026-10-18)
+- Completed: independent bond_measurement_erode_px and thin_solder_measurement_erode_px (current1/1, missing0). Reference/ownership chosen from original regions before nonmutating bbox erosion; local sampling/geometry restore piece offsets before board-point conversion. Thin middle/end parameters do not interact; endpoint dilation remains before erosion; C# schema unchanged.
+- Files: height_measurement.py, detect_board.py, config/3D/config.json + README, process/OUTPUT_PARAMETERS.md, tests/test_solder_height_erosion.py.
+- Evidence: 163 algorithm tests passed; real10-piece batch completed,132 solder regions/110valid unchanged; all10 reference planes, wire measurements and full instance masks match prior run exactly. Sampling/geometry-only132-region replay median52.832->34.716ms, same output as full-frame erosion; disabled exact equality.
+- Remaining: no implementation blockers. Radius1 is a tunable initial value; thin endpoint dilation/erosion require joint calibration. Report: visualization/output/solder-height-erosion-20261018/live-report/report.html.

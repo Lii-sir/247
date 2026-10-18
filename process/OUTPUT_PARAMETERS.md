@@ -326,8 +326,15 @@ ROI 汇总复用实例测量的 ROI 分配与像素数；若掩码清理失败�
 `height_measurement_3d.parameters.wire_measurement_erode_px` 控制 wire，
 `thin_measurement_erode_px` 控制 thin 中间段。单位为 3D 像素半径，0 关闭。
 `WireMeasurements[].Mask3DLocal` 返回收缩后的实际采样区域，`Height3D.Point` 从该区域内选择；
-收缩后无有效深度时 `IsValid=false/IsOk=false/Point=null`。C# 字段不变，平台参考面和焊脚流程不变。
+收缩后无有效深度时 `IsValid=false/IsOk=false/Point=null`。C# 字段不变，平台参考面不变，该引线参数不控制焊脚流程。
 详见 [3D 配置说明](../config/3D/README.md)。
+
+焊点/焊脚也支持独立内缩参数：`bond_measurement_erode_px` 控制 bond，
+`thin_solder_measurement_erode_px` 控制 thin 两端，均位于 `height_measurement_3d.parameters`。
+它们不影响 `thin_measurement_erode_px` 控制的中间引线。`SolderMeasurements[].Mask3DLocal`
+返回内缩后的实际测量区（分片坐标）；`Height3D.Point` 仍是整板坐标。空内区、内部深度无效或
+无参考面时返回 `IsValid=false/IsOk=false/Point=null`。C#字段不增加，参考面仍使用内缩前区域确定。
+
 
 
 ### 8.1 `WireMeasurementResult`

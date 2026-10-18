@@ -17,3 +17,13 @@
 - 基准：10个历史实拍银浆公开轮廓重建，同一矩形几何、6次中位，通用polygon溢出核心1409.952ms -> roi_inset 602.805ms；单片构造中位0.08465ms。该基准不包含模板/GPU/3D，整板耗时变化不能全归因于此核优化。
 - 文件：silver_inspection.py、detect_board.py、config/2D/config.json及README、process/OUTPUT_PARAMETERS.md、visualization/viewer.js及html/README、tests/test_silver_roi_inset.py、visualization/tests/test_bending_viewer.cjs。
 - 实测报告：visualization/output/silver-roi-inset-20261018/live-report/report.html；benchmark.json/live-validation.json/tests.log同级。四边值需按现场样本调整；矩形不补偿旋转/透视。无新增C#字段，硬编码polygon/SIFT字符串的上位机需识别roi_inset。
+
+## bond 与 thin 两端焊脚测高独立内缩
+- 完成：新增 bond_measurement_erode_px / thin_solder_measurement_erode_px（非负整数，旧配置缺项0，当前初值各1）。原始thin先独立拆中间和两端，两端保持映射→膨胀6px→内缩；不与thin中间段参数冲突。
+- 实现：先用原2D/3D区域确定芯片归属和参考面，再用erode_measurement_mask_crop生成独立局部数组，绝不改共享bond/实例mask。measure_mask_height增加内部关键字mask_offset，深度读取和斜参考面求值均恢复分片坐标；输出几何同样恢复，最后按原路径转换整板点。0参数无复制/扫描，复用形态学核缓存。C#字段/调用不变。
+- 文件：height_measurement.py、detect_board.py、config/3D/config.json及README、process/OUTPUT_PARAMETERS.md、tests/test_solder_height_erosion.py。
+- 验证：163项算法测试通过（新增10项），覆盖全图/局部腐蚀等价、图像边界/孔洞/空内区、关闭无额外分配、共享mask不变、斜平面及整板坐标、两类和thin中间/端部独立、平台/芯片参考不变。
+- 实拍：10片及整板3D完成，132个焊点焊脚（112bond/10start/10end），有效110，与上一轮一致，无新增无效。全部有效点坐标/深度/参考差/阈值核验通过；10片参考面、引线测量、完整实例mask与上一轮逐字段完全相同。本次整板16.129s，不作为受控端到端加速结论。
+- 性能：132个公开焊点区域多边形重建+实际深度回放，9次中位，旧采样+几何52.832ms→新局部内缩/采样/几何34.716ms。关闭与原结果完全一致，开启与全图腐蚀结果完全一致；不包含配准/参考面拟合/推理。
+- 产物：visualization/output/solder-height-erosion-20261018/live-report/report.html；benchmark.json、live-validation.json、tests.log同级。
+- 限制：1px为可调初值，需样本校准；thin焊脚内缩作用于膨胀搜索区外圈，需要与thin_solder_search_dilation_px配合，不等同于真实焊料轮廓剥边。

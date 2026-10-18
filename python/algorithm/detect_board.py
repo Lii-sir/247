@@ -26,6 +26,7 @@ from algorithm.height_measurement import (
     HeightConfig,
     dilate_mask,
     erode_wire_mask_in_place,
+    erode_measurement_mask_crop,
     fit_chip_plane,
     fit_local_platform_plane,
     fit_platform_plane,
@@ -1531,13 +1532,19 @@ class DetectBoard:
             if plane is None:
                 plane = platform_plane
             max_height = self.height_config.max_solder_platform_height_mm
+        # Select reference/chip ownership using the original region above.
+        # Solder masks may alias instance masks: erode only an independent bbox.
+        erode_px = (self.height_config.bond_measurement_erode_px
+                    if endpoint == "bond" else self.height_config.thin_solder_measurement_erode_px)
+        measurement_mask, measurement_offset = erode_measurement_mask_crop(mask_3d, erode_px)
         height = measure_mask_height(
             depth,
-            mask_3d,
+            measurement_mask,
             plane,
             self.height_config,
             reference=reference,
             max_height_mm=max_height,
+            mask_offset=measurement_offset,
         )
         return {
             "measurement_id": int(instance.get("instance_id", 0)) * 3 + {
@@ -1553,7 +1560,7 @@ class DetectBoard:
             "chip_inside": bool(inside),
             "reference_plane": plane,
             "mask_2d": _mask_geometry(mask_2d, offset=crop_box[:2], epsilon=1.0),
-            "mask_3d_local": _mask_geometry(mask_3d, offset=(0, 0), epsilon=1.0),
+            "mask_3d_local": _mask_geometry(measurement_mask, offset=measurement_offset, epsilon=1.0),
             "height_3d": height,
         }
 
