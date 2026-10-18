@@ -355,7 +355,9 @@
             const text = registration.fallback_used
               ? "silver boundary · fallback: original template points"
               : registration.status === "ok"
-              ? registration.method === "sift_ransac"
+              ? registration.method === "roi_inset"
+                ? "ROI 内缩边界"
+                : registration.method === "sift_ransac"
                 ? `silver boundary · SIFT ${registration.inliers ?? "—"}/${registration.matches ?? "—"} inliers · err ${number(registration.reprojection_error_px, 1)} px`
                 : "silver boundary · calibrated points"
               : `silver boundary · ${registration.status}: ${registration.message || "mapping failed"}`;
@@ -410,6 +412,8 @@
     const root = $("checks");
     root.replaceChildren();
     const two = result2dOfPiece(piece);
+    const silverBoundaryLabel = (two.silver_overflow_2d || piece?.silver_overflow_2d)?.registration?.method === "roi_inset"
+      ? "银浆边界生成" : "银浆边界配准";
     const checks = [
       ["片级结论", piece?.is_ok],
       ["配准", piece?.registration?.is_valid],
@@ -418,7 +422,7 @@
       ["芯片外观", piece?.chip_anomaly_2d?.is_ok ?? two.chip_anomaly_2d?.is_ok],
       ["银浆连通", (two.silver_continuity_2d || piece?.silver_continuity_2d)?.is_ok],
       ["银浆溢出", (two.silver_overflow_2d || piece?.silver_overflow_2d)?.is_ok],
-      ["银浆边界配准", (two.silver_overflow_2d || piece?.silver_overflow_2d)?.registration?.status === "not_configured" ? null : (two.silver_overflow_2d || piece?.silver_overflow_2d)?.registration?.is_valid],
+      [silverBoundaryLabel, (two.silver_overflow_2d || piece?.silver_overflow_2d)?.registration?.status === "not_configured" ? null : (two.silver_overflow_2d || piece?.silver_overflow_2d)?.registration?.is_valid],
       ["引线高度", Array.isArray(piece?.wire_measurements) && piece.wire_measurements.length ? piece.wire_measurements.every((x) => x.height_3d?.is_ok === true) : null],
       ["焊脚高度", Array.isArray(piece?.solder_measurements) && piece.solder_measurements.length ? piece.solder_measurements.every((x) => x.height_3d?.is_ok === true) : null],
       ["配准分数", piece?.registration?.score == null ? "—" : number(piece.registration.score, 4)],
@@ -429,11 +433,14 @@
       const label = document.createElement("div"); label.textContent = name;
       const result = document.createElement("strong"); result.className = valueClass; result.textContent = typeof value === "boolean" || value == null ? statusText(value) : String(value);
       card.append(label, result);
-      if (name === "银浆溢出" || name === "银浆边界配准") {
+      if (name === "银浆溢出" || name === silverBoundaryLabel) {
         const overflow = two.silver_overflow_2d || piece?.silver_overflow_2d;
         const status = { not_configured: "未标定", uncertain: "配准/测量不确定", overflow: "存在越界银浆", ok: "通过" };
         const note = document.createElement("p");
         note.textContent = overflow?.message || status[overflow?.status] || overflow?.status || "未返回边界诊断";
+        if (overflow?.registration?.method === "roi_inset") {
+          note.textContent = `ROI 内缩边界 · ${overflow?.message || status[overflow?.status] || overflow?.status || "边界无效"}`;
+        }
         if (overflow?.registration?.fallback_used) {
           note.textContent = `已回退到模板原始点（未配准） · ${overflow.registration.message || "匹配失败"} · ${status[overflow?.status] || overflow?.status}`;
         }

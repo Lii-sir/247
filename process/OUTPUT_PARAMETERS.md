@@ -181,7 +181,7 @@ ROI 汇总复用实例测量的 ROI 分配与像素数；若掩码清理失败�
 
 | JSON 字段             | C# 属性              | 说明                                                                     |
 | --------------------- | -------------------- | ------------------------------------------------------------------------ |
-| `mode`              | `Mode`             | 当前主要使用`polygon`                                                  |
+| `mode`              | `Mode`             | 当前使用 `roi_inset`，兼容 `polygon/line`                                                  |
 | `points`            | `Points`           | 实际允许边界顶点，不是 SIFT 特征点                                       |
 | `coordinate_system` | `CoordinateSystem` | 正常公开结果为`image`，表示目标原图坐标；内部局部坐标可标记为 `crop` |
 | `is_within_crop`    | `IsWithinCrop`     | `bool?`；是否全部位于检测 ROI                                          |
@@ -189,13 +189,18 @@ ROI 汇总复用实例测量的 ROI 分配与像素数；若掩码清理失败�
 **边界允许超出 ROI。** `IsWithinCrop=false` 不表示产品 NG，也不阻止检测。
 算法保留完整多边形，只评价 ROI 内实际分割到的银浆；不能保证 ROI 外未检测区域没有缺陷。
 
+当前配置的银浆边界来自检测 ROI 四边内缩，`Boundary.Mode=roi_inset`，`Points` 仍为四个有序原图顶点。
+原 C# 字段及调用方式不变；上位机应按 Points 绘制矩形，不能仅识别 `polygon` 模式。
+内缩模式的 `Registration.Method=roi_inset/Status=ok/IsValid=true/FallbackUsed=false`，不返回特征匹配统计。
+内缩配置无效时诊断为 `uncertain`、`IsOk=null`，`Registration.Status=failed/IsValid=false`。
+
 ### 5.2 配准和回退：`BoundaryRegistration2D`
 
 | JSON 字段                                       | C# 属性                                      | 说明                                                                                               |
 | ----------------------------------------------- | -------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `method`                                      | `Method`                                   | `sift_ransac`：匹配；`template_points_fallback`：直接使用模板点；兼容模式可为 `fixed_points` |
+| `method`                                      | `Method`                                   | `roi_inset`：复用检测 ROI 内缩生成；`sift_ransac`：模板匹配；`template_points_fallback`：直接使用模板点；兼容模式可为 `fixed_points` |
 | `status`                                      | `Status`                                   | 常见为`ok/fallback/failed/not_configured`；与缺陷诊断状态不同                                    |
-| `is_valid`                                    | `IsValid`                                  | 是否为有效配准，回退时为`false`                                                                  |
+| `is_valid`                                    | `IsValid`                                  | 是否有效；`roi_inset` 时表示边界构建成功，模板回退时为 `false`                                                                  |
 | `fallback_used`                               | `FallbackUsed`                             | 是否使用模板原始点回退                                                                             |
 | `matches`                                     | `Matches`                                  | `int?`；筛选及去重后的候选匹配数                                                                 |
 | `inliers`                                     | `Inliers`                                  | `int?`；RANSAC 内点数                                                                            |

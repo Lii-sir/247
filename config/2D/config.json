@@ -111,11 +111,17 @@
     }
   },
   "silver_overflow_2d": {
-    "description": "基于模板预标定多边形，经SIFT/RANSAC配准后的银浆越界检测；未标定或配准失败不判OK",
+    "description": "复用圆定位检测ROI，按四边像素内缩生成银浆允许矩形；边界无效不判OK",
     "parameters": {
       "boundary": {
-        "mode": "polygon",
-        "calibration_path": "calibration/silver_boundary.json"
+        "mode": "roi_inset",
+        "inset_unit": "px",
+        "insets": {
+          "left": 376,
+          "top": 146,
+          "right": 34,
+          "bottom": 128
+        }
       },
       "silver_class": "silver",
       "tolerance_px": 0.0,

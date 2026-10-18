@@ -8,7 +8,7 @@
 - `wire_bending_2d.parameters`：引线/细线 ROI 和弯曲度阈值。
 
 - `silver_continuity_2d.parameters`：银浆断连/联通参数。
-- `silver_overflow_2d.parameters`：预标定多边形经 SIFT/RANSAC 配准后的银浆允许边界、容差和最小缺陷面积。
+- `silver_overflow_2d.parameters`：检测 ROI 四边内缩生成的银浆允许边界、容差和最小缺陷面积。
 - `chip_rotation_2d.parameters`：芯片外接矩形角度阈值。
 - `chip_anomaly_2d.parameters`：芯片外观异常和 EfficientAD 模型区间映射。
 
@@ -27,19 +27,51 @@
 `vertical_split.offset_radius` 控制实验脚本中的竖向分割线：
 `split_x = round(circle_x + offset_radius * radius + offset_px)`。ROI 工具保存时
 会更新 `common_2d.parameters` 和对应功能块的 `parameters`。
-银浆溢出边界单独保存在 `calibration/silver_boundary.json`，不再从芯片外接框生成。
+## 银浆允许边界：复用检测 ROI，四边按像素内缩
 
-运行 `visualization/calibrate_silver_boundary.py --image <模板原图> --open`，在现有
-HTML 查看器中按顺序点选真实允许区域顶点并下载 JSON；之后使用同一脚本的
-`--image <同一模板原图> --apply <下载的JSON>` 安装标定。
-模板点为完整模板原图像素坐标，`template_path` 相对于标定 JSON 解析。真实图像通过
-SIFT/FLANN/RANSAC 得到模板到当前图的 Homography，再将边界转到检测 crop 作越界判断。
-所有图片使用同一份模板和点集，逐张配准。当前标定启用
-`fallback_to_template_points=true`，匹配失败时直接将模板点作为目标原图坐标，
-继续进行越界判断，结果中标记 `registration.status=fallback`、`fallback_used=true`。
-回退不缩放或移动边界，需要模板与目标图拍摄位置和像素尺寸一致。
-未标定、模板校验失败或边界落出检测 crop 时仍返回 `not_configured`/`uncertain`，
-`is_ok=null`。设为 `false` 可禁用配准失败回退。
+当前 `silver_overflow_2d.parameters` 为：
+
+```json
+{
+  "boundary": {
+    "mode": "roi_inset",
+    "inset_unit": "px",
+    "insets": {"left": 376, "top": 146, "right": 34, "bottom": 128}
+  },
+  "silver_class": "silver",
+  "tolerance_px": 0.0,
+  "min_area_px": 1
+}
+```
+
+四边参数是非负有限数，单位为原始 2D 图像像素，可独立调整，支持小数。
+当前初值来自原标定模板：先找圆计算该模板的检测 ROI，再取原标定四边形各边中点，
+换算为距对应 ROI 边的距离并四舍五入；这只是当前项目初值，需要按现场样本核对。
+默认单位为 `px`；可选 `radius_ratio` 则将各内缩量乘以本片圆半径。
+修改配置后需重新初始化算法。
+
+已有检测框为 `[x1,y1,x2,y2]`，允许边界顶点依次为：
+`[x1+left,y1+top]`、`[x2-right,y1+top]`、`[x2-right,y2-bottom]`、`[x1+left,y2-bottom]`。
+使用 ROI 连续坐标边界 `x2/y2`，不减 1；边界线上的像素允许通过，0 内缩覆盖完整检测 ROI。
+左右内缩量之和必须小于 ROI 宽度，上下之和必须小于高度；缺参数、负值、非有限值或
+内缩过大时返回 `uncertain/is_ok=null`，不自动放宽、不回退模板坐标。
+圆定位失败沿用 2D 预处理失败逻辑，不会用旧帧圆或边界继续检测。
+
+此模式直接复用本片的检测 ROI，不重复找圆，不读取模板、不做特征匹配；轴对齐矩形用
+向量化距离公式判断越界，角点使用欧氏距离以保留原 `tolerance_px` 语义，连通域过滤规则不变。
+它随检测 ROI 平移；使用 px 时内缩距离不随半径缩放。矩形不会跟随工件旋转或透视形变。
+只检查检测 ROI 内已有银浆掩码，不能保证 ROI 外没有缺陷。
+
+C# 调用和字段不变，`Boundary.Mode` 和 `Registration.Method` 均为 `roi_inset`，
+`Registration.Status=ok`、`IsValid=true` 表示边界构建成功，**不是模板配准成功**；
+`FallbackUsed=false`，不产生匹配/内点数。`Boundary.Points` 正常公开输出为 2D 原图坐标。
+可视化显示黄色矩形，并注明“ROI 内缩边界”。
+
+旧模板模式仍保留。需要切换时，将 boundary 改为
+`{"mode":"polygon","calibration_path":"calibration/silver_boundary.json"}`。
+此时才读取原标定模板和四边形，逐张 SIFT/FLANN/RANSAC 配准；
+`fallback_to_template_points` 仅对该模板模式生效，不影响 `roi_inset`。
+模板标定工具仍为 `visualization/calibrate_silver_boundary.py`；执行其 `--apply` 会安装标定并切回模板模式。
 
 运行 `scripts/roi_configurator.py` 可在同一张 2D 图片上标定 3D 引脚平台参考区：
 按 `F` 添加矩形，拖动框内移动、拖动角点拉伸，`V` 清空平台框，`U` 撤销，

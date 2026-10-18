@@ -479,11 +479,13 @@ class DetectBoard:
                     self._gpu_worker_slots.put(resource)
 
     def prepare_silver_boundary(self, prepared: Dict[str, Any]):
-        """Image-only registration can overlap inference on the same source."""
+        """Build the silver boundary from the existing ROI or template."""
+        raw_boundary = (self.silver_config.get("overflow") or {}).get("boundary") or {}
+        roi_inset = str(raw_boundary.get("mode", "")).strip().casefold() == "roi_inset"
         return _silver_inspection.prepare_boundary(
             self.silver_config, crop_box=prepared["crop_box"], circle=prepared["circle"],
             image_shape=prepared["crop"].shape[:2], image=prepared["image"],
-            target_gray=self._prepared_gray_image(prepared),
+            target_gray=None if roi_inset else self._prepared_gray_image(prepared),
             base_dir=self._silver_config_base_dir())
 
     @staticmethod

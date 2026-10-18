@@ -17,6 +17,16 @@ Bridge DTO 说明通用响应、2D/联合3D结果、银浆回退、测高坐标�
 查看器回归：`node --test visualization/tests/test_bending_viewer.cjs`；报告生成回归：
 `.venv/Scripts/python.exe -B -m unittest discover -s visualization/tests -p 'test_*.py'`。
 
+## 当前银浆边界：ROI 内缩
+
+当前配置使用 `silver_overflow_2d.parameters.boundary.mode=roi_inset`，默认单位 `px`，
+四边 `insets.left/top/right/bottom` 独立设置。复用圆定位后的检测 ROI，无模板特征匹配。
+图上黄色边界标注“ROI 内缩边界”，检查卡显示“银浆边界生成”；失败时显示不确定/边界失败，
+不回退模板坐标。修改后重新初始化并检测，新报告才会使用新边界。
+参数、初值来源和坐标约定见 [2D 配置说明](../config/2D/README.md)。
+
+以下模板标定说明仅适用于主动切回 `polygon + calibration_path` 的旧模板模式。
+
 ## 银浆允许边界：模板标定 → SIFT 映射 → 查看黄色边界
 
 银浆溢出现在使用 `config/2D/calibration/silver_boundary.json` 中的预标定多边形。

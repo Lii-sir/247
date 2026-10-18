@@ -110,4 +110,14 @@ test('legacy joint-only reports still show bending and missing data stays unknow
   assert.equal(rows(view)[1].children[3].textContent,'—');
 });
 
+test('ROI-inset silver boundaries show their source instead of template registration',()=>{
+  const view=createViewer({response:{ok:true},pieces:[{piece_id:1,results_2d:{silver_overflow_2d:{
+    is_ok:true,status:'ok',boundary:{mode:'roi_inset',coordinate_system:'image',points:[[20,20],[150,20],[150,80],[20,80]]},
+    registration:{method:'roi_inset',status:'ok',is_valid:true,fallback_used:false},
+  }}}]});
+  assert.ok(view.texts.some((item)=>item.text==='ROI 内缩边界'));
+  assert.ok(!view.texts.some((item)=>item.text.includes('calibrated points')));
+  assert.ok(view.nodes.checks.children.some((card)=>card.children[0].textContent==='银浆边界生成'));
+});
+
 module.exports={createViewer,rows};

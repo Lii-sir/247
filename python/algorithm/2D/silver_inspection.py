@@ -58,14 +58,26 @@ class Boundary:
     points: tuple[tuple[float, float], ...]
     mode: str = "polygon"
     registration: dict[str, Any] | None = field(default=None, compare=False)
+    _rectangle_bounds: tuple[float, float, float, float] | None = field(
+        default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         points = np.asarray(self.points, dtype=np.float64)
         if points.ndim != 2 or points.shape[1] != 2 or not np.isfinite(points).all():
             raise ValueError("silver boundary points must be finite 2D coordinates")
         object.__setattr__(self, "points", tuple(tuple(map(float, p)) for p in points))
-        if self.mode not in {"polygon", "line"}:
-            raise ValueError("silver boundary mode must be polygon or line")
+        if self.mode not in {"polygon", "line", "roi_inset"}:
+            raise ValueError("silver boundary mode must be polygon, line or roi_inset")
+        if self.mode == "roi_inset":
+            if len(points) != 4:
+                raise ValueError("ROI inset boundary needs four rectangle vertices")
+            left, top = points[0]
+            right, bottom = points[2]
+            expected = np.array([[left, top], [right, top], [right, bottom], [left, bottom]])
+            if right <= left or bottom <= top or not np.array_equal(points, expected):
+                raise ValueError("ROI inset boundary must be an ordered axis-aligned rectangle")
+            object.__setattr__(self, "_rectangle_bounds", (left, top, right, bottom))
+            return
         if len(points) < 3 or (self.mode == "line" and len(points) != 3):
             raise ValueError("silver boundary polygon needs at least 3 points; line needs 3 points")
         if len(np.unique(points, axis=0)) != len(points):
@@ -96,14 +108,23 @@ class Boundary:
         points = np.asarray(self.points)
         if (
             np.any(points < 0)
-            or np.any(points[:, 0] > width - 1)
-            or np.any(points[:, 1] > height - 1)
+            or np.any(points[:, 0] > (width if self.mode == "roi_inset" else width - 1))
+            or np.any(points[:, 1] > (height if self.mode == "roi_inset" else height - 1))
         ):
             raise ValueError("silver boundary is outside the 2D crop")
 
     def signed_distance(self, points: Sequence[Sequence[float]]) -> np.ndarray:
         """Return negative distances inside and positive distances outside."""
         query = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+        if self._rectangle_bounds is not None:
+            left, top, right, bottom = self._rectangle_bounds
+            x, y = query.T
+            dx = np.maximum(left - x, x - right)
+            dy = np.maximum(top - y, y - bottom)
+            # Euclidean distance at corners, exactly matching polygon distance;
+            # a simple max(dx,dy) would change tolerance/diagnostic semantics.
+            return (np.hypot(np.maximum(dx, 0), np.maximum(dy, 0))
+                    + np.minimum(np.maximum(dx, dy), 0))
         vertices = np.asarray(self.points)
         if self.mode == "line":
             a, b, inside = vertices
@@ -950,6 +971,41 @@ def _match_template_points(
     return result
 
 
+def _roi_inset_boundary(raw: Mapping[str, Any], crop_box: Sequence[int],
+                        circle: Sequence[float] | None, image_shape: Sequence[int]) -> Boundary:
+    """Reuse the existing detection crop without any image/template processing."""
+    box = np.asarray(crop_box, dtype=np.float64)
+    if box.shape != (4,) or not np.isfinite(box).all():
+        raise ValueError("ROI inset boundary requires a finite crop box")
+    x1, y1, x2, y2 = box
+    width, height = x2-x1, y2-y1
+    if x1 < 0 or y1 < 0 or width <= 0 or height <= 0 or len(image_shape) < 2 or (height, width) != tuple(image_shape[:2]):
+        raise ValueError("ROI inset crop box must match the detection image shape")
+    unit = str(raw.get("inset_unit", "px")).strip().casefold()
+    if unit not in {"px", "radius_ratio"}:
+        raise ValueError("silver ROI inset_unit must be px or radius_ratio")
+    values = raw.get("insets")
+    if not isinstance(values, Mapping) or any(name not in values for name in ("left", "top", "right", "bottom")):
+        raise ValueError("silver ROI insets must configure left, top, right and bottom")
+    offsets = []
+    for name in ("left", "top", "right", "bottom"):
+        value = values[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or value < 0:
+            raise ValueError(f"silver ROI inset {name} must be finite and non-negative")
+        offsets.append(float(value))
+    if unit == "radius_ratio":
+        if circle is None or len(circle) != 3 or not np.isfinite(circle).all() or circle[2] <= 0:
+            raise ValueError("radius_ratio silver ROI insets require a valid detected circle")
+        offsets = [value * float(circle[2]) for value in offsets]
+    left, top, inset_right, inset_bottom = offsets
+    right, bottom = width-inset_right, height-inset_bottom
+    if right <= left or bottom <= top:
+        raise ValueError("silver ROI insets leave no positive boundary width or height")
+    return Boundary(((left, top), (right, top), (right, bottom), (left, bottom)), "roi_inset",
+                    {"method": "roi_inset", "status": "ok", "is_valid": True,
+                     "fallback_used": False})
+
+
 def build_boundary(
     config: Mapping[str, Any],
     *,
@@ -963,6 +1019,8 @@ def build_boundary(
     raw = config.get("boundary") if isinstance(config, Mapping) else None
     if not isinstance(raw, Mapping):
         return None
+    if str(raw.get("mode", "")).strip().casefold() == "roi_inset":
+        return _roi_inset_boundary(raw, crop_box, circle, image_shape)
     calibration = raw
     calibration_path = raw.get("calibration_path")
     if calibration_path:
@@ -1179,11 +1237,13 @@ def inspect_masks(
             "status": "not_configured" if calibration_missing or not boundary_error else "uncertain",
             "is_ok": None,
             "message": boundary_error or "silver overflow boundary is not configured",
-            "registration": {"method": "sift_ransac" if (raw_boundary or {}).get("calibration_path") or (raw_boundary or {}).get("template_path") else "fixed_points",
+            "registration": {"method": "roi_inset" if str((raw_boundary or {}).get("mode", "")).strip().casefold() == "roi_inset" else "sift_ransac" if (raw_boundary or {}).get("calibration_path") or (raw_boundary or {}).get("template_path") else "fixed_points",
                              "status": "not_configured" if calibration_missing else "failed", "is_valid": False,
                              "message": boundary_error or "silver overflow boundary is not configured"},
         }
-        if boundary_error and isinstance(raw_boundary, Mapping) and raw_boundary.get("fallback_to_template_points"):
+        if (boundary_error and isinstance(raw_boundary, Mapping)
+                and str(raw_boundary.get("mode", "")).strip().casefold() != "roi_inset"
+                and raw_boundary.get("fallback_to_template_points")):
             overflow["registration"].update({"fallback_used": True,
                 "method": "template_points_fallback", "status": "fallback"})
     else:

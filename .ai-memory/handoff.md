@@ -60,3 +60,9 @@
 - Files: height_measurement.py, detect_board.py, config/3D/config.json + README, process/OUTPUT_PARAMETERS.md, tests/test_wire_height_erosion.py.
 - Evidence: 144 tests passed; real 10-piece batch completed with 52 valid points (42 wire/10 thin), point/depth/plane/threshold consistency checked. Published-mask core replay median 127.817ms old -> 23.014ms enabled; disabled exact equality, 15.911ms.
 - Remaining/blockers: no implementation work. Config radii require sample calibration; benchmark is measurement core, not end-to-end speed. Report: visualization/output/wire-height-erosion-20261018/live-report/report.html. Existing silver registration fallbacks remain outside scope.
+
+## Silver boundary from ROI pixel insets (2026-10-18)
+- Completed: boundary.mode=roi_inset, inset_unit=px, independent L376/T146/R34/B128 values seeded from original template edge midpoints relative to its circle-based crop. Reuses crop_box; skips SIFT/template IO/gray work; fast exact rectangular signed distances. Invalid config is uncertain, no template fallback. Optional radius_ratio and legacy template mode remain supported.
+- Files: silver_inspection.py, detect_board.py, config/2D/config.json + README, output parameter docs, viewer.js/html/README, Python ROI tests and frontend tests.
+- Evidence: 153 algorithm + 26 report + 8 frontend tests passed. Real 10-piece 2D + board3D batch completed in 19.147s (startup excluded), all ROI boundary coordinates and joint metadata checked; no template-stage logs. Ten-mask equal-geometry overflow-core replay median 1409.952 -> 602.805ms; boundary build median0.08465ms, not an end-to-end speed guarantee.
+- Remaining: no implementation blockers; production inset calibration and rotation limitations remain. C# fields unchanged but mode/method now roi_inset. Report: visualization/output/silver-roi-inset-20261018/live-report/report.html.
