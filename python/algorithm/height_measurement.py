@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Dict, Sequence
 
 import numpy as np
@@ -25,6 +26,8 @@ class HeightConfig:
     thin_solder_search_dilation_px: int = 6
     platform_local_ring_px: int = 24
     semantic_exclusion_dilation_px: int = 3
+    wire_measurement_erode_px: int = 0
+    thin_measurement_erode_px: int = 0
 
     @classmethod
     def from_dict(cls, values: Dict[str, Any] | None) -> "HeightConfig":
@@ -70,11 +73,19 @@ class HeightConfig:
             semantic_exclusion_dilation_px=int(
                 values.get("semantic_exclusion_dilation_px", cls.semantic_exclusion_dilation_px)
             ),
+            wire_measurement_erode_px=values.get(
+                "wire_measurement_erode_px", cls.wire_measurement_erode_px),
+            thin_measurement_erode_px=values.get(
+                "thin_measurement_erode_px", cls.thin_measurement_erode_px),
         )
         config.validate()
         return config
 
     def validate(self) -> None:
+        for name in ("wire_measurement_erode_px", "thin_measurement_erode_px"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"height_measurement_3d.{name} must be a non-negative integer")
         if not 0 < self.height_percentile <= 100:
             raise ValueError("height_3d.height_percentile must be in (0, 100]")
         if not 0 < self.plane_percentile <= 100:
@@ -252,6 +263,29 @@ def dilate_mask(mask: np.ndarray, radius_px: int) -> np.ndarray:
     return cv2.dilate(binary, _ellipse_kernel(radius_px))
 
 
+def erode_wire_mask_in_place(mask: np.ndarray, radius_px: int) -> np.ndarray:
+    """Trim a newly aligned, owned uint8 mask without a full-frame copy.
+
+    Radius is in 3D pixels. Erosion has zero background at every bbox/image
+    edge. The aligned source is not shared with semantic-plane masks, so only
+    the independently warped wire-height region is changed by this function.
+    """
+    if radius_px == 0:
+        return mask
+    if radius_px < 0:
+        raise ValueError("wire erosion radius must be non-negative")
+    x, y, width, height = cv2.boundingRect(mask)
+    if width == 0:
+        return mask
+    local = mask[y:y+height, x:x+width]
+    if min(width, height) <= 2 * radius_px:
+        local[:] = 0
+    else:
+        local[:] = cv2.erode(local, _ellipse_kernel(radius_px),
+                             borderType=cv2.BORDER_CONSTANT, borderValue=0)
+    return mask
+
+
 def measure_mask_height(
     depth: np.ndarray,
     mask: np.ndarray,
@@ -261,7 +295,16 @@ def measure_mask_height(
     max_height_mm: float | None = None,
 ) -> Dict[str, Any]:
     """Measure the high percentile depth point above a fitted reference plane."""
-    ys, xs = np.nonzero(np.asarray(mask) > 0)
+    source = np.asarray(mask)
+    if source.dtype == np.uint8:
+        # Warp output is uint8. Find its bounds in OpenCV, then enumerate only
+        # the local region instead of allocating/scanning a full-depth boolean
+        # mask per wire. Row-major point order is preserved, including ties.
+        left, top, width, height = cv2.boundingRect(source)
+        ys, xs = np.nonzero(source[top:top+height, left:left+width])
+        ys, xs = ys + top, xs + left
+    else:
+        ys, xs = np.nonzero(source > 0)
     valid = _valid_depth(depth[ys, xs], config)
     ys, xs = ys[valid], xs[valid]
     if len(xs) == 0:
@@ -387,6 +430,7 @@ def _box(values: Any, name: str) -> tuple[float, float, float, float]:
     return result
 
 
+@lru_cache(maxsize=32)
 def _ellipse_kernel(radius: int) -> np.ndarray:
     size = max(1, radius * 2 + 1)
     return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))

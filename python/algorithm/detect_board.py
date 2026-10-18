@@ -25,6 +25,7 @@ from algorithm.config import (
 from algorithm.height_measurement import (
     HeightConfig,
     dilate_mask,
+    erode_wire_mask_in_place,
     fit_chip_plane,
     fit_local_platform_plane,
     fit_platform_plane,
@@ -1624,6 +1625,12 @@ class DetectBoard:
                 depth.shape,
                 registration,
             )
+            erode_px = (self.height_config.thin_measurement_erode_px
+                        if class_name == "thin" else self.height_config.wire_measurement_erode_px)
+            if erode_px:
+                # This separately warped mask is owned by this measurement;
+                # complete instance/semantic masks remain intact for planes.
+                erode_wire_mask_in_place(aligned, erode_px)
             height = measure_mask_height(
                 depth,
                 aligned,

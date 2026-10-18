@@ -317,6 +317,14 @@ ROI 汇总复用实例测量的 ROI 分配与像素数；若掩码清理失败�
 
 ## 8. 引线、焊点和高度
 
+联合引线测高支持在配准后按类别剔除掩码边缘：
+`height_measurement_3d.parameters.wire_measurement_erode_px` 控制 wire，
+`thin_measurement_erode_px` 控制 thin 中间段。单位为 3D 像素半径，0 关闭。
+`WireMeasurements[].Mask3DLocal` 返回收缩后的实际采样区域，`Height3D.Point` 从该区域内选择；
+收缩后无有效深度时 `IsValid=false/IsOk=false/Point=null`。C# 字段不变，平台参考面和焊脚流程不变。
+详见 [3D 配置说明](../config/3D/README.md)。
+
+
 ### 8.1 `WireMeasurementResult`
 
 `RegionId/InstanceId/ClassName` 标识引线；`Mask2D` 为原图几何；

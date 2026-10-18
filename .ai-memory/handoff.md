@@ -54,3 +54,9 @@
 - Evidence: 134 algorithm + 26 report tests passed; Bridge Debug/Release builds passed; real 10-piece sample completed, 72 2D ratios and 52 joint cached measurements verified. Artifacts: visualization/output/wire-bending-validation-20261017/.
 - Remaining: no implementation work; sample-label threshold calibration advised. Existing 0.75 threshold and user config/DLL edits preserved.
 - Limits: five silver SIFT allocation failures triggered configured fallback during the real batch. src/ remains ignored by existing repository rules; DTO edits are local and compiled under src/Bridge/bin, root DLL preserved.
+
+## Per-class wire height edge removal (2026-10-18)
+- Completed: independent wire_measurement_erode_px / thin_measurement_erode_px (current config 2/1, missing=0); local in-place erosion after warp, interior P95, invalid on empty interior, published measurement mask updated. Complete semantic masks and solder paths preserved. uint8 height enumeration localized and kernels cached.
+- Files: height_measurement.py, detect_board.py, config/3D/config.json + README, process/OUTPUT_PARAMETERS.md, tests/test_wire_height_erosion.py.
+- Evidence: 144 tests passed; real 10-piece batch completed with 52 valid points (42 wire/10 thin), point/depth/plane/threshold consistency checked. Published-mask core replay median 127.817ms old -> 23.014ms enabled; disabled exact equality, 15.911ms.
+- Remaining/blockers: no implementation work. Config radii require sample calibration; benchmark is measurement core, not end-to-end speed. Report: visualization/output/wire-height-erosion-20261018/live-report/report.html. Existing silver registration fallbacks remain outside scope.

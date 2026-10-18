@@ -124,6 +124,8 @@
       "gray_offset": 32768.0,
       "vertical_resolution_mm": 0.00105,
       "height_percentile": 95.0,
+      "wire_measurement_erode_px": 2,
+      "thin_measurement_erode_px": 1,
       "plane_percentile": 35.0,
       "plane_min_valid_points": 100,
       "chip_min_valid_points": 100,
