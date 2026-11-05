@@ -392,7 +392,7 @@
         if (!height?.point) return;
         const space = height.point_coordinate_space || piece.height_point_coordinate_space;
         const originRow = Number(piece.depth_origin_row ?? piece.depth_start_row ?? 0);
-        const y = Number(height.point.y) - (space === "board_3d" ? originRow : 0);
+        const y = Number(height.point.y) - (["board_3d", "pitch_corrected_board_3d"].includes(space) ? originRow : 0);
         points.push({ ...height.point, y, label, ok: height.is_ok });
       };
       (piece.wire_measurements || []).forEach((item) => appendHeightPoint(item.height_3d, `wire #${item.instance_id}`));

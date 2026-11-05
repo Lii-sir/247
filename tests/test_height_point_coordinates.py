@@ -83,7 +83,7 @@ class HeightPointTests(unittest.TestCase):
         from contextlib import ExitStack
         stack = ExitStack()
         for name in ("platform_mask_2d", "platform_mask_3d", "register_platform_masks",
-                     "refine_affine_registration", "estimate_perspective"):
+                     "refine_affine_registration"):
             stack.enter_context(patch.object(module, name, return_value={"is_valid": True}))
         return stack
 

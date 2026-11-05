@@ -1,4 +1,4 @@
-"""Independent, offline result viewer. Never imports or executes algorithms."""
+"""Offline viewer: no inference; replays depth-only Pitch preprocessing when needed."""
 from __future__ import annotations
 
 import argparse
@@ -112,6 +112,16 @@ def build_payload(document: Any, *, base_dir: Path, images_2d: Path | None = Non
                 depth = np.asarray(image).copy()
             if depth.ndim != 2 or depth.dtype.kind not in "ui":
                 raise ValueError("Depth must be a single-channel integer image")
+            correction = board.get("pitch_correction") or (response.get("results_3d") or {}).get("pitch_correction") or {}
+            if correction.get("applied"):
+                import sys
+                sys.path.insert(0, str(HERE.parent / "python"))
+                from algorithm.tilt_correction import correct_smartray_pitch
+                settings = {**correction, "enabled_3d": True, "enabled_2d": False,
+                            "image_role": "independent_camera", "input_state": "uncorrected",
+                            "trigger_mode": "external"}
+                _, depth, _ = correct_smartray_pitch(None, depth, settings)
+
         except (OSError, ValueError) as exc:
             warnings.append(f"3D 预览不可用：{exc}")
             depth = None

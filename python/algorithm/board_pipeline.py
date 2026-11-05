@@ -6,6 +6,7 @@ import time
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import Any
+from algorithm.tilt_correction import depth_coordinate_space
 from algorithm.timing import timing_context, measure, record_duration, timed_call, note
 
 
@@ -19,6 +20,7 @@ class _Board:
     claimed: set = field(default_factory=set)
     results: dict = field(default_factory=dict)
     depth: Any = None
+    depth_correction: dict = field(default_factory=dict)
     depth_inflight: bool = False
     pieces: list = field(default_factory=list)
     completion: Future | None = None
@@ -254,20 +256,22 @@ class BoardPipeline:
             start = time.perf_counter()
             depth = timed_call("depth_read_decode_ms", self.detector._read_3d, req)
             read_ms = (time.perf_counter() - start) * 1000
+            depth, correction = self.detector.prepare_3d_depth(depth)
             start = time.perf_counter()
             pieces = timed_call("depth_segmentation_ms", segment.segment_depth_image,
                                 depth, self.detector.segmentation_config)
             if len(pieces) != self.detector.expected_piece_count:
                 raise ValueError("3D piece count does not match board configuration")
-            return depth, pieces, read_ms, (time.perf_counter() - start) * 1000
+            return depth, pieces, read_ms, (time.perf_counter() - start) * 1000, correction
 
         def decoded(future):
             try:
-                depth, pieces, read_ms, segment_ms = future.result()
+                depth, pieces, read_ms, segment_ms, correction = future.result()
                 with self._lock:
                     if self._current(state):
                         state.depth_inflight = False
                         state.depth, state.pieces = depth, pieces
+                        state.depth_correction = correction
                         state.depth_ready_at = time.perf_counter()
                         state.timings.update(shared_memory_read_decode_ms=read_ms,
                                              segmentation_3d_ms=segment_ms)
@@ -300,7 +304,7 @@ class BoardPipeline:
             timings = {"matching_input_wait_ms": pair_wait}
             future = self._submit_timed(self.joint_pool, "joint", timings, state.board_id, piece_id,
                                        state.request_id, self.detector.measure_prepared_piece,
-                                       piece_id, entry, state.depth, piece)
+                                       piece_id, entry, state.depth, piece, state.depth_correction)
             future.add_done_callback(lambda result, pid=piece_id: self._measured(state, pid, result))
 
     def _measured(self, state, piece_id, future):
@@ -329,6 +333,8 @@ class BoardPipeline:
         response = dict(ok=True, cmd="detect_3d_board", stage="3d",
                         board_id=state.board_id, batch_id=state.board_id,
                         results_board=dict(
+                            pitch_correction=state.depth_correction,
+                            depth_coordinate_space=depth_coordinate_space(state.depth_correction),
                             registration_ok=all(p["registration"]["is_valid"] for p in results),
                             is_ok=all(p["registration"]["is_valid"] and p["is_ok"] for p in results),
                             pieces=results),

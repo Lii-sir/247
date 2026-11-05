@@ -5,3 +5,7 @@ visualization/output/
 visualization/smoke-run/
 echo "__pycache__/" >> .gitignore
 *.zip
+.ai-memory/
+*.cmd
+demodatasets/
+tests/

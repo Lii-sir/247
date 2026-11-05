@@ -691,3 +691,10 @@ screen_y = image_y * zoom + pan_y
 
 需要这些额外图层时应明确扩展接口/DTO，或保留已经取得的单片返回结果，
 不要依赖当前 DLL 实际没有返回的可视化字段。
+
+
+## SmartRay Pitch正式接入与坐标（2026-11-05）
+
+正式联合配准现为粗配准+仿射，不执行透视求解。`results_board`、`results_3d`及联合单片包含`pitch_correction`元数据与`depth_coordinate_space`。默认关闭，`board_3d`表示本次输入板栅格；补偿实际执行时标签为`pitch_corrected_board_3d`。对应的`height_point_coordinate_space`与`Height3D.point_coordinate_space`同样标记补偿栅格，点已加本片在补偿后整板中的起始行，勿重复偏移。掩码与参考面仍为补偿后分片局部坐标。
+
+补偿后的点不能直接叠加到未补偿的原始深度PNG。C# DTO新增`PitchCorrection`（原始JSON字段字典）和`DepthCoordinateSpace`；需使用更新的Bridge构建产物才能按类型读取这些新增字段。模型公式、标定及开关详见config/3D/README.md。

@@ -63,6 +63,11 @@ static class Program
                     "Requests do not have unique correlation IDs.");
                 Check(scan.Result.Ok && scan.Result.ResultsBoard?.Pieces.Count == 10,
                     "Final board must contain exactly ten matching pieces.");
+                Check(scan.Result.ResultsBoard?.DepthCoordinateSpace == "board_3d",
+                    "Board depth coordinate tag was lost during DTO mapping.");
+                Check(scan.Result.ResultsBoard?.PitchCorrection != null &&
+                    scan.Result.ResultsBoard.PitchCorrection.TryGetValue("applied", out var applied) && !applied.GetBoolean(),
+                    "Pitch correction metadata was lost during DTO mapping.");
 
                 var orphan = bridge.ThreeD.DetectBoardSharedMemoryAsync("orphan-board", depth.Name, 3);
                 Thread.Sleep(50);

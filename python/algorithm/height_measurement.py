@@ -377,8 +377,10 @@ def height_points_to_board(piece: Dict[str, Any]) -> Dict[str, Any]:
     share the same height object and must not receive the offset twice.
     Reference planes and mask_3d_local remain in piece-local coordinates.
     """
-    if piece.get("height_point_coordinate_space") == "board_3d":
+    board_spaces = {"board_3d", "pitch_corrected_board_3d"}
+    if piece.get("height_point_coordinate_space") in board_spaces:
         return piece
+    space = piece.get("depth_coordinate_space", "board_3d")
     row_offset = int(piece["depth_start_row"])
 
     def convert(item):
@@ -387,12 +389,12 @@ def height_points_to_board(piece: Dict[str, Any]) -> Dict[str, Any]:
             return item
         converted = dict(height)
         point = height.get("point")
-        if isinstance(point, dict) and height.get("point_coordinate_space") != "board_3d":
+        if isinstance(point, dict) and height.get("point_coordinate_space") not in board_spaces:
             converted["point"] = {**point, "x": int(point["x"]), "y": int(point["y"]) + row_offset}
-        converted["point_coordinate_space"] = "board_3d"
+        converted["point_coordinate_space"] = space
         return {**item, "height_3d": converted}
 
-    result = {**piece, "height_point_coordinate_space": "board_3d"}
+    result = {**piece, "height_point_coordinate_space": space}
     for field in ("wire_measurements", "solder_measurements", "masks"):
         if isinstance(piece.get(field), list):
             result[field] = [convert(item) for item in piece[field]]

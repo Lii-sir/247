@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import sys
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -66,12 +67,28 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(result["pieces"][0]["timings"]["affine_registration_ms"], 123)
 
     def test_no_algorithm_import(self):
-        self.assertFalse(any(name.startswith("algorithm.") for name in sys.modules))
+        code = "import importlib.util,sys; s=importlib.util.spec_from_file_location('report',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); assert not any(n.startswith('algorithm.') or n=='torch' for n in sys.modules)"
+        result = subprocess.run([sys.executable, "-B", "-c", code, str(ROOT / "generate_report.py")], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_mismatched_image_disables_overlay(self):
         self.response["results_board"]["pieces"][0]["image_2d_size"] = [200, 100]
         result = report.build_payload(self.response, base_dir=self.root, images_2d=self.images)
         self.assertFalse(result["pieces"][0]["overlay_2d_valid"])
+
+    def test_pitch_preview_uses_corrected_grid(self):
+        from algorithm.tilt_correction import correct_smartray_pitch
+        depth = np.zeros((80,100),np.uint16);depth[20:60,10:90]=32958
+        Image.fromarray(depth).save(self.depth)
+        settings = dict(model='smartray_pitch',enabled_3d=True,input_state='uncorrected',
+                        scan_pitch_mm=.01,angle_deg=30,z_step_mm=.00105)
+        _, expected, info = correct_smartray_pitch(None,depth,settings)
+        self.response['results_board']['pitch_correction'] = info
+        item = self.response['results_board']['pieces'][0];item.update(depth_start_row=0,depth_end_row=80)
+        result = report.build_payload(self.response,base_dir=self.root,depth_path=self.depth)
+        rgb, limits = report._depth_rgb(expected)
+        self.assertEqual(result['pieces'][0]['preview_3d']['url'],report._data_url(rgb,'PNG')['url'])
+        self.assertEqual(result['pieces'][0]['preview_3d']['gray_range'],limits)
 
     def test_json_escape(self):
         encoded = report.safe_script_json({"name": "</script><img onerror='alert(1)'>"})

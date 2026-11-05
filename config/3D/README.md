@@ -6,7 +6,7 @@
 - `segmentation_3d`：一张整板深度图分成十片的参数。
 - `registration_3d`：初始尺度模板匹配参数。
 - `dynamic_affine_3d`：每片运行时仿射优化参数。
-- `perspective_registration_3d`：左侧框架边缘和圆特征透视拟合参数。
+- `smartray_pitch_3d`：分片前的SmartRay Pitch补偿，默认关闭；确认SDK状态和标定后，通过`enabled_3d`启用。
 - `height_measurement_3d`：芯片/引脚平台平面、焊脚和引线高度阈值。引脚平台 ROI 在 2D 图片上由 ROI 工具画定，以该片圆心/半径归一化后保存在本文件；每片处理时使用其透视矩阵映射到 3D，再排除所有对齐后的 YOLO 掩码拟合平台平面。未画 ROI 时平台参考面无效，不会退回固定 3D AOI。
 - `wire_height_3d`：独立 3D 接口的引线中心线 P95 参数。
 
@@ -75,3 +75,22 @@ C# 方法和字段不增加。`SolderMeasurements[].Mask3DLocal` 是实际内缩
 ## 线程配置
 
 `common_3d.parameters.threading.worker_budget` 是工作线程池总预算（当前默认 14），代码不设置硬编码最大值；各线程池配置之和仍不能超过该预算。`cpu_workers`（当前默认 7）配置输入准备、深度处理和联合 3D 共用的 CPU 线程池。增加 GPU 工作线程时，应同步增加预算。实际吞吐仍取决于运行硬件和显存。
+
+## 正式流程：Pitch → 分片 → 粗配准 → 仿射 → 测高
+
+透视配准阶段已移除，旧`perspective_registration_3d`块不再读取，不再输出对应的求解耗时；`homography_2d_to_3d`仍以3×3齐次矩阵表示仿射映射，底行为[0,0,1]。这不影响芯片外观裁剪等其他功能使用OpenCV的几何映射。
+
+新增可选功能块`smartray_pitch_3d`，只由`enabled_3d`控制是否执行。缺少整个块时关闭；启用后始终按未补偿的原始输入处理。启用前至少确认：
+
+- 正式配置不再使用`input_state`。如果数据已由SDK补偿，请将`enabled_3d`设为`false`，否则会重复处理。旧`input_state`字段会被忽略，不再触发跳过。
+- `angle_deg`为实际Pitch角，`scan_axis=rows/columns`对应深度图扫描方向。
+- `transform_direction=recover_ideal`使用Z=Z′/cosβ、X=X′−Z′tanβ；`document_forward`使用文档正向公式。按设备导出定义确认方向。
+- 外触发`scan_pitch_mm>0`；内触发设置`trigger_mode=internal`、`transport_rate_mm_s>0`、`scan_rate_hz>0`，以速度/频率计算基础步距。
+- `gray_offset`、`z_step_mm`必须与测高配置的灰度零点、垂直分辨率一致；`z_origin_mm`是灰度零点对应的设备物理Z，并非旋转中心。
+- 此功能块仅包含3D参数；算法名在内部固定，配置不需要`model`、`enabled_2d`、`image_role`或`input_state`。旧配置中的默认2D字段可兼容读取，但尝试启用2D同步映射会报错。正式补偿返回信息也不再带2D映射字段。
+
+整板深度只补偿一次，随后分片、配准、参考面拟合和测高都使用这份数据。流式、同步缓存整板、批量板级和独立3D入口均已接入。无效/越界点与碰撞处理沿用测试算法，不写回共享内存或原始图像。
+
+响应`results_board`/`results_3d`新增`pitch_correction`和`depth_coordinate_space`；联合单片也含对应元数据。关闭时为输入栅格`board_3d`；本工具实际补偿为`pitch_corrected_board_3d`，测高点标签同步，mask/平面仍为该栅格的分片局部坐标。无法把补偿坐标当原图坐标直接画在原始深度PNG上。离线报告会依据补偿元数据重建显示栅格；传入的应为原始采集深度文件。
+
+C# DTO新增元数据属性，现有测高点/掩码字段保持；源码已构建验证。上位机若继续引用旧DLL，新增属性不会出现在旧类型中，需要更新引用的构建产物。不要重复对SDK已矫正数据启用原始数据补偿。

@@ -43,7 +43,7 @@ from algorithm.registration import (
     refine_affine_registration,
     register_platform_masks,
 )
-from algorithm.perspective_registration import estimate_perspective
+from algorithm.tilt_correction import correct_smartray_depth, production_pitch_parameters, depth_coordinate_space
 from transport.shared_memory import read_shared_memory, SharedImage
 from algorithm.timing import timed_call, measure, note, record_duration, current_timings
 
@@ -83,7 +83,7 @@ class DetectBoard:
         self.registration_config = RegistrationConfig()
         self.height_config = HeightConfig()
         self.dynamic_affine_config: Dict[str, Any] = {}
-        self.perspective_registration_config: Dict[str, Any] = {}
+        self.pitch_config: Dict[str, Any] = {}
         # The streaming 2D path uses the same circle-relative crop as the
         # standalone 2D detector.  ``crop_roi`` remains the explicit fallback
         # for callers that do not provide the circle configuration.
@@ -335,9 +335,8 @@ class DetectBoard:
         self.dynamic_affine_config = dict(
             feature_parameters(config, "dynamic_affine_3d") or {}
         )
-        self.perspective_registration_config = dict(
-            feature_parameters(config, "perspective_registration_3d") or {}
-        )
+        self.pitch_config = production_pitch_parameters(config, self.height_config.gray_offset,
+                                                        self.height_config.vertical_resolution_mm)
 
     def _validate_gpu_requirement(self) -> None:
         if not torch.cuda.is_available():
@@ -684,6 +683,9 @@ class DetectBoard:
             read_start = time.perf_counter()
             depth = self._read_3d(req)
             read_decode_ms = self.elapsed_ms(read_start)
+            pitch_start = time.perf_counter()
+            depth, pitch_correction = self.prepare_3d_depth(depth)
+            pitch_ms = self.elapsed_ms(pitch_start)
 
             segment_start = time.perf_counter()
             depth_pieces = segment_depth_image(depth, self.segmentation_config)
@@ -695,10 +697,9 @@ class DetectBoard:
 
             align_start = time.perf_counter()
             results = []
-            perspective_config = self.perspective_registration_config
             for index, piece in enumerate(depth_pieces):
                 piece_id = index + 1
-                results.append(self.measure_prepared_piece(piece_id, entries[piece_id], depth, piece))
+                results.append(self.measure_prepared_piece(piece_id, entries[piece_id], depth, piece, pitch_correction))
             alignment_ms = self.elapsed_ms(align_start)
             total_ms = self.elapsed_ms(start)
             return {
@@ -708,6 +709,8 @@ class DetectBoard:
                 "board_id": board_id,
                 "batch_id": board_id,
                 "results_board": {
+                    "pitch_correction": pitch_correction,
+                    "depth_coordinate_space": depth_coordinate_space(pitch_correction),
                     "registration_ok": all(
                         piece["registration"]["is_valid"] for piece in results
                     ),
@@ -725,8 +728,9 @@ class DetectBoard:
                 "elapsed_ms": total_ms,
                 "timings": {
                     "shared_memory_read_decode_ms": read_decode_ms,
+                    "smartray_pitch_ms": pitch_ms,
                     "segmentation_3d_ms": segmentation_ms,
-                    "perspective_registration_and_mask_alignment_ms": alignment_ms,
+                    "registration_and_mask_alignment_ms": alignment_ms,
                     "total_detect_ms": total_ms,
                 },
                 "message": "3D board aligned with cached 2D piece masks",
@@ -748,9 +752,9 @@ class DetectBoard:
                     self._piece_cache.pop(board_id, None)
 
     def measure_prepared_piece(self, piece_id: int, entry: Dict[str, Any],
-                               depth: np.ndarray, piece: Dict[str, Any]) -> Dict[str, Any]:
+                               depth: np.ndarray, piece: Dict[str, Any],
+                               pitch_correction: Dict[str, Any] | None = None) -> Dict[str, Any]:
         """CPU-only joint work after the matching 2D and depth piece are ready."""
-        perspective_config = self.perspective_registration_config
         y1, y2 = int(piece["y1"]), int(piece["y2"])
         local_depth = depth[y1:y2]
         depth_mask = timed_call("platform_mask_3d_ms", platform_mask_3d, local_depth, self.registration_config)
@@ -764,9 +768,6 @@ class DetectBoard:
             local_depth,
             registration,
             self.dynamic_affine_config,
-        )
-        registration = timed_call("perspective_registration_ms", estimate_perspective,
-            entry["gray_image"], local_depth, registration, perspective_config
         )
         aligned_masks = timed_call("mask_alignment_ms", lambda: [
             self._align_instance(
@@ -791,6 +792,8 @@ class DetectBoard:
             "wire_roi_checks": entry.get("wire_roi_checks", []),
             "depth_start_row": y1,
             "depth_end_row": y2,
+            "pitch_correction": pitch_correction or {},
+            "depth_coordinate_space": depth_coordinate_space(pitch_correction or {}),
             "registration": registration,
             "is_ok": bool(
                 measurement["is_ok"]
@@ -950,6 +953,9 @@ class DetectBoard:
                 gray_images.append(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
             depth = self._read_3d(depth_descriptor)
             shared_memory_read_decode_ms = self.elapsed_ms(read_start)
+            pitch_start = time.perf_counter()
+            depth, pitch_correction = self.prepare_3d_depth(depth)
+            pitch_ms = self.elapsed_ms(pitch_start)
 
             segment_start = time.perf_counter()
             depth_pieces = segment_depth_image(depth, self.segmentation_config)
@@ -983,10 +989,6 @@ class DetectBoard:
                 registration = refine_affine_registration(
                     gray_images[index], local_depth, registration, self.dynamic_affine_config
                 )
-                registration = estimate_perspective(
-                    gray_images[index], local_depth, registration,
-                    self.perspective_registration_config,
-                )
                 crop_box, circle, roi_boxes = crop_metadata[index]
                 instances = self._extract_instances(prediction, crop.shape[:2])
                 aligned_masks = [
@@ -1005,6 +1007,8 @@ class DetectBoard:
                         "wire_rois_2d": [list(roi) for roi in roi_boxes],
                         "depth_start_row": y1,
                         "depth_end_row": y2,
+                        "pitch_correction": pitch_correction,
+                        "depth_coordinate_space": depth_coordinate_space(pitch_correction),
                         "registration": registration,
                         "is_ok": measurement["is_ok"],
                         "reference_planes": measurement["reference_planes"],
@@ -1021,6 +1025,8 @@ class DetectBoard:
                 "stage": "board",
                 "batch_id": str(req.get("batch_id") or ""),
                 "results_board": {
+                    "pitch_correction": pitch_correction,
+                    "depth_coordinate_space": depth_coordinate_space(pitch_correction),
                     "registration_ok": all(
                         piece["registration"]["is_valid"] for piece in results
                     ),
@@ -1033,6 +1039,7 @@ class DetectBoard:
                 "elapsed_ms": elapsed_ms,
                 "timings": {
                     "shared_memory_read_decode_ms": shared_memory_read_decode_ms,
+                    "smartray_pitch_ms": pitch_ms,
                     "segmentation_3d_ms": segmentation_ms,
                     "yolo_batch_inference_ms": inference_ms,
                     "registration_and_mask_alignment_ms": alignment_ms,
@@ -1085,6 +1092,9 @@ class DetectBoard:
         if image is None:
             raise ValueError(f"unable to decode 2D image for piece {descriptor.get('piece_id')}")
         return image
+
+    def prepare_3d_depth(self, depth: np.ndarray):
+        return timed_call("smartray_pitch_ms", correct_smartray_depth, depth, self.pitch_config)
 
     @staticmethod
     def _read_3d(descriptor: Dict[str, Any]) -> np.ndarray:
@@ -1324,8 +1334,8 @@ class DetectBoard:
                     raise ValueError("detected 2D circle is unavailable")
                 if registration.get("is_valid") is False:
                     raise ValueError("2D/3D registration is invalid")
-                if registration.get("perspective_valid") is not True:
-                    raise ValueError("piece perspective registration is invalid")
+                if registration.get("is_valid") is not True:
+                    raise ValueError("piece affine registration is invalid")
                 roi_mask, boxes, polygons = map_platform_rois(
                     circle, self.height_config.platform_roi_offsets,
                     registration, depth.shape,
@@ -1754,7 +1764,7 @@ class DetectBoard:
         self.chip_alignment_config = {}
         self.chip_anomaly_config = {"configured": False}
         self.dynamic_affine_config = {}
-        self.perspective_registration_config = {}
+        self.pitch_config = {}
         if self.chip_anomaly_inspector is not None:
             self.chip_anomaly_inspector.release()
         self.chip_anomaly_inspector = None

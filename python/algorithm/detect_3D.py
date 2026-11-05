@@ -3,6 +3,7 @@ import time
 from importlib import import_module
 from typing import Any, Dict
 
+from algorithm.tilt_correction import correct_smartray_depth, production_pitch_parameters, depth_coordinate_space
 from algorithm.config import feature_parameters, load_runtime_config
 from transport.shared_memory import read_shared_memory
 
@@ -24,6 +25,7 @@ class Detect3D:
         self.model_path = None
         self.config_path = None
         self.segmentation_config = SegmentationConfig()
+        self.pitch_config = {}
 
     def handle_init(self, req: Dict[str, Any]) -> Dict[str, Any]:
         start_time = time.perf_counter()
@@ -33,9 +35,11 @@ class Detect3D:
         self.config_path = req.get("config_path")
 
         config_text = req.get("config_text")
+        self.pitch_config = {}
         try:
             configure_measurement(None)
             self.segmentation_config = SegmentationConfig()
+            self.pitch_config = {}
         except Exception:
             pass
 
@@ -46,6 +50,9 @@ class Detect3D:
                 self.segmentation_config = SegmentationConfig.from_dict(values)
                 measurement_values = feature_parameters(config, "wire_height_3d")
                 configure_measurement(measurement_values)
+                self.pitch_config = production_pitch_parameters(config,
+                    float(measurement_values.get("gray_offset", 32768.)),
+                    float(measurement_values.get("vertical_resolution_mm", .00105)))
             except Exception as exc:
                 return {
                     "ok": False,
@@ -104,12 +111,17 @@ class Detect3D:
             decode_start = time.perf_counter()
             depth = decode_depth_png(data, data_format)
             decode_ms = self.elapsed_ms(decode_start)
+            pitch_start = time.perf_counter()
+            depth, pitch_correction = correct_smartray_depth(depth, self.pitch_config)
+            pitch_ms = self.elapsed_ms(pitch_start)
             segment_start = time.perf_counter()
             pieces = segment_depth_image(depth, self.segmentation_config)
             segmentation_ms = self.elapsed_ms(segment_start)
             measurement_start = time.perf_counter()
             pieces = measure_depth(depth, pieces)
-            results_3d = {"is_ok": all(piece["is_ok"] for piece in pieces),
+            results_3d = {"pitch_correction": pitch_correction,
+                          "depth_coordinate_space": depth_coordinate_space(pitch_correction),
+                          "is_ok": all(piece["is_ok"] for piece in pieces),
                           "pieces": pieces}
             measurement_ms = self.elapsed_ms(measurement_start)
             algorithm_detect_ms = self.elapsed_ms(algorithm_start)
@@ -144,6 +156,7 @@ class Detect3D:
                 "shared_memory_read_ms": shared_memory_read_ms,
                 "algorithm_detect_ms": algorithm_detect_ms,
                 "decode_ms": decode_ms,
+                "smartray_pitch_ms": pitch_ms,
                 "segmentation_ms": segmentation_ms,
                 "measurement_ms": measurement_ms,
                 "received_bytes": float(len(data)),
@@ -159,6 +172,7 @@ class Detect3D:
         self.model_path = None
         self.config_path = None
         self.segmentation_config = SegmentationConfig()
+        self.pitch_config = {}
         gc.collect()
 
     @staticmethod

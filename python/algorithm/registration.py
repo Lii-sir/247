@@ -154,6 +154,7 @@ def refine_affine_registration(
     result["affine_score_before"] = None
     result["affine_score_after"] = None
     result["affine_zone_losses"] = []
+    result["affine_scoring_region_ids"] = []
 
     if image_2d_gray.ndim != 2 or depth_piece.ndim != 2:
         result["affine_error"] = "affine registration requires grayscale 2D and 2D depth arrays"
@@ -188,7 +189,10 @@ def refine_affine_registration(
     target_mask = cv2.morphologyEx(target_mask, cv2.MORPH_CLOSE, kernel)
     target_height, target_width = target_mask.shape
 
-    rois = _affine_rois(values.get("rois"), target_width, target_height)
+    regions = _affine_regions(values.get("rois"), target_width, target_height,
+                              values.get("selected_regions"))
+    rois = [box for _, box in regions]
+    result["affine_scoring_region_ids"] = [region_id for region_id, _ in regions]
     if not rois:
         result["affine_error"] = f"no valid affine scoring zones for depth shape {target_mask.shape}"
         return result
@@ -344,11 +348,12 @@ def _full_affine(parameters: np.ndarray, preview_scale: float) -> np.ndarray:
     return matrix
 
 
-def _affine_rois(
+def _affine_regions(
     raw: Any,
     width: int,
     height: int,
-) -> list[tuple[int, int, int, int]]:
+    selected_regions: Sequence[int] | None = None,
+) -> list[tuple[int, tuple[int, int, int, int]]]:
     if raw is None:
         raw = [
             [165, 40, 520, max(40, height - 44)],
@@ -358,15 +363,29 @@ def _affine_rois(
     if not isinstance(raw, (list, tuple)):
         return []
     rois = []
-    for item in raw:
+    for region_id, item in enumerate(raw, start=1):
         if not isinstance(item, (list, tuple)) or len(item) != 4:
             continue
         x0, y0, x1, y1 = (int(value) for value in item)
         x0, x1 = max(0, x0), min(width, x1)
         y0, y1 = max(0, y0), min(height, y1)
         if x1 > x0 and y1 > y0:
-            rois.append((x0, y0, x1, y1))
+            rois.append((region_id, (x0, y0, x1, y1)))
+    if selected_regions is not None:
+        if (not isinstance(selected_regions, (list, tuple)) or not selected_regions
+                or any(isinstance(i, bool) or not isinstance(i, int) for i in selected_regions)
+                or len(set(selected_regions)) != len(selected_regions)):
+            raise ValueError("selected_regions须为非空、不重复的区域编号列表，如[1,2]")
+        available = {region_id for region_id, _ in rois}
+        if not set(selected_regions).issubset(available):
+            raise ValueError("所选仿射评分区不存在或超出深度片范围，请检查区域编号和ROI")
+        rois = [(region_id, box) for region_id, box in rois if region_id in selected_regions]
     return rois
+
+
+def _affine_rois(raw: Any, width: int, height: int) -> list[tuple[int, int, int, int]]:
+    """Compatibility wrapper returning every valid scoring box."""
+    return [box for _, box in _affine_regions(raw, width, height)]
 
 
 def align_crop_mask_to_depth(

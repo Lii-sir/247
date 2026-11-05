@@ -90,6 +90,9 @@ class FakeDetector:
         with self.lock:
             self.closed_inputs += 1
 
+    def prepare_3d_depth(self, depth):
+        return depth, {"applied": False, "reason": "disabled"}
+
     def _read_3d(self, req):
         self.depth_started.set()
         if req.get("fail_3d"):
@@ -99,7 +102,7 @@ class FakeDetector:
             depth[index * 10:index * 10 + 5] = 33000
         return depth
 
-    def measure_prepared_piece(self, piece_id, entry, depth, piece):
+    def measure_prepared_piece(self, piece_id, entry, depth, piece, pitch_correction=None):
         time.sleep(self.delay)
         if entry.get("fail_joint"):
             raise ValueError("synthetic registration failure")

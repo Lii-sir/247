@@ -87,19 +87,6 @@
       "ftol": 0.0001
     }
   },
-  "perspective_registration_3d": {
-    "description": "根据左侧引脚框架边缘和圆特征动态拟合透视变换",
-    "parameters": {
-      "threshold_2d": 50,
-      "max_edge_samples": 1100,
-      "max_nfev": 45,
-      "circle_search_scale": 0.25,
-      "circle_2d_min_radius": 115,
-      "circle_2d_max_radius": 165,
-      "circle_3d_min_radius": 135,
-      "circle_3d_max_radius": 205
-    }
-  },
   "height_measurement_3d": {
     "description": "使用ROI工具标定的2D引脚平台区域，经每片透视矩阵映射到3D拟合平台面；检测焊脚和引线相对平台/芯片平面的高度差",
     "parameters": {
@@ -138,6 +125,20 @@
       "thin_solder_measurement_erode_px": 1,
       "platform_local_ring_px": 24,
       "semantic_exclusion_dilation_px": 3
+    }
+  },
+  "smartray_pitch_3d": {
+    "description": "整板深度分片前的SmartRay Pitch补偿；enabled_3d控制开关，按未补偿输入处理",
+    "parameters": {
+      "enabled_3d": true,
+      "transform_direction": "recover_ideal",
+      "scan_axis": "rows",
+      "trigger_mode": "external",
+      "scan_pitch_mm": 0.02,
+      "angle_deg": 15.0,
+      "z_step_mm": 0.00105,
+      "gray_offset": 32768.0,
+      "z_origin_mm": 0.0
     }
   }
 }

@@ -9,7 +9,7 @@ function plotted(piece) {
   const nodes = new Map();
   const arcs = [];
   const makeNode = (id = '') => ({
-    id, textContent: '', style: {}, children: [],
+    id, textContent: '', style: {}, dataset: {}, children: [],
     append(...items) { this.children.push(...items); },
     appendChild(item) { this.children.push(item); },
     replaceChildren(...items) { this.children = items; },
@@ -40,7 +40,7 @@ function piece(space, row = 1000) {
   return {piece_id: 2, depth_start_row: row, depth_end_row: row + 200,
     height_point_coordinate_space: space, depth_origin_row: row,
     wire_measurements: [{instance_id: 1, height_3d: {
-      point: {x: 75, y: space === 'board_3d' ? row + 31 : 31}, is_ok: true}}],
+      point: {x: 75, y: ['board_3d','pitch_corrected_board_3d'].includes(space) ? row + 31 : 31}, is_ok: true}}],
     solder_measurements: [],
   };
 }
@@ -55,4 +55,5 @@ assert.deepEqual(plotted(tagged), [[75, 31]], 'Height-specific tag survives C# r
 const absent = piece('board_3d');
 absent.wire_measurements[0].height_3d.point = null;
 assert.deepEqual(plotted(absent), [], 'Invalid height has no fabricated point');
-console.log('5 real-viewer coordinate checks passed');
+assert.deepEqual(plotted(piece('pitch_corrected_board_3d')), [[75,31]], 'Corrected full-board point is plotted relative to corrected preview');
+console.log('6 real-viewer coordinate checks passed');

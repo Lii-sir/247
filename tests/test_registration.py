@@ -14,6 +14,33 @@ from algorithm import registration
 
 
 class AffineScoreTests(unittest.TestCase):
+    def test_only_selected_regions_contribute_to_objective(self):
+        gray=np.zeros((20,30),np.uint8)
+        depth=np.zeros((20,30),np.uint16)
+        depth[:10,10:20]=200  # Only R2 disagrees with the source mask.
+        coarse=dict(scale=1.,tx=0.,ty=0.,homography_2d_to_3d=np.eye(3).tolist())
+        base=dict(preview_scale=1.,morphology_kernel_size=1,penalty_weight=0.,
+                  rois=[[0,0,10,10],[10,0,20,10],[20,0,30,10]])
+        for selected,ids,expected in ((None,[1,2,3],1/3),([1],[1],0.),([2],[2],1.),([3,1],[1,3],0.)):
+            values=dict(base)
+            if selected is not None:values['selected_regions']=selected
+            captured=[]
+            def optimize(fn,x0,**kwargs):
+                captured.append(fn(x0));return SimpleNamespace(x=x0,nit=0)
+            with patch.object(registration,'minimize',side_effect=optimize):
+                result=registration.refine_affine_registration(gray,depth,coarse,values)
+            self.assertEqual(result['affine_scoring_region_ids'],ids)
+            self.assertEqual(len(result['affine_zone_losses']),len(ids))
+            self.assertAlmostEqual(result['affine_score_before'],expected)
+            self.assertAlmostEqual(captured[0],expected)
+
+    def test_invalid_selection_is_rejected_and_ids_survive_clipping(self):
+        raw=[[0,0,10,10],[10,0,20,10],[20,0,30,10]]
+        for selected in ([],[0],[4],[True],[1,1],'1'):
+            with self.assertRaises(ValueError):registration._affine_regions(raw,30,20,selected)
+        clipped=[[0,0,0,5],[-5,0,10,12],[20,0,40,12]]
+        self.assertEqual(registration._affine_regions(clipped,30,20,[2]),[(2,(0,0,10,12))])
+
     def test_binary_mismatch_score_matches_int16_absolute_mean(self):
         image = np.zeros((40, 50), dtype=np.uint8)
         image[5:30, 8:42] = 200
