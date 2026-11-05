@@ -5,6 +5,7 @@
   const state = {
     selected: Number(data.pieces?.[0]?.piece_id || 1),
     showMasks: true,
+    alignmentAlpha: .5, alignmentMode: "blend", alignmentMapped: true, alignmentProjected: false,
     showBending: true,
     showRois: true,
     showPoints: true,
@@ -17,6 +18,7 @@
     views: {
       "canvas2d": { scale: 1, x: 0, y: 0, fitted: false, drag: null },
       "canvas3d": { scale: 1, x: 0, y: 0, fitted: false, drag: null },
+      "canvasAlignment": { scale: 1, x: 0, y: 0, fitted: false, drag: null },
     },
   };
 
@@ -191,7 +193,7 @@
         state.selected = Number(piece.piece_id);
         state.highlight = null;
         state.views.canvas2d.fitted = false;
-        state.views.canvas3d.fitted = false;
+        state.views.canvas3d.fitted = false; state.views.canvasAlignment.fitted = false;
         renderAll();
       });
       root.appendChild(button);
@@ -244,6 +246,71 @@
     ctx.fillStyle = color;
     ctx.fillText(text, 4, -2);
     ctx.restore();
+  }
+
+  function alignmentMatrix(piece) {
+    let raw = piece.registration?.homography_2d_to_3d || piece.registration?.matrix_2d_to_3d;
+    if (!Array.isArray(raw) || ![2,3].includes(raw.length) || raw.some(row=>!Array.isArray(row)||row.length!==3)) return null;
+    raw = raw.map(row=>row.map(Number));
+    if (raw.length===2) raw.push([0,0,1]);
+    if (!raw.flat().every(Number.isFinite) || Math.abs(raw[2][2])<1e-12 || Math.abs(raw[2][0])+Math.abs(raw[2][1])>1e-12) return null;
+    const h=raw.map(row=>row.map(v=>v/raw[2][2]));
+    return Math.abs(h[0][0]*h[1][1]-h[0][1]*h[1][0])>1e-12 ? h : null;
+  }
+
+  function alignmentImage(asset, piece) {
+    if (!asset?._alignmentImage) {
+      asset._alignmentImage = new Image();
+      asset._alignmentImage.onload = () => { if(selectedPiece()===piece) renderAlignment(piece); };
+      asset._alignmentImage.onerror = () => { asset._alignmentError=true; if(selectedPiece()===piece) renderAlignment(piece); };
+      asset._alignmentImage.src = asset.url;
+    }
+    return asset._alignmentImage.complete&&!asset._alignmentError ? asset._alignmentImage : null;
+  }
+
+  function renderAlignment(piece) {
+    if(!piece){$("alignment-section").hidden=true;return;}
+    $("alignment-section").hidden=!piece.registration;
+    if (!piece.registration) return;
+    const h=alignmentMatrix(piece),source=piece.preview_2d,depth=piece.preview_3d;
+    const canvas=$("canvasAlignment"),ctx=canvas.getContext("2d"),rect=canvas.getBoundingClientRect(),dpr=window.devicePixelRatio||1;
+    canvas.width=Math.max(1,Math.round(rect.width*dpr));canvas.height=Math.max(1,Math.round(rect.height*dpr));
+    ctx.setTransform(dpr,0,0,dpr,0,0);ctx.fillStyle="#070c13";ctx.fillRect(0,0,rect.width,rect.height);
+    $("alignment-info").textContent=depth?`${depth.width} × ${depth.height} · 片 ${piece.piece_id}`:"未加载深度片";
+    if (!h||!source?.url||!depth?.url||piece.overlay_2d_valid===false) {
+      $("alignment-note").textContent=!h?"未提供有效仿射矩阵；历史透视结果不在此视图近似展示。":piece.overlay_2d_valid===false?"2D原图尺寸与检测结果不一致，已停用对齐预览。":"缺少2D原图或3D深度预览，无法显示叠加。";
+      return;
+    }
+    const view=state.views.canvasAlignment,w=Number(depth.width),height=Number(depth.height);
+    if(!view.fitted){view.scale=Math.max(.005,Math.min((rect.width-28)/w,(rect.height-28)/height,4));view.x=(rect.width-w*view.scale)/2;view.y=(rect.height-height*view.scale)/2;view.fitted=true;}
+    ctx.save();ctx.translate(view.x,view.y);ctx.scale(view.scale,view.scale);ctx.viewerScale=view.scale;
+    ctx.beginPath();ctx.rect(0,0,w,height);ctx.clip();
+    const base=alignmentImage(depth,piece),photo=alignmentImage(source,piece);
+    if(base)ctx.drawImage(base,0,0,w,height);
+    if(photo){
+      ctx.save();
+      if(state.alignmentMode==="wipe"){ctx.beginPath();ctx.rect(0,0,w*state.alignmentAlpha,height);ctx.clip();}
+      else ctx.globalAlpha=state.alignmentAlpha;
+      // Full 2D image coordinates -> local depth piece. No crop/board offset.
+      ctx.transform(h[0][0],h[1][0],h[0][1],h[1][1],h[0][2],h[1][2]);
+      ctx.drawImage(photo,0,0,Number(source.width),Number(source.height));ctx.restore();
+    }
+    for(const item of piece.masks||[]){
+      const selected=Number(item.instance_id)===state.highlight?.id;
+      if(state.alignmentMapped){ctx.setLineDash([]);drawGeometry(ctx,item.mask_3d_local,"#4ed3ca",selected);}
+      if(state.alignmentProjected){
+        ctx.setLineDash([6/view.scale,4/view.scale]);
+        for(const contour of item.mask_2d?.contours||[]){
+          const points=contour.map(([x,y])=>[h[0][0]*x+h[0][1]*y+h[0][2],h[1][0]*x+h[1][1]*y+h[1][2]]);
+          polygon(ctx,points,"#e3a6ff",selected?3:1.5);
+        }
+      }
+      const bounds=item.mask_3d_local?.bounding_box;
+      if(bounds&&(state.alignmentMapped||state.alignmentProjected))drawText(ctx,bounds[0],bounds[1],`${item.class_name||"instance"} #${item.instance_id}`,"#e7edf7");
+    }
+    ctx.setLineDash([]);ctx.restore();
+    const space=piece.depth_coordinate_space==="pitch_corrected_board_3d"?"Pitch补偿后的深度片":"输入深度片";
+    $("alignment-note").textContent=(piece.registration.is_valid===false?"配准标记无效，以下仅展示该矩阵的投影。 ":"")+`2D原图按本次实际矩阵投影到${space}；不重新优化，不重复添加裁剪偏移或整板起始行。`+(source._alignmentError||depth._alignmentError?" 预览图加载失败，请重新生成报告。":"");
   }
 
   function renderCanvas(canvas, piece, kind) {
@@ -570,7 +637,7 @@
     const range = piece.preview_3d?.gray_range;
     $("image3d-info").textContent = piece.preview_3d ? `${piece.preview_3d.width} × ${piece.preview_3d.height}${range ? ` · 灰度 ${number(range[0], 0)}–${number(range[1], 0)}` : ""}` : "未加载深度图";
     $("image2d-note").textContent = piece.overlay_2d_valid === false ? "原图尺寸与检测结果不一致，已停用叠加。" : "轮廓使用检测返回的原始像素坐标。";
-    renderCanvas($("canvas2d"), piece, "2d"); renderCanvas($("canvas3d"), piece, "3d");
+    renderCanvas($("canvas2d"), piece, "2d"); renderCanvas($("canvas3d"), piece, "3d"); renderAlignment(piece);
     renderChecks(piece); renderMeasurements(piece); renderDetails(piece); refreshCalibration();
   }
 
@@ -604,9 +671,14 @@
     canvas.addEventListener("pointercancel", () => { state.views[canvas.id].drag = null; });
   }
 
+  $("alignment-alpha").addEventListener("input",event=>{state.alignmentAlpha=Math.max(0,Math.min(1,Number(event.target.value)/100));renderAlignment(selectedPiece());});
+  $("alignment-mode").addEventListener("change",event=>{state.alignmentMode=event.target.value;renderAlignment(selectedPiece());});
+  $("alignment-mapped").addEventListener("change",event=>{state.alignmentMapped=event.target.checked;renderAlignment(selectedPiece());});
+  $("alignment-projected").addEventListener("change",event=>{state.alignmentProjected=event.target.checked;renderAlignment(selectedPiece());});
+  $("alignment-fit").addEventListener("click",()=>{state.views.canvasAlignment.fitted=false;renderAlignment(selectedPiece());});
   const checkboxState = { "show-masks": "showMasks", "show-bending": "showBending", "show-rois": "showRois", "show-points": "showPoints", "show-labels": "showLabels" };
   Object.entries(checkboxState).forEach(([id, key]) => $(id).addEventListener("change", (event) => { state[key] = event.target.checked; renderAll(); }));
-  $("fit-views").addEventListener("click", () => { state.views.canvas2d.fitted = false; state.views.canvas3d.fitted = false; renderAll(); });
+  $("fit-views").addEventListener("click", () => { state.views.canvas2d.fitted = false; state.views.canvas3d.fitted = false; state.views.canvasAlignment.fitted = false; renderAll(); });
   if (data.calibration?.enabled) {
     $("calibration-panel").hidden = false;
     $("calibration-enable").addEventListener("change", (event) => {
@@ -633,8 +705,8 @@
     renderAll();
   });
   $("export-json").addEventListener("click", () => { const blob = new Blob([JSON.stringify(data.response, null, 2)], { type: "application/json" }); const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = `${data.board_id || "detection"}-response.json`; link.click(); URL.revokeObjectURL(link.href); });
-  bindCanvas($("canvas2d")); bindCanvas($("canvas3d"));
-  window.addEventListener("resize", () => { state.views.canvas2d.fitted = false; state.views.canvas3d.fitted = false; renderAll(); });
+  bindCanvas($("canvas2d")); bindCanvas($("canvas3d")); bindCanvas($("canvasAlignment"));
+  window.addEventListener("resize", () => { state.views.canvas2d.fitted = false; state.views.canvas3d.fitted = false; state.views.canvasAlignment.fitted = false; renderAll(); });
   renderTimeline();
   renderAll();
 })();

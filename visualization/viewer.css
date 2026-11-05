@@ -8,3 +8,5 @@
 .legend i.bending-ok{background:#65d8b1}.legend i.bending-ng{background:#ff6b7a}.legend i.bending-unknown{background:#97a6ba}
 tr.bending-ng td:first-child{border-left:3px solid #ff6b7a}tr.bending-ok td:first-child{border-left:3px solid #65d8b1}tr.bending-unknown td:first-child{border-left:3px solid #97a6ba}
 #wire-bending-summary{line-height:1.7;text-align:right}
+
+.alignment-panel{margin-bottom:18px}.alignment-wrap{height:540px}.alignment-controls{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:12px 15px;border-bottom:1px solid var(--line);font-size:12px}.alignment-controls label{display:flex;gap:7px;align-items:center}.alignment-controls select{font:inherit;background:var(--surface2);color:var(--ink);border:1px solid var(--line);border-radius:5px;padding:6px}.alignment-controls input{accent-color:var(--blue)}.alignment-controls input[type=range]{width:110px}.alignment-panel .image-note{min-height:0;padding:7px 15px}[hidden]{display:none!important}@media(max-width:600px){.alignment-wrap{height:360px}.alignment-controls{gap:10px}}

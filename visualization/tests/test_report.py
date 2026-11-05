@@ -77,6 +77,7 @@ class ReportTests(unittest.TestCase):
         self.assertFalse(result["pieces"][0]["overlay_2d_valid"])
 
     def test_pitch_preview_uses_corrected_grid(self):
+        sys.path.insert(0, str(ROOT.parent / "python"))
         from algorithm.tilt_correction import correct_smartray_pitch
         depth = np.zeros((80,100),np.uint16);depth[20:60,10:90]=32958
         Image.fromarray(depth).save(self.depth)
