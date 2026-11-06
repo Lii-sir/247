@@ -33,23 +33,23 @@
   </component>
   <component name="NextEditCompletionFeaturesState">
     <decayedCancelled>
-      <entry key="MS100" value="1.3114939142760442" />
-      <entry key="MS500" value="2.904129757576774" />
-      <entry key="S2" value="6.49324019389747" />
-      <entry key="S5" value="11.267231862565273" />
-      <entry key="S10" value="17.203197297583955" />
-      <entry key="S30" value="28.6398533260863" />
-      <entry key="S60" value="33.952586256261064" />
-      <entry key="M2" value="37.387292954602884" />
-      <entry key="M5" value="43.60229928960249" />
-      <entry key="M10" value="60.19590941886101" />
-      <entry key="M15" value="76.53794330699684" />
-      <entry key="M30" value="114.21255284914821" />
-      <entry key="H1" value="170.21100949131153" />
-      <entry key="H2" value="249.90219305176532" />
-      <entry key="H4" value="341.96142943286134" />
-      <entry key="D1" value="670.1928067784514" />
-      <entry key="W1" value="866.2567731923701" />
+      <entry key="MS100" value="1.3655084530136994" />
+      <entry key="MS500" value="2.8030612937183457" />
+      <entry key="S2" value="4.471935363610688" />
+      <entry key="S5" value="8.642308883755355" />
+      <entry key="S10" value="15.237653843231552" />
+      <entry key="S30" value="33.52167087281448" />
+      <entry key="S60" value="53.18526529592956" />
+      <entry key="M2" value="80.15160946401939" />
+      <entry key="M5" value="124.31288524790216" />
+      <entry key="M10" value="162.28609333066345" />
+      <entry key="M15" value="187.90081431301758" />
+      <entry key="M30" value="238.3844842875467" />
+      <entry key="H1" value="303.49318037352646" />
+      <entry key="H2" value="389.6901742167425" />
+      <entry key="H4" value="486.8651244053779" />
+      <entry key="D1" value="822.052149226609" />
+      <entry key="W1" value="1020.6841369853923" />
     </decayedCancelled>
     <decayedSelected>
       <entry key="MS100" value="0.0" />
@@ -71,23 +71,23 @@
       <entry key="W1" value="0.0" />
     </decayedSelected>
     <decayedShown>
-      <entry key="MS100" value="1.256088574327411" />
-      <entry key="MS500" value="2.8781419510469957" />
-      <entry key="S2" value="6.475700989354331" />
-      <entry key="S5" value="11.239536853095602" />
-      <entry key="S10" value="17.173971063459373" />
-      <entry key="S30" value="28.62226343829663" />
-      <entry key="S60" value="33.942235845434745" />
-      <entry key="M2" value="37.381648424429564" />
-      <entry key="M5" value="43.59941548381525" />
-      <entry key="M10" value="60.19328264786278" />
-      <entry key="M15" value="76.5354183749177" />
-      <entry key="M30" value="114.2104856633907" />
-      <entry key="H1" value="170.2094828265534" />
-      <entry key="H2" value="249.90111079212573" />
-      <entry key="H4" value="341.96070476433493" />
-      <entry key="D1" value="670.192602695445" />
-      <entry key="W1" value="866.2567380690177" />
+      <entry key="MS100" value="1.3036072859196213" />
+      <entry key="MS500" value="2.756093750530699" />
+      <entry key="S2" value="4.437431855580703" />
+      <entry key="S5" value="8.594827980860385" />
+      <entry key="S10" value="15.19597386220149" />
+      <entry key="S30" value="33.497995122377624" />
+      <entry key="S60" value="53.163948961658384" />
+      <entry key="M2" value="80.128679765031" />
+      <entry key="M5" value="124.29481374159197" />
+      <entry key="M10" value="162.2737274738012" />
+      <entry key="M15" value="187.8912155940904" />
+      <entry key="M30" value="238.3784922500054" />
+      <entry key="H1" value="303.4895543302031" />
+      <entry key="H2" value="389.68799727750525" />
+      <entry key="H4" value="486.86383729914144" />
+      <entry key="D1" value="822.051848290013" />
+      <entry key="W1" value="1020.6840878986411" />
     </decayedShown>
   </component>
   <component name="ProjectColorInfo">{
@@ -106,7 +106,7 @@
     "RunOnceActivity.git.unshallow": "true",
     "RunOnceActivity.typescript.service.memoryLimit.init": "true",
     "codeWithMe.voiceChat.enabledByDefault": "false",
-    "git-widget-placeholder": "4d652155",
+    "git-widget-placeholder": "work-from-4d652155",
     "ignore.virus.scanning.warn.message": "true",
     "last_opened_file_path": "D:/projects/247-likai",
     "nodejs_package_manager_path": "npm",
@@ -161,7 +161,7 @@
       <workItem from="1793867981795" duration="10287000" />
       <workItem from="1793931648681" duration="7673000" />
       <workItem from="1793947107670" duration="8126000" />
-      <workItem from="1793957365872" duration="1786000" />
+      <workItem from="1793957365872" duration="2332000" />
     </task>
     <servers />
   </component>
@@ -202,7 +202,7 @@
                   <entry key="branch">
                     <value>
                       <list>
-                        <option value="master" />
+                        <option value="origin/yinxkj" />
                       </list>
                     </value>
                   </entry>
