@@ -591,8 +591,8 @@ class DetectBoard:
                 replaced = piece_id in board_cache
                 board_cache[piece_id] = entry
                 cache_state = self._cache_state_locked(board_id)
+        public_instances = timed_call("public_2d_geometry_ms", self._public_2d_instances, instances, crop_box)
         total_ms = self.elapsed_ms(start)
-        public_instances = timed_call("public_2d_geometry_ms", lambda: [self._public_2d_instance(item, crop_box) for item in instances])
         checks = [bool(item.get("is_ok")) for item in instances]
         checks.extend(bool(item.get("is_ok")) for item in wire_roi_checks)
         if chip_diagnostics.get("enabled") and chip_diagnostics.get("is_ok") is not True:
@@ -1687,6 +1687,12 @@ class DetectBoard:
             for key, value in instance.items()
             if key != "mask" and not key.startswith("_")
         }
+
+    def _public_2d_instances(self, instances, crop_box):
+        snapshots = [dict(item) for item in instances]
+        return self._instance_tasks.map(
+            lambda item: self._public_2d_instance(item, crop_box), snapshots,
+            timing_stage="public_2d_geometry_work_ms")
 
     def _public_2d_instance(
         self, instance: Dict[str, Any], crop_box: Sequence[int] | None = None

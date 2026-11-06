@@ -204,17 +204,17 @@ def measure_chip_expansion_overflow(
     chip_class: str = "chip",
     outward_length_px: int = 20,
     min_chip_area_px: int = 100,
+    *, mask_cache=None,
 ) -> OverflowMeasurement:
     """Measure silver outside expanded axis-aligned chip rectangles."""
     if isinstance(outward_length_px, bool) or int(outward_length_px) < 1:
         raise ValueError("chip expansion outward_length_px must be positive")
     shape = (int(image_shape[0]), int(image_shape[1]))
-    chip, chip_count = _union_masks(instances, (chip_class,), shape)
+    cache = mask_cache or _MaskUnionCache(instances, shape)
+    chip, chip_count = cache.union((chip_class,))
     if chip_count == 0 or not chip.any():
         raise ValueError(f"no {chip_class} mask was detected")
-    components_count, labels, stats, _ = cv2.connectedComponentsWithStats(
-        chip.astype(np.uint8), 8
-    )
+    components_count, labels, stats, origin = cache.components(chip_class)
     expanded = np.zeros_like(chip)
     for label in range(1, components_count):
         x, y, width, height, area = map(int, stats[label])
@@ -227,7 +227,7 @@ def measure_chip_expansion_overflow(
         expanded[y1:y2, x1:x2] = True
     if not expanded.any():
         raise ValueError(f"no {chip_class} component reached min_chip_area_px")
-    silver, silver_count = _union_masks(instances, (settings.silver_class,), shape)
+    silver, silver_count = cache.union((settings.silver_class,))
     if silver_count == 0 or not silver.any():
         raise ValueError(f"no {settings.silver_class} mask was detected")
     outside = silver & ~expanded
@@ -473,6 +473,36 @@ def _union_masks(
     return mask, count
 
 
+class _MaskUnionCache:
+    """One inspection owns this cache; never retain it across input images."""
+    def __init__(self, instances, shape):
+        self.instances = tuple(instances)
+        self.shape = shape
+        self.unions = {}
+        self.component_cache = {}
+
+    def union(self, names):
+        key = tuple(sorted({_key(name) for name in names}))
+        if key not in self.unions:
+            self.unions[key] = _union_masks(self.instances, key, self.shape)
+        return self.unions[key]
+
+    def components(self, name):
+        key = _key(name)
+        if key not in self.component_cache:
+            mask, _ = self.union((name,))
+            x, y, width, height = cv2.boundingRect(mask.astype(np.uint8))
+            # Keep the global 2x2 CCL scan alignment and component order.
+            left, top = x // 2 * 2, y // 2 * 2
+            local = mask[top:y+height, left:x+width].astype(np.uint8)
+            count, labels, stats, _ = cv2.connectedComponentsWithStats(local, 8)
+            stats = stats.copy()
+            stats[1:, cv2.CC_STAT_LEFT] += left
+            stats[1:, cv2.CC_STAT_TOP] += top
+            self.component_cache[key] = count, labels, stats, (left, top)
+        return self.component_cache[key]
+
+
 def _measure_chip_component(
     component: np.ndarray,
     chip_union: np.ndarray,
@@ -482,9 +512,12 @@ def _measure_chip_component(
     chip_index: int,
     *,
     compact_masks: bool = False,
+    component_origin: tuple[int, int] = (0, 0),
 ) -> dict[str, Any]:
-    height, width = component.shape
+    height, width = chip_union.shape
     ys, xs = np.nonzero(component)
+    ox, oy = component_origin
+    xs, ys = xs + ox, ys + oy
     if len(xs) == 0:
         raise ValueError(f"chip component {chip_index} has no pixels")
     x1, x2 = int(xs.min()), int(xs.max()) + 1
@@ -570,8 +603,12 @@ def _measure_chip_component(
     local_missing_mask[ring_y, ring_x] = (
         missing_sectors[indices] & ~local_covered[ring_y, ring_x]
     )
+    local_chip = np.zeros(local_ring.shape, dtype=bool)
+    left, top = max(outer_x1, ox), max(outer_y1, oy)
+    right, bottom = min(outer_x2, ox + component.shape[1]), min(outer_y2, oy + component.shape[0])
+    local_chip[top-outer_y1:bottom-outer_y1, left-outer_x1:right-outer_x1] = component[top-oy:bottom-oy, left-ox:right-ox]
     masks = {
-        "chip_mask": component[local_slice].copy(),
+        "chip_mask": local_chip,
         "ring_mask": local_ring,
         "silver_mask": local_silver,
         "occlusion_mask": local_occlusion,
@@ -582,10 +619,9 @@ def _measure_chip_component(
     else:
         # Preserve the direct helper's existing full-image mask contract.
         for name, local in list(masks.items()):
-            full = np.zeros(component.shape, dtype=bool)
+            full = np.zeros(chip_union.shape, dtype=bool)
             full[local_slice] = local
             masks[name] = full
-        masks["chip_mask"] = component
     return {
         **masks,
         "center_xy": center,
@@ -608,35 +644,39 @@ def measure_continuity(
     instances: Iterable[Mapping[str, Any]],
     image_shape: Sequence[int],
     settings: ContinuitySettings,
+    *, mask_cache=None,
 ) -> ContinuityMeasurement:
     shape = (int(image_shape[0]), int(image_shape[1]))
-    chip, chip_count = _union_masks(instances, (settings.chip_class,), shape)
+    cache = mask_cache or _MaskUnionCache(instances, shape)
+    chip, chip_count = cache.union((settings.chip_class,))
     if chip_count == 0 or not chip.any():
         raise ValueError(f"no {settings.chip_class} mask was detected")
-    silver, silver_count = _union_masks(instances, (settings.silver_class,), shape)
+    silver, silver_count = cache.union((settings.silver_class,))
     if silver_count == 0 or not silver.any():
         raise ValueError(f"no {settings.silver_class} mask was detected")
-    occlusion, _ = _union_masks(instances, settings.occlusion_classes, shape)
+    occlusion, _ = cache.union(settings.occlusion_classes)
     if settings.occlusion_dilation_px:
         diameter = settings.occlusion_dilation_px * 2 + 1
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (diameter, diameter))
         occlusion = cv2.dilate(occlusion.astype(np.uint8), kernel) > 0
 
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(chip.astype(np.uint8), 8)
+    count, labels, stats, (label_x, label_y) = cache.components(settings.chip_class)
     components: list[dict[str, Any]] = []
     for label in range(1, count):
         area = int(stats[label, cv2.CC_STAT_AREA])
         if area < settings.min_chip_area_px:
             continue
+        x, y, width, height = map(int, stats[label, :4])
         components.append(
             _measure_chip_component(
-                labels == label,
+                labels[y-label_y:y-label_y+height, x-label_x:x-label_x+width] == label,
                 chip,
                 silver,
                 occlusion,
                 settings,
                 len(components) + 1,
                 compact_masks=True,
+                component_origin=(x, y),
             )
         )
     if not components:
@@ -652,6 +692,11 @@ def measure_continuity(
             merged[name][y:y + height, x:x + width] |= item[name]
     chip_mask, ring_mask, silver_mask, occlusion_mask, missing_mask = (
         merged[name] for name in mask_names)
+    x0 = min(item['outer_bbox_xyxy'][0] for item in components)
+    y0 = min(item['outer_bbox_xyxy'][1] for item in components)
+    x1 = max(item['outer_bbox_xyxy'][2] for item in components)
+    y1 = max(item['outer_bbox_xyxy'][3] for item in components)
+    counted = [merged[name][y0:y1, x0:x1] for name in mask_names]
     centers = np.asarray([item["center_xy"] for item in components], dtype=float)
     weights = np.asarray([item["chip_area_px"] for item in components], dtype=float)
     center = tuple(map(float, np.average(centers, axis=0, weights=weights)))
@@ -665,11 +710,11 @@ def measure_continuity(
         for item in components
     ]
     return ContinuityMeasurement(
-        int(chip_mask.sum()),
-        int(ring_mask.sum()),
-        int(silver_mask.sum()),
-        int(occlusion_mask.sum()),
-        int((ring_mask & ~occlusion_mask).sum()),
+        int(np.count_nonzero(counted[0])),
+        int(np.count_nonzero(counted[1])),
+        int(np.count_nonzero(counted[2])),
+        int(np.count_nonzero(counted[3])),
+        int(np.count_nonzero(counted[1] & ~counted[3])),
         sum(item["covered_sector_count"] for item in components),
         sum(item["valid_sector_count"] for item in components),
         sum(item["ignored_sector_count"] for item in components),
@@ -1196,6 +1241,8 @@ def inspect_masks(
             boundary_within_crop = False
     instances = list(instances)
 
+    mask_cache = _MaskUnionCache(instances, shape)
+
     overflow: dict[str, Any]
     if not overflow_enabled:
         overflow = {"status": "disabled", "is_ok": None}
@@ -1209,6 +1256,7 @@ def inspect_masks(
                 chip_class=str(expansion.get("chip_class", "chip")),
                 outward_length_px=int(expansion.get("outward_length_px", 20)),
                 min_chip_area_px=int(expansion.get("min_chip_area_px", 100)),
+                mask_cache=mask_cache,
             )
             overflow = {
                 "status": "overflow" if measurement.defect_area_px else "ok",
@@ -1248,10 +1296,8 @@ def inspect_masks(
                 "method": "template_points_fallback", "status": "fallback"})
     else:
         try:
-            silver_mask, silver_count = timed_call("silver_mask_union_ms", _union_masks,
-                instances,
+            silver_mask, silver_count = timed_call("silver_mask_union_ms", mask_cache.union,
                 (str(overflow_config.get("silver_class", "silver")),),
-                shape,
             )
             if silver_count == 0 or not silver_mask.any():
                 raise ValueError(
@@ -1295,7 +1341,7 @@ def inspect_masks(
     else:
         try:
             measurement = timed_call("silver_continuity_measure_ms", measure_continuity,
-                instances, shape, continuity_settings(continuity_config)
+                instances, shape, continuity_settings(continuity_config), mask_cache=mask_cache
             )
             disconnected = measurement.is_disconnected
             continuity = {

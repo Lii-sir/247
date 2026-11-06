@@ -93,3 +93,7 @@ ROI 外部分不参与测高，thin 焊脚仍从完整掩码的两端划分。
 ## 线程配置
 
 在 `common_2d.parameters.threading` 中配置 `postprocess_workers`（当前默认 5）和 `gpu_workers`（当前默认 2）。统一板级检测会为每个 GPU 工作线程加载独立的 YOLO 与 EfficientAD 模型副本；增加 GPU 工作线程时，也要相应提高 3D 配置中的 `worker_budget`。独立 2D/3D 旧接口目前只支持一个 GPU 工作线程。
+
+统一板级流程的公开实例几何使用3D配置中的`common_3d.parameters.threading.instance_workers`（1为串行），通过独立字典快照提交任务，只读共享掩码，父线程按原顺序收集。`public_2d_geometry_ms`是阶段墙钟，`public_2d_geometry_work_ms`是各实例工作耗时之和；`total_detect_ms`现在包含公开几何生成，完整请求仍可参考`request_pipeline_ms`。
+
+同一次银胶检查共用分类联合掩码及芯片连通域，跨图不复用。芯片连通域在保持全局2×2扫描对齐的有效包围框内计算，每个分量仅在自身包围框比较标签，汇总统计仅扫描所有外扩区域的包围框。保留原全尺寸输出掩码、芯片顺序、扇区统计及合格判定。
