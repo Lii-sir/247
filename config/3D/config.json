@@ -6,21 +6,82 @@
         "piece_count": 10
       },
       "threading": {
-        "worker_budget": 60,
-        "cpu_workers": 10,
-        "joint_workers": 10,
-        "instance_workers": 16
+        "worker_budget": 80,
+        "cpu_workers": 15,
+        "joint_workers": 15,
+        "instance_workers": 20
       }
     }
   },
   "segmentation_3d": {
-    "description": "将一张整板深度图分割为十片",
-    "parameters": {
-      "expected_piece_count": 10,
-      "mode": "auto",
-      "fixed_rois": []
-    }
-  },
+      "description": "整板切片自动/固定",
+      "parameters":{
+        "expected_piece_count": 10,
+        "mode": "fixed",
+        "fixed_rois": [
+        [
+          162,
+          305,
+          1339,
+          1083
+        ],
+        [
+          162,
+          1202,
+          1339,
+          1982
+        ],
+        [
+          162,
+          2099,
+          1339,
+          2855
+        ],
+        [
+          162,
+          2995,
+          1337,
+          3750
+        ],
+        [
+          162,
+          3891,
+          1336,
+          4644
+        ],
+        [
+          162,
+          4786,
+          1339,
+          5544
+        ],
+        [
+          162,
+          5681,
+          1342,
+          6440
+        ],
+        [
+          162,
+          6577,
+          1344,
+          7341
+        ],
+        [
+          162,
+          7473,
+          1343,
+          8240
+        ],
+        [
+          162,
+          8363,
+          1338,
+          9165
+        ]
+      ]
+      }
+    },
   "wire_height_3d": {
     "description": "3D独立接口的引线中心线P95高度检测",
     "parameters": {
@@ -87,8 +148,8 @@
       ],
       "penalty_weight": 0.005,
       "maxiter": 35,
-      "xtol": 0.0001,
-      "ftol": 0.0001
+      "xtol": 0.001,
+      "ftol": 0.01
     }
   },
   "height_measurement_3d": {

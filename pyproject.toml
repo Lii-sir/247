@@ -1,5 +1,5 @@
 [project]
-name = "247-likai"
+name = "yinxkj"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -11,10 +11,12 @@ dependencies = [
     "opencv-python>=4.8,<6",
     "scipy>=1.10,<2",
     "ultralytics>=8.3,<9",
+    "torch==2.7.1",
+    "torchvision==0.22.1",
 ]
 
 [project.scripts]
-247-likai = "247_likai:main"
+247-likai = "yinxkj:main"
 
 [build-system]
 requires = ["uv_build>=0.12.3,<0.13.0"]
@@ -22,4 +24,16 @@ build-backend = "uv_build"
 
 [tool.uv.build-backend]
 module-root = ""
-module-name = "247_likai"
+module-name = "yinxkj"
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
