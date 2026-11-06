@@ -1294,14 +1294,16 @@ class DetectBoard:
         }
 
     def _mask_in_wire_rois(
-        self, mask: np.ndarray, wire_rois: Sequence[Sequence[int]] | None = None
+        self, mask: np.ndarray, wire_rois: Sequence[Sequence[int]] | None = None,
+        *, mask_offset: Sequence[int] = (0, 0),
     ) -> np.ndarray:
         output = np.zeros_like(mask, dtype=np.uint8)
         height, width = output.shape
+        ox, oy = mask_offset
         for raw_roi in self.wire_rois if wire_rois is None else wire_rois:
             x1, y1, x2, y2 = (int(value) for value in raw_roi)
-            x1, x2 = max(0, x1), min(width, x2)
-            y1, y2 = max(0, y1), min(height, y2)
+            x1, x2 = max(0, x1 - ox), min(width, x2 - ox)
+            y1, y2 = max(0, y1 - oy), min(height, y2 - oy)
             if x2 > x1 and y2 > y1:
                 output[y1:y2, x1:x2] = mask[y1:y2, x1:x2]
         return output
@@ -1402,12 +1404,7 @@ class DetectBoard:
         for instance in instances:
             class_name = instance["class_name"].lower()
             if class_name == "thin":
-                middle_2d, solder_2d = split_thin_mask(
-                    instance["_mask_2d_array"],
-                    self.height_config.thin_solder_end_ratio,
-                )
-                instance["_thin_wire_mask_2d"] = middle_2d
-                instance["_thin_solder_masks_2d"] = solder_2d
+                solder_2d = instance["_thin_solder_masks_2d"]
                 for endpoint, solder_mask_2d in zip(("start", "end"), solder_2d):
                     solder_mask_3d = align_crop_mask_to_depth(
                         solder_mask_2d,
@@ -1580,6 +1577,16 @@ class DetectBoard:
             "height_3d": height,
         }
 
+    def _prepare_thin_parts(self, wires):
+        # Owned by this piece; children only read these arrays. Rebuild once
+        # per measurement so a later run cannot reuse a previous split ratio.
+        for wire in wires:
+            if wire["class_name"].lower() == "thin":
+                middle, endpoints = split_thin_mask(
+                    wire["_mask_2d_array"], self.height_config.thin_solder_end_ratio)
+                wire["_thin_wire_mask_2d"] = middle
+                wire["_thin_solder_masks_2d"] = endpoints
+
     def _measure_wire_regions(
         self,
         depth: np.ndarray,
@@ -1594,92 +1601,72 @@ class DetectBoard:
         if not wires:
             return []
         wire_rois = self.wire_rois if wire_rois is None else wire_rois
-        output = []
-        offset = np.asarray(crop_box[:2], dtype=np.int32)
-        for wire in wires:
-            class_name = wire["class_name"].lower()
-            source_mask = np.asarray(wire["_mask_2d_array"], dtype=np.uint8)
-            if class_name == "thin":
-                source_mask, _ = split_thin_mask(
-                    source_mask, self.height_config.thin_solder_end_ratio
-                )
-            if not np.any(self._mask_in_wire_rois(source_mask, wire_rois)):
-                # Wires outside the configured 2D arc-height ROI are not measured.
-                continue
-            cleaned = _geometry.clean_mask(
-                source_mask,
-                min_area=self.min_component_area,
-                kernel_size=5,
-            )
-            cleaned = self._mask_in_wire_rois(cleaned, wire_rois)
-            if not np.any(cleaned):
-                height = measure_mask_height(
-                    depth, np.zeros_like(depth, dtype=np.uint8), platform_plane,
-                    self.height_config, reference="wire_platform",
-                    max_height_mm=self.height_config.max_wire_platform_height_mm,
-                )
-                height["is_ok"] = False
-                output.append({
-                    "region_id": len(output) + 1,
-                    "instance_id": int(wire.get("instance_id", 0)),
-                    "class_name": str(wire.get("class_name", "")),
-                    "mask_2d": _mask_geometry(cleaned, offset=crop_box[:2], epsilon=1.0),
-                    "mask_3d_local": _mask_geometry(np.zeros_like(depth, dtype=np.uint8), offset=(0, 0), epsilon=1.0),
-                    "bending_2d": wire.get("bending_2d", {"is_valid": False, "is_ok": False}),
-                    "height_3d": height,
-                })
-                continue
-            # Bending is calculated once on the original YOLO instance during
-            # the 2D stage.  Keep that result here; only the central thin mask
-            # is changed for the independent 3D wire-height measurement.
-            bending = wire.get("bending_2d")
-            if not isinstance(bending, dict):
-                # Use the original full instance, before thin-end splitting and
-                # height-ROI clipping, just like the immediate 2D measurement.
-                bending_mask = _geometry.clean_mask(
-                    np.asarray(wire["_mask_2d_array"], dtype=np.uint8),
-                    min_area=self.min_component_area, kernel_size=5,
-                )
-                bending = _geometry.measure_wire_bending(
-                    bending_mask, wire_rois, self.rectangle_ratio_threshold,
-                    output_offset=offset,
-                )
-            aligned = align_crop_mask_to_depth(
-                cleaned.astype(np.uint8) * 255,
-                crop_box,
-                depth.shape,
-                registration,
-            )
-            erode_px = (self.height_config.thin_measurement_erode_px
-                        if class_name == "thin" else self.height_config.wire_measurement_erode_px)
-            if erode_px:
-                # This separately warped mask is owned by this measurement;
-                # complete instance/semantic masks remain intact for planes.
-                erode_wire_mask_in_place(aligned, erode_px)
-            height = measure_mask_height(
-                depth,
-                aligned,
-                platform_plane,
-                self.height_config,
-                reference="wire_platform",
-                max_height_mm=self.height_config.max_wire_platform_height_mm,
-            )
-            output.append(
-                {
-                    "region_id": len(output) + 1,
-                    "instance_id": int(wire.get("instance_id", 0)),
-                    "class_name": str(wire.get("class_name", "")),
-                    "mask_2d": _mask_geometry(
-                        cleaned, offset=crop_box[:2], epsilon=2.0
-                    ),
-                    "mask_3d_local": _mask_geometry(
-                        aligned, offset=(0, 0), epsilon=1.0
-                    ),
-                    "bending_2d": bending,
-                    "height_3d": height,
-                }
-            )
+        timed_call("height_prepare_thin_ms", self._prepare_thin_parts, wires)
+        results = self._instance_tasks.map(
+            lambda wire: self._measure_wire_region(depth, wire, registration,
+                                                   platform_plane, wire_rois, crop_box),
+            wires, timing_stage="height_wire_work_ms",
+        )
+        output = [item for item in results if item is not None]
+        for region_id, item in enumerate(output, 1):
+            item["region_id"] = region_id
         return output
+
+    def _measure_wire_region(self, depth, wire, registration, platform_plane, wire_rois, crop_box):
+        class_name = wire["class_name"].lower()
+        source_mask = np.asarray(wire["_thin_wire_mask_2d"] if class_name == "thin"
+                                 else wire["_mask_2d_array"], dtype=np.uint8)
+        height, width = source_mask.shape
+        # Existence check reads just ROI intersections, without a full image.
+        intersects = False
+        for x1, y1, x2, y2 in wire_rois:
+            left, top = max(0, x1), max(0, y1)
+            right, bottom = min(width, x2), min(height, y2)
+            if right > left and bottom > top and np.any(source_mask[top:bottom, left:right]):
+                intersects = True
+                break
+        if not intersects:
+            return None
+        # Keep global cleaning BEFORE ROI clipping, with all morphology halo.
+        cleaned, local_offset = _geometry.clean_mask_crop(
+            source_mask, min_area=self.min_component_area, kernel_size=5)
+        cleaned = self._mask_in_wire_rois(cleaned, wire_rois, mask_offset=local_offset)
+        full_offset = np.asarray(crop_box[:2], dtype=np.int32) + local_offset
+        if not np.any(cleaned):
+            empty = np.zeros((1, 1), dtype=np.uint8)
+            height_result = measure_mask_height(
+                depth, empty, platform_plane, self.height_config, reference="wire_platform",
+                max_height_mm=self.height_config.max_wire_platform_height_mm)
+            height_result["is_ok"] = False
+            return dict(instance_id=int(wire.get("instance_id", 0)),
+                class_name=str(wire.get("class_name", "")),
+                mask_2d=_mask_geometry(cleaned, offset=full_offset, epsilon=1.0),
+                mask_3d_local=_mask_geometry(empty, offset=(0, 0), epsilon=1.0),
+                bending_2d=wire.get("bending_2d", {"is_valid": False, "is_ok": False}),
+                height_3d=height_result)
+        bending = wire.get("bending_2d")
+        if not isinstance(bending, dict):
+            bending_mask, bending_offset = _geometry.clean_mask_crop(
+                np.asarray(wire["_mask_2d_array"], dtype=np.uint8),
+                min_area=self.min_component_area, kernel_size=5)
+            bending = _geometry.measure_wire_bending(
+                bending_mask, wire_rois, self.rectangle_ratio_threshold,
+                mask_offset=bending_offset, output_offset=crop_box[:2])
+        local_crop = (int(full_offset[0]), int(full_offset[1]),
+                      int(full_offset[0] + cleaned.shape[1]), int(full_offset[1] + cleaned.shape[0]))
+        aligned = align_crop_mask_to_depth(cleaned.astype(np.uint8) * 255,
+                                           local_crop, depth.shape, registration)
+        erode_px = (self.height_config.thin_measurement_erode_px if class_name == "thin"
+                    else self.height_config.wire_measurement_erode_px)
+        if erode_px:
+            erode_wire_mask_in_place(aligned, erode_px)
+        height_result = measure_mask_height(depth, aligned, platform_plane, self.height_config,
+            reference="wire_platform", max_height_mm=self.height_config.max_wire_platform_height_mm)
+        return dict(instance_id=int(wire.get("instance_id", 0)),
+            class_name=str(wire.get("class_name", "")),
+            mask_2d=_mask_geometry(cleaned, offset=full_offset, epsilon=2.0),
+            mask_3d_local=_mask_geometry(aligned, offset=(0, 0), epsilon=1.0),
+            bending_2d=bending, height_3d=height_result)
 
     @staticmethod
     def _matching_chip(
