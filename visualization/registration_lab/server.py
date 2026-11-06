@@ -112,6 +112,8 @@ def validate_saved_matrix(profile, context):
             raise ValueError("矩阵文件的图像尺寸无效")
     if any(saved.get(k) != context[k] for k in ("source_space", "target_space", "preprocessing")):
         raise ValueError("矩阵的坐标或Pitch设置与当前输入不一致，请恢复保存时的图像来源和补偿设置")
+    if "segmentation" in saved and saved["segmentation"] != context.get("segmentation"):
+        raise ValueError("矩阵的分片设置与当前不同，局部原点可能改变，请重新配准")
     same_source = saved["image_size"] == context["image_size"]
     if context["source_space"] == "smartray_intensity_depth_piece":
         same_source = saved["image_size"][0] == context["image_size"][0]
@@ -122,9 +124,46 @@ def validate_saved_matrix(profile, context):
     if np.any(np.abs(denominator) < 1e-12) or denominator.min() < 0 < denominator.max():
         raise ValueError("矩阵投影在当前图像内经过无穷远线，无法复用")
     warnings = []
+    if "segmentation" not in saved and "segmentation" in context:
+        warnings.append("旧矩阵未记录分片模式，请核对深度片局部原点是否一致")
     if saved["depth_size"][1] != context["depth_size"][1]:
         warnings.append("深度片高度与来源不同；按当前画幅显示，矩阵未缩放、未叠加整板行偏移")
     return matrix, warnings
+
+
+def calibrate_segmentation(request, progress=lambda value: None):
+    """Scan one depth board once, without 2D input or registration."""
+    if request.get("depth_mode", "board") != "board":
+        raise ValueError("固定分片标定需要整板深度图，不能使用已分好的单片")
+    parameters = request.get("parameters")
+    values = parameters.get("segmentation_3d") if isinstance(parameters, dict) else None
+    if not isinstance(values, dict):
+        raise ValueError("整板分片参数必须是对象")
+    # Recalibration always scans pixels, even if the current settings are fixed.
+    automatic = {**values, "mode": "auto", "fixed_rois": []}
+    config = segment.SegmentationConfig.from_dict(automatic)
+    timings = {}
+
+    def timed(name, function, *args):
+        progress(name)
+        started = time.perf_counter()
+        result = function(*args)
+        timings[name] = round((time.perf_counter() - started) * 1000, 3)
+        return result
+
+    depth = timed("读取深度", read_image, request["image_3d"], True)
+    settings = {**request.get("tilt", {}), "enabled_2d": False,
+                "image_role": "independent_camera"}
+    _, depth, correction = timed("SmartRay Pitch补偿", correct_smartray_pitch,
+                                 None, depth, settings)
+    pieces = timed("自动扫描整板", segment.segment_depth_image, depth, config)
+    fixed = {**values, "mode": "fixed", "expected_piece_count": config.expected_piece_count,
+             "fixed_rois": [[p[k] for k in ("x1", "y1", "x2", "y2")] for p in pieces]}
+    # Reject padded overlapping bands rather than exporting an unusable config.
+    segment.SegmentationConfig.from_dict(fixed)
+    return dict(segmentation_3d=fixed, pieces=pieces,
+                board_size=[depth.shape[1], depth.shape[0]], correction=correction,
+                timings=timings)
 
 
 def run_registration(request, progress=lambda value: None):
@@ -173,6 +212,13 @@ def run_registration(request, progress=lambda value: None):
                     np.asarray([[1, 0, 0], [0, 1, -y1], [0, 0, 1]]) @ np.asarray(transform)).tolist()
     local = depth[y1:y2]  # Production keeps the full width, not the segmentation X bbox.
     context = matrix_context(image, local, correction, request.get("tilt", {}))
+    context["segmentation"] = {"mode": "piece"}
+    if mode == "board":
+        segmentation = segment.SegmentationConfig.from_dict(parameters["segmentation_3d"])
+        context["segmentation"] = dict(mode=segmentation.mode,
+            expected_piece_count=segmentation.expected_piece_count)
+        if segmentation.mode == "fixed":
+            context["segmentation"]["fixed_rois"] = [list(box) for box in segmentation.fixed_rois]
     affine_parameters = parameters["dynamic_affine_3d"]
     all_regions = _affine_regions(affine_parameters.get("rois"), local.shape[1], local.shape[0])
     used_regions = ([] if registration_mode == "reuse" else
@@ -304,7 +350,7 @@ class Handler(BaseHTTPRequestHandler):
                 upload = Path(self.server.upload_dir.name) / (uuid.uuid4().hex + ".image")
                 upload.write_bytes(self.rfile.read(size))
                 return self.send(200, {"path": str(upload)})
-            if path != "/api/run":
+            if path not in {"/api/run", "/api/calibrate-segmentation"}:
                 return self.send(404, {"error": "接口不存在"})
             request = json.loads(self.rfile.read(size))
             with self.server.lock:
@@ -320,7 +366,8 @@ class Handler(BaseHTTPRequestHandler):
 
             def execute():
                 try:
-                    result = run_registration(request, lambda phase: update(phase=phase))
+                    function = calibrate_segmentation if path == "/api/calibrate-segmentation" else run_registration
+                    result = function(request, lambda phase: update(phase=phase))
                     update(status="done", result=result)
                 except Exception as exc:
                     update(status="failed", error=str(exc))

@@ -27,10 +27,10 @@ function syncRegionChoices(){
   const text=document.createElement('span');text.textContent='R'+id;label.append(input,text);area.append(label);regionCheckboxes.push({id,input});input.disabled=$('alignmentMode').value==='reuse';
  }
 }
-let submittedSignature=null;
+let submittedSignature=null, calibrationSignature=null;
 const formIds=['alignmentMode','path2','path3','piece','depthMode','compensationMode','imageRole','scanAxis','direction','trigger','angle','pitch','speed','frequency','zstep','grayOffset','zorigin','affine',...Object.keys(sections).map(k=>'param-'+k)];
 function formSignature(){return JSON.stringify([$('alignmentMode').value==='reuse'?matrixRevision:0,formIds.map(id=>[id,$(id).value,$(id).checked])]);}
-function markDirty(){$('pendingChanges').hidden=!current||formSignature()===submittedSignature;}
+function markDirty(){$('pendingChanges').hidden=!current||formSignature()===submittedSignature;if(calibrationSignature!==null)$('sliceCalibration').hidden=formSignature()!==calibrationSignature;}
 function updateMatrixUI(){
  const reuse=$('alignmentMode').value==='reuse';$('matrixReuseFields').hidden=!reuse;
  const source=savedMatrix?.source;
@@ -91,9 +91,9 @@ function setTilt(t={}){
 for(const id of ['compensationMode','imageRole','trigger','scanAxis','direction'])$(id).onchange=()=>{updateTiltUI();markDirty();};
 updateTiltUI();
 function download(data,name){const url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
-for(const [key,label] of Object.entries(sections)){const d=document.createElement('details');const s=document.createElement('summary');s.textContent=label;const t=document.createElement('textarea');t.id='param-'+key;t.setAttribute('aria-label',label);t.spellcheck=false;d.append(s,t);$('parameters').append(d);}
+for(const [key,label] of Object.entries(sections)){const d=document.createElement('details');d.id='section-'+key;const s=document.createElement('summary');s.textContent=label;const t=document.createElement('textarea');t.id='param-'+key;t.setAttribute('aria-label',label);t.spellcheck=false;d.append(s,t);$('parameters').append(d);}
 $('param-dynamic_affine_3d').oninput=()=>{syncRegionChoices();markDirty();};
-function busy(){ $('run').disabled=!ready||running||uploading>0; }
+function busy(){ $('run').disabled=!ready||running||uploading>0;$('scanFixedSlices').disabled=!ready||running||uploading>0; }
 const fileEntries={2:new Map(),3:new Map()},manualOptions={};
 function showFile(n,path,name,manual=false){
  const select=$('samples'+n);$('path'+n).value=path;
@@ -156,6 +156,7 @@ async function renderResult(){
  $('warning').textContent=`当前阶段算法有效标记：${flag?'true':'false'}。${r.affine_error||''}此标记不是独立精度验收。${corrected?' 已应用SmartRay Pitch '+d.correction.angle_deg+'°。3D丢弃点 '+(d.correction.discarded_points??0)+'，碰撞点 '+(d.correction.collision_points??0)+'；空洞未填补。':''}`;
  if(d.correction?.reason==='already_sdk_corrected')$('warning').textContent+=' 输入已由Studio/SDK矫正，本工具已跳过重复补偿。';
  if(d.matrix_reuse)$('warning').textContent='已复用保存矩阵，跳过配准求解及评分；当前片精度未自动验收。'+(d.matrix_reuse.warnings||[]).join('；');
+ $('useFixedSlices').disabled=!(d.pieces?.length);
  $('saveMatrix').disabled=false;
  $('source').src=d.source_preview;$('pin').disabled=showingA;$('showA').textContent=showingA?'返回当前 B':'查看 A';$('exportResult').disabled=false;draw();
 }
@@ -188,6 +189,41 @@ canvas.addEventListener('wheel',e=>{e.preventDefault();const old=zoom;zoom=Math.
 canvas.onpointerdown=e=>{drag={x:e.clientX,y:e.clientY,px:pan.x,py:pan.y};canvas.setPointerCapture(e.pointerId);};canvas.onpointermove=e=>{if(drag){pan={x:drag.px+e.clientX-drag.x,y:drag.py+e.clientY-drag.y};draw();}};canvas.onpointerup=canvas.onpointercancel=()=>drag=null;canvas.ondblclick=fit;
 $('fit').onclick=fit;$('view').onchange=draw;$('opacity').oninput=draw;new ResizeObserver(draw).observe($('viewport'));
 $('showAffineRois').onchange=()=>{updateRoiInfo();draw();};
+$('scanFixedSlices').onclick=async()=>{
+ if(running||uploading>0)return;
+ try{
+  if($('depthMode').value!=='board')throw Error('请使用整板深度图进行固定分片标定');
+  const image_3d=$('path3').value.trim();if(!image_3d)throw Error('请先选择3D整板深度图');
+  let segmentation;try{segmentation=JSON.parse($('param-segmentation_3d').value);}catch{throw Error('整板分片参数不是有效JSON');}
+  if(!segmentation||typeof segmentation!=='object'||Array.isArray(segmentation))throw Error('整板分片参数必须是对象');
+  const request={image_3d,depth_mode:'board',tilt:tiltSettings(),parameters:{segmentation_3d:segmentation}},signature=formSignature();
+  running=true;busy();$('sliceCalibration').hidden=true;status('正在自动扫描3D整板…');
+  const job=await api('/api/calibrate-segmentation',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(request)});
+  while(true){
+   await new Promise(r=>setTimeout(r,500));const state=await api('/api/jobs/'+job.id);
+   if(state.status==='failed')throw Error(state.error);
+   if(state.status==='done'){
+    if(formSignature()!==signature)throw Error('扫描期间输入或参数发生变化，未覆盖当前配置，请重新扫描');
+    const d=state.result,p=d.segmentation_3d;
+    $('param-segmentation_3d').value=JSON.stringify(p,null,2);$('advancedSettings').open=true;$('section-segmentation_3d').open=true;markDirty();
+    calibrationSignature=formSignature();$('sliceCalibration').textContent='整板 '+d.board_size.join(' × ')+' · 从上到下 '+p.fixed_rois.length+' 片\n'+p.fixed_rois.map((box,i)=>'第'+(i+1)+'片：['+box.join(', ')+']').join('\n');$('sliceCalibration').hidden=false;
+    status('已自动扫描并生成'+p.fixed_rois.length+'片固定配置，仅更新本页；可导出参数用于正式流程。');break;
+   }
+   status('标定中 · '+state.phase);
+  }
+ }catch(err){status(err.message,true);}finally{running=false;busy();}
+};
+$('useFixedSlices').onclick=()=>{
+ try{
+  if(running||uploading>0)throw Error('请等待当前任务完成');
+  if(showingA||!current?.pieces?.length||formSignature()!==submittedSignature)throw Error('请先按当前输入和参数完成整板配准，再固定本板分片');
+  const p=JSON.parse($('param-segmentation_3d').value);
+  p.mode='fixed';p.expected_piece_count=current.pieces.length;
+  p.fixed_rois=current.pieces.map(box=>[box.x1,box.y1,box.x2,box.y2]);
+  $('param-segmentation_3d').value=JSON.stringify(p,null,2);$('advancedSettings').open=true;$('section-segmentation_3d').open=true;markDirty();
+  status('已固定本板'+p.expected_piece_count+'片坐标，仅更新本页。正式配置须使用相同Pitch设置；可导出参数。');
+ }catch(err){status(err.message,true);}
+};
 $('pin').onclick=()=>{pinned=current;$('showA').disabled=false;status('已保留当前结果为 A；修改参数后再次运行可比较');};
 $('showA').onclick=()=>{showingA=!showingA;renderResult().catch(e=>status(e.message,true));};
 $('exportResult').onclick=()=>{const d=activeResult();if(!d)return;const {depth_preview,depth_color_preview,source_preview,...record}=d;record.stages=d.stages.map(({warped,warped_color,edges,...s})=>s);download(record,'registration-test.json');};

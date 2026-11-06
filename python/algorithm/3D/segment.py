@@ -32,6 +32,8 @@ class SegmentationConfig:
     max_internal_gap_height: int = 5
     padding_x: int = 0
     padding_y: int = 0
+    mode: str = "auto"
+    fixed_rois: tuple[tuple[int, int, int, int], ...] = ()
 
     @classmethod
     def from_dict(cls, values: Dict[str, Any]) -> "SegmentationConfig":
@@ -44,14 +46,38 @@ class SegmentationConfig:
             "max_internal_gap_height",
             "padding_x",
             "padding_y",
+            "mode",
+            "fixed_rois",
         }
-        config = cls(**{key: values[key] for key in allowed if key in values})
+        parameters = {key: values[key] for key in allowed if key in values}
+        if "fixed_rois" in parameters:
+            raw = parameters["fixed_rois"]
+            if not isinstance(raw, (list, tuple)) or any(not isinstance(box, (list, tuple)) for box in raw):
+                raise ValueError("segmentation.fixed_rois must be a list of [x1,y1,x2,y2] boxes")
+            parameters["fixed_rois"] = tuple(tuple(box) for box in raw)
+        config = cls(**parameters)
         config.validate()
         return config
 
     def validate(self) -> None:
         if self.expected_piece_count <= 0:
             raise ValueError("expected_piece_count must be greater than 0")
+        if self.mode not in {"auto", "fixed"}:
+            raise ValueError("segmentation.mode must be auto or fixed")
+        if self.mode == "fixed":
+            if len(self.fixed_rois) != self.expected_piece_count:
+                raise ValueError("fixed_rois count must equal expected_piece_count")
+            previous_end = 0
+            for index, box in enumerate(self.fixed_rois, 1):
+                if len(box) != 4 or any(type(v) is not int for v in box):
+                    raise ValueError(f"fixed ROI {index} must contain four integer pixel coordinates")
+                x1, y1, x2, y2 = box
+                if x1 < 0 or y1 < 0 or x2 <= x1 or y2 <= y1:
+                    raise ValueError(f"fixed ROI {index} has invalid bounds")
+                if y1 < previous_end:
+                    raise ValueError("fixed_rois must be top-to-bottom without overlapping row ranges")
+                previous_end = y2
+            return
         if not 0 < self.row_occupancy_threshold <= 1:
             raise ValueError("row_occupancy_threshold must be in (0, 1]")
         if not 0 < self.column_occupancy_threshold <= 1:
@@ -102,6 +128,15 @@ def segment_depth_image(
     config.validate()
     if depth.ndim != 2 or depth.size == 0:
         raise ValueError("depth image must be a non-empty two-dimensional array")
+
+    if config.mode == "fixed":
+        height, width = depth.shape
+        pieces = []
+        for piece_id, (x1, y1, x2, y2) in enumerate(config.fixed_rois, 1):
+            if x2 > width or y2 > height:
+                raise ValueError(f"fixed ROI {piece_id} exceeds depth image size {width}x{height}")
+            pieces.append(dict(piece_id=piece_id, x1=x1, y1=y1, x2=x2, y2=y2, defects=[]))
+        return pieces
 
     valid_mask = depth > config.min_valid_depth
     min_piece_height = max(

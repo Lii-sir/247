@@ -20,7 +20,9 @@
 <label>公式方向<select id="direction"><option value="recover_ideal">还原：测量值 → 理想值</option><option value="document_forward">文档正向：理想值 → 测量值</option></select></label>
 <label>触发方式<select id="trigger"><option value="external">外触发：标定步距</option><option value="internal">内触发：速度 ÷ 频率</option></select></label>
 <details><summary>深度标定 / 公式说明</summary><div class="detail-body"><label>Z分辨率（mm/灰度）<input id="zstep" type="number" value="0.00105" step="any"></label><label>灰度零点<input id="grayOffset" type="number" value="32768" step="any"></label><label>灰度零点对应设备Z（mm）<input id="zorigin" type="number" value="0" step="any"></label><p class="notice">文档：X′=X+Z·sinβ，Z′=Z·cosβ。还原：Z=Z′/cosβ，X=X′−Z′·tanβ。X为扫描方向。光学镜头朝激光方向扫描时角为负，反向为正。标定值须与设备导出格式一致。</p></div></details>
-<h3 class="subheading">配准阶段</h3><div class="checks"><span>✓ 粗配准</span><label><input id="affine" type="checkbox" checked> 仿射</label></div><div id="parameters"></div>
+<h3 class="subheading">配准阶段</h3><div class="checks"><span>✓ 粗配准</span><label><input id="affine" type="checkbox" checked> 仿射</label></div>
+<button id="scanFixedSlices" type="button" disabled>自动扫描并生成固定分片</button><small>仅需3D整板图，按当前Pitch设置扫描一次；生成配置后固定使用。</small><pre id="sliceCalibration" hidden></pre>
+<button id="useFixedSlices" type="button" disabled>将本板分片设为固定</button><small>使用本次配准结果的分片坐标，仅更新本页；可导出后写入正式配置。</small><div id="parameters"></div>
 <div class="actions"><button id="reset">恢复默认</button><button id="import">导入参数</button><button id="exportParams">导出参数</button><input id="paramsFile" type="file" accept=".json" hidden></div><small>参数仅用于测试，不写回生产配置。</small>
 </div></details>
 <div class="runbar"><button id="run" class="primary" disabled>运行配准 <span>↗</span></button><p id="status" role="status">正在加载配置…</p></div></aside>

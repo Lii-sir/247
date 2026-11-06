@@ -13,3 +13,4 @@
 #roiInfo{line-height:1.8;margin:10px 0;color:#607e85;overflow-wrap:anywhere}.roi-toggle{cursor:pointer}
 
 .scoring-choice{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:0 0 12px;padding:10px 12px;background:#fff;border:1px solid var(--line);border-radius:6px;font-size:11px}.scoring-choice small{margin:0}.scoring-choice label{cursor:pointer}
+#sliceCalibration{white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;line-height:1.8;padding:10px;background:#e9f3ef;border-radius:6px}

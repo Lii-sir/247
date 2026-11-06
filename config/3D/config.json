@@ -15,7 +15,9 @@
   "segmentation_3d": {
     "description": "将一张整板深度图分割为十片",
     "parameters": {
-      "expected_piece_count": 10
+      "expected_piece_count": 10,
+      "mode": "auto",
+      "fixed_rois": []
     }
   },
   "wire_height_3d": {
