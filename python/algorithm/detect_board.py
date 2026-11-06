@@ -100,10 +100,12 @@ class DetectBoard:
         self._piece_cache_lock = threading.RLock()
         self._inference_lock = threading.RLock()
         self._instance_tasks = InstanceTasks()
+        self._pitch_tasks = InstanceTasks(thread_name_prefix="pitch")
 
     def handle_init(self, req: Dict[str, Any]) -> Dict[str, Any]:
         start = time.perf_counter()
-        if self.model is not None or self.chip_anomaly_inspector is not None or self._instance_tasks.workers > 1:
+        if (self.model is not None or self.chip_anomaly_inspector is not None
+                or self._instance_tasks.workers > 1 or self._pitch_tasks.workers > 1):
             self.release()
         self.config_path = str(req.get("config_path") or "") or None
         raw_model_paths = req.get("model_path")
@@ -341,6 +343,7 @@ class DetectBoard:
                                                         self.height_config.vertical_resolution_mm)
         threading_values = _dict(common_3d.get("threading", {}), "common_3d.parameters.threading")
         self._instance_tasks.configure(threading_values.get("instance_workers", 16))
+        self._pitch_tasks.configure(self.pitch_config.get("projection_workers", 1))
 
     def _validate_gpu_requirement(self) -> None:
         if not torch.cuda.is_available():
@@ -1091,7 +1094,8 @@ class DetectBoard:
         return image
 
     def prepare_3d_depth(self, depth: np.ndarray):
-        return timed_call("smartray_pitch_ms", correct_smartray_depth, depth, self.pitch_config)
+        return timed_call("smartray_pitch_ms", correct_smartray_depth, depth, self.pitch_config,
+                          tasks=self._pitch_tasks)
 
     @staticmethod
     def _read_3d(descriptor: Dict[str, Any]) -> np.ndarray:
@@ -1733,6 +1737,7 @@ class DetectBoard:
 
     def release(self) -> None:
         self._instance_tasks.close()
+        self._pitch_tasks.close()
         for resource in self._gpu_worker_resources[1:]:
             resource["inspector"].release()
         self._gpu_worker_resources = []

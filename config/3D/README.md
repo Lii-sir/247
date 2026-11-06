@@ -140,3 +140,11 @@ C# DTO新增元数据属性，现有测高点/掩码字段保持；源码已构�
 `dynamic_affine_3d.parameters.score_mode`为`roi`（默认）或`full`（旧整图评分，可用于对照/回退）。ROI模式只生成所选评分框的采样结果，不生成整个目标画幅；区域裁剪、分区平均和剪切惩罚不变。保留全局目标坐标和原画幅尾部取整边界。当前逐像素验证的后端为OpenCV5 AVX2；其他后端、关闭优化或超出remap尺寸限制时自动使用full，并在返回值`affine_score_mode`显示实际方式。
 
 配准结果新增`affine_function_evaluations`（优化器nfev）、`affine_optimizer_success/status`、`affine_stop_reason`、`affine_optimizer_ms`，以及`affine_score_calls/total_ms/mean_ms`。score_calls包含初始和最终检查，通常比nfev多2次；平均评分耗时可区分评分次数与单次评分成本。停止原因与最终损失合格判断独立，未改变Powell参数、迭代上限或合格阈值。
+
+## Pitch条带并行
+
+`smartray_pitch_3d.parameters.projection_workers`默认配置为8，必须为正整数；设为1串行。省略该项的旧配置按1处理。统一板级和独立3D检测器各自在初始化时配置独立Pitch线程池，跨板复用，释放/重新初始化时关闭；它与joint及instance线程池分开，也不计入桥接层原有worker_budget。
+
+按非扫描轴分条带：rows扫描分列，columns扫描分行。每个条带覆盖整个扫描方向，投影和碰撞聚合仅写自己的缓冲，父线程按条带顺序合并，因此跨行的大位移不会造成并发写冲突。投影公式、np.rint取整、0/65535无效值、越界过滤、碰撞取最大矫正深度保持不变。同栅格强度图复用本次投影点，平局仍取最大的原始源索引，不再二次投影。
+
+`smartray_pitch_ms`仍是整体墙钟；新增`pitch_projection_work_ms`为各条带工作耗时之和（有计时上下文时记录）。补偿元数据中的`projection_workers`是本次实际条带数，受非扫描方向尺寸和可用线程数限制。独立函数/配准台未传入持久池时使用一次性私有池并在结束时关闭；不开补偿或SDK已补偿时仍原样跳过。

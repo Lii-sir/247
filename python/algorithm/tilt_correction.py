@@ -4,6 +4,7 @@ X is transport. Inverse: Z=Z'/cos(beta), X=X'-Z'*tan(beta).
 from __future__ import annotations
 import math
 import numpy as np
+from algorithm.instance_tasks import InstanceTasks
 
 MODEL = 'smartray_pitch'
 
@@ -30,10 +31,10 @@ def production_pitch_parameters(config, gray_offset=32768., z_step_mm=.00105):
     return values
 
 
-def correct_smartray_depth(depth, settings):
+def correct_smartray_depth(depth, settings, *, tasks=None):
     """Production-only API: no 2D input, mapping or 2D metadata."""
     internal = {**(settings or {}), 'input_state': 'uncorrected'}
-    _, corrected, info = correct_smartray_pitch(None, depth, internal)
+    _, corrected, info = correct_smartray_pitch(None, depth, internal, tasks=tasks)
     hidden = {'enabled_2d', 'requested_2d', 'image_role', 'image_transform_original_to_corrected', 'input_state'}
     return corrected, {key: value for key, value in info.items() if key not in hidden}
 
@@ -49,7 +50,7 @@ def _number(settings, key, default):
     return value
 
 
-def correct_smartray_pitch(image, depth, settings):
+def correct_smartray_pitch(image, depth, settings, *, tasks=None):
     settings = settings or {}
     want2 = bool(settings.get('enabled_2d', False))
     want3 = bool(settings.get('enabled_3d', False))
@@ -108,11 +109,27 @@ def correct_smartray_pitch(image, depth, settings):
     tangent = math.tan(math.radians(angle))
     h, w = depth.shape
 
-    def project(start):
-        block = depth[start:start+256]
-        rows, cols = np.nonzero((block > 0) & (block < 65535))
-        rows = rows + start
-        z = (depth[rows, cols].astype(float)-offset)*step + origin
+    workers = settings.get('projection_workers', 1)
+    if type(workers) is not int or workers < 1:
+        raise ValueError('projection_workers必须为正整数')
+    owned_tasks = tasks is None
+    if owned_tasks:
+        tasks = InstanceTasks(workers, thread_name_prefix="pitch")
+    # Collisions can only happen along the scan axis. Each strip spans that
+    # entire axis and owns an independent output buffer; no concurrent scatter
+    # ever writes into another strip, even for very large depth shifts.
+    extent = w if axis == 'rows' else h
+    strip_count = min(workers, tasks.workers, extent)
+    boundaries = np.linspace(0, extent, strip_count + 1, dtype=int)
+    spans = list(zip(boundaries[:-1], boundaries[1:]))
+
+    def project_strip(span):
+        left, right = span
+        source = depth[:, left:right] if axis == 'rows' else depth[left:right, :]
+        th, tw = source.shape
+        rows, cols = np.nonzero((source > 0) & (source < 65535))
+        input_count = len(rows)
+        z = (source[rows, cols].astype(float)-offset)*step + origin
         if direction == 'recover_ideal':
             shift, corrected_z = -z*tangent, z/cosine
         else:
@@ -123,31 +140,49 @@ def correct_smartray_pitch(image, depth, settings):
         else:
             cc = np.rint(cols + shift/pitch).astype(np.int64)
         raw = np.rint((corrected_z-origin)/step + offset)
-        valid = (rr >= 0) & (rr < h) & (cc >= 0) & (cc < w) & (raw >= 1) & (raw <= 65534)
-        return len(rows), rr[valid]*w+cc[valid], rows[valid]*w+cols[valid], raw[valid].astype(np.uint16)
-
-    output = np.zeros(h*w, np.uint16)
-    input_count = projected_count = 0
-    for start in range(0, h, 256):
-        count, dst, _, raw = project(start)
-        input_count += count
-        projected_count += len(dst)
+        valid = (rr >= 0) & (rr < th) & (cc >= 0) & (cc < tw) & (raw >= 1) & (raw <= 65534)
+        dst = rr[valid]*tw + cc[valid]
+        raw = raw[valid].astype(np.uint16)
+        output = np.zeros(th*tw, np.uint16)
         np.maximum.at(output, dst, raw)
-    if want2:
-        # Copy the intensity of the winning depth sample; deterministic ties.
-        winners = np.full(h*w, -1, np.int64)
-        for start in range(0, h, 256):
-            _, dst, src, raw = project(start)
+        corrected_image = None
+        if want2:
+            # Reuse the same projected points instead of projecting a second
+            # time. Ties choose the greatest source index along the scan axis,
+            # exactly as in the original whole-board algorithm.
+            src = rows[valid]*tw + cols[valid]
+            winners = np.full(th*tw, -1, np.int64)
             select = raw == output[dst]
             np.maximum.at(winners, dst[select], src[select])
-        corrected = np.zeros_like(image)
-        present = winners >= 0
-        flat_shape = (h*w,) + image.shape[2:]
-        corrected.reshape(flat_shape)[present] = image.reshape(flat_shape)[winners[present]]
-        image = corrected
-        # A depth-dependent remap is not a 3x3 homography.
+            source_image = image[:, left:right] if axis == 'rows' else image[left:right, :]
+            corrected_image = np.zeros_like(source_image)
+            present = winners >= 0
+            flat_shape = (th*tw,) + image.shape[2:]
+            corrected_image.reshape(flat_shape)[present] = source_image.reshape(flat_shape)[winners[present]]
+        return output.reshape(th, tw), corrected_image, input_count, len(dst), int(np.count_nonzero(output))
+
+    try:
+        projected = tasks.map(project_strip, spans, timing_stage='pitch_projection_work_ms')
+    finally:
+        if owned_tasks:
+            tasks.close()
+    output = np.zeros_like(depth)
+    corrected_image = np.zeros_like(image) if want2 else image
+    input_count = projected_count = count = 0
+    for (left, right), (strip, intensity, valid_count, projected_size, output_count) in zip(spans, projected):
+        if axis == 'rows':
+            output[:, left:right] = strip
+            if want2: corrected_image[:, left:right] = intensity
+        else:
+            output[left:right, :] = strip
+            if want2: corrected_image[left:right, :] = intensity
+        input_count += valid_count
+        projected_count += projected_size
+        count += output_count
+    if want2:
+        image = corrected_image
         info['image_transform_original_to_corrected'] = None
-    count = int(np.count_nonzero(output))
+    info.update(projection_workers=strip_count)
     info.update(enabled_2d=want2, enabled_3d=True, applied=True, angle_deg=angle,
                 input_state=state, image_role=role, scan_axis=axis, scan_pitch_mm=pitch,
                 trigger_mode=trigger, transform_direction=direction, z_step_mm=step,

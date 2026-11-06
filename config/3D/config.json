@@ -135,6 +135,7 @@
     "description": "整板深度分片前的SmartRay Pitch补偿；enabled_3d控制开关，按未补偿输入处理",
     "parameters": {
       "enabled_3d": true,
+      "projection_workers": 8,
       "transform_direction": "recover_ideal",
       "scan_axis": "rows",
       "trigger_mode": "external",

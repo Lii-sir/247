@@ -6,9 +6,10 @@ from algorithm.timing import measure, record_duration, timing_context, timing_me
 
 
 class InstanceTasks:
-    def __init__(self, workers=1):
+    def __init__(self, workers=1, *, thread_name_prefix="instance"):
         self.workers = 1
         self._pool = None
+        self._thread_name_prefix = thread_name_prefix
         self.configure(workers)
 
     def configure(self, workers):
@@ -19,7 +20,7 @@ class InstanceTasks:
             return
         self.close()
         if workers > 1:
-            self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="instance")
+            self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix=self._thread_name_prefix)
         self.workers = workers
 
     def close(self):
