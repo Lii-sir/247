@@ -4,10 +4,7 @@
     <option name="autoReloadType" value="ALL" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="f45a9d93-da79-4d4c-b621-f1da0bf4d833" name="更改" comment="">
-      <change beforePath="$PROJECT_DIR$/config/2D/config.json" beforeDir="false" afterPath="$PROJECT_DIR$/config/2D/config.json" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/config/3D/config.json" beforeDir="false" afterPath="$PROJECT_DIR$/config/3D/config.json" afterDir="false" />
-    </list>
+    <list default="true" id="f45a9d93-da79-4d4c-b621-f1da0bf4d833" name="更改" comment="" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -36,23 +33,23 @@
   </component>
   <component name="NextEditCompletionFeaturesState">
     <decayedCancelled>
-      <entry key="MS100" value="1.0" />
-      <entry key="MS500" value="1.0" />
-      <entry key="S2" value="1.0" />
-      <entry key="S5" value="1.000000000000002" />
-      <entry key="S10" value="1.0000000638188056" />
-      <entry key="S30" value="1.0069847583748528" />
-      <entry key="S60" value="1.151713029180363" />
-      <entry key="M2" value="2.0937090300843426" />
-      <entry key="M5" value="11.422135283322033" />
-      <entry key="M10" value="33.04898729353347" />
-      <entry key="M15" value="50.42687332651802" />
-      <entry key="M30" value="86.87838739125542" />
-      <entry key="H1" value="140.6430336688842" />
-      <entry key="H2" value="217.90437108549787" />
-      <entry key="H4" value="307.36246475116997" />
-      <entry key="D1" value="631.3974655750291" />
-      <entry key="W1" value="825.66899659107" />
+      <entry key="MS100" value="1.3114939142760442" />
+      <entry key="MS500" value="2.904129757576774" />
+      <entry key="S2" value="6.49324019389747" />
+      <entry key="S5" value="11.267231862565273" />
+      <entry key="S10" value="17.203197297583955" />
+      <entry key="S30" value="28.6398533260863" />
+      <entry key="S60" value="33.952586256261064" />
+      <entry key="M2" value="37.387292954602884" />
+      <entry key="M5" value="43.60229928960249" />
+      <entry key="M10" value="60.19590941886101" />
+      <entry key="M15" value="76.53794330699684" />
+      <entry key="M30" value="114.21255284914821" />
+      <entry key="H1" value="170.21100949131153" />
+      <entry key="H2" value="249.90219305176532" />
+      <entry key="H4" value="341.96142943286134" />
+      <entry key="D1" value="670.1928067784514" />
+      <entry key="W1" value="866.2567731923701" />
     </decayedCancelled>
     <decayedSelected>
       <entry key="MS100" value="0.0" />
@@ -74,23 +71,23 @@
       <entry key="W1" value="0.0" />
     </decayedSelected>
     <decayedShown>
-      <entry key="MS100" value="0.9526379980439373" />
-      <entry key="MS500" value="0.9903428719330246" />
-      <entry key="S2" value="0.9975769252644544" />
-      <entry key="S5" value="0.9990300646389054" />
-      <entry key="S10" value="0.9995149784425708" />
-      <entry key="S30" value="1.0068215692690472" />
-      <entry key="S60" value="1.15161547820663" />
-      <entry key="M2" value="2.0935154518728374" />
-      <entry key="M5" value="11.42073246834695" />
-      <entry key="M10" value="33.04663882200455" />
-      <entry key="M15" value="50.42447401998046" />
-      <entry key="M30" value="86.87642406729127" />
-      <entry key="H1" value="140.64159536207092" />
-      <entry key="H2" value="217.90334900992426" />
-      <entry key="H4" value="307.36177691635186" />
-      <entry key="D1" value="631.3972693274418" />
-      <entry key="W1" value="825.6689626679268" />
+      <entry key="MS100" value="1.256088574327411" />
+      <entry key="MS500" value="2.8781419510469957" />
+      <entry key="S2" value="6.475700989354331" />
+      <entry key="S5" value="11.239536853095602" />
+      <entry key="S10" value="17.173971063459373" />
+      <entry key="S30" value="28.62226343829663" />
+      <entry key="S60" value="33.942235845434745" />
+      <entry key="M2" value="37.381648424429564" />
+      <entry key="M5" value="43.59941548381525" />
+      <entry key="M10" value="60.19328264786278" />
+      <entry key="M15" value="76.5354183749177" />
+      <entry key="M30" value="114.2104856633907" />
+      <entry key="H1" value="170.2094828265534" />
+      <entry key="H2" value="249.90111079212573" />
+      <entry key="H4" value="341.96070476433493" />
+      <entry key="D1" value="670.192602695445" />
+      <entry key="W1" value="866.2567380690177" />
     </decayedShown>
   </component>
   <component name="ProjectColorInfo">{
@@ -102,20 +99,20 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent">{
-  &quot;keyToString&quot;: {
-    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.typescript.service.memoryLimit.init&quot;: &quot;true&quot;,
-    &quot;codeWithMe.voiceChat.enabledByDefault&quot;: &quot;false&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;7c84d990&quot;,
-    &quot;ignore.virus.scanning.warn.message&quot;: &quot;true&quot;,
-    &quot;last_opened_file_path&quot;: &quot;D:/projects/247-likai&quot;,
-    &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
-    &quot;python.packages.toolwindow.project.migrated.to.right.top.v2&quot;: &quot;true&quot;
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "ModuleVcsDetector.initialDetectionPerformed": "true",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.git.unshallow": "true",
+    "RunOnceActivity.typescript.service.memoryLimit.init": "true",
+    "codeWithMe.voiceChat.enabledByDefault": "false",
+    "git-widget-placeholder": "4d652155",
+    "ignore.virus.scanning.warn.message": "true",
+    "last_opened_file_path": "D:/projects/247-likai",
+    "nodejs_package_manager_path": "npm",
+    "python.packages.toolwindow.project.migrated.to.right.top.v2": "true"
   }
-}</component>
+}]]></component>
   <component name="RunManager">
     <configuration name="main" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
       <module name="yinxkj" />
@@ -164,7 +161,7 @@
       <workItem from="1793867981795" duration="10287000" />
       <workItem from="1793931648681" duration="7673000" />
       <workItem from="1793947107670" duration="8126000" />
-      <workItem from="1793957365872" duration="1340000" />
+      <workItem from="1793957365872" duration="1786000" />
     </task>
     <servers />
   </component>
