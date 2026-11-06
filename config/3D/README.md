@@ -134,3 +134,9 @@ C# DTO新增元数据属性，现有测高点/掩码字段保持；源码已构�
 芯片外部填充区域及面积在父线程统一准备（`height_prepare_chip_regions_ms`），焊脚归属查询只读，不再在子任务中写缓存。平台/芯片参考面和引线处理完成后，各bond及thin端点使用同一实例线程池并行计算；子任务只返回结果，父线程按原实例及start/end顺序写回字段。即使某任务失败，也先结束所有运行中的兄弟任务，再返回错误。
 
 焊脚计时：`height_solder_wall_ms`为整段焊脚任务墙钟；`height_solder_work_ms`累计完整子任务（含thin端点映射、膨胀）；原`height_solder_ms`保留为其中测高/归属/几何处理的累计耗时。三者相互包含或重叠，不应相加。上述改动不调整仿射参数、参考面选择、测高百分位或合格阈值。
+
+## 仿射评分范围与诊断
+
+`dynamic_affine_3d.parameters.score_mode`为`roi`（默认）或`full`（旧整图评分，可用于对照/回退）。ROI模式只生成所选评分框的采样结果，不生成整个目标画幅；区域裁剪、分区平均和剪切惩罚不变。保留全局目标坐标和原画幅尾部取整边界。当前逐像素验证的后端为OpenCV5 AVX2；其他后端、关闭优化或超出remap尺寸限制时自动使用full，并在返回值`affine_score_mode`显示实际方式。
+
+配准结果新增`affine_function_evaluations`（优化器nfev）、`affine_optimizer_success/status`、`affine_stop_reason`、`affine_optimizer_ms`，以及`affine_score_calls/total_ms/mean_ms`。score_calls包含初始和最终检查，通常比nfev多2次；平均评分耗时可区分评分次数与单次评分成本。停止原因与最终损失合格判断独立，未改变Powell参数、迭代上限或合格阈值。

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import Any, Dict, Sequence
 
 import cv2
@@ -155,6 +156,10 @@ def refine_affine_registration(
     result["affine_score_after"] = None
     result["affine_zone_losses"] = []
     result["affine_scoring_region_ids"] = []
+    result.update(affine_function_evaluations=0, affine_score_calls=0,
+                  affine_score_total_ms=0., affine_score_mean_ms=0.,
+                  affine_optimizer_success=None, affine_optimizer_status=None,
+                  affine_stop_reason="not_started")
 
     if image_2d_gray.ndim != 2 or depth_piece.ndim != 2:
         result["affine_error"] = "affine registration requires grayscale 2D and 2D depth arrays"
@@ -199,6 +204,22 @@ def refine_affine_registration(
     target_rois = tuple(
         target_mask[y0:y1, x0:x1] for x0, y0, x1, y1 in rois
     )
+    score_mode = values.get("score_mode", "roi")
+    if score_mode not in {"roi", "full"}:
+        result["affine_error"] = "dynamic_affine.score_mode must be roi or full"
+        return result
+    # remap uses signed-short coordinates. Preserve the former path for
+    # exceptional image sizes beyond that API's supported range.
+    if max(*source_mask.shape, target_height, target_width) >= 32767:
+        score_mode = "full"
+    if (cv2.__version__.split('.')[0] != '5' or not cv2.useOptimized()
+            or '*AVX2' not in cv2.getCPUFeaturesLine().split()):
+        # Only enable the optimized kernel on the validated CPU backend.
+        score_mode = "full"
+    grids = [_affine_roi_grid(box) for box in rois] if score_mode == "roi" else None
+    result["affine_score_mode"] = score_mode
+    score_calls = 0
+    score_seconds = 0.
 
     initial_matrix = _registration_matrix(coarse_registration)
     p0 = _affine_parameters_from_matrix(initial_matrix, preview_scale)
@@ -240,18 +261,18 @@ def refine_affine_registration(
     penalty_weight = float(values.get("penalty_weight", 0.005))
 
     def score(parameters: np.ndarray, details: bool = False):
+        nonlocal score_calls, score_seconds
+        started = time.perf_counter()
         scaled = _scaled_affine(parameters)
-        warped = cv2.warpAffine(
-            source_mask,
-            scaled,
-            (target_width, target_height),
-            flags=cv2.INTER_NEAREST,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
-        )
+        if score_mode == "roi":
+            patches = _warp_affine_rois(source_mask, scaled, rois, grids, target_width)
+        else:
+            warped = cv2.warpAffine(source_mask, scaled, (target_width, target_height),
+                flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            patches = (warped[y0:y1, x0:x1] for x0, y0, x1, y1 in rois)
         losses = [
-            float(np.count_nonzero(warped[y0:y1, x0:x1] != target_roi) / target_roi.size)
-            for (x0, y0, x1, y1), target_roi in zip(rois, target_rois)
+            float(np.count_nonzero(patch != target_roi) / target_roi.size)
+            for patch, target_roi in zip(patches, target_rois)
         ]
         # Penalize shear more than translation, matching the reference
         # experiment while allowing real lens/perspective anisotropy.
@@ -260,11 +281,14 @@ def refine_affine_registration(
             + (parameters[3] / max(shear_limit, 1e-6)) ** 2
         )
         value = float(np.mean(losses) + penalty)
+        score_calls += 1
+        score_seconds += time.perf_counter() - started
         if details:
-            return value, losses, warped
+            return value, losses
         return value
 
-    before, _, _ = score(p0, details=True)
+    before, _ = score(p0, details=True)
+    optimizer_started = time.perf_counter()
     try:
         optimized = minimize(
             score,
@@ -280,9 +304,20 @@ def refine_affine_registration(
     except (ValueError, RuntimeError, FloatingPointError) as exc:
         result["affine_error"] = str(exc)
         result["affine_score_before"] = before
+        result.update(affine_stop_reason=str(exc), affine_optimizer_success=False,
+            affine_function_evaluations=max(0, score_calls - 1), affine_score_calls=score_calls,
+            affine_score_total_ms=score_seconds * 1000,
+            affine_score_mean_ms=score_seconds * 1000 / max(1, score_calls))
         return result
 
-    after, losses, _ = score(optimized.x, details=True)
+    result["affine_optimizer_ms"] = (time.perf_counter() - optimizer_started) * 1000
+    result["affine_function_evaluations"] = int(getattr(optimized, "nfev", score_calls - 1))
+    result["affine_optimizer_success"] = bool(optimized.success) if hasattr(optimized, "success") else None
+    result["affine_optimizer_status"] = int(optimized.status) if hasattr(optimized, "status") else None
+    result["affine_stop_reason"] = str(getattr(optimized, "message", "optimizer did not report a stop reason"))
+    after, losses = score(optimized.x, details=True)
+    result.update(affine_score_calls=score_calls, affine_score_total_ms=score_seconds * 1000,
+                  affine_score_mean_ms=score_seconds * 1000 / max(1, score_calls))
     matrix = _full_affine(optimized.x, preview_scale)
     result["affine_valid"] = bool(
         np.all(np.isfinite(matrix))
@@ -304,6 +339,44 @@ def refine_affine_registration(
     # final validity is decided by the dynamically fitted affine quality.
     result["is_valid"] = bool(result["affine_valid"])
     return result
+
+
+def _affine_roi_grid(box):
+    x0, y0, x1, y1 = box
+    return np.arange(x0, x1, dtype=np.float32), np.arange(y0, y1, dtype=np.float32)
+
+
+def _warp_affine_rois(source, matrix, rois, grids, canvas_width):
+    """Sample only scoring pixels using GLOBAL destination coordinates.
+
+    OpenCV 5's uint8 nearest kernel uses float32 row arithmetic followed by
+    SIMD FMA in X; its scalar tail has left-associated arithmetic instead.
+    Use global X/Y and the ORIGINAL canvas width to preserve that boundary.
+    See OpenCV modules/imgproc/src/warp_kernels.simd.hpp (nearest 8UC1).
+    """
+    inverse = cv2.invertAffineTransform(matrix).astype(np.float32)
+    features = cv2.getCPUFeaturesLine().split()
+    fma = cv2.useOptimized() and '*AVX2' in features
+    unroll = 16 if fma else 8
+    vector_end = canvas_width // unroll * unroll
+    for (x0, y0, x1, y1), (x, y) in zip(rois, grids):
+        coordinates = np.empty((y1-y0, x1-x0, 2), np.int16)
+        for axis in range(2):
+            row = y * inverse[axis, 1] + inverse[axis, 2]
+            if fma:
+                # float64 represents a product of two float32 values exactly;
+                # one cast reproduces fused multiply-add rounding.
+                positions = (x.astype(np.float64)[None, :] * float(inverse[axis, 0])
+                             + row.astype(np.float64)[:, None]).astype(np.float32)
+            else:
+                positions = x[None, :] * inverse[axis, 0] + row[:, None]
+            tail = max(0, vector_end - x0)
+            if tail < len(x):
+                positions[:, tail:] = ((x[None, tail:] * inverse[axis, 0]
+                    + y[:, None] * inverse[axis, 1]) + inverse[axis, 2])
+            coordinates[:, :, axis] = np.clip(np.rint(positions), -32768, 32767)
+        yield cv2.remap(source, coordinates, None, cv2.INTER_NEAREST,
+                        borderMode=cv2.BORDER_CONSTANT, borderValue=0)
 
 
 def _registration_matrix(registration: Dict[str, Any]) -> np.ndarray:
