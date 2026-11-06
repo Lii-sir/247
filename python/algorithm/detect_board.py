@@ -46,6 +46,7 @@ from algorithm.registration import (
 from algorithm.tilt_correction import correct_smartray_depth, production_pitch_parameters, depth_coordinate_space
 from transport.shared_memory import read_shared_memory, SharedImage
 from algorithm.timing import timed_call, measure, note, record_duration, current_timings
+from algorithm.instance_tasks import InstanceTasks
 
 
 _segment = import_module("algorithm.3D.segment")
@@ -98,10 +99,11 @@ class DetectBoard:
         self._piece_cache: Dict[str, Dict[int, Dict[str, Any]]] = {}
         self._piece_cache_lock = threading.RLock()
         self._inference_lock = threading.RLock()
+        self._instance_tasks = InstanceTasks()
 
     def handle_init(self, req: Dict[str, Any]) -> Dict[str, Any]:
         start = time.perf_counter()
-        if self.model is not None or self.chip_anomaly_inspector is not None:
+        if self.model is not None or self.chip_anomaly_inspector is not None or self._instance_tasks.workers > 1:
             self.release()
         self.config_path = str(req.get("config_path") or "") or None
         raw_model_paths = req.get("model_path")
@@ -337,6 +339,8 @@ class DetectBoard:
         )
         self.pitch_config = production_pitch_parameters(config, self.height_config.gray_offset,
                                                         self.height_config.vertical_resolution_mm)
+        threading_values = _dict(common_3d.get("threading", {}), "common_3d.parameters.threading")
+        self._instance_tasks.configure(threading_values.get("instance_workers", 16))
 
     def _validate_gpu_requirement(self) -> None:
         if not torch.cuda.is_available():
@@ -769,12 +773,8 @@ class DetectBoard:
             registration,
             self.dynamic_affine_config,
         )
-        aligned_masks = timed_call("mask_alignment_ms", lambda: [
-            self._align_instance(
-                item, local_depth.shape, registration, entry.get("crop_box", self.crop_roi)
-            )
-            for item in entry["instances"]
-        ])
+        aligned_masks = timed_call("mask_alignment_ms", self._align_instances,
+            entry["instances"], local_depth.shape, registration, entry.get("crop_box", self.crop_roi))
         measurement = timed_call("height_measurement_ms", self._measure_piece,
             local_depth,
             aligned_masks,
@@ -991,10 +991,7 @@ class DetectBoard:
                 )
                 crop_box, circle, roi_boxes = crop_metadata[index]
                 instances = self._extract_instances(prediction, crop.shape[:2])
-                aligned_masks = [
-                    self._align_instance(instance, local_depth.shape, registration, crop_box)
-                    for instance in instances
-                ]
+                aligned_masks = self._align_instances(instances, local_depth.shape, registration, crop_box)
                 measurement = self._measure_piece(
                     local_depth, aligned_masks, registration,
                     wire_rois=roi_boxes, crop_box=crop_box, circle=circle,
@@ -1269,6 +1266,12 @@ class DetectBoard:
                 }
             )
         return output
+
+    def _align_instances(self, instances, depth_shape, registration, crop_box=None):
+        return self._instance_tasks.map(
+            lambda item: self._align_instance(item, depth_shape, registration, crop_box),
+            instances, timing_stage="instance_alignment_work_ms",
+        )
 
     def _align_instance(
         self,
@@ -1753,6 +1756,7 @@ class DetectBoard:
         }
 
     def release(self) -> None:
+        self._instance_tasks.close()
         for resource in self._gpu_worker_resources[1:]:
             resource["inspector"].release()
         self._gpu_worker_resources = []

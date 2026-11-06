@@ -8,7 +8,8 @@
       "threading": {
         "worker_budget": 60,
         "cpu_workers": 10,
-        "joint_workers": 10
+        "joint_workers": 10,
+        "instance_workers": 16
       }
     }
   },

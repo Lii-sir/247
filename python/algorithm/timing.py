@@ -34,6 +34,12 @@ def current_timings():
     return context["timings"] if context is not None else {}
 
 
+def timing_metadata():
+    """Copy request metadata for children, excluding the mutable timing totals."""
+    context = _context.get()
+    return {key: value for key, value in context.items() if key != "timings"} if context else None
+
+
 def note(event, **values):
     context = _context.get()
     if context is None or context["log"] is None or not _enabled("BRIDGE_TIMING_LOG", "1"):
