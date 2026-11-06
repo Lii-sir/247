@@ -1201,12 +1201,15 @@ class DetectBoard:
                 masks.unsqueeze(1), size=crop_shape, mode="nearest"
             ).squeeze(1)
         masks = masks > 0.5
+        # Convert all masks from this image together and perform one mask D2H
+        # transfer. Conversion allocates new storage, so mul_ never modifies
+        # the prediction tensor. NumPy slices below share disjoint CPU regions.
+        masks_cpu = masks.to(torch.uint8).mul_(255).cpu().numpy()
         classes = boxes.cls.detach().cpu().numpy()
         confidences = boxes.conf.detach().cpu().numpy()
         names = getattr(result, "names", {}) or {}
         instances = []
-        for index, mask_tensor in enumerate(masks):
-            mask = (mask_tensor.to(torch.uint8) * 255).cpu().numpy()
+        for index, mask in enumerate(masks_cpu):
             if int(np.count_nonzero(mask)) < self.min_component_area:
                 continue
             class_id = int(classes[index]) if index < len(classes) else -1
