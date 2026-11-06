@@ -14,12 +14,14 @@ import sys
 import threading
 import time
 from urllib.parse import urlsplit, parse_qs
+from urllib.request import Request, urlopen
 import uuid
 import webbrowser
 from PIL import Image
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
+SERVICE_NAME = "detection-validation-lab"
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(ROOT / "python"))
 from detect_and_view import ProtocolClient, algorithm_request, mapped_file, save_timing_csv
@@ -98,30 +100,48 @@ class Runner:
         self.mapper, self.reporter = mapper, reporter
         self.client = None
         self.fingerprint = None
+        self._state_lock = threading.RLock()
+        self._stopping = threading.Event()
 
-    def close(self):
-        if self.client is not None:
-            try:
-                self.client.close()
-            finally:
-                self.client = None
-                self.fingerprint = None
+    def close(self, *, force=False):
+        with self._state_lock:
+            if self.client is not None:
+                try:
+                    if force:
+                        self.client.close(force=True)
+                    else:
+                        self.client.close()
+                finally:
+                    self.client = None
+                    self.fingerprint = None
+
+    def stop(self):
+        with self._state_lock:
+            self._stopping.set()
+            self.close(force=True)
 
     def _ensure(self, request, progress):
         stamps = {p: [Path(p).stat().st_mtime_ns, Path(p).stat().st_size]
                   for p in request.get("model_path", {}).values()}
         fingerprint = hashlib.sha256(json.dumps([request, stamps], sort_keys=True).encode()).hexdigest()
-        if self.client is not None and self.client.process.poll() is None and fingerprint == self.fingerprint:
-            return dict(model_reused=True, process_pid=self.client.process.pid)
-        self.close()
-        progress("初始化模型（首次需要加载CUDA模型）")
-        self.client = self.client_factory(Path(sys.executable), ROOT / "python/transport/bridge_server.py", self.folder / "python.log")
+        with self._state_lock:
+            if self._stopping.is_set():
+                raise RuntimeError("验证台正在停止")
+            if self.client is not None and self.client.process.poll() is None and fingerprint == self.fingerprint:
+                return dict(model_reused=True, process_pid=self.client.process.pid)
+            self.close()
+            progress("初始化模型（首次需要加载CUDA模型）")
+            self.client = self.client_factory(Path(sys.executable), ROOT / "python/transport/bridge_server.py", self.folder / "python.log")
+            client = self.client
         for req in ({"cmd": "init"}, request):
-            reply = self.client.request(req, 900)
+            reply = client.request(req, 900)
             if not reply.get("ok"):
                 raise RuntimeError(reply.get("error") or reply.get("message") or "模型初始化失败")
-        self.fingerprint = fingerprint
-        return dict(model_reused=False, process_pid=self.client.process.pid)
+        with self._state_lock:
+            if self._stopping.is_set():
+                raise RuntimeError("验证台正在停止")
+            self.fingerprint = fingerprint
+        return dict(model_reused=False, process_pid=client.process.pid)
 
     def run(self, rows, board_id, mode, count, folder, progress):
         board_id, images, depth = board_inputs(rows, board_id, mode, count)
@@ -134,6 +154,8 @@ class Runner:
             envelope["image_3d"] = depth["path"]
         started, startup = time.perf_counter(), {}
         try:
+            if self._stopping.is_set():
+                raise RuntimeError("验证台正在停止")
             progress("检查图像格式与深度位数")
             for row in images + ([depth] if depth else []):
                 with Image.open(row["path"]) as image:
@@ -193,7 +215,7 @@ class Runner:
         except Exception as exc:
             envelope["response"] = dict(ok=False, board_id=board_id, error=str(exc))
         finally:
-            if self.client is not None:
+            if self.client is not None and not self._stopping.is_set():
                 try:
                     self.client.request(dict(cmd="release_board", board_id=board_id), 15)
                 except (OSError, RuntimeError, TimeoutError):
@@ -201,6 +223,9 @@ class Runner:
         envelope["benchmark"] = dict(total_wall_ms=round((time.perf_counter()-started)*1000, 2), **startup)
         (folder / "result.json").write_text(json.dumps(envelope, ensure_ascii=False, indent=2), encoding="utf-8")
         save_timing_csv(envelope, folder / "timings.csv")
+        if self._stopping.is_set():
+            return dict(ok=False, product_is_ok=None, board_id=board_id,
+                        error="验证台已停止，本次验证已中断", output_dir=str(folder))
         progress("生成交互报告")
         self.reporter(envelope, folder / "report.html", base_dir=folder, force=True)
         if self.client is not None:
@@ -230,8 +255,12 @@ class Server(ThreadingHTTPServer):
 
     def server_close(self):
         super().server_close()
-        self.pool.shutdown(wait=True)
-        self.runner.close()
+        # Interrupt pending protocol waits BEFORE joining the job executor.
+        # Joining first can otherwise wait for the full 900-second timeout.
+        try:
+            self.runner.stop()
+        finally:
+            self.pool.shutdown(wait=True, cancel_futures=True)
 
 
 def defaults():
@@ -267,6 +296,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/api/defaults":
                 return self.send(200, defaults())
+            if path == "/api/health":
+                return self.send(200, dict(service=SERVICE_NAME))
             if path == "/api/history":
                 with self.server.lock:
                     rows = [dict(id=key, **job) for key, job in reversed(list(self.server.jobs.items()))]
@@ -304,6 +335,12 @@ class Handler(BaseHTTPRequestHandler):
                 file = self.server.folder / "uploads" / (token + Path(name).suffix.lower())
                 file.write_bytes(self.rfile.read(size))
                 return self.send(200, dict(id=token, kind=kind, name=name, path=str(file), **guess_numbers(name, kind)))
+            if parsed.path == "/api/shutdown":
+                self.rfile.read(size)
+                self.send(200, dict(stopping=True))
+                # shutdown() must run outside the serve_forever thread.
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+                return
             if parsed.path != "/api/run":
                 return self.send(404, {"error": "接口不存在"})
             request = json.loads(self.rfile.read(size))
@@ -333,15 +370,52 @@ class Handler(BaseHTTPRequestHandler):
             self.send(400, {"error":str(exc)})
 
 
+def service_running(port):
+    try:
+        with urlopen(f"http://127.0.0.1:{port}/api/health", timeout=1) as response:
+            value = json.load(response)
+        return isinstance(value, dict) and value.get("service") == SERVICE_NAME
+    except (OSError, ValueError):
+        return False
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--port", type=int, default=8770)
     p.add_argument("--output-dir", type=Path, default=ROOT/"visualization/output/validation-lab")
     p.add_argument("--open", action="store_true")
+    p.add_argument("--stop", action="store_true", help="停止指定端口的验证台及其检测进程")
     args = p.parse_args()
-    with Server(args.port, args.output_dir) as server:
+    url = f"http://127.0.0.1:{args.port}"
+    def reopen_existing():
+        print(f"验证台已在运行，复用：{url}", flush=True)
+        if args.open:
+            webbrowser.open(url)
+    running = service_running(args.port)
+    if args.stop:
+        if not running:
+            print(f"未找到运行中的验证台：{url}", flush=True)
+            return
+        with urlopen(Request(url + "/api/shutdown", data=b"{}",
+                             headers={"Content-Type": "application/json"}), timeout=5) as response:
+            json.load(response)
+        print("已发送停止命令，验证台及其检测进程将退出。", flush=True)
+        return
+    if running:
+        reopen_existing()
+        return
+    try:
+        server = Server(args.port, args.output_dir)
+    except OSError as exc:
+        # Two launch commands can both pass the first check before one binds.
+        if service_running(args.port):
+            reopen_existing()
+            return
+        raise SystemExit(f"无法启动验证台：{exc}。请检查端口或用 --port 指定其他端口。") from exc
+    with server:
         url = f"http://127.0.0.1:{server.server_port}"
         print(f"Detection validation: {url}", flush=True)
+        print("按 Ctrl+C 停止；也可在另一终端运行同一命令并加 --stop。", flush=True)
         if args.open:webbrowser.open(url)
         try:server.serve_forever()
         except KeyboardInterrupt:pass

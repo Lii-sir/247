@@ -26,6 +26,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class ProtocolClient:
     def __init__(self, python: Path, server: Path, log_path: Path):
+        python = Path(python)
+        if python.name.casefold() == "pythonw.exe":
+            # The UI can run without a console; the protocol worker still
+            # needs Python's standard streams, redirected to our private pipes.
+            python = python.with_name("python.exe")
         self.log = log_path.open("w", encoding="utf-8")
         env = {**os.environ, "PYTHONUTF8": "1", "PYTHONDONTWRITEBYTECODE": "1"}
         try:
@@ -39,9 +44,12 @@ class ProtocolClient:
             self.log.close()
             raise
         self.lines: queue.Queue[str | None] = queue.Queue()
-        self.pending: dict[str, queue.Queue[dict]] = {}
+        self.pending: dict[str, queue.Queue[dict | BaseException]] = {}
         self.pending_lock = threading.Lock()
         self.write_lock = threading.Lock()
+        self._closed = threading.Event()
+        self._reader_done = threading.Event()
+        self._close_lock = threading.Lock()
         self.timeline: list[dict] = []
         self.started_at = time.perf_counter()
         self.reader = threading.Thread(target=self._read, daemon=True)
@@ -60,17 +68,33 @@ class ProtocolClient:
                     with self.pending_lock:
                         waiter = self.pending.get(str(request_id))
                     if waiter is not None:
-                        waiter.put(response)
+                        try:
+                            waiter.put_nowait(response)
+                        except queue.Full:
+                            pass  # Shutdown may have already notified this waiter.
                         continue
                 self.lines.put(response)
         finally:
+            self._reader_done.set()
+            self._fail_pending("Detection process exited before replying")
             self.lines.put(None)
+
+    def _fail_pending(self, message):
+        with self.pending_lock:
+            waiters = list(self.pending.values())
+        for waiter in waiters:
+            try:
+                waiter.put_nowait(RuntimeError(message))
+            except queue.Full:
+                pass
 
     def request(self, value: dict, timeout: float) -> dict:
         request_id = uuid.uuid4().hex
         request = {**value, "request_id": request_id}
-        waiter: queue.Queue[dict] = queue.Queue(maxsize=1)
+        waiter: queue.Queue[dict | BaseException] = queue.Queue(maxsize=1)
         with self.pending_lock:
+            if self._closed.is_set() or self._reader_done.is_set() or self.process.poll() is not None:
+                raise RuntimeError("Detection process is closed")
             self.pending[request_id] = waiter
         try:
             with self.write_lock:
@@ -89,6 +113,8 @@ class ProtocolClient:
         finally:
             with self.pending_lock:
                 self.pending.pop(request_id, None)
+        if isinstance(response, BaseException):
+            raise response
         received = time.perf_counter()
         with self.pending_lock:
             self.timeline.append({
@@ -101,17 +127,30 @@ class ProtocolClient:
             })
         return response
 
-    def close(self):
+    def close(self, *, force=False):
+        with self._close_lock:
+            if self._closed.is_set():
+                return
+            self._close_process(force)
+
+    def _close_process(self, force):
         try:
             if self.process.poll() is None:
-                try:
-                    self.request({"cmd": "release"}, 10)
-                    self.process.wait(timeout=3)
-                except (OSError, RuntimeError, TimeoutError, subprocess.TimeoutExpired):
-                    if self.process.poll() is None:
-                        self.process.kill()
+                if force:
+                    self._closed.set()
+                    self._fail_pending("Detection service is stopping")
+                    self.process.kill()
+                else:
+                    try:
+                        self.request({"cmd": "release"}, 10)
+                        self.process.wait(timeout=3)
+                    except (OSError, RuntimeError, TimeoutError, subprocess.TimeoutExpired):
+                        if self.process.poll() is None:
+                            self.process.kill()
             self.process.wait(timeout=5)
         finally:
+            self._closed.set()
+            self._fail_pending("Detection process is closed")
             if self.process.stdin:
                 self.process.stdin.close()
             self.reader.join(timeout=2)
