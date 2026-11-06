@@ -322,6 +322,8 @@ ROI 汇总复用实例测量的 ROI 分配与像素数；若掩码清理失败�
 
 ## 8. 引线、焊点和高度
 
+3D测高对所有已检测的`wire/thin/bond`执行，不再使用`WireRois2D`筛选实例或裁剪测高区域。`wire`使用完整清理掩码，`thin`中间段及两端焊脚分别测量，`bond`全量测量；清理后为空、无有效深度或参考面无效时保留无效记录。`WireRois2D/WireRoiChecks`仍属于2D弯曲/缺线诊断，平台参考面采样ROI和配准ROI保留。3D高度合格仅由高度结果判断，整体联合合格仍合并2D检查。
+
 联合引线测高支持在配准后按类别剔除掩码边缘：
 `height_measurement_3d.parameters.wire_measurement_erode_px` 控制 wire，
 `thin_measurement_erode_px` 控制 thin 中间段。单位为 3D 像素半径，0 关闭。

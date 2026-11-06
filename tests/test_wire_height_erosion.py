@@ -101,7 +101,7 @@ class WireHeightErosionTests(unittest.TestCase):
         h, w = depth.shape
         return detector._measure_wire_regions(depth, items,
             registration or dict(scale=1, tx=0, ty=0), dict(coefficients=[0., 0., 32768.]),
-            [(0, 0, w, h)], (0, 0, w, h))
+            crop_box=(0, 0, w, h))
 
     def test_wire_and_thin_parameters_are_independent_and_remove_reflective_points(self):
         depth, items = self.fixture()
@@ -165,7 +165,7 @@ class WireHeightErosionTests(unittest.TestCase):
             with patch.object(board, 'map_platform_rois', return_value=(np.ones_like(depth, np.uint8), [], [])):
                 outputs.append(detector._measure_piece(depth, copy.deepcopy(items),
                     dict(scale=1, tx=0, ty=0, is_valid=True, perspective_valid=True),
-                    [(0, 0, 180, 160)], (0, 0, 180, 160), (10, 10, 10)))
+                    crop_box=(0, 0, 180, 160), circle=(10, 10, 10)))
         self.assertEqual(outputs[0]['reference_planes'], outputs[1]['reference_planes'])
         self.assertEqual(outputs[0]['solder_measurements'], outputs[1]['solder_measurements'])
         self.assertNotEqual(outputs[0]['wire_measurements'], outputs[1]['wire_measurements'])

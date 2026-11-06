@@ -197,7 +197,7 @@ class WireBendingTests(unittest.TestCase):
         self.assertTrue(instances[0]["bending_2d"]["is_ok"])
         self.assertEqual(instances[1]["bending_2d"]["status"], "empty_mask")
 
-    def test_joint_height_reuses_bending_or_measures_original_thin_instance(self):
+    def test_joint_height_reuses_bending_without_computing_2d_diagnostics(self):
         from algorithm import detect_board as module
         detector = DetectBoard(lambda _: None)
         detector.min_component_area = 5
@@ -217,9 +217,12 @@ class WireBendingTests(unittest.TestCase):
                  patch.object(module, "measure_mask_height", return_value={"is_ok": True}), \
                  patch.object(geometry, "measure_wire_bending", wraps=geometry.measure_wire_bending) as measure:
                 results = detector._measure_wire_regions(
-                    np.zeros_like(mask), [wire], {}, None, [self.roi], (200, 300, 330, 410))
-            self.assertEqual(results[0]["bending_2d"], expected)
-            self.assertEqual(measure.call_count, 0 if cached else 1)
+                    np.zeros_like(mask), [wire], {}, None, crop_box=(200, 300, 330, 410))
+            if cached:
+                self.assertEqual(results[0]["bending_2d"], expected)
+            else:
+                self.assertEqual(results[0]["bending_2d"]["status"], "not_evaluated")
+            self.assertEqual(measure.call_count, 0)
 
     def test_cleaning_failure_is_unavailable_and_empty_roi_is_ng(self):
         for measure in self.detectors():

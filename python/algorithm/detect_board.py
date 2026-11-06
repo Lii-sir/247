@@ -782,7 +782,6 @@ class DetectBoard:
             local_depth,
             aligned_masks,
             registration,
-            entry.get("roi_boxes", self.wire_rois),
             crop_box=entry.get("crop_box", self.crop_roi),
             circle=entry.get("circle"),
         )
@@ -997,7 +996,7 @@ class DetectBoard:
                 aligned_masks = self._align_instances(instances, local_depth.shape, registration, crop_box)
                 measurement = self._measure_piece(
                     local_depth, aligned_masks, registration,
-                    wire_rois=roi_boxes, crop_box=crop_box, circle=circle,
+                    crop_box=crop_box, circle=circle,
                 )
                 results.append(
                     height_points_to_board({
@@ -1297,31 +1296,15 @@ class DetectBoard:
             "_mask_3d_array": aligned,
         }
 
-    def _mask_in_wire_rois(
-        self, mask: np.ndarray, wire_rois: Sequence[Sequence[int]] | None = None,
-        *, mask_offset: Sequence[int] = (0, 0),
-    ) -> np.ndarray:
-        output = np.zeros_like(mask, dtype=np.uint8)
-        height, width = output.shape
-        ox, oy = mask_offset
-        for raw_roi in self.wire_rois if wire_rois is None else wire_rois:
-            x1, y1, x2, y2 = (int(value) for value in raw_roi)
-            x1, x2 = max(0, x1 - ox), min(width, x2 - ox)
-            y1, y2 = max(0, y1 - oy), min(height, y2 - oy)
-            if x2 > x1 and y2 > y1:
-                output[y1:y2, x1:x2] = mask[y1:y2, x1:x2]
-        return output
-
     def _measure_piece(
         self,
         depth: np.ndarray,
         instances: list[Dict[str, Any]],
         registration: Dict[str, Any],
-        wire_rois: Sequence[Sequence[int]] | None = None,
         crop_box: Sequence[int] | None = None,
         circle: Sequence[float] | None = None,
     ) -> Dict[str, Any]:
-        """Measure all 3D heights for one aligned piece.
+        """Measure every detected wire/thin/bond, without a target-selection ROI.
 
         ``thin`` is both a wire and two solder joints: its first and last
         principal-axis 2 percent are measured as solder and the middle 96
@@ -1398,7 +1381,6 @@ class DetectBoard:
             instances,
             registration,
             platform_plane,
-            wire_rois,
             crop_box=crop_box,
         )
         wire_by_instance = {
@@ -1438,8 +1420,7 @@ class DetectBoard:
                 instance["height_3d"] = None
 
         wire_ok = [
-            bool(item["bending_2d"].get("is_ok"))
-            and bool(item["height_3d"].get("is_ok"))
+            bool(item["height_3d"].get("is_ok"))
             for item in wire_measurements
         ]
         solder_ok = [bool(item["height_3d"].get("is_ok")) for item in solder_measurements]
@@ -1582,45 +1563,34 @@ class DetectBoard:
         instances: list[Dict[str, Any]],
         registration: Dict[str, Any],
         platform_plane: Dict[str, Any] | None,
-        wire_rois: Sequence[Sequence[int]] | None = None,
         crop_box: Sequence[int] | None = None,
     ) -> list[Dict[str, Any]]:
         crop_box = tuple(crop_box or self.crop_roi)
         wires = [item for item in instances if item["class_name"].lower() in {"wire", "thin"}]
         if not wires:
             return []
-        wire_rois = self.wire_rois if wire_rois is None else wire_rois
         timed_call("height_prepare_thin_ms", self._prepare_thin_parts, wires)
         results = self._instance_tasks.map(
             lambda wire: self._measure_wire_region(depth, wire, registration,
-                                                   platform_plane, wire_rois, crop_box),
+                                                   platform_plane, crop_box),
             wires, timing_stage="height_wire_work_ms",
         )
-        output = [item for item in results if item is not None]
-        for region_id, item in enumerate(output, 1):
+        for region_id, item in enumerate(results, 1):
             item["region_id"] = region_id
-        return output
+        return results
 
-    def _measure_wire_region(self, depth, wire, registration, platform_plane, wire_rois, crop_box):
+    def _measure_wire_region(self, depth, wire, registration, platform_plane, crop_box):
         class_name = wire["class_name"].lower()
         source_mask = np.asarray(wire["_thin_wire_mask_2d"] if class_name == "thin"
                                  else wire["_mask_2d_array"], dtype=np.uint8)
-        height, width = source_mask.shape
-        # Existence check reads just ROI intersections, without a full image.
-        intersects = False
-        for x1, y1, x2, y2 in wire_rois:
-            left, top = max(0, x1), max(0, y1)
-            right, bottom = min(width, x2), min(height, y2)
-            if right > left and bottom > top and np.any(source_mask[top:bottom, left:right]):
-                intersects = True
-                break
-        if not intersects:
-            return None
-        # Keep global cleaning BEFORE ROI clipping, with all morphology halo.
+        # Clean the complete instance within its bbox, preserving morphology
+        # halo. The 2D bending/presence ROIs never filter or clip height pixels.
         cleaned, local_offset = _geometry.clean_mask_crop(
             source_mask, min_area=self.min_component_area, kernel_size=5)
-        cleaned = self._mask_in_wire_rois(cleaned, wire_rois, mask_offset=local_offset)
         full_offset = np.asarray(crop_box[:2], dtype=np.int32) + local_offset
+        bending = wire.get("bending_2d")
+        if not isinstance(bending, dict):
+            bending = {"is_valid": False, "is_ok": False, "status": "not_evaluated"}
         if not np.any(cleaned):
             empty = np.zeros((1, 1), dtype=np.uint8)
             height_result = measure_mask_height(
@@ -1631,16 +1601,8 @@ class DetectBoard:
                 class_name=str(wire.get("class_name", "")),
                 mask_2d=_mask_geometry(cleaned, offset=full_offset, epsilon=1.0),
                 mask_3d_local=_mask_geometry(empty, offset=(0, 0), epsilon=1.0),
-                bending_2d=wire.get("bending_2d", {"is_valid": False, "is_ok": False}),
+                bending_2d=bending,
                 height_3d=height_result)
-        bending = wire.get("bending_2d")
-        if not isinstance(bending, dict):
-            bending_mask, bending_offset = _geometry.clean_mask_crop(
-                np.asarray(wire["_mask_2d_array"], dtype=np.uint8),
-                min_area=self.min_component_area, kernel_size=5)
-            bending = _geometry.measure_wire_bending(
-                bending_mask, wire_rois, self.rectangle_ratio_threshold,
-                mask_offset=bending_offset, output_offset=crop_box[:2])
         local_crop = (int(full_offset[0]), int(full_offset[1]),
                       int(full_offset[0] + cleaned.shape[1]), int(full_offset[1] + cleaned.shape[0]))
         aligned = align_crop_mask_to_depth(cleaned.astype(np.uint8) * 255,

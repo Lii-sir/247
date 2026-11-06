@@ -160,7 +160,7 @@ class SolderHeightErosionTests(unittest.TestCase):
                               bending_2d=dict(is_valid=True,is_ok=True)))
         with patch.object(board,'map_platform_rois',return_value=(np.ones_like(depth,np.uint8),[],[])):
             result = detector._measure_piece(depth,items,dict(scale=1,tx=0,ty=0,is_valid=True,perspective_valid=True),
-                [(0,0,200,160)],(0,0,200,160),(10,10,10))
+                crop_box=(0,0,200,160),circle=(10,10,10))
         return result
 
     def test_thin_middle_endpoints_and_reference_planes_are_independent(self):

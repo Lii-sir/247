@@ -484,7 +484,7 @@
     const checks = [
       ["片级结论", piece?.is_ok],
       ["配准", piece?.registration?.is_valid],
-      ["引线 ROI", Array.isArray(piece?.wire_roi_checks) ? (piece.wire_roi_checks.length ? piece.wire_roi_checks.every((x) => x.is_ok === true) : null) : two.wire_bending_2d?.is_ok],
+      ["2D 引线 ROI", Array.isArray(piece?.wire_roi_checks) ? (piece.wire_roi_checks.length ? piece.wire_roi_checks.every((x) => x.is_ok === true) : null) : two.wire_bending_2d?.is_ok],
       ["芯片旋转", two.chip_rotation_2d?.is_ok],
       ["芯片外观", piece?.chip_anomaly_2d?.is_ok ?? two.chip_anomaly_2d?.is_ok],
       ["银浆连通", (two.silver_continuity_2d || piece?.silver_continuity_2d)?.is_ok],

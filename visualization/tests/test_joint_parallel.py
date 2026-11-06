@@ -155,21 +155,22 @@ class WireParallelTests(unittest.TestCase):
             mask = np.zeros((120,160), np.uint8)
             cv2.line(mask, (0, 15+index*23), (150, 25+index*23), 255, 7)
             masks.append(dict(instance_id=index+1, class_name='thin' if index%2 else 'wire',
-                              _mask_2d_array=mask, _mask_3d_array=np.zeros_like(depth,np.uint8)))
+                              _mask_2d_array=mask, _mask_3d_array=np.zeros_like(depth,np.uint8),
+                              bending_2d={'is_valid':True,'is_ok':True}))
         return depth, masks
 
     def test_local_wire_path_equals_frozen_full_frame_reference(self):
         rng = np.random.default_rng(194)
         for case in range(28):
             depth, items = self.fixture()
-            # Covers missing ROI, cleaning rejection, border objects and ROI
-            # clipping after cleaning. Fractional affine/crop offsets matter.
+            # Compare with the old algorithm over the entire instance domain;
+            # empty instances now have explicit invalid records instead of skips.
             if case%4 == 0:
                 items[0]['_mask_2d_array'][60:75, 20:95] = 255
             if case%5 == 0:
                 items[2]['_mask_2d_array'][:] = 0
             depth[rng.random(depth.shape)<.03] = 0
-            roi = [(10, 10, 140, 100)] if case%3 else [(140,0,159,120),(0,20,50,80)]
+            roi = [(0,0,160,120)]
             a = float(rng.uniform(.7,1.1))
             matrix = [[a,float(rng.uniform(-.015,.015)),float(rng.uniform(-5,5))],
                       [float(rng.uniform(-.015,.015)),a,float(rng.uniform(-3,3))],[0,0,1]]
@@ -183,27 +184,37 @@ class WireParallelTests(unittest.TestCase):
             for workers in (1,4):
                 self.detector._instance_tasks.configure(workers)
                 before=copy.deepcopy(items)
-                actual=self.detector._measure_wire_regions(depth,items,*args)
-                with self.subTest(case=case,workers=workers):self.assertEqual(actual,expected)
+                actual=self.detector._measure_wire_regions(depth,items,registration,args[1],crop_box=args[3])
+                expected_by_id={item['instance_id']:item for item in expected}
+                self.assertEqual([item['instance_id'] for item in actual],[1,2,3,4])
+                with self.subTest(case=case,workers=workers):
+                    for item in actual:
+                        if item['instance_id'] in expected_by_id:
+                            previous=expected_by_id[item['instance_id']]
+                            self.assertEqual({k:v for k,v in item.items() if k!='region_id'},
+                                             {k:v for k,v in previous.items() if k!='region_id'})
+                        else:
+                            self.assertFalse(item['height_3d']['is_valid'])
+                            self.assertIsNone(item['height_3d']['point'])
                 for item,original in zip(items,before):
                     np.testing.assert_array_equal(item['_mask_2d_array'],original['_mask_2d_array'])
 
-    def test_wire_tasks_overlap_preserve_skipped_instance_order(self):
+    def test_wire_tasks_overlap_preserve_all_instance_order(self):
         depth,items=self.fixture()
         barrier=threading.Barrier(4)
         def task(depth,wire,*args):
             barrier.wait(timeout=3)
-            return None if wire['instance_id']==2 else {'instance_id':wire['instance_id']}
+            return {'instance_id':wire['instance_id']}
         with patch.object(self.detector,'_measure_wire_region',side_effect=task):
             result=self.detector._measure_wire_regions(depth,items,{},None)
-        self.assertEqual(result,[{'instance_id':1,'region_id':1},{'instance_id':3,'region_id':2},{'instance_id':4,'region_id':3}])
+        self.assertEqual(result,[{'instance_id':i,'region_id':i} for i in range(1,5)])
 
     def test_thin_split_once_per_piece_and_reused_for_endpoints(self):
         depth,items=self.fixture()
         original=copy.deepcopy(items)
         registration=dict(scale=1.,tx=0.,ty=0.,is_valid=True)
         with patch.object(board,'split_thin_mask',wraps=board.split_thin_mask) as split:
-            actual=self.detector._measure_piece(depth,items,registration,[(0,0,160,120)],(0,0,160,120))
+            actual=self.detector._measure_piece(depth,items,registration,crop_box=(0,0,160,120))
         self.assertEqual(split.call_count,2)
         expected=self.reference._measure_piece(depth,original,registration,[(0,0,160,120)],(0,0,160,120))
         self.assertEqual(actual,expected)
@@ -212,15 +223,14 @@ class WireParallelTests(unittest.TestCase):
                 self.assertIn('_thin_wire_mask_2d',item)
                 self.assertEqual(len(item['_thin_solder_masks_2d']),2)
 
-    def test_cleaning_and_roi_allocation_are_local(self):
+    def test_cleaning_is_local_and_roi_clipping_is_removed(self):
         mask=np.zeros((1000,1500),np.uint8);mask[400:410,700:800]=255
         item=dict(instance_id=1,class_name='wire',_mask_2d_array=mask,bending_2d={'is_ok':True})
-        with patch.object(board._geometry,'clean_mask',wraps=board._geometry.clean_mask) as clean, \
-             patch.object(self.detector,'_mask_in_wire_rois',wraps=self.detector._mask_in_wire_rois) as clip:
+        with patch.object(board._geometry,'clean_mask',wraps=board._geometry.clean_mask) as clean:
             self.detector._measure_wire_regions(np.full((1000,1500),33000,np.uint16),[item],
-                dict(scale=1,tx=0,ty=0),dict(coefficients=[0,0,32768]),[(0,0,1500,1000)],(0,0,1500,1000))
+                dict(scale=1,tx=0,ty=0),dict(coefficients=[0,0,32768]),crop_box=(0,0,1500,1000))
         self.assertLess(clean.call_args.args[0].size,mask.size//20)
-        self.assertLess(clip.call_args.args[0].size,mask.size//20)
+        self.assertFalse(hasattr(self.detector,'_mask_in_wire_rois'))
 
 
 class SolderParallelTests(unittest.TestCase):
@@ -252,6 +262,7 @@ class SolderParallelTests(unittest.TestCase):
             elif kind in {'bond','thin'}:depth[mask>0]=33900
             items.append(dict(instance_id=pid,class_name=kind,_mask_2d_array=mask,
                               _mask_3d_array=mask.copy()))
+            if kind in {'wire','thin'}:items[-1]['bending_2d']={'is_valid':True,'is_ok':True}
         return depth,items
 
     def test_complete_measurement_equals_frozen_reference_serial_and_parallel(self):
@@ -279,7 +290,7 @@ class SolderParallelTests(unittest.TestCase):
             for workers in (1,4):
                 self.detector._instance_tasks.configure(workers)
                 actual_items=copy.deepcopy(items)
-                actual=self.detector._measure_piece(depth,actual_items,*args)
+                actual=self.detector._measure_piece(depth,actual_items,args[0],crop_box=args[2],circle=args[3])
                 with self.subTest(case=case,workers=workers):
                     self.assertEqual(actual,expected)
                     for actual_item,expected_item,raw in zip(actual_items,originals,items):
@@ -309,7 +320,7 @@ class SolderParallelTests(unittest.TestCase):
              patch.object(board,'_filled_external_region',wraps=board._filled_external_region) as filled, \
              timing_context(totals,phase='joint',piece_id=1):
             result=self.detector._measure_piece(depth,items,dict(scale=1,tx=0,ty=0,is_valid=True),
-                [(0,0,240,180)],(0,0,240,180),(30,70,10))
+                crop_box=(0,0,240,180),circle=(30,70,10))
         self.assertEqual(filled.call_count,2)
         self.assertEqual(len(set(threads)),4)
         self.assertEqual([item['measurement_id'] for item in result['solder_measurements']],[4,5,6,18])
@@ -346,7 +357,7 @@ class SolderParallelTests(unittest.TestCase):
             depth,items,args=fixtures[pid]
             totals={}
             with timing_context(totals,phase='joint',piece_id=pid+1):
-                result=self.detector._measure_piece(depth,items,*args)
+                result=self.detector._measure_piece(depth,items,args[0],crop_box=args[2],circle=args[3])
             return result,totals
         with ThreadPoolExecutor(max_workers=2) as parents:
             futures=[parents.submit(piece,pid) for pid in range(2)]
@@ -368,7 +379,7 @@ class SolderParallelTests(unittest.TestCase):
         with patch.object(self.detector,'_measure_solder_task',side_effect=task):
             with self.assertRaisesRegex(ValueError,'synthetic solder failure'):
                 self.detector._measure_piece(depth,items,dict(scale=1,tx=0,ty=0,is_valid=True),
-                    [(0,0,240,180)],(0,0,240,180),(30,70,10))
+                    crop_box=(0,0,240,180),circle=(30,70,10))
         self.assertEqual(len(finished),4)
         self.assertTrue(all('height_3d' not in item for item in items))
 
