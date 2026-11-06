@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import sys
 import threading
+from types import MappingProxyType
 import unittest
 from unittest.mock import patch
 
@@ -220,6 +221,156 @@ class WireParallelTests(unittest.TestCase):
                 dict(scale=1,tx=0,ty=0),dict(coefficients=[0,0,32768]),[(0,0,1500,1000)],(0,0,1500,1000))
         self.assertLess(clean.call_args.args[0].size,mask.size//20)
         self.assertLess(clip.call_args.args[0].size,mask.size//20)
+
+
+class SolderParallelTests(unittest.TestCase):
+    def setUp(self):
+        self.detector=DetectBoard(lambda _:None)
+        self.reference=LegacyWireReference(lambda _:None)
+        self.addCleanup(self.detector._instance_tasks.close)
+        self.detector._instance_tasks.configure(4)
+        for detector in (self.detector,self.reference):
+            detector.min_component_area=4
+            detector.height_config=replace(detector.height_config,plane_min_valid_points=4,
+                chip_min_valid_points=4,platform_roi_offsets=((-2.,-3.,-1.,0.),))
+
+    @staticmethod
+    def fixture():
+        shape=(180,240)
+        depth=np.full(shape,33000,np.uint16)
+        items=[]
+        for pid,kind in ((1,'thin'),(2,'bond'),(3,'chip'),(4,'chip'),(5,'wire'),(6,'bond')):
+            mask=np.zeros(shape,np.uint8)
+            if pid==1:cv2.line(mask,(30,120),(175,85),255,7)
+            elif pid==2:mask[80:90,150:166]=255
+            elif pid==3:
+                mask[30:140,100:220]=255;mask[70:100,140:180]=0
+            elif pid==4:mask[65:110,135:185]=255
+            elif pid==5:cv2.line(mask,(30,155),(210,160),255,7)
+            else:mask[20:30,20:40]=255
+            if kind=='chip':depth[mask>0]=33500
+            elif kind in {'bond','thin'}:depth[mask>0]=33900
+            items.append(dict(instance_id=pid,class_name=kind,_mask_2d_array=mask,
+                              _mask_3d_array=mask.copy()))
+        return depth,items
+
+    def test_complete_measurement_equals_frozen_reference_serial_and_parallel(self):
+        rng=np.random.default_rng(221)
+        for case in range(12):
+            depth,items=self.fixture()
+            depth[rng.random(depth.shape)<.02]=0
+            registration=dict(scale=1.,tx=0.,ty=0.,is_valid=True)
+            if case%3==0:
+                registration.update(scale=.95,tx=1.5,ty=-1.25,
+                    homography_2d_to_3d=[[.95,.005,1.5],[-.005,.96,-1.25],[0,0,1]])
+                for item in items:
+                    item['_mask_3d_array']=board.align_crop_mask_to_depth(
+                        item['_mask_2d_array'],(0,0,240,180),depth.shape,registration)
+            for detector in (self.detector,self.reference):
+                detector.height_config=replace(detector.height_config,
+                    bond_measurement_erode_px=case%3,thin_solder_measurement_erode_px=case%2,
+                    thin_measurement_erode_px=case%2)
+            if case==11:
+                for detector in (self.detector,self.reference):
+                    detector.height_config=replace(detector.height_config,plane_min_valid_points=100000)
+            args=(registration,[(0,0,240,180)],(0,0,240,180),(30,70,10))
+            originals=copy.deepcopy(items)
+            expected=self.reference._measure_piece(depth,originals,*args)
+            for workers in (1,4):
+                self.detector._instance_tasks.configure(workers)
+                actual_items=copy.deepcopy(items)
+                actual=self.detector._measure_piece(depth,actual_items,*args)
+                with self.subTest(case=case,workers=workers):
+                    self.assertEqual(actual,expected)
+                    for actual_item,expected_item,raw in zip(actual_items,originals,items):
+                        self.assertEqual(self.detector._public_instance(actual_item),
+                                         self.reference._public_instance(expected_item))
+                        np.testing.assert_array_equal(actual_item['_mask_2d_array'],raw['_mask_2d_array'])
+                        np.testing.assert_array_equal(actual_item['_mask_3d_array'],raw['_mask_3d_array'])
+
+    def test_solder_workers_overlap_read_prepared_cache_and_parent_writes_last(self):
+        depth,items=self.fixture()
+        barrier=threading.Barrier(4)
+        parent=threading.current_thread().ident
+        threads=[]
+        original=self.detector._measure_solder
+        def measure(*args):
+            self.assertNotEqual(threading.current_thread().ident,parent)
+            for item in items:
+                self.assertNotIn('height_3d',item)
+                self.assertNotIn('bond_location',item)
+                if item['class_name']=='chip':
+                    self.assertIn('_filled_chip_region_2d',item)
+            barrier.wait(timeout=3)
+            threads.append(threading.current_thread().name)
+            return original(*args)
+        totals={}
+        with patch.object(self.detector,'_measure_solder',side_effect=measure), \
+             patch.object(board,'_filled_external_region',wraps=board._filled_external_region) as filled, \
+             timing_context(totals,phase='joint',piece_id=1):
+            result=self.detector._measure_piece(depth,items,dict(scale=1,tx=0,ty=0,is_valid=True),
+                [(0,0,240,180)],(0,0,240,180),(30,70,10))
+        self.assertEqual(filled.call_count,2)
+        self.assertEqual(len(set(threads)),4)
+        self.assertEqual([item['measurement_id'] for item in result['solder_measurements']],[4,5,6,18])
+        self.assertTrue(all('height_3d' in item for item in items))
+        for key in ('height_prepare_chip_regions_ms','height_solder_wall_ms','height_solder_work_ms','height_solder_ms'):
+            self.assertGreaterEqual(totals[key],0)
+
+    def test_chip_matching_is_read_only_with_or_without_prepared_cache(self):
+        _,items=self.fixture()
+        chips=[item for item in items if item['class_name']=='chip']
+        point=np.zeros((180,240),np.uint8);point[85,155]=255
+        for prepare in (False,True):
+            current=copy.deepcopy(chips)
+            if prepare:self.detector._prepare_chip_regions(current)
+            readonly=[MappingProxyType(chip) for chip in current]
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                results=list(pool.map(lambda _:self.detector._matching_chip({'_mask_2d_array':point},readonly),range(8)))
+            self.assertTrue(all(chip['instance_id']==4 and inside for chip,inside in results))
+            if not prepare:self.assertTrue(all('_filled_chip_region_2d' not in chip for chip in current))
+
+    def test_concurrent_pieces_share_leaf_pool_without_cache_or_output_leaks(self):
+        fixtures=[]
+        expected=[]
+        for pid in range(2):
+            depth,items=self.fixture()
+            depth=depth+pid*50
+            args=(dict(scale=1,tx=0,ty=0,is_valid=True),[(0,0,240,180)],(0,0,240,180),(30,70,10))
+            expected.append(self.reference._measure_piece(depth,copy.deepcopy(items),*args))
+            for item in items:
+                item['_mask_2d_array'].flags.writeable=False
+                item['_mask_3d_array'].flags.writeable=False
+            fixtures.append((depth,items,args))
+        def piece(pid):
+            depth,items,args=fixtures[pid]
+            totals={}
+            with timing_context(totals,phase='joint',piece_id=pid+1):
+                result=self.detector._measure_piece(depth,items,*args)
+            return result,totals
+        with ThreadPoolExecutor(max_workers=2) as parents:
+            futures=[parents.submit(piece,pid) for pid in range(2)]
+            results=[future.result(timeout=10) for future in futures]
+        for (result,totals),reference in zip(results,expected):
+            self.assertEqual(result,reference)
+            self.assertIn('height_solder_work_ms',totals)
+        self.assertIsNot(fixtures[0][1][2]['_filled_chip_region_2d'],fixtures[1][1][2]['_filled_chip_region_2d'])
+
+    def test_failed_solder_tasks_drain_before_return_and_skip_parent_updates(self):
+        depth,items=self.fixture()
+        barrier=threading.Barrier(4)
+        finished=[]
+        def task(job,*args):
+            barrier.wait(timeout=3)
+            finished.append((job[0]['instance_id'],job[1]))
+            if job[1]=='start':raise ValueError('synthetic solder failure')
+            return {'source_instance_id':job[0]['instance_id'],'endpoint':job[1]}
+        with patch.object(self.detector,'_measure_solder_task',side_effect=task):
+            with self.assertRaisesRegex(ValueError,'synthetic solder failure'):
+                self.detector._measure_piece(depth,items,dict(scale=1,tx=0,ty=0,is_valid=True),
+                    [(0,0,240,180)],(0,0,240,180),(30,70,10))
+        self.assertEqual(len(finished),4)
+        self.assertTrue(all('height_3d' not in item for item in items))
 
 
 if __name__ == '__main__':

@@ -1367,6 +1367,7 @@ class DetectBoard:
         chips = [
             item for item in instances if item["class_name"].lower() == "chip"
         ]
+        timed_call("height_prepare_chip_regions_ms", self._prepare_chip_regions, chips)
         chip_planes: Dict[int, Dict[str, Any] | None] = {}
         for chip in chips:
             # Build this exclusion union without the current chip instance.
@@ -1400,69 +1401,32 @@ class DetectBoard:
             int(item["instance_id"]): item for item in wire_measurements
         }
 
-        solder_measurements: list[Dict[str, Any]] = []
+        solder_jobs = []
         for instance in instances:
             class_name = instance["class_name"].lower()
             if class_name == "thin":
-                solder_2d = instance["_thin_solder_masks_2d"]
-                for endpoint, solder_mask_2d in zip(("start", "end"), solder_2d):
-                    solder_mask_3d = align_crop_mask_to_depth(
-                        solder_mask_2d,
-                        crop_box,
-                        depth.shape,
-                        registration,
-                    )
-                    # The registration scale is not necessarily one.  Expand
-                    # after mapping so this parameter is expressed in actual
-                    # depth-image pixels, which is the search range needed to
-                    # tolerate a very thin 2D endpoint missing the 3D ridge.
-                    solder_mask_3d = dilate_mask(
-                        solder_mask_3d,
-                        self.height_config.thin_solder_search_dilation_px,
-                    )
-                    solder_measurements.append(
-                        timed_call("height_solder_ms", self._measure_solder,
-                            depth,
-                            solder_mask_2d,
-                            solder_mask_3d,
-                            instance,
-                            endpoint,
-                            chips,
-                            chip_planes,
-                            platform_plane,
-                            semantic_exclusion,
-                            crop_box,
-                        )
-                    )
-                wire_result = wire_by_instance.get(int(instance["instance_id"]))
-                instance["height_3d"] = (
-                    wire_result["height_3d"] if wire_result is not None else None
-                )
+                solder_jobs.extend((instance, endpoint, mask) for endpoint, mask in
+                    zip(("start", "end"), instance["_thin_solder_masks_2d"]))
             elif class_name == "bond":
-                solder_measurements.append(
-                    timed_call("height_solder_ms", self._measure_solder,
-                        depth,
-                        instance["_mask_2d_array"],
-                        instance["_mask_3d_array"],
-                        instance,
-                        "bond",
-                        chips,
-                        chip_planes,
-                        platform_plane,
-                        semantic_exclusion,
-                        crop_box,
-                    )
-                )
-                solder_result = solder_measurements[-1]
+                solder_jobs.append((instance, "bond", instance["_mask_2d_array"]))
+        solder_measurements = timed_call("height_solder_wall_ms", self._instance_tasks.map,
+            lambda job: self._measure_solder_task(job, depth, registration, chips, chip_planes,
+                platform_plane, semantic_exclusion, crop_box),
+            solder_jobs, timing_stage="height_solder_work_ms")
+        bond_by_instance = {item["source_instance_id"]: item for item in solder_measurements
+                            if item["endpoint"] == "bond"}
+        # All child tasks have finished. Only this parent updates instances.
+        for instance in instances:
+            class_name = instance["class_name"].lower()
+            if class_name in {"thin", "wire"}:
+                wire_result = wire_by_instance.get(int(instance["instance_id"]))
+                instance["height_3d"] = wire_result["height_3d"] if wire_result is not None else None
+            elif class_name == "bond":
+                solder_result = bond_by_instance[instance["instance_id"]]
                 instance["height_3d"] = solder_result["height_3d"]
                 instance["bond_location"] = solder_result["location"]
                 instance["reference_instance_id"] = solder_result["reference_instance_id"]
                 instance["chip_inside"] = solder_result["chip_inside"]
-            elif class_name == "wire":
-                wire_result = wire_by_instance.get(int(instance["instance_id"]))
-                instance["height_3d"] = (
-                    wire_result["height_3d"] if wire_result is not None else None
-                )
             elif class_name == "chip":
                 instance["height_3d"] = None
                 instance["plane_3d"] = chip_planes.get(instance["instance_id"])
@@ -1508,6 +1472,27 @@ class DetectBoard:
             if mask.shape == shape:
                 union = np.maximum(union, mask)
         return dilate_mask(union, self.height_config.semantic_exclusion_dilation_px)
+
+    @staticmethod
+    def _prepare_chip_regions(chips):
+        # Refresh once per piece; ownership workers never populate caches.
+        for chip in chips:
+            region = _filled_external_region(chip["_mask_2d_array"])
+            chip["_filled_chip_region_2d"] = region
+            chip["_filled_chip_area_2d"] = int(np.count_nonzero(region))
+
+    def _measure_solder_task(self, job, depth, registration, chips, chip_planes,
+                             platform_plane, semantic_exclusion, crop_box):
+        instance, endpoint, mask_2d = job
+        if endpoint == "bond":
+            mask_3d = instance["_mask_3d_array"]
+        else:
+            mask_3d = align_crop_mask_to_depth(mask_2d, crop_box, depth.shape, registration)
+            # Expand after mapping: this radius is measured in depth pixels.
+            mask_3d = dilate_mask(mask_3d, self.height_config.thin_solder_search_dilation_px)
+        return timed_call("height_solder_ms", self._measure_solder,
+            depth, mask_2d, mask_3d, instance, endpoint, chips, chip_planes,
+            platform_plane, semantic_exclusion, crop_box)
 
     def _measure_solder(
         self,
@@ -1682,17 +1667,15 @@ class DetectBoard:
         best_chip = None
         best_area = None
         for chip in chips:
-            # Aligned chip dicts belong to one measurement task. Multiple
-            # bond/thin endpoints reuse this unchanged external region.
+            # Normal piece execution precomputes these caches in the parent.
+            # Direct callers without preparation get a read-only fallback.
             chip_region = chip.get("_filled_chip_region_2d")
             if chip_region is None:
                 chip_region = _filled_external_region(chip["_mask_2d_array"])
-                chip["_filled_chip_region_2d"] = chip_region
             if chip_region[center_y, center_x]:
                 area = chip.get("_filled_chip_area_2d")
                 if area is None:
                     area = int(np.count_nonzero(chip_region))
-                    chip["_filled_chip_area_2d"] = area
                 if best_area is None or area < best_area:
                     best_chip, best_area = chip, area
         return best_chip, best_chip is not None

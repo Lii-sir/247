@@ -111,6 +111,7 @@ class LocalHeightTests(unittest.TestCase):
                  {"instance_id": 2, "_mask_2d_array": small}]
         with patch.object(detect_board, "_filled_external_region",
                           wraps=detect_board._filled_external_region) as filled:
+            detect_board.DetectBoard._prepare_chip_regions(chips)
             for _ in range(3):
                 for x, y, expected in [(50, 50, 2), (20, 20, 1), (0, 0, None)]:
                     bond = np.zeros_like(large)
