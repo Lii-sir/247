@@ -14,11 +14,11 @@
     }
   },
   "segmentation_3d": {
-      "description": "整板切片自动/固定",
-      "parameters":{
-        "expected_piece_count": 10,
-        "mode": "fixed",
-        "fixed_rois": [
+    "description": "将一张整板深度图分割为十片",
+    "parameters": {
+      "expected_piece_count": 10,
+      "mode": "fixed",
+      "fixed_rois": [
         [
           162,
           305,
@@ -80,8 +80,8 @@
           9165
         ]
       ]
-      }
-    },
+    }
+  },
   "wire_height_3d": {
     "description": "3D独立接口的引线中心线P95高度检测",
     "parameters": {
@@ -148,7 +148,7 @@
       ],
       "penalty_weight": 0.005,
       "maxiter": 35,
-      "xtol": 0.001,
+      "xtol": 0.0001,
       "ftol": 0.01
     }
   },

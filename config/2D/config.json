@@ -59,7 +59,7 @@
         "imgsz": 640,
         "conf": 0.5,
         "iou": 0.3,
-        "max_det": 30,
+        "max_det": 50,
         "device": "0",
         "end2end": false
       },
@@ -151,7 +151,7 @@
         {
           "range": [
             1.31,
-            3.0
+            2.0
           ],
           "model": "chip_long"
         }
