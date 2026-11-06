@@ -137,7 +137,7 @@ C# DTO新增元数据属性，现有测高点/掩码字段保持；源码已构�
 
 ## 仿射评分范围与诊断
 
-`dynamic_affine_3d.parameters.score_mode`为`roi`（默认）或`full`（旧整图评分，可用于对照/回退）。ROI模式只生成所选评分框的采样结果，不生成整个目标画幅；区域裁剪、分区平均和剪切惩罚不变。保留全局目标坐标和原画幅尾部取整边界。当前逐像素验证的后端为OpenCV5 AVX2；其他后端、关闭优化或超出remap尺寸限制时自动使用full，并在返回值`affine_score_mode`显示实际方式。
+`dynamic_affine_3d.parameters.score_mode`为`full`（默认，原生整图评分）或`roi`（仅手动对照的试验路径）。ROI版本虽通过像素一致性检查，但每次评分构造坐标数组、浮点转换和remap可能比原生warpAffine更慢，不能仅凭处理像素减少认定提速；用户日志出现仿射阶段严重回退后，代码缺省值和正式配置均恢复full。ROI模式区域裁剪、分区平均和剪切惩罚不变；保留全局目标坐标和原画幅尾部取整边界。当前逐像素验证的后端为OpenCV5 AVX2；其他后端、关闭优化或超出remap尺寸限制时自动使用full，并在返回值`affine_score_mode`显示实际方式。
 
 配准结果新增`affine_function_evaluations`（优化器nfev）、`affine_optimizer_success/status`、`affine_stop_reason`、`affine_optimizer_ms`，以及`affine_score_calls/total_ms/mean_ms`。score_calls包含初始和最终检查，通常比nfev多2次；平均评分耗时可区分评分次数与单次评分成本。停止原因与最终损失合格判断独立，未改变Powell参数、迭代上限或合格阈值。
 

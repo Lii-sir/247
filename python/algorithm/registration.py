@@ -204,7 +204,9 @@ def refine_affine_registration(
     target_rois = tuple(
         target_mask[y0:y1, x0:x1] for x0, y0, x1, y1 in rois
     )
-    score_mode = values.get("score_mode", "roi")
+    # Native warpAffine is the production default. ROI sampling preserves
+    # pixels but its coordinate arrays can cost more than the pixels saved.
+    score_mode = values.get("score_mode", "full")
     if score_mode not in {"roi", "full"}:
         result["affine_error"] = "dynamic_affine.score_mode must be roi or full"
         return result

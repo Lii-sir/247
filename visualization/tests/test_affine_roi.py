@@ -59,11 +59,26 @@ class AffineRoiTests(unittest.TestCase):
             fn(x0)
             return SimpleNamespace(x=x0,nit=0,nfev=1,success=False,status=2,message='iteration limit')
         with patch.object(reg,'minimize',side_effect=optimize),patch.object(reg.cv2,'warpAffine',side_effect=AssertionError('full warp forbidden')):
-            result=reg.refine_affine_registration(image,depth,coarse,parameters)
+            result=reg.refine_affine_registration(image,depth,coarse,{**parameters,'score_mode':'roi'})
         self.assertEqual(result['affine_stop_reason'],'iteration limit')
         self.assertEqual(result['affine_function_evaluations'],1)
         invalid=reg.refine_affine_registration(image,depth,coarse,{**parameters,'score_mode':'bad'})
         self.assertIn('score_mode',invalid['affine_error'])
+
+    def test_production_default_uses_native_warp_and_preserves_diagnostics(self):
+        image,depth,coarse,parameters=self.fixture()
+        def optimize(fn,x0,**kwargs):
+            fn(x0)
+            return SimpleNamespace(x=x0,nit=1,nfev=1,success=True,status=0,message='converged')
+        with patch.object(reg,'minimize',side_effect=optimize), \
+             patch.object(reg,'_warp_affine_rois',side_effect=AssertionError('ROI must be explicit')), \
+             patch.object(reg.cv2,'warpAffine',wraps=cv2.warpAffine) as warp:
+            result=reg.refine_affine_registration(image,depth,coarse,parameters)
+        self.assertEqual(warp.call_count,3)
+        self.assertEqual(result['affine_score_mode'],'full')
+        self.assertEqual(result['affine_function_evaluations'],1)
+        self.assertEqual(result['affine_stop_reason'],'converged')
+        self.assertGreaterEqual(result['affine_score_mean_ms'],0)
 
     def test_optimizer_exception_preserves_diagnostics(self):
         image,depth,coarse,parameters=self.fixture()
