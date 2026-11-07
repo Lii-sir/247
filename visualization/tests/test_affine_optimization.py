@@ -113,5 +113,79 @@ class AffineOptimizationTests(unittest.TestCase):
         missing=reg.refine_affine_registration(*args[:3],values)
         self.assertIn('context_missing',missing['affine_initialization']['reason'])
 
+    def test_multiscale_matrix_uses_actual_source_and_target_ratios(self):
+        source=np.ones((73,101),np.uint8);target=np.ones((55,93),np.uint8)
+        full=reg._AffineScore(source,target,[(0,0,93,55)],0.,.02,cache_enabled=True)
+        low=full.resized(.5)
+        p=np.array([.8,.9,.001,-.002,500.,300.])
+        with patch.object(reg.cv2,'warpAffine',wraps=cv2.warpAffine) as warp:
+            low(p)
+        matrix=reg._scaled_affine(p)
+        src=np.diag([low.source.shape[1]/101,low.source.shape[0]/73,1.])
+        dst=np.diag([low.target.shape[1]/93,low.target.shape[0]/55,1.])
+        expected=dst @ np.vstack([matrix,[0,0,1]]) @ np.linalg.inv(src)
+        np.testing.assert_allclose(warp.call_args.args[1],expected[:2],rtol=0,atol=1e-12)
+
+    def test_multiscale_caches_do_not_share_losses(self):
+        source=np.zeros((8,8),np.uint8);target=source.copy();target[1,1]=1
+        full=reg._AffineScore(source,target,[(0,0,8,8)],0.,.02,cache_enabled=True)
+        low=full.resized(.5)
+        p=np.array([1,1,0,0,1000,400.])
+        self.assertNotEqual(full(p),low(p))
+        self.assertEqual(full.misses,1);self.assertEqual(low.misses,1)
+        self.assertIsNot(full.cache,low.cache)
+
+    def test_multiscale_keeps_canonical_parameters_and_sums_stage_calls(self):
+        args=self.fixture();seen=[]
+        def optimize(fn,x0,**kwargs):
+            seen.append((x0.copy(),kwargs['bounds']))
+            fn(x0)
+            return SimpleNamespace(x=x0.copy(),nit=1,nfev=1,success=True,status=0,message='done')
+        with patch.object(reg,'minimize',side_effect=optimize):
+            result=reg.refine_affine_registration(*args[:3],{**args[3],'cache_enabled':True,'multiscale':{'enabled':True}})
+        self.assertEqual([stage['name'] for stage in result['affine_stages']],['search','refine'])
+        self.assertEqual(result['affine_function_evaluations'],2)
+        np.testing.assert_array_equal(seen[0][0],seen[1][0])
+        self.assertEqual(seen[0][1][4],(965.,1035.))
+        self.assertTrue(result['affine_multiscale']['applied'])
+        self.assertEqual(result['affine_score_mode'],'full')
+
+    def test_refine_boundary_triggers_original_full_search(self):
+        args=list(self.fixture());args[0][:]=0;args[1][:]=0
+        seen=[]
+        def optimize(fn,x0,**kwargs):
+            seen.append(kwargs['bounds'])
+            x=np.array([b[0] for b in kwargs['bounds']]) if len(seen)==2 else x0.copy()
+            fn(x)
+            return SimpleNamespace(x=x,nit=1,nfev=1,success=True,status=0,message='done')
+        with patch.object(reg,'minimize',side_effect=optimize):
+            result=reg.refine_affine_registration(*args[:3],{**args[3],'penalty_weight':0.,'multiscale':{'enabled':True}})
+        self.assertEqual([stage['name'] for stage in result['affine_stages']],['search','refine','fallback'])
+        self.assertEqual(seen[0],seen[2])
+        self.assertEqual(result['affine_multiscale']['fallback_reason'],'refine_window_boundary')
+        self.assertEqual(result['affine_function_evaluations'],3)
+
+    def test_multiscale_error_falls_back_and_final_score_never_uses_low_loss(self):
+        args=self.fixture();calls=[]
+        def optimize(fn,x0,**kwargs):
+            calls.append(1)
+            if len(calls)==1:raise ValueError('low stage failed')
+            fn(x0)
+            return SimpleNamespace(x=x0,nit=1,nfev=1,success=True,status=0,message='done')
+        with patch.object(reg,'minimize',side_effect=optimize):
+            result=reg.refine_affine_registration(*args[:3],{**args[3],'multiscale':{'enabled':True}})
+        self.assertTrue(result['affine_multiscale']['fallback_used'])
+        self.assertEqual(result['affine_multiscale']['fallback_reason'],'search_error')
+        self.assertTrue(result['is_valid'])
+        self.assertEqual(result['affine_score_after'],0.)
+
+    def test_real_synthetic_multiscale_preserves_best_full_seed(self):
+        args=self.fixture()
+        args[1][:]=cv2.warpAffine(args[1],np.array([[1,0,2.],[0,1,0.]]),(100,70),flags=cv2.INTER_NEAREST)
+        result=reg.refine_affine_registration(*args[:3],{**args[3],'cache_enabled':True,
+            'multiscale':{'enabled':True,'search_maxiter':2,'refine_maxiter':2}})
+        self.assertLessEqual(result['affine_score_after'],result['affine_initial_score'])
+        self.assertTrue(np.isfinite(result['affine_matrix_2d_to_3d']).all())
+
 
 if __name__=='__main__':unittest.main()

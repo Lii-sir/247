@@ -155,6 +155,10 @@ C# DTO新增元数据属性，现有测高点/掩码字段保持；源码已构�
 
 新增`affine_initial_parameters`、`affine_coarse_parameters`及`affine_initial_score`；`affine_score_before`仍代表原粗配准初值的完整评分。候选检查计入score_calls但不计入SciPy nfev。此功能可能改变收敛结果，需用同一板/不同板对照最终各区损失、映射位置与测高结果后再正式启用。
 
+`multiscale.enabled`默认false。启用时先在`search_scale`（默认0.5）分辨率搜索，再做完整分辨率局部精修；两阶段迭代上限分别由`search_maxiter/refine_maxiter`控制。完整规范掩码先闭运算再降采样，矩阵按源/目标实际尺寸比例换算；6参数及边界始终保持完整分辨率单位，评分框同步floor/ceil缩放且不丢弃某个分区。各分辨率使用独立缓存，低分辨率损失不参与最终合格判断。
+
+精修窗口半径为原搜索半径乘`refine_window_ratio`（默认0.25），且截在原边界内。完整评分退化、超过阈值、碰到新窗口边界或阶段异常时，回退原粗配准起点和原边界的完整搜索。保留实际完整评分候选中较好的解，不能据此保证等同原优化器的最优解。`affine_stages`逐级记录nfev、尺寸、边界、耗时、停止状态，顶层nfev/optimizer_ms为各级之和；`affine_multiscale`说明回退与最终解来源。完整阶段墙钟仍看timings中的affine_registration_ms；新增affine_optimization_pipeline_ms还覆盖级间准备和验证。实际速度和质量须由实图验证，默认不启用。
+
 ## Pitch条带并行
 
 `smartray_pitch_3d.parameters.projection_workers`默认配置为8，必须为正整数；设为1串行。省略该项的旧配置按1处理。统一板级和独立3D检测器各自在初始化时配置独立Pitch线程池，跨板复用，释放/重新初始化时关闭；它与joint及instance线程池分开，也不计入桥接层原有worker_budget。

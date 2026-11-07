@@ -7,7 +7,7 @@ from typing import Any, Dict, Sequence
 
 import cv2
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import minimize, OptimizeResult
 
 
 @dataclass(frozen=True)
@@ -153,6 +153,7 @@ def refine_affine_registration(
     values = values or {}
     result = dict(coarse_registration)
     result["affine_valid"] = False
+    result["is_valid"] = False
     result["affine_score_before"] = None
     result["affine_score_after"] = None
     result["affine_zone_losses"] = []
@@ -291,33 +292,31 @@ def refine_affine_registration(
                   affine_initial_score=float(initial_score), affine_coarse_parameters=p0.tolist())
     optimizer_calls_before = score.calls
     optimizer_started = time.perf_counter()
+    stages, objectives = [], [score]
     try:
-        optimized = minimize(
-            score,
-            start,
-            method="Powell",
-            bounds=list(zip(lower, upper)),
-            options={
-                "maxiter": int(values.get("maxiter", 35)),
-                "xtol": float(values.get("xtol", 1e-4)),
-                "ftol": float(values.get("ftol", 1e-4)),
-            },
-        )
+        optimized, stages, objectives, search_info = _search_affine(
+            score, start, p0, lower, upper, values, initial_score)
+        if search_info.get("fatal_error"):
+            raise ValueError(search_info["fatal_error"])
     except (ValueError, RuntimeError, FloatingPointError) as exc:
         result["affine_error"] = str(exc)
         result["affine_score_before"] = before
         result.update(affine_stop_reason=str(exc), affine_optimizer_success=False,
-            affine_function_evaluations=max(0, score.calls - optimizer_calls_before))
-        result.update(score.diagnostics())
+            affine_function_evaluations=sum(stage["nfev"] for stage in stages) if stages else max(0, score.calls-optimizer_calls_before))
+        result.update(_score_diagnostics(objectives))
+        result["affine_stages"] = stages
         return result
 
-    result["affine_optimizer_ms"] = (time.perf_counter() - optimizer_started) * 1000
-    result["affine_function_evaluations"] = int(getattr(optimized, "nfev", score.calls - optimizer_calls_before))
-    result["affine_optimizer_success"] = bool(optimized.success) if hasattr(optimized, "success") else None
-    result["affine_optimizer_status"] = int(optimized.status) if hasattr(optimized, "status") else None
-    result["affine_stop_reason"] = str(getattr(optimized, "message", "optimizer did not report a stop reason"))
+    result["affine_optimization_pipeline_ms"] = (time.perf_counter()-optimizer_started)*1000
+    result["affine_stages"] = stages
+    result["affine_multiscale"] = search_info
+    result["affine_optimizer_ms"] = sum(stage["optimizer_ms"] for stage in stages)
+    result["affine_function_evaluations"] = sum(stage["nfev"] for stage in stages)
+    result["affine_optimizer_success"] = bool(optimized.success) if hasattr(optimized,"success") else None
+    result["affine_optimizer_status"] = int(optimized.status) if hasattr(optimized,"status") else None
+    result["affine_stop_reason"] = str(getattr(optimized,"message","optimizer did not report a stop reason"))
     after, losses = score(optimized.x, details=True)
-    result.update(score.diagnostics())
+    result.update(_score_diagnostics(objectives))
     matrix = _full_affine(optimized.x, preview_scale)
     result["affine_valid"] = bool(
         np.all(np.isfinite(matrix))
@@ -326,7 +325,7 @@ def refine_affine_registration(
     result["affine_score_before"] = float(before)
     result["affine_score_after"] = float(after)
     result["affine_zone_losses"] = [float(value) for value in losses]
-    result["affine_iterations"] = int(getattr(optimized, "nit", 0) or 0)
+    result["affine_iterations"] = sum(stage["iterations"] for stage in stages)
     result["affine_matrix_2d_to_3d"] = matrix.tolist()
     result["homography_2d_to_3d"] = np.vstack(
         [matrix, np.asarray([0.0, 0.0, 1.0])]
@@ -570,8 +569,9 @@ def _validate_box(box: Sequence[int], name: str) -> None:
 class _AffineScore:
     """One image/one scoring resolution. Exact keys; no cross-image cache."""
     def __init__(self, source, target, rois, penalty_weight, shear_limit,
-                 *, score_mode="full", cache_enabled=False):
+                 *, score_mode="full", cache_enabled=False, ratios=(1.,1.,1.,1.), scale=1.):
         self.source, self.target, self.rois = source, target, rois
+        self.ratios, self.scale = ratios, scale
         self.penalty_weight, self.shear_limit = penalty_weight, shear_limit
         self.score_mode, self.cache_enabled = score_mode, cache_enabled
         self.grids = [_affine_roi_grid(box) for box in rois] if score_mode == "roi" else None
@@ -591,6 +591,12 @@ class _AffineScore:
             self.misses += 1
             compute_started = time.perf_counter()
             matrix = _scaled_affine(parameters)
+            if self.ratios != (1.,1.,1.,1.):
+                sx,sy,tx,ty = self.ratios
+                matrix[:,0] /= sx
+                matrix[:,1] /= sy
+                matrix[0,:] *= tx
+                matrix[1,:] *= ty
             if self.score_mode == "roi":
                 patches = _warp_affine_rois(self.source, matrix, self.rois, self.grids, self.target.shape[1])
             else:
@@ -616,3 +622,121 @@ class _AffineScore:
             affine_score_total_ms=self.seconds*1000,affine_score_mean_ms=self.seconds*1000/max(1,self.calls),
             affine_score_compute_ms=self.compute_seconds*1000,
             affine_score_compute_mean_ms=self.compute_seconds*1000/max(1,self.misses))
+
+    def resized(self, scale):
+        if self.score_mode != "full":
+            raise ValueError("multiscale requires native full score_mode")
+        sh,sw = self.source.shape
+        th,tw = self.target.shape
+        ss = (max(1,round(sw*scale)),max(1,round(sh*scale)))
+        ts = (max(1,round(tw*scale)),max(1,round(th*scale)))
+        rx,ry = ts[0]/tw,ts[1]/th
+        rois = [(max(0,int(np.floor(x0*rx))),max(0,int(np.floor(y0*ry))),
+                 min(ts[0],int(np.ceil(x1*rx))),min(ts[1],int(np.ceil(y1*ry))))
+                for x0,y0,x1,y1 in self.rois]
+        if any(x1<=x0 or y1<=y0 for x0,y0,x1,y1 in rois):
+            raise ValueError("multiscale produced an empty scoring region")
+        return _AffineScore(cv2.resize(self.source,ss,interpolation=cv2.INTER_NEAREST),
+            cv2.resize(self.target,ts,interpolation=cv2.INTER_NEAREST),rois,self.penalty_weight,self.shear_limit,
+            cache_enabled=self.cache_enabled,ratios=(ss[0]/sw,ss[1]/sh,rx,ry),scale=scale)
+
+
+def _score_diagnostics(objectives):
+    # The full objective may be reused by refine/validation/fallback. Sum it once.
+    unique = {id(objective):objective for objective in objectives}.values()
+    rows = [objective.diagnostics() for objective in unique]
+    totals = {key:sum(row[key] for row in rows) for key in (
+        "affine_cache_hits","affine_cache_misses","affine_warp_evaluations","affine_score_calls",
+        "affine_score_total_ms","affine_score_compute_ms")}
+    totals.update(affine_cache_enabled=all(row["affine_cache_enabled"] for row in rows),
+        affine_cache_hit_rate=totals["affine_cache_hits"]/max(1,totals["affine_score_calls"]),
+        affine_score_mean_ms=totals["affine_score_total_ms"]/max(1,totals["affine_score_calls"]),
+        affine_score_compute_mean_ms=totals["affine_score_compute_ms"]/max(1,totals["affine_cache_misses"]))
+    return totals
+
+
+def _run_affine_level(score, start, lower, upper, values, name, maxiter):
+    started = time.perf_counter()
+    calls_before = score.calls
+    error = None
+    try:
+        optimized = minimize(score,start,method="Powell",bounds=list(zip(lower,upper)),options={
+            "maxiter":int(maxiter),"xtol":float(values.get("xtol",1e-4)),"ftol":float(values.get("ftol",1e-4))})
+    except (ValueError,RuntimeError,FloatingPointError) as exc:
+        error = str(exc)
+        optimized = OptimizeResult(x=start.copy(),nit=0,nfev=score.calls-calls_before,
+                                   status=-1,success=False,message=error)
+    stage = dict(name=name,scale=score.scale,source_size=list(score.source.shape[::-1]),
+        target_size=list(score.target.shape[::-1]),nfev=int(getattr(optimized,"nfev",score.calls-calls_before)),
+        iterations=int(getattr(optimized,"nit",0) or 0),optimizer_ms=(time.perf_counter()-started)*1000,
+        success=bool(optimized.success) if hasattr(optimized,"success") else None,
+        status=int(optimized.status) if hasattr(optimized,"status") else None,
+        stop_reason=str(getattr(optimized,"message","not reported")),error=error,
+        initial_parameters=start.tolist(),bounds=np.column_stack((lower,upper)).tolist())
+    return optimized,stage
+
+
+def _search_affine(full, start, coarse, lower, upper, values, initial_score):
+    settings = values.get("multiscale") or {}
+    if not isinstance(settings,dict) or type(settings.get("enabled",False)) is not bool:
+        raise ValueError("dynamic_affine.multiscale must contain a boolean enabled")
+    enabled = settings.get("enabled",False)
+    info = dict(enabled=enabled,applied=False,fallback_used=False,fallback_reason=None,solution_source="full")
+    stages,objectives = [],[full]
+    if not enabled:
+        optimized,stage = _run_affine_level(full,start,lower,upper,values,"full",values.get("maxiter",35))
+        stages.append(stage)
+        info["fatal_error"] = stage["error"]
+        return optimized,stages,objectives,info
+    scale = float(settings.get("search_scale",.5))
+    ratio = float(settings.get("refine_window_ratio",.25))
+    if not np.isfinite(scale) or not 0 < scale < 1 or not np.isfinite(ratio) or not 0 < ratio <= 1:
+        raise ValueError("multiscale search_scale must be (0,1); refine_window_ratio must be (0,1]")
+    low = full.resized(scale)
+    objectives.append(low)
+    info.update(applied=True,solution_source="refine",search_scale=scale)
+    searched,search_stage = _run_affine_level(low,start,lower,upper,values,"search",settings.get("search_maxiter",15))
+    stages.append(search_stage)
+    reason = "search_error" if search_stage["error"] else None
+    candidate = np.asarray(searched.x,dtype=float)
+    refined = searched
+    candidates = [(float(initial_score),start.copy(),"initial")]
+    if not reason and np.isfinite(candidate).all() and np.all(candidate>=lower) and np.all(candidate<=upper):
+        search_stage["full_score_after"] = full(candidate)
+        radius = (upper-lower)*.5*ratio
+        fine_lower,fine_upper = np.maximum(lower,candidate-radius),np.minimum(upper,candidate+radius)
+        refined,refine_stage = _run_affine_level(full,candidate,fine_lower,fine_upper,values,
+                                               "refine",settings.get("refine_maxiter",10))
+        stages.append(refine_stage)
+        parameters = np.asarray(refined.x,dtype=float)
+        if refine_stage["error"] or not np.isfinite(parameters).all():
+            reason = "refine_error"
+        else:
+            after = full(parameters)
+            refine_stage["full_score_after"] = after
+            if np.isfinite(after):candidates.append((float(after),parameters.copy(),"refine"))
+            margin = np.maximum((upper-lower)*1e-3,float(values.get("xtol",1e-4))*2)
+            hit = ((parameters-fine_lower <= margin)&(fine_lower>lower+1e-12)) | ((fine_upper-parameters<=margin)&(fine_upper<upper-1e-12))
+            if not np.isfinite(after):reason="nonfinite_full_score"
+            elif after > initial_score+1e-12:reason="full_score_worse_than_initial"
+            elif after > float(values.get("max_score",.25)):reason="full_score_above_threshold"
+            elif np.any(hit):reason="refine_window_boundary"
+    elif not reason:
+        reason = "invalid_search_parameters"
+    if reason:
+        info.update(fallback_used=True,fallback_reason=reason)
+        refined,fallback_stage = _run_affine_level(full,coarse,lower,upper,values,"fallback",values.get("maxiter",35))
+        stages.append(fallback_stage)
+        if fallback_stage["error"] and len(candidates) == 1:
+            info["fatal_error"] = fallback_stage["error"]
+        if not fallback_stage["error"] and np.isfinite(refined.x).all():
+            value = full(refined.x)
+            fallback_stage["full_score_after"] = value
+            if np.isfinite(value):candidates.append((float(value),np.asarray(refined.x).copy(),"fallback"))
+    # Retain the best of actual full-resolution candidate/seed checks. A low
+    # resolution loss is never compared with any full-resolution loss.
+    _,parameters,source = min(candidates,key=lambda item:item[0])
+    info["solution_source"] = source
+    refined = OptimizeResult(x=parameters,nit=getattr(refined,"nit",0),nfev=getattr(refined,"nfev",0),
+        success=getattr(refined,"success",None),status=getattr(refined,"status",0),message=getattr(refined,"message","not reported"))
+    return refined,stages,objectives,info

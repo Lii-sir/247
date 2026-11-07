@@ -142,6 +142,13 @@
         "enabled": false,
         "profile": null
       },
+      "multiscale": {
+        "enabled": false,
+        "search_scale": 0.5,
+        "search_maxiter": 15,
+        "refine_maxiter": 10,
+        "refine_window_ratio": 0.25
+      },
       "preview_scale": 0.5,
       "threshold_2d": 50,
       "morphology_kernel_size": 3,
