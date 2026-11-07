@@ -203,9 +203,6 @@ def refine_affine_registration(
     if not rois:
         result["affine_error"] = f"no valid affine scoring zones for depth shape {target_mask.shape}"
         return result
-    target_rois = tuple(
-        target_mask[y0:y1, x0:x1] for x0, y0, x1, y1 in rois
-    )
     # Native warpAffine is the production default. ROI sampling preserves
     # pixels but its coordinate arrays can cost more than the pixels saved.
     score_mode = values.get("score_mode", "full")
@@ -268,7 +265,8 @@ def refine_affine_registration(
                          score_mode=score_mode, cache_enabled=cache_enabled)
 
     before, _ = score(p0, details=True)
-    calibration = values.get("calibration") or {}
+    calibration = values.get("calibration", {})
+    if calibration is None:calibration = {}
     if not isinstance(calibration, dict) or type(calibration.get("enabled", False)) is not bool:
         raise ValueError("dynamic_affine.calibration must contain a boolean enabled")
     start = p0.copy()
@@ -310,6 +308,7 @@ def refine_affine_registration(
     result["affine_optimization_pipeline_ms"] = (time.perf_counter()-optimizer_started)*1000
     result["affine_stages"] = stages
     result["affine_multiscale"] = search_info
+    result["affine_budget"] = search_info.get("budget")
     result["affine_optimizer_ms"] = sum(stage["optimizer_ms"] for stage in stages)
     result["affine_function_evaluations"] = sum(stage["nfev"] for stage in stages)
     result["affine_optimizer_success"] = bool(optimized.success) if hasattr(optimized,"success") else None
@@ -655,38 +654,90 @@ def _score_diagnostics(objectives):
     return totals
 
 
-def _run_affine_level(score, start, lower, upper, values, name, maxiter):
+def _optional_evaluation_limit(value, name):
+    if value is not None and (type(value) is not int or value < 1):
+        raise ValueError(name + " must be null or a positive integer")
+    return value
+
+
+def _run_affine_level(score, start, lower, upper, values, name, maxiter, *, maxfev=None, budget=None):
     started = time.perf_counter()
+    before_stats = score.diagnostics()
     calls_before = score.calls
     error = None
-    try:
-        optimized = minimize(score,start,method="Powell",bounds=list(zip(lower,upper)),options={
-            "maxiter":int(maxiter),"xtol":float(values.get("xtol",1e-4)),"ftol":float(values.get("ftol",1e-4))})
-    except (ValueError,RuntimeError,FloatingPointError) as exc:
-        error = str(exc)
-        optimized = OptimizeResult(x=start.copy(),nit=0,nfev=score.calls-calls_before,
-                                   status=-1,success=False,message=error)
+    limit = _optional_evaluation_limit(maxfev,"maxfev")
+    remaining = None if budget is None or budget["limit"] is None else max(0,budget["limit"]-budget["used"])
+    if remaining is not None:
+        limit = remaining if limit is None else min(limit,remaining)
+    best_value,best_params = np.inf,None
+    def objective(parameters):
+        nonlocal best_value,best_params
+        value = score(parameters)
+        point = np.asarray(parameters,dtype=float)
+        if (np.isfinite(value) and np.isfinite(point).all() and np.all(point>=lower)
+                and np.all(point<=upper) and value<best_value):
+            best_value,best_params = float(value),point.copy()
+        return value
+    skipped = limit == 0
+    if skipped:
+        optimized = OptimizeResult(x=start.copy(),nit=0,nfev=0,status=1,success=False,
+                                   message="total evaluation budget exhausted; stage not run")
+    else:
+        options = dict(maxiter=int(maxiter),xtol=float(values.get("xtol",1e-4)),ftol=float(values.get("ftol",1e-4)))
+        if limit is not None:options["maxfev"] = limit
+        try:
+            # Best-trial tracking is needed only for an active evaluation cap;
+            # avoid its extra per-call checks on the default unlimited path.
+            optimized = minimize(objective if limit is not None else score,start,
+                                 method="Powell",bounds=list(zip(lower,upper)),options=options)
+        except (ValueError,RuntimeError,FloatingPointError) as exc:
+            error = str(exc)
+            optimized = OptimizeResult(x=start.copy(),nit=0,nfev=score.calls-calls_before,
+                                       status=-1,success=False,message=error)
+    observed_calls = score.calls-calls_before
+    if budget is not None:budget["used"] += observed_calls
+    exhausted = skipped or getattr(optimized,"status",None) == 1 or (limit is not None and observed_calls>=limit)
+    returned = np.asarray(optimized.x,dtype=float).copy()
+    use_best = exhausted and best_params is not None
+    if use_best:
+        optimized = OptimizeResult(x=best_params.copy(),fun=best_value,nit=getattr(optimized,"nit",0),
+            nfev=getattr(optimized,"nfev",observed_calls),status=getattr(optimized,"status",1),
+            success=getattr(optimized,"success",False),message=getattr(optimized,"message","evaluation budget exhausted"))
     stage = dict(name=name,scale=score.scale,source_size=list(score.source.shape[::-1]),
         target_size=list(score.target.shape[::-1]),nfev=int(getattr(optimized,"nfev",score.calls-calls_before)),
         iterations=int(getattr(optimized,"nit",0) or 0),optimizer_ms=(time.perf_counter()-started)*1000,
         success=bool(optimized.success) if hasattr(optimized,"success") else None,
         status=int(optimized.status) if hasattr(optimized,"status") else None,
         stop_reason=str(getattr(optimized,"message","not reported")),error=error,
-        initial_parameters=start.tolist(),bounds=np.column_stack((lower,upper)).tolist())
+        initial_parameters=start.tolist(),bounds=np.column_stack((lower,upper)).tolist(),
+        maxfev=limit,objective_calls=observed_calls,budget_exhausted=bool(exhausted),skipped=skipped,
+        optimizer_returned_parameters=returned.tolist(),used_best_observed=bool(use_best),
+        best_observed_score=float(best_value) if np.isfinite(best_value) else None)
+    own_score = getattr(optimized,"fun",None)
+    stage["objective_score_after"] = float(own_score) if own_score is not None and np.isfinite(own_score) else None
+    after_stats = score.diagnostics()
+    stage.update(cache_hits=after_stats["affine_cache_hits"]-before_stats["affine_cache_hits"],
+        cache_misses=after_stats["affine_cache_misses"]-before_stats["affine_cache_misses"],
+        warp_evaluations=after_stats["affine_warp_evaluations"]-before_stats["affine_warp_evaluations"],
+        score_compute_ms=after_stats["affine_score_compute_ms"]-before_stats["affine_score_compute_ms"])
     return optimized,stage
 
 
 def _search_affine(full, start, coarse, lower, upper, values, initial_score):
-    settings = values.get("multiscale") or {}
+    settings = values.get("multiscale", {})
+    if settings is None:settings = {}
     if not isinstance(settings,dict) or type(settings.get("enabled",False)) is not bool:
         raise ValueError("dynamic_affine.multiscale must contain a boolean enabled")
     enabled = settings.get("enabled",False)
     info = dict(enabled=enabled,applied=False,fallback_used=False,fallback_reason=None,solution_source="full")
+    limit = _optional_evaluation_limit(values.get("maxfev"),"maxfev")
+    budget = dict(limit=_optional_evaluation_limit(values.get("total_maxfev"),"total_maxfev"),used=0)
     stages,objectives = [],[full]
     if not enabled:
-        optimized,stage = _run_affine_level(full,start,lower,upper,values,"full",values.get("maxiter",35))
+        optimized,stage = _run_affine_level(full,start,lower,upper,values,"full",values.get("maxiter",35),maxfev=limit,budget=budget)
         stages.append(stage)
         info["fatal_error"] = stage["error"]
+        info["budget"] = dict(budget,exhausted=budget["limit"] is not None and budget["used"]>=budget["limit"])
         return optimized,stages,objectives,info
     scale = float(settings.get("search_scale",.5))
     ratio = float(settings.get("refine_window_ratio",.25))
@@ -695,7 +746,8 @@ def _search_affine(full, start, coarse, lower, upper, values, initial_score):
     low = full.resized(scale)
     objectives.append(low)
     info.update(applied=True,solution_source="refine",search_scale=scale)
-    searched,search_stage = _run_affine_level(low,start,lower,upper,values,"search",settings.get("search_maxiter",15))
+    searched,search_stage = _run_affine_level(low,start,lower,upper,values,"search",settings.get("search_maxiter",15),
+        maxfev=settings.get("search_maxfev") if settings.get("search_maxfev") is not None else limit,budget=budget)
     stages.append(search_stage)
     reason = "search_error" if search_stage["error"] else None
     candidate = np.asarray(searched.x,dtype=float)
@@ -706,7 +758,8 @@ def _search_affine(full, start, coarse, lower, upper, values, initial_score):
         radius = (upper-lower)*.5*ratio
         fine_lower,fine_upper = np.maximum(lower,candidate-radius),np.minimum(upper,candidate+radius)
         refined,refine_stage = _run_affine_level(full,candidate,fine_lower,fine_upper,values,
-                                               "refine",settings.get("refine_maxiter",10))
+            "refine",settings.get("refine_maxiter",10),
+            maxfev=settings.get("refine_maxfev") if settings.get("refine_maxfev") is not None else limit,budget=budget)
         stages.append(refine_stage)
         parameters = np.asarray(refined.x,dtype=float)
         if refine_stage["error"] or not np.isfinite(parameters).all():
@@ -725,8 +778,10 @@ def _search_affine(full, start, coarse, lower, upper, values, initial_score):
         reason = "invalid_search_parameters"
     if reason:
         info.update(fallback_used=True,fallback_reason=reason)
-        refined,fallback_stage = _run_affine_level(full,coarse,lower,upper,values,"fallback",values.get("maxiter",35))
+        refined,fallback_stage = _run_affine_level(full,coarse,lower,upper,values,"fallback",values.get("maxiter",35),maxfev=limit,budget=budget)
         stages.append(fallback_stage)
+        if fallback_stage["skipped"]:
+            info.update(fallback_used=False,fallback_not_run="total_evaluation_budget_exhausted")
         if fallback_stage["error"] and len(candidates) == 1:
             info["fatal_error"] = fallback_stage["error"]
         if not fallback_stage["error"] and np.isfinite(refined.x).all():
@@ -737,6 +792,7 @@ def _search_affine(full, start, coarse, lower, upper, values, initial_score):
     # resolution loss is never compared with any full-resolution loss.
     _,parameters,source = min(candidates,key=lambda item:item[0])
     info["solution_source"] = source
+    info["budget"] = dict(budget,exhausted=budget["limit"] is not None and budget["used"]>=budget["limit"])
     refined = OptimizeResult(x=parameters,nit=getattr(refined,"nit",0),nfev=getattr(refined,"nfev",0),
         success=getattr(refined,"success",None),status=getattr(refined,"status",0),message=getattr(refined,"message","not reported"))
     return refined,stages,objectives,info

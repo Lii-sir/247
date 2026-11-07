@@ -187,5 +187,81 @@ class AffineOptimizationTests(unittest.TestCase):
         self.assertLessEqual(result['affine_score_after'],result['affine_initial_score'])
         self.assertTrue(np.isfinite(result['affine_matrix_2d_to_3d']).all())
 
+    def test_budget_uses_best_trial_instead_of_last_completed_powell_position(self):
+        args=list(self.fixture());args[1][:]=cv2.warpAffine(args[1],np.array([[1,0,2.],[0,1,0.]]),(100,70),flags=cv2.INTER_NEAREST)
+        def optimize(fn,x0,**kwargs):
+            better=x0.copy();better[4]+=2
+            fn(x0);fn(better)
+            return SimpleNamespace(x=x0.copy(),nit=0,nfev=2,success=False,status=1,message='maxfev reached')
+        with patch.object(reg,'minimize',side_effect=optimize):
+            result=reg.refine_affine_registration(*args[:3],{**args[3],'cache_enabled':True,'maxfev':2})
+        self.assertEqual(result['affine_function_evaluations'],2)
+        self.assertEqual(result['affine_score_after'],0.)
+        self.assertEqual(result['tx'],2.)
+        self.assertTrue(result['affine_stages'][0]['used_best_observed'])
+        self.assertFalse(result['affine_optimizer_success'])
+        self.assertTrue(result['affine_valid'])
+
+    def test_total_budget_caps_all_stages_and_reports_blocked_fallback(self):
+        args=list(self.fixture());args[0][:]=0;args[1][:]=0
+        limits=[]
+        def optimize(fn,x0,**kwargs):
+            limit=kwargs['options']['maxfev'];limits.append(limit)
+            point=x0.copy() if len(limits)==1 else np.array([b[0] for b in kwargs['bounds']])
+            for _ in range(limit):fn(point)
+            return SimpleNamespace(x=point,nit=0,nfev=limit,success=False,status=1,message='maxfev reached')
+        with patch.object(reg,'minimize',side_effect=optimize):
+            result=reg.refine_affine_registration(*args[:3],{**args[3],'penalty_weight':0.,'total_maxfev':3,
+                'multiscale':{'enabled':True,'search_maxfev':2,'refine_maxfev':5}})
+        self.assertEqual(limits,[2,1])
+        self.assertEqual(result['affine_function_evaluations'],3)
+        self.assertEqual(result['affine_budget']['used'],3)
+        self.assertTrue(result['affine_budget']['exhausted'])
+        self.assertFalse(result['affine_multiscale']['fallback_used'])
+        self.assertEqual(result['affine_multiscale']['fallback_not_run'],'total_evaluation_budget_exhausted')
+        self.assertTrue(result['affine_stages'][-1]['skipped'])
+
+    def test_real_synthetic_maxfev_is_independent_of_quality(self):
+        args=self.fixture()
+        result=reg.refine_affine_registration(*args[:3],{**args[3],'cache_enabled':True,'maxfev':6})
+        self.assertEqual(result['affine_function_evaluations'],6)
+        self.assertEqual(result['affine_optimizer_status'],1)
+        self.assertFalse(result['affine_optimizer_success'])
+        self.assertTrue(result['affine_valid'])
+        self.assertEqual(result['affine_score_after'],0.)
+
+    def test_invalid_budgets_are_rejected_and_errors_do_not_keep_coarse_validity(self):
+        args=self.fixture()
+        for field in ('maxfev','total_maxfev'):
+            for value in (0,-1,True,1.5,'150'):
+                result=reg.refine_affine_registration(*args[:3],{**args[3],field:value})
+                self.assertIn(field,result['affine_error'])
+                self.assertFalse(result['is_valid'])
+        with patch.object(reg,'minimize',side_effect=ValueError('all stages failed')):
+            result=reg.refine_affine_registration(*args[:3],{**args[3],'multiscale':{'enabled':True}})
+        self.assertFalse(result['is_valid'])
+        self.assertIn('failed',result['affine_error'])
+
+    def test_saved_report_comparison_supports_formal_envelope_and_lab_export(self):
+        import importlib.util
+        spec=importlib.util.spec_from_file_location('affine_comparison',ROOT/'visualization/compare_affine_results.py')
+        comparison=importlib.util.module_from_spec(spec);spec.loader.exec_module(comparison)
+        record=dict(affine_score_after=.1,affine_function_evaluations=10,matrix_2d_to_3d=[[1,0,0],[0,1,0]])
+        first={'response':{'results_board':{'pieces':[{'piece_id':1,'registration':record,'timings':{'affine_registration_ms':100.}}]}}}
+        second={'inputs':{'piece_id':1},'stages':[{'registration':record}],'timings':{'仿射配准':50.}}
+        result=comparison.compare(first,second)['pieces'][0]
+        self.assertEqual(result['wall_reduction_fraction'],.5)
+        self.assertTrue(result['matrix_identical'])
+        second['inputs']['piece_id']=2
+        with self.assertRaises(ValueError):comparison.compare(first,second)
+
+    def test_default_options_and_explicit_disabled_options_are_equivalent(self):
+        args=self.fixture()
+        first=reg.refine_affine_registration(*args[:3],args[3])
+        second=reg.refine_affine_registration(*args[:3],{**args[3],'cache_enabled':True,'maxfev':None,
+            'total_maxfev':None,'calibration':{'enabled':False,'profile':None},'multiscale':{'enabled':False}})
+        for key in ('affine_matrix_2d_to_3d','affine_score_after','affine_function_evaluations'):
+            self.assertEqual(first[key],second[key],key)
+
 
 if __name__=='__main__':unittest.main()

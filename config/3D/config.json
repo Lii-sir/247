@@ -147,8 +147,12 @@
         "search_scale": 0.5,
         "search_maxiter": 15,
         "refine_maxiter": 10,
+        "search_maxfev": null,
+        "refine_maxfev": null,
         "refine_window_ratio": 0.25
       },
+      "maxfev": null,
+      "total_maxfev": null,
       "preview_scale": 0.5,
       "threshold_2d": 50,
       "morphology_kernel_size": 3,

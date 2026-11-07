@@ -159,6 +159,8 @@ C# DTO新增元数据属性，现有测高点/掩码字段保持；源码已构�
 
 精修窗口半径为原搜索半径乘`refine_window_ratio`（默认0.25），且截在原边界内。完整评分退化、超过阈值、碰到新窗口边界或阶段异常时，回退原粗配准起点和原边界的完整搜索。保留实际完整评分候选中较好的解，不能据此保证等同原优化器的最优解。`affine_stages`逐级记录nfev、尺寸、边界、耗时、停止状态，顶层nfev/optimizer_ms为各级之和；`affine_multiscale`说明回退与最终解来源。完整阶段墙钟仍看timings中的affine_registration_ms；新增affine_optimization_pipeline_ms还覆盖级间准备和验证。实际速度和质量须由实图验证，默认不启用。
 
+`maxfev`为每次Powell调用的评估上限；多尺度`search_maxfev/refine_maxfev`为null时继承它。`total_maxfev`限制本次配准所有优化阶段的调用总数（含回退）；均默认null，非null须为正整数。缓存命中也消耗优化器评估预算，初始/候选/最终验收等额外检查不消耗该预算但计入实际耗时。每阶段保存已评估最佳有限参数的副本，仅在预算截断时优先取它，避免未完成线搜索丢掉更好试探点。`affine_budget`与`affine_stages`标记预算消耗、skipped及used_best_observed；总预算耗尽导致回退未运行时有fallback_not_run标记。停止状态与最终质量独立。实图分组步骤见[仿射验收说明](../../visualization/AFFINE_OPTIMIZATION_TESTING.md)。
+
 ## Pitch条带并行
 
 `smartray_pitch_3d.parameters.projection_workers`默认配置为8，必须为正整数；设为1串行。省略该项的旧配置按1处理。统一板级和独立3D检测器各自在初始化时配置独立Pitch线程池，跨板复用，释放/重新初始化时关闭；它与joint及instance线程池分开，也不计入桥接层原有worker_budget。
