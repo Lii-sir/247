@@ -137,6 +137,7 @@
     "description": "每片运行时动态拟合仿射变换",
     "parameters": {
       "score_mode": "full",
+      "cache_enabled": true,
       "preview_scale": 0.5,
       "threshold_2d": 50,
       "morphology_kernel_size": 3,

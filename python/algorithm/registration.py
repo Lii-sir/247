@@ -218,10 +218,7 @@ def refine_affine_registration(
             or '*AVX2' not in cv2.getCPUFeaturesLine().split()):
         # Only enable the optimized kernel on the validated CPU backend.
         score_mode = "full"
-    grids = [_affine_roi_grid(box) for box in rois] if score_mode == "roi" else None
     result["affine_score_mode"] = score_mode
-    score_calls = 0
-    score_seconds = 0.
 
     initial_matrix = _registration_matrix(coarse_registration)
     p0 = _affine_parameters_from_matrix(initial_matrix, preview_scale)
@@ -262,34 +259,14 @@ def refine_affine_registration(
     )
     penalty_weight = float(values.get("penalty_weight", 0.005))
 
-    def score(parameters: np.ndarray, details: bool = False):
-        nonlocal score_calls, score_seconds
-        started = time.perf_counter()
-        scaled = _scaled_affine(parameters)
-        if score_mode == "roi":
-            patches = _warp_affine_rois(source_mask, scaled, rois, grids, target_width)
-        else:
-            warped = cv2.warpAffine(source_mask, scaled, (target_width, target_height),
-                flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-            patches = (warped[y0:y1, x0:x1] for x0, y0, x1, y1 in rois)
-        losses = [
-            float(np.count_nonzero(patch != target_roi) / target_roi.size)
-            for patch, target_roi in zip(patches, target_rois)
-        ]
-        # Penalize shear more than translation, matching the reference
-        # experiment while allowing real lens/perspective anisotropy.
-        penalty = penalty_weight * (
-            (parameters[2] / max(shear_limit, 1e-6)) ** 2
-            + (parameters[3] / max(shear_limit, 1e-6)) ** 2
-        )
-        value = float(np.mean(losses) + penalty)
-        score_calls += 1
-        score_seconds += time.perf_counter() - started
-        if details:
-            return value, losses
-        return value
+    cache_enabled = values.get("cache_enabled", False)
+    if type(cache_enabled) is not bool:
+        raise ValueError("dynamic_affine.cache_enabled must be boolean")
+    score = _AffineScore(source_mask, target_mask, rois, penalty_weight, shear_limit,
+                         score_mode=score_mode, cache_enabled=cache_enabled)
 
     before, _ = score(p0, details=True)
+    optimizer_calls_before = score.calls
     optimizer_started = time.perf_counter()
     try:
         optimized = minimize(
@@ -307,19 +284,17 @@ def refine_affine_registration(
         result["affine_error"] = str(exc)
         result["affine_score_before"] = before
         result.update(affine_stop_reason=str(exc), affine_optimizer_success=False,
-            affine_function_evaluations=max(0, score_calls - 1), affine_score_calls=score_calls,
-            affine_score_total_ms=score_seconds * 1000,
-            affine_score_mean_ms=score_seconds * 1000 / max(1, score_calls))
+            affine_function_evaluations=max(0, score.calls - optimizer_calls_before))
+        result.update(score.diagnostics())
         return result
 
     result["affine_optimizer_ms"] = (time.perf_counter() - optimizer_started) * 1000
-    result["affine_function_evaluations"] = int(getattr(optimized, "nfev", score_calls - 1))
+    result["affine_function_evaluations"] = int(getattr(optimized, "nfev", score.calls - optimizer_calls_before))
     result["affine_optimizer_success"] = bool(optimized.success) if hasattr(optimized, "success") else None
     result["affine_optimizer_status"] = int(optimized.status) if hasattr(optimized, "status") else None
     result["affine_stop_reason"] = str(getattr(optimized, "message", "optimizer did not report a stop reason"))
     after, losses = score(optimized.x, details=True)
-    result.update(affine_score_calls=score_calls, affine_score_total_ms=score_seconds * 1000,
-                  affine_score_mean_ms=score_seconds * 1000 / max(1, score_calls))
+    result.update(score.diagnostics())
     matrix = _full_affine(optimized.x, preview_scale)
     result["affine_valid"] = bool(
         np.all(np.isfinite(matrix))
@@ -516,3 +491,54 @@ def _validate_box(box: Sequence[int], name: str) -> None:
     x1, y1, x2, y2 = box
     if x1 < 0 or y1 < 0 or x2 <= x1 or y2 <= y1:
         raise ValueError(f"{name} is invalid: {tuple(box)}")
+
+
+class _AffineScore:
+    """One image/one scoring resolution. Exact keys; no cross-image cache."""
+    def __init__(self, source, target, rois, penalty_weight, shear_limit,
+                 *, score_mode="full", cache_enabled=False):
+        self.source, self.target, self.rois = source, target, rois
+        self.penalty_weight, self.shear_limit = penalty_weight, shear_limit
+        self.score_mode, self.cache_enabled = score_mode, cache_enabled
+        self.grids = [_affine_roi_grid(box) for box in rois] if score_mode == "roi" else None
+        self.targets = [target[y0:y1,x0:x1] for x0,y0,x1,y1 in rois]
+        self.cache = {}
+        self.calls = self.hits = self.misses = self.warps = 0
+        self.seconds = self.compute_seconds = 0.
+
+    def __call__(self, parameters, details=False):
+        started = time.perf_counter()
+        self.calls += 1
+        key = tuple(float(v) for v in parameters)
+        if self.cache_enabled and key in self.cache:
+            self.hits += 1
+            value, zones = self.cache[key]
+        else:
+            self.misses += 1
+            compute_started = time.perf_counter()
+            matrix = _scaled_affine(parameters)
+            if self.score_mode == "roi":
+                patches = _warp_affine_rois(self.source, matrix, self.rois, self.grids, self.target.shape[1])
+            else:
+                warped = cv2.warpAffine(self.source, matrix, (self.target.shape[1],self.target.shape[0]),
+                    flags=cv2.INTER_NEAREST,borderMode=cv2.BORDER_CONSTANT,borderValue=0)
+                patches = (warped[y0:y1,x0:x1] for x0,y0,x1,y1 in self.rois)
+            zones = tuple(float(np.count_nonzero(patch != target) / target.size)
+                          for patch,target in zip(patches,self.targets))
+            penalty = self.penalty_weight * ((parameters[2]/max(self.shear_limit,1e-6))**2
+                                            +(parameters[3]/max(self.shear_limit,1e-6))**2)
+            value = float(np.mean(zones)+penalty)
+            self.warps += 1
+            self.compute_seconds += time.perf_counter()-compute_started
+            if self.cache_enabled and np.isfinite(value):
+                self.cache[key] = (value,zones)
+        self.seconds += time.perf_counter()-started
+        return (value,list(zones)) if details else value
+
+    def diagnostics(self):
+        return dict(affine_cache_enabled=self.cache_enabled,affine_cache_hits=self.hits,
+            affine_cache_misses=self.misses,affine_cache_hit_rate=self.hits/max(1,self.calls),
+            affine_warp_evaluations=self.warps,affine_score_calls=self.calls,
+            affine_score_total_ms=self.seconds*1000,affine_score_mean_ms=self.seconds*1000/max(1,self.calls),
+            affine_score_compute_ms=self.compute_seconds*1000,
+            affine_score_compute_mean_ms=self.compute_seconds*1000/max(1,self.misses))

@@ -143,6 +143,14 @@ C# DTO新增元数据属性，现有测高点/掩码字段保持；源码已构�
 
 配准结果新增`affine_function_evaluations`（优化器nfev）、`affine_optimizer_success/status`、`affine_stop_reason`、`affine_optimizer_ms`，以及`affine_score_calls/total_ms/mean_ms`。score_calls包含初始和最终检查，通常比nfev多2次；平均评分耗时可区分评分次数与单次评分成本。停止原因与最终损失合格判断独立，未改变Powell参数、迭代上限或合格阈值。
 
+## 仿射优化开关与测试
+
+`dynamic_affine_3d.parameters.cache_enabled`当前配置为true，省略时false。缓存仅属于本片/本次优化的固定评分分辨率，以完全相同的6参数作键；不量化参数、不保存变换图、不跨片复用。开关不会改变目标函数或Powell评估序列。
+
+新增`affine_cache_hits/misses/hit_rate`、`affine_warp_evaluations`和`affine_score_compute_ms/compute_mean_ms`。`affine_function_evaluations`仍是SciPy调用目标函数的次数，缓存命中也计入；`affine_score_calls`还包含优化外检查；`affine_warp_evaluations`才是真正执行评分变换的次数。`affine_score_total_ms/mean_ms`包含缓存查询，compute两项只统计实际计算。均在每片`registration`中。
+
+实图测试由使用者执行：同一套10片输入、同配置和并发，分别cache_enabled=false/true，比较每片最终矩阵、最终损失、各区损失、真实变换次数及`affine_registration_ms`。命中率不设30%硬门槛，以墙钟和输出一致性判断。重新初始化后参数生效。
+
 ## Pitch条带并行
 
 `smartray_pitch_3d.parameters.projection_workers`默认配置为8，必须为正整数；设为1串行。省略该项的旧配置按1处理。统一板级和独立3D检测器各自在初始化时配置独立Pitch线程池，跨板复用，释放/重新初始化时关闭；它与joint及instance线程池分开，也不计入桥接层原有worker_budget。
