@@ -65,22 +65,24 @@ def build_flows():
       '整板深度就绪且该片joint_entry已发布|同片未被claimed，防止重复计算|受early_joint_workers约束|不等待银胶检查结束', kind='gate', src=(P, '_schedule_ready'))
     n('o-post', '2D最终诊断与公开几何', '银胶两项串行；实例几何并行', 0, 6,
       '复用联合掩码检查溢胶与断连|按实例并行生成公开2D几何|汇总2D结论并保存entry|释放原始图像共享内存owner', pool='postprocess', src=(B, 'finish_2d_piece'))
-    n('o-joint', '每片配准与全实例测高', '粗配准 → 仿射 → 掩码 → 高度', 2, 6,
-      '一片使用同一个全局仿射矩阵|实例映射由独立instance池处理|拟合参考平面后依次处理引线、焊脚|所有wire/thin/bond参与测高，不再用2D引线ROI筛选', pool='joint', times=('joint_phase_ms',), src=(B, 'measure_prepared_piece'))
+    n('o-registration', '每片独立配准', '粗配准 → 仿射；registration池', 2, 6,
+      '按registration_workers限制并发|每片拟合一个全局矩阵|完成后回调提交映射测高，不等待其完成|注册线程可以继续处理下一片', pool='registration', times=('registration_phase_ms',), src=(B, 'register_prepared_piece'))
+    n('o-joint', '掩码映射与全实例测高', '接收同一矩阵；joint池', 2, 7,
+      '按joint_workers独立限制并发|实例映射由共享instance池处理|拟合参考平面后依次处理引线、焊脚|所有wire/thin/bond参与测高，不再用2D引线ROI筛选', pool='joint', times=('joint_measurement_phase_ms',), src=(B, 'measure_registered_piece'))
     n('o-2ddone', '本片2D响应 / entry就绪', '2D请求独立返回', 0, 7,
       '输出2D检查、公开掩码和阶段耗时|记录完整entry|尝试推进整板汇合', kind='data', src=(P, 'submit_2d'))
-    n('o-3ddone', '本片联合结果就绪', '几何 / 平面 / 高度 / 配准', 2, 7,
+    n('o-3ddone', '本片联合结果就绪', '几何 / 平面 / 高度 / 配准', 2, 8,
       '保存结果到state.results[piece_id]|将高度点转换到整板坐标|掩码轮廓仍为片局部坐标|后续仍会合并完整2D诊断', kind='data', src=(P, '_measured'))
-    n('o-all', '整板最终汇合', 'N个entries + N个results + 无inflight', 1, 8,
+    n('o-all', '整板最终汇合', 'N个entries + N个results + 无inflight', 1, 9,
       '必须收齐所有2D诊断和联合结果|按片号排序|再次合并银胶、外观等晚到诊断|单片NG与接口错误分别处理', kind='gate', src=(P, '_complete_if_ready'))
-    n('o-return', '整板JSON响应与释放', 'request_id匹配；stdout单行', 1, 9,
+    n('o-return', '整板JSON响应与释放', 'request_id匹配；stdout单行', 1, 10,
       '整板registration_ok与is_ok分别汇总|返回released板信息|删除本板缓存并完成Future|桥接层写JSON响应并归还请求容量', kind='data', src=(T, '_accept'))
     for a,b,label,kind in [('o-entry','o-2d','逐片提交','fork'),('o-entry','o-depth','整板提交','fork'),
         ('o-2d','o-fork','','serial'),('o-fork','o-gpu','','fork'),('o-fork','o-boundary','','fork'),
         ('o-depth','o-pitch','','serial'),('o-pitch','o-slices','','serial'),('o-gpu','o-geometry','','serial'),
         ('o-geometry','o-postgate','','wait'),('o-boundary','o-postgate','','wait'),
         ('o-geometry','o-joingate','提前发布','data'),('o-slices','o-joingate','','wait'),
-        ('o-postgate','o-post','','serial'),('o-joingate','o-joint','','serial'),('o-post','o-2ddone','','serial'),
+        ('o-postgate','o-post','','serial'),('o-joingate','o-registration','','serial'),('o-registration','o-joint','回调交接','data'),('o-post','o-2ddone','','serial'),
         ('o-joint','o-3ddone','','serial'),('o-2ddone','o-all','','wait'),('o-3ddone','o-all','','wait'),('o-all','o-return','','serial')]:e(a,b,label,kind)
 
     scene('initialization', '初始化与资源', '协议初始化、算法初始化、模型副本和线程池', [
@@ -99,7 +101,7 @@ def build_flows():
     n('i-replicas','建立其余GPU工作资源','worker 2…G；初始化循环串行',1,5,
       '为每个GPU工作资源构造独立YOLO|为该资源加载独立EfficientAD预测器|建立独立锁和可用CUDA流|资源进入槽位队列，推理完成后归还',pool='gpu',src=(B,'_load_gpu_worker_replicas'))
     n('i-pools','应用正式执行器并建立pipeline','只有算法初始化成功才切换',1,6,
-      '校验各独立池总数不超过worker_budget|缺省silver池可别名到postprocess，joint可别名到cpu|只有空闲时允许重配线程池|BoardPipeline持有这些执行器并按事件调度',kind='parallel',src=(T,'_configure_thread_pools'))
+      '校验各独立池总数不超过worker_budget，独立registration池也计入|缺省silver池可别名到postprocess，joint可别名到cpu，registration可别名到joint|只有空闲时允许重配线程池|BoardPipeline持有这些执行器并按事件调度',kind='parallel',src=(T,'_configure_thread_pools'))
     n('i-ready','返回算法初始化成功','模型驻留，等待输入',1,7,
       '返回模型加载耗时和线程配置|同配置/同模型的验证台任务可复用检测进程|配置或模型文件指纹改变后重新初始化|退出时关闭自有池并释放模型',kind='data',src=(V,'_ensure'))
     for a,b in zip(['i-init','i-config','i-board','i-cuda','i-ad','i-replicas','i-pools'],['i-config','i-board','i-cuda','i-ad','i-replicas','i-pools','i-ready']):e(a,b)
@@ -209,7 +211,7 @@ def build_flows():
         'score_mode默认full，仍只在所选ROI计算损失。ROI自建坐标映射为手动试验路径，曾发生耗时回退。',
         '停止优化不等于对齐合格；当前合格逻辑不要求optimizer.success=True。'])
     n('r-gate','本片联合工作启动','depth + joint_entry已就绪',1,0,
-      '在joint_pool中执行measure_prepared_piece|取本片全宽深度视图|2D实例、完整原图灰度和平台掩码来自joint_entry|无需等银胶最终诊断',pool='joint',src=(B,'measure_prepared_piece'),times=('joint_queue_ms','matching_input_wait_ms'))
+      '在registration_pool中执行register_prepared_piece|取本片全宽深度视图|2D实例、完整原图灰度和平台掩码来自joint_entry|无需等银胶最终诊断',pool='registration',src=(B,'register_prepared_piece'),times=('registration_queue_ms','matching_input_wait_ms'))
     n('r-platform','构造3D平台掩码','depth_piece > 0并闭运算',1,1,
       '对片深度的非零像素二值化|按registration_3d.morphology_kernel_size闭运算|2D平台掩码此前已在准备阶段生成|两幅掩码进入固定尺度模板匹配',pool='joint',src=(R,'platform_mask_3d'),times=('platform_mask_3d_ms',))
     n('r-coarse','粗配准模板匹配','TM_CCOEFF_NORMED',1,2,
@@ -226,11 +228,17 @@ def build_flows():
       '整轮改善按ftol判定：2×(旧损失−新损失) ≤ ftol×(abs旧+abs新)+极小量|达到maxiter也停止|xtol用于方向搜索精度，不直接表示像素误差|maxfev可限制每级调用，total_maxfev限制总调用；均默认null，无毫秒超时|单级触边不自动回退；多级精修窗口触边会尝试原范围回退，总预算耗尽时明确记录未运行',pool='joint',kind='decision',src=(R,'refine_affine_registration'),params=('dynamic_affine_3d.parameters.maxiter','dynamic_affine_3d.parameters.xtol','dynamic_affine_3d.parameters.ftol'))
     n('r-verdict','完整评分与最终质量标记','独立于优化器停止状态',1,8,
       '对最终参数再评分并输出各区损失|换回原始2D→3D片局部2×3矩阵及3×3表示|矩阵全部有限且最终损失≤max_score才affine_valid|未配置max_score时默认0.25|不要求optimizer.success=True；迭代触顶仍可能质量达标|记录缓存/真实warp/逐级nfev/均耗/预算/回退；预算截断时保留本阶段最佳有限试探，最终仍用完整评分',pool='joint',src=(R,'refine_affine_registration'),times=('affine_registration_ms',))
-    n('r-map','逐实例并行映射','共享只读H；独立目标缓冲',1,9,
+    # All solver steps above run in the registration executor; later height
+    # steps run in joint, with instance leaf tasks in their shared executor.
+    for node in current['nodes']:
+        node['pool'] = 'registration'
+    n('r-handoff','提交映射测高队列','回调交接，不等待下游Future',1,9,
+      '配准完成后把同一个矩阵交给joint池|registration线程立即可处理下一片|joint池独立限制映射测高并发|已释放或失败的板不再投递，排队旧代任务执行前再检查',kind='data',src=(P,'_registered'),times=('joint_measurement_queue_ms',))
+    n('r-map','逐实例并行映射','共享只读H；独立目标缓冲',1,10,
       '原crop局部掩码先加crop左上角变成原图坐标|实际矩阵为H_full×T_crop_to_full|nearest映射到完整片局部深度画幅|各实例提取2D/3D几何，字典和输出由任务独立持有|父线程按原实例顺序汇总|一片左右及全部类别都使用同一个矩阵',pool='instance',kind='parallel',src=(R,'align_crop_mask_to_depth'),times=('mask_alignment_ms','instance_alignment_work_ms'))
-    n('r-height','进入参考面与全实例测高','已对齐实例 + 深度片',1,10,
+    n('r-height','进入参考面与全实例测高','已对齐实例 + 深度片',1,11,
       '语义掩码用于参考面排除|完整实例用于chip/bond归属等|wire/thin测高会另按清理/分段构造测量掩码|不按2D引线ROI筛选测高对象',pool='joint',src=(B,'_measure_piece'))
-    chain=['r-gate','r-platform','r-coarse','r-source','r-initial','r-score','r-powell','r-stop','r-verdict','r-map','r-height']
+    chain=['r-gate','r-platform','r-coarse','r-source','r-initial','r-score','r-powell','r-stop','r-verdict','r-handoff','r-map','r-height']
     for a,b in zip(chain,chain[1:]):e(a,b)
     e('r-stop','r-score','继续搜索','loop')
 

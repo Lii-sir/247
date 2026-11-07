@@ -102,6 +102,12 @@ class FakeDetector:
             depth[index * 10:index * 10 + 5] = 33000
         return depth
 
+    def register_prepared_piece(self, piece_id, entry, depth, piece, pitch_correction=None):
+        return dict(is_valid=True)
+
+    def measure_registered_piece(self, piece_id, entry, depth, piece, registration, pitch_correction=None):
+        return self.measure_prepared_piece(piece_id, entry, depth, piece, pitch_correction)
+
     def measure_prepared_piece(self, piece_id, entry, depth, piece, pitch_correction=None):
         time.sleep(self.delay)
         if entry.get("fail_joint"):

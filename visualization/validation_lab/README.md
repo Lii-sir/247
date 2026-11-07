@@ -41,6 +41,8 @@ Windows若不希望保留命令窗口，可直接运行：
 
 ## 正式流程与模型生命周期
 
+正式流式联合链路已拆为独立配准池→映射测高池，回调交接、不占线程等待下一阶段。`config/3D/config.json`的`common_3d.parameters.threading.registration_workers`控制配准（当前4），`joint_workers`控制映射和测高（当前2），`early_joint_workers`控制2D诊断尚未完成时在途联合片数（当前2）。修改后重新验证会按配置重建；真实节拍需实测。每片新增`registration_*`、`joint_measurement_*`及`joint_pipeline_ms`，两个池的排队分别报告；原`joint_phase_ms`为两个执行阶段之和，不含中间排队。
+
 复用`detect_and_view.ProtocolClient`、命名共享内存与正式`bridge_server.py`，逐片发送实际`board_id/piece_id`，整板3D与2D并发提交；不替换算法或伪造检测结果。模型按当前配置初始化一次，相同配置和模型文件时间/尺寸不变时复用；配置或模型文件变化时关闭旧服务重新初始化。
 
 参数来自`config/2D/config.json`与`config/3D/config.json`。页面显示当前片数和Pitch概况，不写回生产配置。当前正式配准为粗配准+仿射，Pitch只处理深度。模型初始化或检测失败会记录错误并尝试生成失败报告；产品NG与接口失败分别显示。

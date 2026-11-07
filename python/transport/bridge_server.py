@@ -37,6 +37,7 @@ class AlgorithmServer:
         self.postprocess_pool = None
         self.silver_pool = None
         self.joint_pool = None
+        self.registration_pool = None
         self.gpu_pool = None
         self.pipeline = None
         self.threading_info = {}
@@ -155,6 +156,7 @@ class AlgorithmServer:
         )
         silver_pool_shared = "silver_workers" not in values_2d and "BRIDGE_SILVER_WORKERS" not in os.environ
         joint_pool_shared = "joint_workers" not in values_3d and "BRIDGE_JOINT_WORKERS" not in os.environ
+        registration_pool_shared = "registration_workers" not in values_3d and "BRIDGE_REGISTRATION_WORKERS" not in os.environ
         # Reserve explicitly requested independent pools before assigning the
         # remaining budget to preparation/postprocessing. Missing keys retain
         # the old aliases and do not consume an extra worker allocation.
@@ -164,7 +166,10 @@ class AlgorithmServer:
         joint = 0 if joint_pool_shared else self._thread_count(
             "joint_workers", values_3d.get("joint_workers", os.environ.get("BRIDGE_JOINT_WORKERS"))
         )
-        reserved = silver + joint
+        registration = 0 if registration_pool_shared else self._thread_count(
+            "registration_workers", values_3d.get("registration_workers", os.environ.get("BRIDGE_REGISTRATION_WORKERS"))
+        )
+        reserved = silver + joint + registration
         postprocess = self._thread_count(
             "postprocess_workers",
             values_2d.get(
@@ -183,10 +188,12 @@ class AlgorithmServer:
             silver = postprocess
         if joint_pool_shared:
             joint = cpu
+        if registration_pool_shared:
+            registration = joint
         early_joint = self._thread_count(
             "early_joint_workers", values_3d.get("early_joint_workers", joint)
         )
-        if early_joint > joint:
+        if registration_pool_shared and early_joint > joint:
             raise ValueError("early_joint_workers cannot exceed joint_workers")
         shared_cpu_pool = budget == 2 and cpu == 1 and postprocess == 1 and gpu == 1
         effective_total = cpu + gpu
@@ -196,11 +203,14 @@ class AlgorithmServer:
             effective_total += silver
         if not joint_pool_shared:
             effective_total += joint
+        if not registration_pool_shared:
+            effective_total += registration
         if effective_total > budget:
             raise ValueError(
                 "threading configuration exceeds worker_budget: "
                 f"cpu_workers={cpu}, postprocess_workers={postprocess}, "
                 f"gpu_workers={gpu}, silver_workers={silver}, joint_workers={joint}, "
+                f"registration_workers={registration}, "
                 f"effective_total={effective_total}, worker_budget={budget}"
             )
         return {
@@ -213,6 +223,9 @@ class AlgorithmServer:
             "silver_pool_shared": silver_pool_shared,
             "joint_workers": joint,
             "joint_pool_shared": joint_pool_shared,
+            "registration_workers": registration,
+            "registration_pool_shared": registration_pool_shared,
+            "effective_workers": effective_total,
             "early_joint_workers": early_joint,
         }
 
@@ -229,13 +242,15 @@ class AlgorithmServer:
             and self.threading_info.get("silver_pool_shared") == settings["silver_pool_shared"]
             and self.threading_info.get("joint_workers") == settings["joint_workers"]
             and self.threading_info.get("joint_pool_shared") == settings["joint_pool_shared"]
+            and self.threading_info.get("registration_workers") == settings["registration_workers"]
+            and self.threading_info.get("registration_pool_shared") == settings["registration_pool_shared"]
             and self.threading_info.get("gpu_workers") == settings["gpu_workers"]
         )
         if not same_budget:
             old_pools = {
                 id(pool): pool
                 for pool in (self.cpu_pool, self.postprocess_pool,
-                             self.silver_pool, self.joint_pool, self.gpu_pool)
+                             self.silver_pool, self.registration_pool, self.joint_pool, self.gpu_pool)
                 if pool is not None
             }
             created_pools = []
@@ -254,6 +269,7 @@ class AlgorithmServer:
                 postprocess_pool = cpu_pool if settings["postprocess_pool_shared"] else create_pool("postprocess")
                 silver_pool = postprocess_pool if settings["silver_pool_shared"] else create_pool("silver")
                 joint_pool = cpu_pool if settings["joint_pool_shared"] else create_pool("joint")
+                registration_pool = joint_pool if settings["registration_pool_shared"] else create_pool("registration")
             except Exception:
                 for pool in created_pools:
                     pool.shutdown(wait=True)
@@ -262,12 +278,14 @@ class AlgorithmServer:
             self.postprocess_pool = postprocess_pool
             self.silver_pool = silver_pool
             self.joint_pool = joint_pool
+            self.registration_pool = registration_pool
             self.gpu_pool = gpu_pool
             if self.pipeline is not None:
                 self.pipeline.cpu_pool = cpu_pool
                 self.pipeline.postprocess_pool = postprocess_pool
                 self.pipeline.silver_pool = silver_pool
                 self.pipeline.joint_pool = joint_pool
+                self.pipeline.registration_pool = registration_pool
                 self.pipeline.gpu_pool = gpu_pool
             for pool in old_pools.values():
                 pool.shutdown(wait=True)
@@ -278,6 +296,8 @@ class AlgorithmServer:
                 for key in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS")
             },
             "source": source,
+            # Do not import native libraries before configure_native_threads.
+            "opencv_threads": sys.modules["cv2"].getNumThreads() if "cv2" in sys.modules else None,
         }
         if self.pipeline is not None:
             self.pipeline.early_joint_workers = settings["early_joint_workers"]
@@ -397,6 +417,7 @@ class AlgorithmServer:
                 postprocess_pool=self.postprocess_pool,
                 silver_pool=self.silver_pool,
                 joint_pool=self.joint_pool,
+                registration_pool=self.registration_pool,
                 early_joint_workers=self.threading_info["early_joint_workers"],
                 timeout_seconds=float(os.environ.get("BRIDGE_BOARD_TIMEOUT_SECONDS", "90")),
                 max_pending_boards=int(os.environ.get("BRIDGE_MAX_PENDING_BOARDS", "4")))
@@ -487,7 +508,7 @@ class AlgorithmServer:
             wait(pending)
         for pool in {id(pool): pool for pool in (
                 self.gpu_pool, self.silver_pool, self.postprocess_pool,
-                self.joint_pool, self.cpu_pool) if pool is not None}.values():
+                self.registration_pool, self.joint_pool, self.cpu_pool) if pool is not None}.values():
             pool.shutdown(wait=True)
 
     def run(self):

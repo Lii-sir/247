@@ -762,7 +762,14 @@ class DetectBoard:
     def measure_prepared_piece(self, piece_id: int, entry: Dict[str, Any],
                                depth: np.ndarray, piece: Dict[str, Any],
                                pitch_correction: Dict[str, Any] | None = None) -> Dict[str, Any]:
-        """CPU-only joint work after the matching 2D and depth piece are ready."""
+        """Synchronous compatibility entry; streaming schedules these stages separately."""
+        registration = self.register_prepared_piece(piece_id, entry, depth, piece, pitch_correction)
+        return self.measure_registered_piece(piece_id, entry, depth, piece, registration, pitch_correction)
+
+    def register_prepared_piece(self, piece_id: int, entry: Dict[str, Any],
+                               depth: np.ndarray, piece: Dict[str, Any],
+                               pitch_correction: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        """Fit one piece's matrix without waiting for mapping or height work."""
         y1, y2 = int(piece["y1"]), int(piece["y2"])
         local_depth = depth[y1:y2]
         depth_mask = timed_call("platform_mask_3d_ms", platform_mask_3d, local_depth, self.registration_config)
@@ -778,6 +785,15 @@ class DetectBoard:
             self.dynamic_affine_config,
             context=affine_coordinate_context(entry["gray_image"].shape, local_depth.shape, pitch_correction),
         )
+        return registration
+
+    def measure_registered_piece(self, piece_id: int, entry: Dict[str, Any],
+                                 depth: np.ndarray, piece: Dict[str, Any],
+                                 registration: Dict[str, Any],
+                                 pitch_correction: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        """Consume the fitted matrix; own all mapped masks and measurement outputs."""
+        y1, y2 = int(piece["y1"]), int(piece["y2"])
+        local_depth = depth[y1:y2]
         aligned_masks = timed_call("mask_alignment_ms", self._align_instances,
             entry["instances"], local_depth.shape, registration, entry.get("crop_box", self.crop_roi))
         measurement = timed_call("height_measurement_ms", self._measure_piece,

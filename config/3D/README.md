@@ -74,7 +74,41 @@ C# 方法和字段不增加。`SolderMeasurements[].Mask3DLocal` 是实际内缩
 
 ## 线程配置
 
-`common_3d.parameters.threading.worker_budget` 是工作线程池总预算（当前默认 14），代码不设置硬编码最大值；各线程池配置之和仍不能超过该预算。`cpu_workers`（当前默认 7）配置输入准备、深度处理和联合 3D 共用的 CPU 线程池。增加 GPU 工作线程时，应同步增加预算。实际吞吐仍取决于运行硬件和显存。
+`common_3d.parameters.threading`控制正式流式调度。当前配置：
+
+```json
+{
+  "worker_budget": 80,
+  "cpu_workers": 15,
+  "registration_workers": 4,
+  "joint_workers": 2,
+  "early_joint_workers": 2,
+  "instance_workers": 20
+}
+```
+
+- `registration_workers`：独立配准池，执行3D平台掩码、粗配准和仿射；4路是待实测起点，不改变Powell、评分及停止条件。
+- `joint_workers`：独立后续池，只执行掩码映射、参考面、测高和结果整理；一片配准完成便可进入此池，不要求凑齐其它片。
+- `early_joint_workers`：全部2D诊断完成前，允许进入联合链路但尚未完成的片数上限，计数覆盖配准、测高和中间排队；不是配准线程数。独立配准池模式下可以大于单个池的并发数；旧共享模式仍校验不超过joint_workers。全部2D完成后由两个池各自限制并发。
+- `cpu_workers`：图像/深度输入准备和2D几何，不再占用该池等待独立配准和测高。
+- `instance_workers`：整个检测器共享的实例任务池，供实例映射、引线、焊脚和公开2D几何复用；不为每片另建一套。
+- `worker_budget`：桥接层独立池预算，包含CPU、GPU、postprocess、silver、registration、joint；别名池只算一次，不包括instance、Pitch和底层库内部线程。当前桥接池总额66；初始化响应的`threading.effective_workers`记录实际预算内总额。
+
+旧配置没有`registration_workers`时，配准池别名到joint池，不消耗额外预算，仍通过回调交接两个阶段；可用环境变量`BRIDGE_REGISTRATION_WORKERS`显式启用，JSON优先。新配置已独立启用。注册池不等待测高Future，测高池也不向自身提交片级父任务；关闭、失败或释放后，尚未执行的旧代3D任务会跳过。同步缓存整板及旧批量接口保留原调用方式，使用相同配准/测高函数，独立池调度作用于`BoardPipeline`正式流式入口。
+
+修改线程参数后需要重新初始化；验证台配置变化会重建检测器。可先固定`joint_workers=2`，分别试`registration_workers=4/6/8`，再固定较优配准并发试`joint_workers=2/4`。比较整板完成时间和长尾，不仅比较单片仿射；检查矩阵、分区损失、掩码及测高结果一致。
+
+新增计时字段位于每片`timings`：
+
+|字段|含义|
+|---|---|
+|`registration_queue_ms` / `registration_phase_ms`|配准池排队 / 平台掩码+粗配准+仿射阶段墙钟|
+|`joint_measurement_queue_ms` / `joint_measurement_phase_ms`|映射测高池排队 / 映射、测高和整理墙钟|
+|`joint_pipeline_ms`|本片提交配准到测高完成，包含两个队列与交接开销|
+|`joint_queue_ms`|兼容原字段，等于`registration_queue_ms`，不代表全部排队|
+|`joint_phase_ms`|两个执行阶段墙钟之和，不含中间排队；不能当作新流水线端到端延迟|
+
+`affine_registration_ms`、`mask_alignment_ms`和各测高子计时保持原函数边界。不要把这些嵌套字段重复相加。初始化快照新增`threading.opencv_threads`，仅记录已加载OpenCV的实际值，不在初始化快照阶段改变线程设置。
 
 ## 正式流程：Pitch → 分片 → 粗配准 → 仿射 → 测高
 

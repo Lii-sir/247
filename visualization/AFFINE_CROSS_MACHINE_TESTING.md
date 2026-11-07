@@ -1,5 +1,7 @@
 # Windows 仿射配准：跨机器完整测试流程
 
+更新：正式流式流程已拆成配准池（`registration_workers`）和映射测高池（`joint_workers`）。本文CPU基准仍只测配准函数，不模拟其它阶段竞争；正式复验请分别调整两项，先固定测高2路比较配准4/6/8路，再比较测高2/4路。保持`early_joint_workers`和其它参数一致。每片同时比较`joint_pipeline_ms`、两个池的queue/phase和原仿射子计时，整板节拍以`total_detect_ms`为准。详见config/3D/README.md“线程配置”。
+
 目标是解释配准台单片不到200ms、正式整板中单片约1800ms的差异，并验证已有优化开关。先测同一算法在不同并发下的表现，再比较算法开关。不要先修改生产线程数、标定或容差。
 
 `benchmark_affine.py`只执行正式流程中的CPU配准函数，不加载YOLO、EfficientAD、PyTorch或模型。不要求CUDA显卡。它读取当前生产配置，先完成解码、Pitch、固定分片和粗配准；这些只执行一次，单独记录、不计入仿射阶段。每片保留完整2D原图灰度和对应深度片的完整宽度，与正式坐标一致。

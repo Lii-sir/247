@@ -62,15 +62,18 @@ def make_document():
     gpu = int(t2.get('gpu_workers',1));post = int(t2.get('postprocess_workers',5))
     cpu = int(t3.get('cpu_workers',max(1,budget-gpu-post)))
     silver = int(t2.get('silver_workers',post));joint = int(t3.get('joint_workers',cpu))
+    registration = int(t3.get('registration_workers',joint))
     instance = int(t3.get('instance_workers',16))
     pitch = int(three.get('smartray_pitch_3d',{}).get('parameters',{}).get('projection_workers',1))
     effective = cpu+gpu+post+(silver if 'silver_workers' in t2 else 0)+(joint if 'joint_workers' in t3 else 0)
+    effective += registration if 'registration_workers' in t3 else 0
     pools = [
         ['cpu',cpu,'2D读取/圆定位/平台掩码；geometry；3D读取/Pitch调用/分片','不同片与深度输入可重叠；一个任务内部按函数顺序执行'],
         ['gpu',gpu,'每槽独立YOLO + EfficientAD资源和流','同资源内YOLO→掩码→EfficientAD串行；各资源可重叠'],
         ['silver',silver,'图像侧银胶允许边界准备','缺少silver_workers时别名到postprocess；当前是否独立见配置'],
         ['postprocess',post,'银胶溢出/断连、公开几何汇总和完整2D响应','溢胶与断连当前串行；公开几何投递到instance池'],
-        ['joint',joint,'每片粗配准、仿射、参考面与高度阶段','一片一任务；各片可并行；不等银胶完成'],
+        ['registration',registration,'每片3D平台掩码、粗配准和仿射','完成后回调提交joint；不等待映射测高；缺项别名到joint'],
+        ['joint',joint,'每片掩码映射、参考面与高度阶段','独立限制并发；接收同片求得的矩阵；不重复配准'],
         ['instance',instance,'实例映射、公开2D几何、各根引线及各个焊脚','额外池，不计入桥接worker_budget；父任务等子任务，子任务不嵌套提交同池'],
         ['pitch',pitch,'独立条带投影与碰撞处理','额外池；分非扫描轴，输出缓冲互不写冲突']]
     coords = [
@@ -122,13 +125,16 @@ def make_document():
         ['3D整板','smartray_pitch_ms','整板Pitch整体墙钟','pitch_projection_work_ms是条带工作和'],
         ['3D整板','depth_segmentation_ms','真实分片函数耗时','segmentation_3d_ms为外层包裹计时'],
         ['联合','matching_input_wait_ms','两路就绪时刻之差的绝对值','不说明谁先到；不是额外计算或完整等待'],
-        ['联合','joint_queue_ms','提交联合任务到开始执行','与输入匹配差值不同'],
+        ['联合','joint_queue_ms','兼容字段，等于registration_queue_ms','不代表测高池排队'],
+        ['联合','registration_queue_ms / registration_phase_ms','配准池排队 / 配准阶段墙钟','平台掩码、粗配准和仿射'],
+        ['联合','joint_measurement_queue_ms / joint_measurement_phase_ms','测高池排队 / 执行墙钟','映射、测高和结果整理'],
+        ['联合','joint_pipeline_ms','本片提交配准到测高完成','含两个队列和交接开销'],
         ['联合','affine_registration_ms','准备、全部评分和优化器整段','nfev/均耗/停止原因在registration对象中'],
         ['联合','mask_alignment_ms','全部实例映射与几何完成墙钟','instance_alignment_work_ms是子任务工作和'],
         ['联合','height_measurement_ms','参考面、引线、焊脚等整体','包含其各项子计时和未细分操作'],
         ['联合','height_wire_regions_ms','thin准备及所有引线完成墙钟','包含height_prepare_thin_ms；work不另加'],
         ['联合','height_solder_wall_ms','全部焊脚任务完成墙钟','work包含端点映射/膨胀；height_solder_ms是其内部累计工作'],
-        ['联合','joint_phase_ms','本片联合总墙钟','各片并发，不能乘片数作为整板耗时'],
+        ['联合','joint_phase_ms','配准与映射测高执行墙钟之和','不含中间排队，端到端看joint_pipeline_ms；各片不能相加当整板耗时'],
         ['整板','total_detect_ms','3D整板请求受理到所有结果齐全','不一定从第一张2D采集开始；不等于2D+深度+联合简单相加']]
     historical = {'request_pipeline_ms':2348.8998,'cpu_prepare_phase_ms':529.793,'gpu_phase_ms':1447.2737,
         'yolo_predict_wall_ms':1251.9292,'mask_extract_to_cpu_ms':78.8593,'efficientad_total_ms':112.7374,

@@ -33,11 +33,12 @@ class _Board:
 class BoardPipeline:
     def __init__(self, detector, cpu_pool, gpu_pool, *, timeout_seconds=90.0,
                  max_pending_boards=16, postprocess_pool=None,
-                 silver_pool=None, joint_pool=None, early_joint_workers=1):
+                 silver_pool=None, joint_pool=None, registration_pool=None, early_joint_workers=1):
         self.detector, self.cpu_pool, self.gpu_pool = detector, cpu_pool, gpu_pool
         self.postprocess_pool = postprocess_pool if postprocess_pool is not None else cpu_pool
         self.silver_pool = silver_pool if silver_pool is not None else self.postprocess_pool
         self.joint_pool = joint_pool if joint_pool is not None else cpu_pool
+        self.registration_pool = registration_pool if registration_pool is not None else self.joint_pool
         self.timeout_seconds = timeout_seconds
         self.max_pending_boards = max_pending_boards
         if isinstance(early_joint_workers, bool) or not isinstance(early_joint_workers, int) or early_joint_workers < 1:
@@ -78,9 +79,13 @@ class BoardPipeline:
                     received_piece_count=len(ids), piece_ids=ids,
                     ready_for_3d=len(ids) == self.detector.expected_piece_count)
 
-    def _submit_timed(self, pool, phase, timings, board_id, piece_id, request_id, function, *args):
+    def _submit_timed(self, pool, phase, timings, board_id, piece_id, request_id, function, *args, state=None):
         queued = time.perf_counter()
         def invoke():
+            if state is not None:
+                with self._lock:
+                    if not self._current(state):
+                        raise RuntimeError("board was released before queued 3D work started")
             started = time.perf_counter()
             with timing_context(timings, phase=phase, board_id=board_id, piece_id=piece_id,
                                 request_id=request_id, log=getattr(self.detector, "log", None)):
@@ -92,7 +97,7 @@ class BoardPipeline:
                     response, entry = result
                     response.setdefault("timings", {}).update(timings)
                     entry["_2d_ready_at"] = time.perf_counter()
-                elif phase == "joint" and isinstance(result, dict):
+                elif phase in {"joint", "joint_measurement"} and isinstance(result, dict):
                     result.setdefault("timings", {}).update(timings)
                 return result
         return pool.submit(invoke)
@@ -294,7 +299,8 @@ class BoardPipeline:
             if piece_id not in state.joint_entries or piece_id in state.claimed:
                 continue
             # Keep heavy 3D from overwhelming still-running 2D diagnostics.
-            # Once every 2D entry is complete, use the full joint executor.
+            # This bounds admitted pieces across both 3D stages. Once every
+            # 2D entry is complete, each executor supplies its own concurrency limit.
             if (len(state.entries) < self.detector.expected_piece_count
                     and len(state.claimed) - len(state.results) >= self.early_joint_workers):
                 break
@@ -302,14 +308,43 @@ class BoardPipeline:
             entry = state.joint_entries[piece_id]
             pair_wait = abs(state.depth_ready_at - entry.get("_2d_ready_at", state.depth_ready_at)) * 1000
             timings = {"matching_input_wait_ms": pair_wait}
-            future = self._submit_timed(self.joint_pool, "joint", timings, state.board_id, piece_id,
-                                       state.request_id, self.detector.measure_prepared_piece,
-                                       piece_id, entry, state.depth, piece, state.depth_correction)
-            future.add_done_callback(lambda result, pid=piece_id: self._measured(state, pid, result))
+            started = time.perf_counter()
+            try:
+                future = self._submit_timed(self.registration_pool, "registration", timings,
+                    state.board_id, piece_id, state.request_id, self.detector.register_prepared_piece,
+                    piece_id, entry, state.depth, piece, state.depth_correction, state=state)
+                future.add_done_callback(lambda result, box=piece, source=entry, ts=timings, begin=started:
+                    self._registered(state, box, source, ts, begin, result))
+            except Exception as exc:
+                self._terminate(state, self._failure(state.board_id, "joint_detection_failed", str(exc)))
+                return
 
-    def _measured(self, state, piece_id, future):
+    def _registered(self, state, piece, entry, timings, started, future):
+        """Hand off without blocking a registration worker on the measurement pool."""
+        try:
+            registration = future.result()
+            with self._lock:
+                if not self._current(state):
+                    return
+                piece_id = int(piece["piece_id"])
+                measured = self._submit_timed(self.joint_pool, "joint_measurement", timings,
+                    state.board_id, piece_id, state.request_id, self.detector.measure_registered_piece,
+                    piece_id, entry, state.depth, piece, registration, state.depth_correction, state=state)
+                measured.add_done_callback(lambda result: self._measured(
+                    state, piece_id, result, timings=timings, started=started))
+        except Exception as exc:
+            with self._lock:
+                self._terminate(state, self._failure(state.board_id, "joint_detection_failed", str(exc)))
+
+    def _measured(self, state, piece_id, future, *, timings, started):
         try:
             piece = future.result()
+            # Preserve the old active-work aggregate. Report both queues and
+            # end-to-end stage latency separately rather than hiding queueing.
+            timings["joint_queue_ms"] = timings["registration_queue_ms"]
+            timings["joint_phase_ms"] = timings["registration_phase_ms"] + timings["joint_measurement_phase_ms"]
+            timings["joint_pipeline_ms"] = (time.perf_counter() - started) * 1000
+            piece.setdefault("timings", {}).update(timings)
             with self._lock:
                 if not self._current(state):
                     return

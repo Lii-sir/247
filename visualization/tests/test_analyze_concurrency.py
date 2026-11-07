@@ -20,6 +20,21 @@ class ConcurrencyTests(unittest.TestCase):
                                {"start_ms": 10, "end_ms": 20}])
         self.assertEqual(stats["peak"], 1)
 
+    def test_split_and_legacy_joint_intervals_are_all_preserved(self):
+        records = []
+        stages = ("joint_phase_ms", "registration_phase_ms", "affine_registration_ms",
+                  "joint_measurement_phase_ms")
+        for stage in stages:
+            for event, clock in (("begin", 1), ("end", 3)):
+                records.append(dict(stage=stage, event=event, clock_ms=clock,
+                                    pid=1, board_id="A", piece_id=1, thread=stage))
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "python.log"
+            path.write_text("\n".join("[TIMING] " + json.dumps(row) for row in records), encoding="utf-8")
+            intervals, warnings = read_intervals(path)
+        self.assertEqual(set(stages), {row["stage"] for row in intervals})
+        self.assertFalse(warnings)
+
     def test_read_interleaved_requests_and_reject_failed_or_unfinished(self):
         def row(request, event, clock, **fields):
             return {"pid": 1, "board_id": "A", "request_id": request,
