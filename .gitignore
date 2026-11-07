@@ -9,3 +9,4 @@ echo "__pycache__/" >> .gitignore
 *.cmd
 demodatasets/
 tests/
+.venv-affine/

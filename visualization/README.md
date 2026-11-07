@@ -1,5 +1,7 @@
 # 独立检测结果查看器
 
+仿射单片/整批并发及优化开关实验：见 [Windows跨机器完整测试流程](AFFINE_CROSS_MACHINE_TESTING.md)，使用不加载模型的`benchmark_affine.py`。
+
 
 ## 2D / 3D 配准叠加展示
 
