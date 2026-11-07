@@ -41,6 +41,8 @@ Windows若不希望保留命令窗口，可直接运行：
 
 ## 正式流程与模型生命周期
 
+2D银浆检测和公开实例几何固定走独立CPU进程，配置位于`common_2d.parameters.threading.cpu_process_workers/cpu_process_affinity`，当前2进程、2物理核；配准仍默认4进程、4核。初始化的`cpu_2d_execution`及每片2D响应的`cpu_2d_worker`可核对实际PID/核范围。读取解码与GPU阶段保持原路径，早期3D不会等待2D重诊断。仅2D验证会在本次内存配置关闭空闲配准池的核预留，保留2D CPU进程的核策略，不写回磁盘。
+
 正式流式联合链路已拆为独立配准池→映射测高池，回调交接、不占线程等待下一阶段。`config/3D/config.json`的`common_3d.parameters.threading.registration_workers`控制配准（当前4），`joint_workers`控制映射和测高（当前2），`early_joint_workers`控制2D诊断尚未完成时在途联合片数（当前2）。修改后重新验证会按配置重建；真实节拍需实测。每片新增`registration_*`、`joint_measurement_*`及`joint_pipeline_ms`，两个池的排队分别报告；原`joint_phase_ms`为两个执行阶段之和，不含中间排队。
 
 配准现在固定使用常驻子进程，无thread模式。当前开启`registration_affinity`，给4个配准进程划分4个真实物理核，主进程使用剩余核；核不足或设置失败会报初始化错误。只想关闭绑核可设`registration_affinity.enabled=false`，仍是进程配准。共享区准备、传输计时与纯子进程计算分开；查看初始化响应`threading.registration_execution`与每片`registration.registration_worker`核对PID、核集合和Torch未加载。配准台的直接求解时间不能代表正式多进程整板节拍。

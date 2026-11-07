@@ -25,7 +25,7 @@ def register_arrays(gray, mask_2d, depth_piece, registration_config, affine_conf
                       coarse, affine_config, context=affine_coordinate_context(gray.shape, depth_piece.shape, correction))
 
 
-def initialize(assignments, assignment_index, ready, warmup_gate):
+def initialize(assignments, assignment_index, ready, warmup_gate, role="registration", extra_imports=()):
     global _startup, _warmup_gate
     try:
         # Set before importing numerical libraries; no inherited model imports are allowed.
@@ -42,6 +42,9 @@ def initialize(assignments, assignment_index, ready, warmup_gate):
         import numpy
         import scipy
         from algorithm import registration
+        from importlib import import_module
+        for name in extra_imports:
+            import_module(name)
         cv2.setNumThreads(1)
         if "torch" in sys.modules:
             raise RuntimeError("registration worker imported Torch; use the model-free Bridge entry point")
@@ -49,7 +52,7 @@ def initialize(assignments, assignment_index, ready, warmup_gate):
         if os.name == "nt":
             from algorithm.cpu_partition import current_cpus
             actual = current_cpus()
-        _startup = dict(pid=os.getpid(), cpu_ids=actual, assigned_cpu_ids=assigned,
+        _startup = dict(pid=os.getpid(), role=role, cpu_ids=actual, assigned_cpu_ids=assigned,
                         executable=sys.executable, prefix=sys.prefix,
                         opencv_threads=cv2.getNumThreads(), torch_loaded=False,
                         native_threads={key: os.environ[key] for key in
@@ -93,7 +96,7 @@ def run(payload):
                 local = arrays["depth"][y1:y2, :]
                 registration = register_arrays(arrays["gray"], arrays["mask"], local,
                     payload["registration_config"], payload["affine_config"], payload["correction"])
-        return dict(ok=True, registration=registration, timings=timings, logs=logs,
+        return dict(ok=True, result=registration, timings=timings, logs=logs,
                     worker=_startup, started=started, finished=time.perf_counter())
     except Exception as error:
         failure = dict(ok=False, error=f"{type(error).__name__}: {error}", traceback=traceback.format_exc(),

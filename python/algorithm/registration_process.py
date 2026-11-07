@@ -64,15 +64,20 @@ class SharedBoardInputs:
             raise RuntimeError("registration shared-memory cleanup failed: "+str(errors[0]))
 
     def prepare(self, piece_id, gray, mask, depth):
+        return self.prepare_named(dict(depth=depth, gray=gray, mask=mask),
+                                  dict(depth="depth", gray=(piece_id, "gray"), mask=(piece_id, "mask")), kinds="ui")
+
+    def prepare_named(self, arrays, cache_keys=None, *, kinds="buif"):
+        """Publish CPU arrays without pickling their pixel buffers."""
         import numpy as np
         with self._lock:
             if self._closed:
                 raise RuntimeError("board shared inputs have been released")
             result = {}
-            for name, key, source in (("depth", "depth", depth), ("gray", (piece_id, "gray"), gray),
-                                      ("mask", (piece_id, "mask"), mask)):
+            for name, source in arrays.items():
+                key = (cache_keys or {}).get(name, name)
                 if key not in self._blocks:
-                    if not isinstance(source, np.ndarray) or source.ndim != 2 or not source.size or source.dtype.kind not in "ui":
+                    if not isinstance(source, np.ndarray) or source.ndim != 2 or not source.size or source.dtype.kind not in kinds:
                         raise ValueError(f"registration {name} must be a nonempty 2D integer array")
                     handle = SharedMemory(create=True, size=source.nbytes)
                     try:
@@ -94,13 +99,14 @@ class SharedBoardInputs:
 
 class RegistrationProcesses:
     """Parent preparation threads never wait for computation in child processes."""
-    def __init__(self, workers, affinity, *, startup_timeout=60):
+    def __init__(self, workers, affinity, *, startup_timeout=60, worker_module=registration_worker, role="registration"):
         self._lock = threading.RLock()
         self._pending = set()
         self._closed = False
         self._executor = None
         self._restore_cpus = None
         self._queues = []
+        self.role, self.worker_module = role, worker_module
         started = time.perf_counter()
         partition = None
         if affinity.get("enabled", False):
@@ -135,19 +141,19 @@ class RegistrationProcesses:
                         os.environ["__PYVENV_LAUNCHER__"] = str(Path(sys.executable).with_name("pythonw.exe"))
                     mp.set_executable(str(executable))
                     self._executor = ProcessPoolExecutor(max_workers=workers, mp_context=ctx,
-                        initializer=registration_worker.initialize, initargs=(assignments, assignment_index, ready, gate))
-                    warmups = [self._executor.submit(registration_worker.warmup) for _ in range(workers)]
+                        initializer=worker_module.initialize, initargs=(assignments, assignment_index, ready, gate, role))
+                    warmups = [self._executor.submit(worker_module.warmup) for _ in range(workers)]
                     deadline, metadata = time.monotonic()+startup_timeout, []
                     for _ in range(workers):
                         try:
                             worker = ready.get(timeout=max(.01, deadline-time.monotonic()))
                         except queue.Empty as error:
-                            raise RuntimeError("registration worker startup timed out") from error
+                            raise RuntimeError(role+" worker startup timed out") from error
                         if not worker["ok"]:
-                            raise RuntimeError("registration worker startup failed: "+worker["error"])
+                            raise RuntimeError(role+" worker startup failed: "+worker["error"])
                         metadata.append(worker)
                     if len({worker["pid"] for worker in metadata}) != workers:
-                        raise RuntimeError("registration worker warmup did not start every process")
+                        raise RuntimeError(role+" worker warmup did not start every process")
                     gate.set()
                     for future in warmups:
                         future.result(timeout=max(.01, deadline-time.monotonic()))
@@ -161,7 +167,7 @@ class RegistrationProcesses:
                 from algorithm.cpu_partition import set_cpus
                 self._restore_cpus = partition["original_cpus"]
                 set_cpus(partition["main_cpus"])
-            self.info = dict(backend="process", process_workers=workers, workers=metadata,
+            self.info = dict(backend="process", role=role, process_workers=workers, workers=metadata,
                              affinity=partition, startup_ms=(time.perf_counter()-started)*1000,
                              shared_inputs="one_depth_per_board_and_one_gray_mask_per_piece")
         except BaseException:
@@ -178,10 +184,20 @@ class RegistrationProcesses:
 
     def submit(self, preparation_pool, inputs, piece_id, entry, depth, piece, correction,
                registration_config, affine_config, timings, metadata, is_current, log=None):
+        def make_payload():
+            arrays = inputs.prepare(piece_id, entry["gray_image"], entry["registration_mask"], depth)
+            return dict(arrays=arrays, rows=[int(piece["y1"]), int(piece["y2"])],
+                        registration_config=asdict(registration_config), affine_config=affine_config,
+                        correction=correction, metadata=metadata)
+        return self.submit_task(preparation_pool, inputs, make_payload, timings, metadata, is_current, log)
+
+    def submit_task(self, preparation_pool, inputs, make_payload, timings, metadata, is_current,
+                    log=None, *, close_inputs=False):
         submitted, output, completion = time.perf_counter(), Future(), Future()
+        role = self.role
         with self._lock:
             if self._closed:
-                raise RuntimeError("registration process service is closed")
+                raise RuntimeError(role+" process service is closed")
             inputs.acquire()
             self._pending.add(completion)
 
@@ -210,9 +226,9 @@ class RegistrationProcesses:
                 packet = future.result()
                 received_at = time.perf_counter()
                 timings.update(packet["timings"])
-                timings["registration_queue_ms"] = (packet["started"]-submitted)*1000
-                timings["registration_result_transfer_ms"] = (received_at-packet["finished"])*1000
-                timings["registration_process_roundtrip_ms"] = (received_at-submitted)*1000
+                timings[role+"_queue_ms"] = (packet["started"]-submitted)*1000
+                timings[role+"_result_transfer_ms"] = (received_at-packet["finished"])*1000
+                timings[role+"_process_roundtrip_ms"] = (received_at-submitted)*1000
                 relay_started = time.perf_counter()
                 if log is not None:
                     for line in packet["logs"]:
@@ -220,26 +236,27 @@ class RegistrationProcesses:
                             log(line)
                         except Exception:
                             pass
-                timings["registration_log_relay_ms"] = (time.perf_counter()-relay_started)*1000
+                timings[role+"_log_relay_ms"] = (time.perf_counter()-relay_started)*1000
                 if not packet["ok"]:
                     raise RuntimeError(packet["error"]+"\n"+packet["traceback"])
-                result = packet["registration"]
-                result["registration_worker"] = packet["worker"]
+                result = packet["result"]
+                result[role+"_worker"] = packet["worker"]
             except Exception as error:
                 finish(error=error)
             else:
                 finish(result=result)
 
         def prepare():
-            timings["registration_dispatch_queue_ms"] = (time.perf_counter()-submitted)*1000
+            timings[role+"_dispatch_queue_ms"] = (time.perf_counter()-submitted)*1000
             if not is_current():
                 raise RuntimeError("board was released before process registration preparation")
             started = time.perf_counter()
-            arrays = inputs.prepare(piece_id, entry["gray_image"], entry["registration_mask"], depth)
-            timings["registration_shared_memory_ms"] = (time.perf_counter()-started)*1000
-            return dict(arrays=arrays, rows=[int(piece["y1"]), int(piece["y2"])],
-                        registration_config=asdict(registration_config), affine_config=affine_config,
-                        correction=correction, metadata=metadata)
+            try:
+                return make_payload()
+            finally:
+                timings[role+"_shared_memory_ms"] = (time.perf_counter()-started)*1000
+                if close_inputs:
+                    inputs.close()
 
         def prepared(future):
             try:
@@ -248,15 +265,19 @@ class RegistrationProcesses:
                     raise RuntimeError("board was released before process registration dispatch")
                 with self._lock:
                     if self._closed:
-                        raise RuntimeError("registration process service closed before dispatch")
-                    work = self._executor.submit(registration_worker.run, payload)
+                        raise RuntimeError(role+" process service closed before dispatch")
+                    work = self._executor.submit(self.worker_module.run, payload)
                 work.add_done_callback(received)
             except Exception as error:
+                if close_inputs:
+                    inputs.close()
                 finish(error=error)
 
         try:
             preparation_pool.submit(prepare).add_done_callback(prepared)
         except Exception as error:
+            if close_inputs:
+                inputs.close()
             finish(error=error)
         return output
 

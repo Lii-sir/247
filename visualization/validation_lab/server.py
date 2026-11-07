@@ -172,6 +172,16 @@ class Runner:
                 pitch = config.get("smartray_pitch_3d", {}).get("parameters")
                 if pitch is not None:
                     pitch["enabled_3d"] = False
+                threading_3d = config.get("common_3d", {}).get("parameters", {}).get("threading", {})
+                affinity = threading_3d.get("registration_affinity")
+                if isinstance(affinity, dict):
+                    # No 3D request will use registration in this mode. Keep
+                    # its inherited default for the active 2D pool, but do not
+                    # reserve physical cores for idle registration workers.
+                    threading_2d = config.setdefault("common_2d", {}).setdefault("parameters", {}).setdefault("threading", {})
+                    threading_2d.setdefault("cpu_process_affinity", dict(enabled=affinity.get("enabled", False),
+                        physical_cores=threading_2d.get("cpu_process_workers", 2)))
+                    affinity["enabled"] = False
                 init["config_text"] = json.dumps(config, ensure_ascii=True)
             height = config["height_measurement_3d"]["parameters"]
             production_pitch_parameters(config, float(height.get("gray_offset", 32768)), float(height.get("vertical_resolution_mm", .00105)))

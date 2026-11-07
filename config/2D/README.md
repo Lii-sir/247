@@ -92,7 +92,43 @@ ROI 外部分不参与测高，thin 焊脚仍从完整掩码的两端划分。
 
 ## 线程配置
 
-在 `common_2d.parameters.threading` 中配置 `postprocess_workers`（当前默认 5）和 `gpu_workers`（当前默认 2）。统一板级检测会为每个 GPU 工作线程加载独立的 YOLO 与 EfficientAD 模型副本；增加 GPU 工作线程时，也要相应提高 3D 配置中的 `worker_budget`。独立 2D/3D 旧接口目前只支持一个 GPU 工作线程。
+正式流式的银浆溢出/断连与公开2D实例几何已移入专用常驻CPU进程，不再投递到主进程的3D共享instance池。读图/圆定位/平台掩码、GPU推理、早期弯曲/缺线/旋转和灰度准备仍按原阶段执行；本次没有把整个2D流程迁出主进程，也没有改变检测算法或阈值。
+
+`common_2d.parameters.threading`新增：
+
+```json
+"cpu_process_workers": 2,
+"cpu_process_affinity": {
+  "enabled": true,
+  "physical_cores": 2
+}
+```
+
+`cpu_process_workers`是2D CPU后处理进程数，环境变量`BRIDGE_2D_CPU_PROCESSES`可作为缺项默认值；JSON优先。`cpu_process_affinity`控制该进程组的Windows物理核分区，进程数不能超过保留核数。当前默认与配准4进程/4物理核一起使用，共预留6个物理核，至少还应给主进程保留1个；建议先按配准4＋2D后处理2复验，不要直接沿用10＋10的大并发。关闭亲和性仍使用进程计算，没有thread回退。
+
+CPU组先从已有可用范围划分，后一个池从剩余范围选择；启用亲和性的池优先启动，关闭时逆序恢复。两组均开启时，配准、2D后处理与主进程CPU集合互不重叠。检查初始化响应的`threading.registration_execution.workers[].cpu_ids`、`threading.cpu_2d_execution.workers[].cpu_ids`与`threading.main_cpu_ids`。只修改Bridge及其子进程，不改系统其它进程；缓存和内存带宽仍然共享。
+
+每片只把实例mask复制到只读共享区，传递必要的标量/公开字段和已准备的银浆Boundary；不传GPU模型、Tensor、整张照片或检测器，不重复SIFT边界准备。子进程OpenCV/BLAS=1，无Torch。进程内按原顺序完成溢出、断连与各实例几何，不修改父进程实例；父进程轻量合并诊断与返回结果。mask实例顺序、编号、轮廓精度、crop偏移及OK/NG保持。
+
+2D进程结果完成前不会释放其共享区；失败或板释放后结束真实在途任务再释放输入。早期joint_entry仍在GPU后的geometry阶段发布，不必等银浆和公开几何。最终整板继续等待全部2D诊断，不能因3D先完成而漏判。
+
+`postprocess_workers`现在负责共享区准备和轻量finalize，不负责正式重后处理；它仍计入父线程预算。2D CPU进程不计入`worker_budget`，初始化单独记录。旧同步入口保留直接计算接口；正式流式固定进程处理。
+
+每片新增`cpu_2d_worker`记录执行进程的PID/核范围/依赖版本/无Torch。计时：
+
+|字段|口径|
+|---|---|
+|`cpu_2d_dispatch_queue_ms` / `cpu_2d_shared_memory_ms`|父准备线程排队 / 共享mask与元数据准备|
+|`cpu_2d_queue_ms`|提交到子进程开始，包含上述准备和进程入队/IPC|
+|`cpu_2d_phase_ms`|子进程挂接mask、银浆及公开几何计算|
+|`cpu_2d_result_transfer_ms` / `cpu_2d_log_relay_ms`|结果返回与调度延迟 / 父进程转发日志|
+|`cpu_postprocess_finalize_phase_ms`|父进程轻量合并结果|
+|`cpu_postprocess_phase_ms`|子进程计算＋父finalize墙钟之和，排除中间排队|
+|`cpu_postprocess_pipeline_ms`|从提交2D CPU任务到完整2D后处理结束，包含准备、队列、IPC和finalize|
+
+`silver_*`与`public_2d_geometry_*`保留在原结果字段中，变为子进程计算口径；`public_2d_geometry_work_ms`是本片逐实例累计工作，不代表独立实例线程池。整个2D响应时间仍以`request_pipeline_ms`为准。修改后重新初始化，在另一台用同样输入预热后比较整板与2D响应中位/长尾，并复核银浆、轮廓、编号及OK/NG。尚未验证真实节拍，不承诺固定提升。
+
+`postprocess_workers`、`silver_workers`、`gpu_workers`当前项目均配置15；前两者是父进程准备/汇总和边界准备线程，重后处理由上述CPU进程执行。统一板级检测为每个GPU工作线程加载独立YOLO与EfficientAD资源；增加父线程配置时仍需满足3D配置中的`worker_budget`。独立2D/3D旧接口目前只支持一个GPU工作线程。
 
 统一板级流程的公开实例几何使用3D配置中的`common_3d.parameters.threading.instance_workers`（1为串行），通过独立字典快照提交任务，只读共享掩码，父线程按原顺序收集。`public_2d_geometry_ms`是阶段墙钟，`public_2d_geometry_work_ms`是各实例工作耗时之和；`total_detect_ms`现在包含公开几何生成，完整请求仍可参考`request_pipeline_ms`。
 

@@ -303,7 +303,7 @@ class ThreadBudgetTests(unittest.TestCase):
                 # This test deliberately clears all OS environment variables
                 # to isolate pool settings. Real spawn is covered by the
                 # process integration tests with a valid Windows environment.
-                with patch.object(server, "_configure_registration_process") as configure_process:
+                with patch.object(server, "_configure_cpu_processes") as configure_process:
                     response = server.handle_init_algorithm({
                         "stage": "board",
                         "config_text": json.dumps(config),

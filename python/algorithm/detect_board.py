@@ -52,6 +52,7 @@ from algorithm.instance_tasks import InstanceTasks
 
 _segment = import_module("algorithm.3D.segment")
 _geometry = import_module("algorithm.2D.defect_geometry")
+_instance_geometry = import_module("algorithm.2D.instance_geometry")
 _circle_roi = import_module("algorithm.2D.circle_roi")
 _silver_inspection = import_module("algorithm.2D.silver_inspection")
 _chip_alignment = import_module("algorithm.2D.chip_alignment")
@@ -567,23 +568,22 @@ class DetectBoard:
         chip_diagnostics, chip_anomaly_diagnostics = entry["chip_rotation_2d"], entry["chip_anomaly_2d"]
         if on_joint_ready is not None:
             on_joint_ready({**entry, "instances": [dict(item) for item in instances]})
-        diagnostics = timed_call("silver_mask_checks_ms", _silver_inspection.inspect_masks,
-            instances,
-            crop.shape[:2],
-            self.silver_config,
-            crop_box=crop_box,
-            circle=circle,
-            image=image,
-            base_dir=self._silver_config_base_dir(),
-            prepared_boundary=prepared.get("silver_boundary"),
-        )
-        # Preserve total silver *work* despite registration moving to another
-        # branch. This aggregate is not the postprocess wall time or a new wait.
-        silver_timings = current_timings()
-        record_duration("silver_total_ms", silver_timings.get("silver_mask_checks_ms", 0.0)
-                        + silver_timings.get("silver_prepare_phase_ms", 0.0))
-        diagnostics = timed_call("silver_geometry_offset_ms", _silver_inspection.offset_geometry, diagnostics, crop_box[:2])
-        postprocess_ms = self.elapsed_ms(postprocess_start)
+        computed = prepared.get("cpu_2d_result")
+        if computed is None:
+            # Direct synchronous entry; formal streaming receives this work
+            # from the dedicated model-free CPU process pool below.
+            diagnostics = timed_call("silver_mask_checks_ms", _silver_inspection.inspect_masks,
+                instances, crop.shape[:2], self.silver_config, crop_box=crop_box, circle=circle,
+                image=image, base_dir=self._silver_config_base_dir(),
+                prepared_boundary=prepared.get("silver_boundary"))
+            silver_timings = current_timings()
+            record_duration("silver_total_ms", silver_timings.get("silver_mask_checks_ms", 0.0)
+                            + silver_timings.get("silver_prepare_phase_ms", 0.0))
+            diagnostics = timed_call("silver_geometry_offset_ms", _silver_inspection.offset_geometry, diagnostics, crop_box[:2])
+            postprocess_ms = self.elapsed_ms(postprocess_start)
+        else:
+            diagnostics = computed["diagnostics"]
+            postprocess_ms = computed["mask_postprocess_ms"]
 
         entry.update(silver_overflow_2d=diagnostics["silver_overflow"],
                      silver_continuity_2d=diagnostics["disconnection"])
@@ -595,7 +595,8 @@ class DetectBoard:
                 replaced = piece_id in board_cache
                 board_cache[piece_id] = entry
                 cache_state = self._cache_state_locked(board_id)
-        public_instances = timed_call("public_2d_geometry_ms", self._public_2d_instances, instances, crop_box)
+        public_instances = (computed["public_instances"] if computed is not None else
+                            timed_call("public_2d_geometry_ms", self._public_2d_instances, instances, crop_box))
         total_ms = self.elapsed_ms(start)
         checks = [bool(item.get("is_ok")) for item in instances]
         checks.extend(bool(item.get("is_ok")) for item in wire_roi_checks)
@@ -785,6 +786,13 @@ class DetectBoard:
         return service.submit(preparation_pool, inputs, piece_id, entry, depth, piece,
             correction, self.registration_config, self.dynamic_affine_config, timings,
             metadata, is_current, log=self.log)
+
+    def submit_2d_postprocess(self, preparation_pool, prepared, timings, metadata, is_current):
+        service = getattr(self, "cpu_2d_process", None)
+        if service is None:
+            raise RuntimeError("2D CPU processes must be initialized before streaming detection")
+        return service.submit_piece(preparation_pool, prepared, self.silver_config,
+            self._silver_config_base_dir(), timings, metadata, is_current, self.log)
 
     def measure_registered_piece(self, piece_id: int, entry: Dict[str, Any],
                                  depth: np.ndarray, piece: Dict[str, Any],
@@ -1682,27 +1690,7 @@ class DetectBoard:
         self, instance: Dict[str, Any], crop_box: Sequence[int] | None = None
     ) -> Dict[str, Any]:
         """Serialize a cached pre-alignment YOLO instance for the 2D reply."""
-        mask = instance.get("mask")
-        offset = tuple(crop_box or self.crop_roi)[:2]
-        return {
-            "instance_id": int(instance.get("instance_id", 0)),
-            "class_id": int(instance.get("class_id", -1)),
-            "class_name": str(instance.get("class_name", "")),
-            "confidence": float(instance.get("confidence", 0.0)),
-            "mask_2d": _mask_geometry(
-                mask,
-                offset=offset,
-                epsilon=1.0,
-            ) if isinstance(mask, np.ndarray) else _mask_geometry(
-                np.zeros((1, 1), dtype=np.uint8), (0, 0), 1.0
-            ),
-            "rectangle": instance.get("rectangle"),
-            "rectangle_ratio": float(instance.get("rectangle_ratio", 0.0)),
-            "bending_2d": instance.get("bending_2d"),
-            "chip_rotation_2d": instance.get("chip_alignment"),
-            "chip_anomaly_2d": instance.get("chip_anomaly_2d"),
-            "is_ok": bool(instance.get("is_ok", True)),
-        }
+        return _instance_geometry.public_instance(instance, crop_box or self.crop_roi, geometry=_mask_geometry)
 
     @staticmethod
     def _failure(error: str, message: str) -> Dict[str, Any]:
@@ -1752,36 +1740,7 @@ def _mask_geometry(
     offset: Sequence[int],
     epsilon: float,
 ) -> Dict[str, Any]:
-    source = np.asarray(mask)
-    # YOLO/aligned uint8 masks already encode foreground by nonzero values.
-    # Contouring is read-only; avoid another full-frame normalization copy.
-    binary = source if source.dtype == np.uint8 else (source > 0).astype(np.uint8)
-    area = int(cv2.countNonZero(binary))
-    if area == 0:
-        return {"area_px": 0, "bounding_box": [], "contours": []}
-    x, y, width, height = cv2.boundingRect(binary)
-    ox, oy = int(offset[0]), int(offset[1])
-    contours, _ = cv2.findContours(
-        binary[y:y + height, x:x + width], cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE, offset=(x, y),
-    )
-    serialized = []
-    for contour in contours:
-        approximate = cv2.approxPolyDP(contour, epsilon, closed=True).reshape(-1, 2)
-        if len(approximate) >= 3:
-            serialized.append(
-                [[int(point[0]) + ox, int(point[1]) + oy] for point in approximate]
-            )
-    return {
-        "area_px": area,
-        "bounding_box": [
-            x + ox,
-            y + oy,
-            x + width + ox,
-            y + height + oy,
-        ],
-        "contours": serialized,
-    }
+    return _instance_geometry.mask_geometry(mask, offset, epsilon)
 
 
 def _filled_external_region(mask: np.ndarray) -> np.ndarray:

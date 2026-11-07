@@ -39,6 +39,8 @@ class AlgorithmServer:
         self.joint_pool = None
         self.registration_pool = None
         self.registration_process = None
+        self.cpu_2d_process = None
+        self._cpu_process_order = []
         self.gpu_pool = None
         self.pipeline = None
         self.threading_info = {}
@@ -80,7 +82,7 @@ class AlgorithmServer:
             if self.pipeline is not None and self.pipeline.has_pending:
                 raise RuntimeError("algorithm initialization requires an idle detector")
             if stage == "board":
-                self._stop_registration_process()
+                self._stop_cpu_processes()
                 board = timed_call("init_board_import_and_construct_ms", self.get_board)
                 configure_gpu_workers = getattr(board, "configure_gpu_worker_count", None)
                 if callable(configure_gpu_workers):
@@ -91,7 +93,7 @@ class AlgorithmServer:
                 if response.get("ok"):
                     self._configure_thread_pools(settings, source="stage_config")
                     try:
-                        self._configure_registration_process(settings)
+                        self._configure_cpu_processes(settings)
                     except Exception:
                         board.release()
                         raise
@@ -206,6 +208,15 @@ class AlgorithmServer:
             "registration_affinity.physical_cores", affinity.get("physical_cores", registration)))
         if affinity["enabled"] and registration > affinity["physical_cores"]:
             raise ValueError("registration_workers cannot exceed registration_affinity.physical_cores")
+        cpu_2d = self._thread_count("cpu_process_workers", values_2d.get("cpu_process_workers",
+                                   os.environ.get("BRIDGE_2D_CPU_PROCESSES", 2)))
+        raw_cpu_affinity = values_2d.get("cpu_process_affinity", {"enabled": affinity["enabled"]})
+        if not isinstance(raw_cpu_affinity, dict) or type(raw_cpu_affinity.get("enabled", False)) is not bool:
+            raise ValueError("cpu_process_affinity.enabled must be boolean")
+        cpu_affinity = dict(enabled=raw_cpu_affinity.get("enabled", False), physical_cores=self._thread_count(
+            "cpu_process_affinity.physical_cores", raw_cpu_affinity.get("physical_cores", cpu_2d)))
+        if cpu_affinity["enabled"] and cpu_2d > cpu_affinity["physical_cores"]:
+            raise ValueError("cpu_process_workers cannot exceed cpu_process_affinity.physical_cores")
         early_joint = self._thread_count(
             "early_joint_workers", values_3d.get("early_joint_workers", joint)
         )
@@ -242,6 +253,8 @@ class AlgorithmServer:
             "registration_workers": registration,
             "registration_pool_shared": registration_pool_shared,
             "registration_affinity": affinity,
+            "cpu_process_workers": cpu_2d,
+            "cpu_process_affinity": cpu_affinity,
             "effective_workers": effective_total,
             "early_joint_workers": early_joint,
         }
@@ -319,25 +332,55 @@ class AlgorithmServer:
         if self.pipeline is not None:
             self.pipeline.early_joint_workers = settings["early_joint_workers"]
 
-    def _configure_registration_process(self, settings):
+    def _configure_cpu_processes(self, settings):
         """Initialize once per detector load, never lazily during a measured request."""
         from algorithm.registration_process import RegistrationProcesses
-        self._stop_registration_process()
+        from algorithm.cpu_2d_process import Cpu2DProcesses
+        self._stop_cpu_processes()
         self.board.registration_process = None
         self.threading_info["registration_execution"] = {"ready": False, "backend": "process"}
-        service = RegistrationProcesses(settings["registration_workers"], settings["registration_affinity"])
-        self.registration_process = service
-        self.board.registration_process = service
-        self.threading_info["registration_execution"] = dict(ready=True, **service.info)
+        self.threading_info["cpu_2d_execution"] = {"ready": False, "backend": "process"}
+        # Pin enabled pools before starting unpinned pools, so the latter
+        # inherit the remaining CPU set instead of overlapping reserved cores.
+        specifications = [
+            ("registration", RegistrationProcesses, settings["registration_workers"], settings["registration_affinity"]),
+            ("cpu_2d", Cpu2DProcesses, settings["cpu_process_workers"], settings["cpu_process_affinity"]),
+        ]
+        specifications.sort(key=lambda item: not item[3]["enabled"])
+        try:
+            for role, factory, count, affinity in specifications:
+                service = factory(count, affinity)
+                self._cpu_process_order.append(service)
+                setattr(self, role+"_process", service)
+                setattr(self.board, role+"_process", service)
+                self.threading_info[role+"_execution"] = dict(ready=True, **service.info)
+            if os.name == "nt":
+                from algorithm.cpu_partition import current_cpus
+                self.threading_info["main_cpu_ids"] = current_cpus()
+        except BaseException:
+            self._stop_cpu_processes()
+            raise
 
-    def _stop_registration_process(self):
-        if self.registration_process is not None:
-            self.registration_process.close()
-            self.registration_process = None
+    def _stop_cpu_processes(self):
+        services, self._cpu_process_order = self._cpu_process_order, []
+        errors = []
+        for service in reversed(services):
+            try:
+                service.close()
+            except Exception as error:
+                errors.append(error)
+        self.registration_process = self.cpu_2d_process = None
+        for role in ("registration", "cpu_2d"):
+            snapshot = self.threading_info.get(role+"_execution")
+            if isinstance(snapshot, dict):
+                snapshot["ready"] = False
         if self.board is not None:
             self.board.registration_process = None
+            self.board.cpu_2d_process = None
         if self.pipeline is not None:
             self.pipeline.drain_joint_jobs()
+        if errors:
+            raise RuntimeError("CPU process shutdown failed: "+str(errors[0]))
 
     def handle_detect(self, req: Dict[str, Any]) -> Dict[str, Any]:
         stage = str(req.get("stage", "board")).lower()
@@ -549,11 +592,7 @@ class AlgorithmServer:
                     self.registration_pool, self.joint_pool, self.cpu_pool) if pool is not None}.values():
                 pool.shutdown(wait=True)
         finally:
-            if self.registration_process is not None:
-                self.registration_process.close()
-                self.registration_process = None
-                if self.board is not None:
-                    self.board.registration_process = None
+            self._stop_cpu_processes()
 
     def run(self):
         self.log("python bridge concurrent protocol server started")

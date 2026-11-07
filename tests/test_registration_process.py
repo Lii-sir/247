@@ -245,7 +245,7 @@ class ProcessPipelineIntegrationTests(unittest.TestCase):
         detector.handle_init = Mock(return_value=dict(ok=True))
         detector.release = Mock()
         server.board = detector
-        with patch.object(server, "_configure_registration_process", side_effect=RuntimeError("worker init failed")):
+        with patch.object(server, "_configure_cpu_processes", side_effect=RuntimeError("worker init failed")):
             response = server.handle_init_algorithm(dict(stage="board", config_text="{}"))
         self.assertFalse(response["ok"])
         self.assertIn("worker init failed", response["error"])

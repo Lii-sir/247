@@ -19,6 +19,9 @@ I = 'python/algorithm/instance_tasks.py'
 V = 'visualization/validation_lab/server.py'
 RP = 'python/algorithm/registration_process.py'
 RW = 'python/algorithm/registration_worker.py'
+D2 = 'python/algorithm/cpu_2d_worker.py'
+P2 = 'python/algorithm/cpu_2d_process.py'
+IG = 'python/algorithm/2D/instance_geometry.py'
 
 
 def build_flows():
@@ -62,18 +65,22 @@ def build_flows():
     n('o-geometry', '2D几何 + joint_entry', '弯曲 / 缺线 / 旋转 / 灰度', 0, 4,
       'GPU完成后在CPU准备联合输入|依次计算2D弯曲、ROI存在性和芯片旋转|缓存完整原图灰度|发布joint_entry，允许联合工作提前启动', pool='cpu', times=('geometry_phase_ms',), src=(B, 'prepare_joint_piece'))
     n('o-postgate', '2D后处理汇合', '等待边界与几何均完成', 0, 5,
-      '分支计数归零后才投递finish任务|此处是事件汇合，不是额外计算线程|若某分支失败，释放输入并返回片级失败', kind='gate', src=(P, 'submit_2d'))
+      '分支计数归零后才投递2D CPU任务准备|此处是事件汇合，不是额外计算线程|若某分支失败，释放输入并返回片级失败', kind='gate', src=(P, 'submit_2d'))
     n('o-joingate', '本片联合就绪门', 'depth + 本片joint_entry', 2, 5,
       '整板深度就绪且该片joint_entry已发布|同片未被claimed，防止重复计算|受early_joint_workers约束|不等待银胶检查结束', kind='gate', src=(P, '_schedule_ready'))
-    n('o-post', '2D最终诊断与公开几何', '银胶两项串行；实例几何并行', 0, 6,
-      '复用联合掩码检查溢胶与断连|按实例并行生成公开2D几何|汇总2D结论并保存entry|释放原始图像共享内存owner', pool='postprocess', src=(B, 'finish_2d_piece'))
+    n('o-post', '2D共享mask与异步派发', '不传模型、GPU Tensor或整张照片', 0, 6,
+      '只复制实例mask到只读共享区|携带必要公开字段与已准备Boundary|父准备线程不等待worker完成|不影响早期joint_entry发布', pool='postprocess', src=(P2, 'submit_piece'))
+    n('o-cpu2d', '2D独立CPU进程', '银浆溢出 → 断连 → 公开几何', 0, 7,
+      '独立于配准和主进程的核组|无Torch，OpenCV/BLAS为1|本片内按原实例顺序处理，不用3D instance池|返回诊断与公开几何，原始实例只读', pool='cpu_2d_process', src=(D2, 'compute'), times=('cpu_2d_phase_ms',))
+    n('o-finalize2d', '父进程轻量合并', '不重复银浆与公开几何计算', 0, 8,
+      '回填完整entry的银浆诊断|汇总原2D检测结论|构造响应并释放原图owner|整板最终仍需等待本次完整2D诊断', pool='postprocess', src=(B, 'finish_2d_piece'))
     n('o-shared', '共享输入与异步派发', '每板一份深度；每片gray/mask', 2, 6,
       '父准备线程复制并发布共享区|整板补偿后深度所有片复用|只向常驻子进程发送描述和数值配置|租约保护取消/释放期间的真实任务输入', pool='registration', times=('registration_shared_memory_ms',), src=(RP, 'prepare'))
     n('o-registration', '常驻进程独立配准', '粗配准 → 仿射；专用物理核组', 2, 7,
       '按registration_workers限制进程数|不加载Torch和模型，原生线程均为1|主进程与配准使用不同物理核组|只读共享区，每片拟合一个全局矩阵|矩阵和诊断返回后立即投递测高', pool='registration_process', times=('registration_phase_ms',), src=(RW, 'register_arrays'))
     n('o-joint', '掩码映射与全实例测高', '接收同一矩阵；joint池', 2, 8,
       '按joint_workers独立限制并发|实例映射由共享instance池处理|拟合参考平面后依次处理引线、焊脚|所有wire/thin/bond参与测高，不再用2D引线ROI筛选', pool='joint', times=('joint_measurement_phase_ms',), src=(B, 'measure_registered_piece'))
-    n('o-2ddone', '本片2D响应 / entry就绪', '2D请求独立返回', 0, 7,
+    n('o-2ddone', '本片2D响应 / entry就绪', '2D请求独立返回', 0, 9,
       '输出2D检查、公开掩码和阶段耗时|记录完整entry|尝试推进整板汇合', kind='data', src=(P, 'submit_2d'))
     n('o-3ddone', '本片联合结果就绪', '几何 / 平面 / 高度 / 配准', 2, 9,
       '保存结果到state.results[piece_id]|将高度点转换到整板坐标|掩码轮廓仍为片局部坐标|后续仍会合并完整2D诊断', kind='data', src=(P, '_measured'))
@@ -86,7 +93,7 @@ def build_flows():
         ('o-depth','o-pitch','','serial'),('o-pitch','o-slices','','serial'),('o-gpu','o-geometry','','serial'),
         ('o-geometry','o-postgate','','wait'),('o-boundary','o-postgate','','wait'),
         ('o-geometry','o-joingate','提前发布','data'),('o-slices','o-joingate','','wait'),
-        ('o-postgate','o-post','','serial'),('o-joingate','o-shared','','serial'),('o-shared','o-registration','跨进程描述','data'),('o-registration','o-joint','回调交接','data'),('o-post','o-2ddone','','serial'),
+        ('o-postgate','o-post','','serial'),('o-joingate','o-shared','','serial'),('o-shared','o-registration','跨进程描述','data'),('o-registration','o-joint','回调交接','data'),('o-post','o-cpu2d','共享mask','data'),('o-cpu2d','o-finalize2d','结果回传','data'),('o-finalize2d','o-2ddone','','serial'),
         ('o-joint','o-3ddone','','serial'),('o-2ddone','o-all','','wait'),('o-3ddone','o-all','','wait'),('o-all','o-return','','serial')]:e(a,b,label,kind)
 
     scene('initialization', '初始化与资源', '协议初始化、算法初始化、模型副本和线程池', [
@@ -106,8 +113,8 @@ def build_flows():
       '为每个GPU工作资源构造独立YOLO|为该资源加载独立EfficientAD预测器|建立独立锁和可用CUDA流|资源进入槽位队列，推理完成后归还',pool='gpu',src=(B,'_load_gpu_worker_replicas'))
     n('i-pools','应用正式执行器并建立pipeline','只有算法初始化成功才切换',1,6,
       '校验各独立池总数不超过worker_budget，独立registration池也计入|缺省silver池可别名到postprocess，joint可别名到cpu，registration可别名到joint|只有空闲时允许重配线程池|BoardPipeline持有这些执行器并按事件调度',kind='parallel',src=(T,'_configure_thread_pools'))
-    n('i-process','预热常驻配准进程与划分CPU','spawn + pythonw，无thread回退',1,7,
-      '初始化全部worker，设OpenCV/BLAS为1且确认未导入Torch|按真实物理核/SMT拓扑选择专用核组|全部worker就绪后限制主进程到剩余CPU|返回PID/亲和性/版本/启动耗时|失败清理worker、恢复主CPU范围并报告初始化失败',kind='parallel',pool='registration_process',src=(T,'_configure_registration_process'),params=('common_3d.parameters.threading.registration_affinity',))
+    n('i-process','预热配准与2D CPU进程','spawn + pythonw，无thread回退',1,7,
+      '分别初始化配准和2D后处理全部worker，OpenCV/BLAS为1且无Torch|按真实物理核/SMT拓扑划分独立核组|启用亲和性的池优先分配，另一池从剩余CPU启动|主进程使用剩余范围，关停按逆序恢复|返回两组PID/亲和性/版本，任一池失败清理全部已创建池',kind='parallel',pool='registration_process',src=(T,'_configure_cpu_processes'),params=('common_3d.parameters.threading.registration_affinity','common_2d.parameters.threading.cpu_process_affinity'))
     n('i-ready','返回算法初始化成功','模型驻留，等待输入',1,8,
       '返回模型加载耗时和线程配置|同配置/同模型的验证台任务可复用检测进程|配置或模型文件指纹改变后重新初始化|退出时关闭自有池并释放模型',kind='data',src=(V,'_ensure'))
     for a,b in zip(['i-init','i-config','i-board','i-cuda','i-ad','i-replicas','i-pools','i-process'],['i-config','i-board','i-cuda','i-ad','i-replicas','i-pools','i-process','i-ready']):e(a,b)
@@ -145,13 +152,17 @@ def build_flows():
       '保存joint_entries[piece_id]|记录_2d_ready_at|立即尝试_schedule_ready|如depth已就绪，可投递本片联合任务',kind='data',src=(P,'submit_2d'))
     n('d-join','边界 + geometry汇合','两支都成功才进入2D最终处理',1,13,
       '回调remaining计数归零|合并各支路计时|先处理支路错误并释放图像owner|成功时投递postprocess池，不在原线程阻塞等待',kind='gate',src=(P,'submit_2d'))
-    n('d-silver','银胶检查','溢胶 → 断连，当前顺序串行',1,14,
-      '建立本次检查的联合掩码缓存|先处理银浆溢出|随后处理银浆连通/断连|把局部几何加回crop原点|更新完整entry中的银胶诊断',pool='postprocess',src=(B,'finish_2d_piece'),times=('silver_mask_checks_ms','silver_geometry_offset_ms'))
-    n('d-public','并行生成公开2D几何','按实例映射，按原顺序汇总',1,15,
-      '对实例字典取只读用途快照|instance池逐实例提取面积、包围框和轮廓|按输入实例顺序汇总|total_detect_ms在公开几何之后取值|request_pipeline_ms覆盖受理到完整响应',pool='instance',kind='parallel',src=(B,'_public_2d_instances'),times=('public_2d_geometry_ms','public_2d_geometry_work_ms'))
-    n('d-return','返回本片2D结果','保留缓存等待整板最终汇合',1,16,
+    n('d-dispatch','只读mask准备与进程派发','每片独立共享区租约',1,14,
+      '只复制实例mask和必要公开字段|复用已准备Boundary，不重复SIFT|不传整张图像或GPU对象|真实worker完成前共享区保持有效',pool='postprocess',src=(P2,'submit_piece'),times=('cpu_2d_shared_memory_ms','cpu_2d_queue_ms'))
+    n('d-silver','进程内银胶检查','溢胶 → 断连，顺序不变',1,15,
+      '建立本次检查的联合掩码缓存|先处理银浆溢出|随后处理银浆连通/断连|把局部几何加回crop原点|诊断返回父进程统一合并',pool='cpu_2d_process',src=(D2,'compute'),times=('silver_mask_checks_ms','silver_geometry_offset_ms'))
+    n('d-public','进程内公开2D几何','本片串行，不同片跨进程并行',1,16,
+      '逐实例读取只读mask|使用相同面积、包围框、轮廓函数|按原实例顺序输出|不占用3D instance池，也不修改父进程实例',pool='cpu_2d_process',src=(IG,'public_instance'),times=('public_2d_geometry_ms','public_2d_geometry_work_ms'))
+    n('d-finalize','父进程轻量finalize','合并诊断与原有2D检查',1,17,
+      '将worker诊断回填完整entry|不重复银浆和公开几何计算|构造实例与总OK/NG|记录子进程计算和父finalize之和，以及完整后处理链路',pool='postprocess',src=(B,'finish_2d_piece'),times=('cpu_postprocess_finalize_phase_ms','cpu_postprocess_pipeline_ms'))
+    n('d-return','返回本片2D结果','保留缓存等待整板最终汇合',1,18,
       '汇总实例、缺线、旋转、外观与银胶结论|响应ok表示接口成功，不等于产品is_ok|写入完整state.entries并清除inflight|归还原图共享内存owner|尝试整板完成门',kind='data',src=(P,'submit_2d'),times=('request_pipeline_ms',))
-    chain=['d-input','d-circle','d-crop','d-platform','d-slot','d-yolo','d-masks','d-anomaly','d-gpudone','d-bending','d-presence','d-rotation','d-ready','d-join','d-silver','d-public','d-return']
+    chain=['d-input','d-circle','d-crop','d-platform','d-slot','d-yolo','d-masks','d-anomaly','d-gpudone','d-bending','d-presence','d-rotation','d-ready','d-join','d-dispatch','d-silver','d-public','d-finalize','d-return']
     for a,b in zip(chain,chain[1:]):e(a,b)
     e('d-platform','d-boundary','并发投递','fork');e('d-boundary','d-join','等待边界','wait')
 
@@ -182,6 +193,9 @@ def build_flows():
       '按模型校准及配置选择评分方法|pool+top先池化并做高响应分数聚合|应用对应模型阈值：运行时覆盖优先于配置和checkpoint|score > threshold为NG，等于阈值为OK|仅在异常分数触发时生成二值定位响应',pool='gpu',src=(A,'_scores_and_response'),params=('chip_anomaly_2d.parameters.score_mode','chip_anomaly_2d.parameters.score_pool_kernel','chip_anomaly_2d.parameters.threshold'),times=('efficientad_score_and_response_ms',))
     n('a-boxes','外观：异常区域返回','形态学 / 连通域 / 坐标映射',2,5,
       '对异常二值图开闭运算|按最小面积筛选连通域框|响应图坐标换算到拉正crop|用逆透视矩阵映射到原始2D图|写入实例外观诊断并汇总所有chip结论',pool='gpu',src=(A,'_component_boxes'),times=('efficientad_component_boxes_ms','efficientad_total_ms'))
+    for node in current['nodes']:
+        if node['pool'] == 'postprocess':
+            node['pool'] = 'cpu_2d_process'
     for chain in [['s-boundary','s-union','s-overflow','s-labels','s-sectors','s-summary'],['a-chip','a-rectify','a-route','a-infer','a-score','a-boxes']]:
         for a,b in zip(chain,chain[1:]):e(a,b)
 

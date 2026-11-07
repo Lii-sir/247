@@ -74,6 +74,8 @@ C# 方法和字段不增加。`SolderMeasurements[].Mask3DLocal` 是实际内缩
 
 ## 线程配置
 
+2D重后处理现另有独立常驻CPU进程与核组，默认2进程/2物理核，见config/2D/README.md。默认与配准4核合计预留6核，主进程使用剩余CPU；初始化/重载先关闭2D与配准进程并排空旧代工作，按分配的逆序恢复亲和性。两池共用同一进程生命周期和共享区租约实现，正式流程均无thread回退。
+
 `common_3d.parameters.threading`控制正式流式调度。当前配置：
 
 ```json

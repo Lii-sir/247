@@ -60,7 +60,7 @@ class BoardPipeline:
         return future
 
     def drain_joint_jobs(self):
-        """After boards are gone, finish old 3D work before model reinitialization."""
+        """After boards are gone, finish old CPU work before model reinitialization."""
         with self._lock:
             if self._boards:
                 raise RuntimeError("cannot drain joint jobs while boards are pending")
@@ -114,7 +114,7 @@ class BoardPipeline:
                 with measure(phase + "_phase_ms"):
                     result = function(*args)
                 note("phase_summary", timings_ms=dict(timings))
-                if phase == "cpu_postprocess" and isinstance(result, tuple):
+                if phase in {"cpu_postprocess", "cpu_postprocess_finalize"} and isinstance(result, tuple):
                     response, entry = result
                     response.setdefault("timings", {}).update(timings)
                     entry["_2d_ready_at"] = time.perf_counter()
@@ -144,6 +144,7 @@ class BoardPipeline:
         output = Future()
         detail_timings = {}
         accepted_at = time.perf_counter()
+        value_post_started = [0.0]
 
         def failed(exc):
             with self._lock:
@@ -160,6 +161,11 @@ class BoardPipeline:
         def postprocessed(future):
             try:
                 response, entry = future.result()
+                if "cpu_2d_phase_ms" in detail_timings:
+                    detail_timings["cpu_postprocess_phase_ms"] = detail_timings["cpu_2d_phase_ms"]+detail_timings["cpu_postprocess_finalize_phase_ms"]
+                    detail_timings["cpu_postprocess_queue_ms"] = detail_timings["cpu_2d_queue_ms"]
+                    detail_timings["cpu_postprocess_pipeline_ms"] = (time.perf_counter()-value_post_started[0])*1000
+                    response.setdefault("timings", {}).update(detail_timings)
                 response.setdefault("timings", {})["request_pipeline_ms"] = (time.perf_counter() - accepted_at) * 1000
                 with self._lock:
                     if not self._current(state):
@@ -208,14 +214,33 @@ class BoardPipeline:
 
                 def finish():
                     try:
-                        return self.detector.finish_2d_piece(value, publish_cache=False)
+                        response, entry = self.detector.finish_2d_piece(value, publish_cache=False)
+                        if value.get("cpu_2d_result") is not None:
+                            response["cpu_2d_worker"] = value["cpu_2d_result"]["cpu_2d_worker"]
+                        return response, entry
                     finally:
                         self.detector.release_prepared_2d(value)
 
+                def computed(result):
+                    try:
+                        data = result.result()
+                        if data is not None:
+                            value["cpu_2d_result"] = data
+                        finalized = self._submit_timed(self.postprocess_pool, "cpu_postprocess_finalize", detail_timings,
+                            board_id, piece_id, req.get("request_id"), finish)
+                        self._track_joint_job(finalized).add_done_callback(postprocessed)
+                    except Exception as exc:
+                        self.detector.release_prepared_2d(value)
+                        failed(exc)
+
+                def is_current():
+                    with self._lock:
+                        return self._current(state)
                 try:
-                    self._submit_timed(self.postprocess_pool, "cpu_postprocess", detail_timings,
-                                       board_id, piece_id, req.get("request_id"), finish
-                                       ).add_done_callback(postprocessed)
+                    value_post_started[0] = time.perf_counter()
+                    job = self.detector.submit_2d_postprocess(self.postprocess_pool, value, detail_timings,
+                        dict(board_id=board_id, piece_id=piece_id, request_id=req.get("request_id")), is_current)
+                    self._track_joint_job(job).add_done_callback(computed)
                 except Exception as exc:
                     self.detector.release_prepared_2d(value)
                     failed(exc)

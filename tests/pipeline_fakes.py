@@ -82,6 +82,19 @@ class FakeDetector:
     def prepare_joint_piece(prepared):
         return dict(prepared)
 
+    def submit_2d_postprocess(self, pool, prepared, timings, metadata, is_current):
+        # Only a scheduling stub. Production dispatches to CPU-only processes.
+        from algorithm.timing import timing_context, measure
+        queued = time.perf_counter()
+        def invoke():
+            if not is_current():
+                raise RuntimeError("board was released before synthetic 2D CPU work")
+            with timing_context(timings, phase="cpu_2d", **metadata):
+                timings["cpu_2d_queue_ms"] = (time.perf_counter()-queued)*1000
+                with measure("cpu_2d_phase_ms"):
+                    return None
+        return pool.submit(invoke)
+
     @staticmethod
     def finalize_joint_piece(piece, entry):
         return piece

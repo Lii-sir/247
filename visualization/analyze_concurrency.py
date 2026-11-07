@@ -16,6 +16,8 @@ STAGES = {
     "efficientad_total_ms": "Chip inspection",
     "geometry_phase_ms": "Joint input geometry",
     "cpu_postprocess_phase_ms": "CPU postprocess",
+    "cpu_2d_phase_ms": "2D CPU process",
+    "cpu_postprocess_finalize_phase_ms": "2D finalize",
     "joint_phase_ms": "Joint 3D",
     "registration_phase_ms": "Registration stage",
     "affine_registration_ms": "Affine registration",
