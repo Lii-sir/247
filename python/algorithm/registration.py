@@ -141,6 +141,7 @@ def refine_affine_registration(
     depth_piece: np.ndarray,
     coarse_registration: Dict[str, Any],
     values: Dict[str, Any] | None = None,
+    *, context: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Dynamically fit one six parameter affine transform for one piece.
 
@@ -266,12 +267,34 @@ def refine_affine_registration(
                          score_mode=score_mode, cache_enabled=cache_enabled)
 
     before, _ = score(p0, details=True)
+    calibration = values.get("calibration") or {}
+    if not isinstance(calibration, dict) or type(calibration.get("enabled", False)) is not bool:
+        raise ValueError("dynamic_affine.calibration must contain a boolean enabled")
+    start = p0.copy()
+    initial_score = before
+    initialization = dict(enabled=calibration.get("enabled", False), source="coarse", reason="disabled",
+                          coarse_score=before, candidate_score=None, profile_valid=False)
+    if initialization["enabled"]:
+        try:
+            candidate = _calibration_seed(calibration.get("profile"), context, p0, preview_scale, lower, upper)
+        except ValueError as exc:
+            initialization["reason"] = str(exc)
+        else:
+            candidate_score = score(candidate)
+            initialization.update(profile_valid=True, candidate_score=float(candidate_score) if np.isfinite(candidate_score) else None)
+            if np.isfinite(candidate_score) and candidate_score < before:
+                start, initial_score = candidate, candidate_score
+                initialization.update(source="calibration_linear", reason="candidate_improved_full_score")
+            else:
+                initialization["reason"] = "candidate_did_not_improve_full_score"
+    result.update(affine_initialization=initialization, affine_initial_parameters=start.tolist(),
+                  affine_initial_score=float(initial_score), affine_coarse_parameters=p0.tolist())
     optimizer_calls_before = score.calls
     optimizer_started = time.perf_counter()
     try:
         optimized = minimize(
             score,
-            p0,
+            start,
             method="Powell",
             bounds=list(zip(lower, upper)),
             options={
@@ -369,6 +392,57 @@ def _registration_matrix(registration: Dict[str, Any]) -> np.ndarray:
         ],
         dtype=np.float64,
     )
+
+
+def affine_coordinate_context(image_shape, depth_shape, correction=None, image_role="independent_camera"):
+    """Geometry contract shared by formal detection and the registration lab."""
+    correction = correction or {}
+    prep = dict(model=correction.get("model", "smartray_pitch"), image_role=image_role,
+                state="applied" if correction.get("applied") else correction.get("reason", "disabled"))
+    if correction.get("applied"):
+        for key in ("angle_deg", "scan_axis", "scan_pitch_mm", "transform_direction",
+                    "z_step_mm", "gray_offset", "z_origin_mm"):
+            prep[key] = correction.get(key)
+    return dict(source_space="independent_2d_image" if image_role == "independent_camera" else "smartray_intensity_depth_piece",
+                target_space="depth_piece_local", image_size=[int(image_shape[1]), int(image_shape[0])],
+                depth_size=[int(depth_shape[1]), int(depth_shape[0])], preprocessing=prep)
+
+
+def _calibration_seed(profile, context, coarse, preview_scale, lower, upper):
+    """Reuse only linear4. Current coarse anchor position is never replaced."""
+    if (not isinstance(profile, dict) or profile.get("format") != "registration_lab_matrix"
+            or type(profile.get("version")) is not int or profile["version"] != 1):
+        raise ValueError("calibration_requires_registration_lab_matrix_profile")
+    saved = profile.get("context")
+    if not isinstance(saved, dict) or not isinstance(context, dict):
+        raise ValueError("calibration_coordinate_context_missing")
+    for key in ("source_space", "target_space", "preprocessing"):
+        if key not in saved or saved[key] != context.get(key):
+            raise ValueError("calibration_coordinate_or_pitch_mismatch")
+    if context.get("source_space") != "independent_2d_image":
+        raise ValueError("calibration_requires_independent_2d_image")
+    for owner in (saved, context):
+        for key in ("image_size", "depth_size"):
+            size = owner.get(key)
+            if not isinstance(size, list) or len(size) != 2 or any(type(v) is not int or v <= 0 for v in size):
+                raise ValueError("calibration_invalid_image_size")
+    if saved["image_size"] != context["image_size"] or saved["depth_size"][0] != context["depth_size"][0]:
+        raise ValueError("calibration_image_resolution_mismatch")
+    raw = profile.get("matrix")
+    if (not isinstance(raw, list) or len(raw) != 3 or any(not isinstance(row, list) or len(row) != 3 for row in raw)
+            or any(isinstance(v, bool) or not isinstance(v, (int, float)) for row in raw for v in row)):
+        raise ValueError("calibration_matrix_must_be_numeric_3x3")
+    matrix = np.asarray(raw, dtype=np.float64)
+    if not np.isfinite(matrix).all() or abs(matrix[2,2]) < 1e-12:
+        raise ValueError("calibration_nonfinite_or_invalid_matrix")
+    matrix = matrix / matrix[2,2]
+    if not np.allclose(matrix[2,:2],0,rtol=0,atol=1e-12) or np.linalg.det(matrix[:2,:2]) <= 0:
+        raise ValueError("calibration_requires_orientation_preserving_affine")
+    candidate = _affine_parameters_from_matrix(matrix[:2], preview_scale)
+    candidate[4:] = coarse[4:]
+    if np.any(candidate < lower) or np.any(candidate > upper):
+        raise ValueError("calibration_candidate_outside_original_bounds")
+    return candidate
 
 
 def _affine_parameters_from_matrix(matrix: np.ndarray, preview_scale: float) -> np.ndarray:

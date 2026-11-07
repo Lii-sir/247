@@ -151,6 +151,10 @@ C# DTO新增元数据属性，现有测高点/掩码字段保持；源码已构�
 
 实图测试由使用者执行：同一套10片输入、同配置和并发，分别cache_enabled=false/true，比较每片最终矩阵、最终损失、各区损失、真实变换次数及`affine_registration_ms`。命中率不设30%硬门槛，以墙钟和输出一致性判断。重新初始化后参数生效。
 
+`calibration.enabled`默认false；启用时把配准台“保存矩阵”的完整JSON放进`calibration.profile`。校验原始2D尺寸、深度宽度、坐标来源及Pitch几何设置后，仅复用线性4项，当前片粗配准参考点位置不变，不复用历史平移和分片行偏移。候选必须位于原粗配准搜索边界内，完整分辨率损失严格更低才作为起点；不匹配、非法或不改善均保留粗配准，并在`affine_initialization.reason`说明原因。片高和分片模式可不同，因为未复用历史平移。仅支持独立2D相机坐标。
+
+新增`affine_initial_parameters`、`affine_coarse_parameters`及`affine_initial_score`；`affine_score_before`仍代表原粗配准初值的完整评分。候选检查计入score_calls但不计入SciPy nfev。此功能可能改变收敛结果，需用同一板/不同板对照最终各区损失、映射位置与测高结果后再正式启用。
+
 ## Pitch条带并行
 
 `smartray_pitch_3d.parameters.projection_workers`默认配置为8，必须为正整数；设为1串行。省略该项的旧配置按1处理。统一板级和独立3D检测器各自在初始化时配置独立Pitch线程池，跨板复用，释放/重新初始化时关闭；它与joint及instance线程池分开，也不计入桥接层原有worker_budget。

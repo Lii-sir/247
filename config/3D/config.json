@@ -138,6 +138,10 @@
     "parameters": {
       "score_mode": "full",
       "cache_enabled": true,
+      "calibration": {
+        "enabled": false,
+        "profile": null
+      },
       "preview_scale": 0.5,
       "threshold_2d": 50,
       "morphology_kernel_size": 3,

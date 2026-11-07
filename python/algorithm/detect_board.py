@@ -37,6 +37,7 @@ from algorithm.height_measurement import (
 )
 from algorithm.registration import (
     RegistrationConfig,
+    affine_coordinate_context,
     align_crop_mask_to_depth,
     platform_mask_2d,
     platform_mask_3d,
@@ -775,6 +776,7 @@ class DetectBoard:
             local_depth,
             registration,
             self.dynamic_affine_config,
+            context=affine_coordinate_context(entry["gray_image"].shape, local_depth.shape, pitch_correction),
         )
         aligned_masks = timed_call("mask_alignment_ms", self._align_instances,
             entry["instances"], local_depth.shape, registration, entry.get("crop_box", self.crop_roi))
@@ -989,7 +991,8 @@ class DetectBoard:
                     self.registration_config,
                 )
                 registration = refine_affine_registration(
-                    gray_images[index], local_depth, registration, self.dynamic_affine_config
+                    gray_images[index], local_depth, registration, self.dynamic_affine_config,
+                    context=affine_coordinate_context(gray_images[index].shape, local_depth.shape, pitch_correction),
                 )
                 crop_box, circle, roi_boxes = crop_metadata[index]
                 instances = self._extract_instances(prediction, crop.shape[:2])

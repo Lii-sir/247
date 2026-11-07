@@ -58,5 +58,60 @@ class AffineOptimizationTests(unittest.TestCase):
             self.assertEqual(results[0][key],results[1][key],key)
         self.assertGreater(results[1]['affine_cache_hits'],0)
 
+    def calibration(self,args,linear=None):
+        image,depth,coarse,values=args
+        context=reg.affine_coordinate_context(image.shape,depth.shape)
+        matrix=np.eye(3)
+        matrix[:2,:2]=linear if linear is not None else [[1.005,0],[0,1.]]
+        matrix[:2,2]=[90000.,-70000.] # Deliberately irrelevant old translation.
+        return dict(format='registration_lab_matrix',version=1,matrix=matrix.tolist(),context=copy.deepcopy(context)),context
+
+    def test_calibration_reuses_only_linear_and_preserves_coarse_anchor_and_bounds(self):
+        args=self.fixture();image,_,coarse,values=args
+        profile,context=self.calibration(args)
+        p0=reg._affine_parameters_from_matrix(reg._registration_matrix(coarse),1.)
+        candidate=p0.copy();candidate[0]=1.005
+        depth=cv2.warpAffine((image>50).astype(np.uint16)*33000,reg._full_affine(candidate,1.),(100,70),flags=cv2.INTER_NEAREST)
+        seen=[]
+        def optimize(fn,start,**kwargs):
+            seen.append((start.copy(),kwargs['bounds']))
+            fn(start)
+            return SimpleNamespace(x=start,nit=1,nfev=1,success=True,status=0,message='done')
+        saved=copy.deepcopy(profile)
+        with patch.object(reg,'minimize',side_effect=optimize):
+            result=reg.refine_affine_registration(image,depth,coarse,
+                {**values,'penalty_weight':0.,'calibration':{'enabled':True,'profile':profile}},context=context)
+        np.testing.assert_array_equal(seen[0][0],candidate)
+        self.assertEqual(seen[0][1][4],(965.,1035.))
+        self.assertEqual(result['affine_initialization']['source'],'calibration_linear')
+        self.assertLess(result['affine_initial_score'],result['affine_score_before'])
+        self.assertEqual(profile,saved)
+
+    def test_calibration_context_failures_retain_coarse_seed(self):
+        args=self.fixture();profile,context=self.calibration(args)
+        invalid=[]
+        for key,value in [('source_space','other'),('image_size',[101,70]),('depth_size',[101,70]),('preprocessing',{})]:
+            item=copy.deepcopy(profile);item['context'][key]=value;invalid.append(item)
+        item=copy.deepcopy(profile);item['matrix'][2][0]=.01;invalid.append(item)
+        item=copy.deepcopy(profile);item['matrix'][0][0]=2.;invalid.append(item)
+        for item in invalid+[None]:
+            with self.subTest(profile=item):
+                result=reg.refine_affine_registration(*args[:3],
+                    {**args[3],'calibration':{'enabled':True,'profile':item}},context=context)
+                self.assertEqual(result['affine_initialization']['source'],'coarse')
+                self.assertFalse(result['affine_initialization']['profile_valid'])
+
+    def test_calibration_allows_piece_height_changes_but_needs_context_and_lower_loss(self):
+        args=self.fixture();profile,context=self.calibration(args,[[1,0],[0,1]])
+        profile['context']['depth_size'][1]+=11
+        profile['context']['segmentation']={'mode':'auto'}
+        context['segmentation']={'mode':'fixed'}
+        values={**args[3],'calibration':{'enabled':True,'profile':profile}}
+        accepted=reg.refine_affine_registration(*args[:3],values,context=context)
+        self.assertTrue(accepted['affine_initialization']['profile_valid'])
+        self.assertEqual(accepted['affine_initialization']['source'],'coarse')
+        missing=reg.refine_affine_registration(*args[:3],values)
+        self.assertIn('context_missing',missing['affine_initialization']['reason'])
+
 
 if __name__=='__main__':unittest.main()

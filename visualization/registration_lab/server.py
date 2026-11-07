@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 ASSETS = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "python"))
 from algorithm.registration import (RegistrationConfig, platform_mask_2d,
-    platform_mask_3d, register_platform_masks, refine_affine_registration, _affine_regions)
+    platform_mask_3d, register_platform_masks, refine_affine_registration, _affine_regions, affine_coordinate_context)
 from algorithm.tilt_correction import correct_smartray_pitch
 segment = import_module("algorithm.3D.segment")
 SECTIONS = ("registration_3d", "dynamic_affine_3d", "segmentation_3d")
@@ -79,15 +79,7 @@ def color_depth(depth):
 def matrix_context(image, depth, correction, settings):
     """Only geometry-affecting preprocessing is relevant to coefficient reuse."""
     role = (settings or {}).get("image_role", "independent_camera")
-    prep = dict(model=correction["model"], image_role=role,
-                state="applied" if correction["applied"] else correction["reason"])
-    if correction["applied"]:
-        for key in ("angle_deg", "scan_axis", "scan_pitch_mm", "transform_direction",
-                    "z_step_mm", "gray_offset", "z_origin_mm"):
-            prep[key] = correction[key]
-    return dict(source_space="independent_2d_image" if role == "independent_camera" else "smartray_intensity_depth_piece",
-                target_space="depth_piece_local", image_size=[image.shape[1], image.shape[0]],
-                depth_size=[depth.shape[1], depth.shape[0]], preprocessing=prep)
+    return affine_coordinate_context(image.shape, depth.shape, correction, role)
 
 
 def validate_saved_matrix(profile, context):
@@ -144,10 +136,10 @@ def calibrate_segmentation(request, progress=lambda value: None):
     config = segment.SegmentationConfig.from_dict(automatic)
     timings = {}
 
-    def timed(name, function, *args):
+    def timed(name, function, *args, **kwargs):
         progress(name)
         started = time.perf_counter()
-        result = function(*args)
+        result = function(*args, **kwargs)
         timings[name] = round((time.perf_counter() - started) * 1000, 3)
         return result
 
@@ -180,10 +172,10 @@ def run_registration(request, progress=lambda value: None):
         raise ValueError("对齐方式必须是estimate或reuse")
     timings = {}
 
-    def timed(name, function, *args):
+    def timed(name, function, *args, **kwargs):
         progress(name)
         t = time.perf_counter()
-        value = function(*args)
+        value = function(*args, **kwargs)
         timings[name] = round((time.perf_counter()-t)*1000, 3)
         return value
 
@@ -241,7 +233,7 @@ def run_registration(request, progress=lambda value: None):
         stages.append(("coarse", "粗配准", registration))
         if request.get("affine", True):
             registration = timed("仿射配准", refine_affine_registration, gray, local, registration,
-                                 parameters["dynamic_affine_3d"])
+                                 parameters["dynamic_affine_3d"], context=context)
             stages.append(("affine", "仿射配准", registration))
     progress("生成预览")
     preview_started = time.perf_counter()
