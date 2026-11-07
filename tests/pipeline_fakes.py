@@ -105,6 +105,20 @@ class FakeDetector:
     def register_prepared_piece(self, piece_id, entry, depth, piece, pitch_correction=None):
         return dict(is_valid=True)
 
+    def submit_registration(self, pool, inputs, piece_id, entry, depth, piece,
+                            correction, timings, metadata, is_current):
+        # Scheduling fake only: production DetectBoard always dispatches a process.
+        from algorithm.timing import timing_context, measure
+        queued = time.perf_counter()
+        def invoke():
+            if not is_current():
+                raise RuntimeError("board was released before synthetic registration")
+            with timing_context(timings, phase="registration", **metadata):
+                timings["registration_queue_ms"] = (time.perf_counter()-queued)*1000
+                with measure("registration_phase_ms"):
+                    return self.register_prepared_piece(piece_id, entry, depth, piece, correction)
+        return pool.submit(invoke)
+
     def measure_registered_piece(self, piece_id, entry, depth, piece, registration, pitch_correction=None):
         return self.measure_prepared_piece(piece_id, entry, depth, piece, pitch_correction)
 

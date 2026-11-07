@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import threading
 import time
-from concurrent.futures import Future
+from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
 from typing import Any
 from algorithm.tilt_correction import depth_coordinate_space
 from algorithm.timing import timing_context, measure, record_duration, timed_call, note
+from algorithm.registration_process import SharedBoardInputs
 
 
 @dataclass
@@ -28,6 +29,7 @@ class _Board:
     timings: dict = field(default_factory=dict)
     depth_ready_at: float = 0.0
     request_id: str | None = None
+    registration_inputs: SharedBoardInputs = field(default_factory=SharedBoardInputs)
 
 
 class BoardPipeline:
@@ -46,6 +48,25 @@ class BoardPipeline:
         self.early_joint_workers = early_joint_workers
         self._lock = threading.RLock()
         self._boards: dict[str, _Board] = {}
+        self._joint_jobs = set()
+
+    def _track_joint_job(self, future):
+        with self._lock:
+            self._joint_jobs.add(future)
+        def completed(done):
+            with self._lock:
+                self._joint_jobs.discard(done)
+        future.add_done_callback(completed)
+        return future
+
+    def drain_joint_jobs(self):
+        """After boards are gone, finish old 3D work before model reinitialization."""
+        with self._lock:
+            if self._boards:
+                raise RuntimeError("cannot drain joint jobs while boards are pending")
+            jobs = list(self._joint_jobs)
+        if jobs:
+            wait(jobs)
 
     @staticmethod
     def _completed(value):
@@ -100,7 +121,8 @@ class BoardPipeline:
                 elif phase in {"joint", "joint_measurement"} and isinstance(result, dict):
                     result.setdefault("timings", {}).update(timings)
                 return result
-        return pool.submit(invoke)
+        future = pool.submit(invoke)
+        return self._track_joint_job(future) if state is not None else future
 
     def submit_2d(self, req):
         board_id = str(req.get("board_id") or "")
@@ -310,9 +332,13 @@ class BoardPipeline:
             timings = {"matching_input_wait_ms": pair_wait}
             started = time.perf_counter()
             try:
-                future = self._submit_timed(self.registration_pool, "registration", timings,
-                    state.board_id, piece_id, state.request_id, self.detector.register_prepared_piece,
-                    piece_id, entry, state.depth, piece, state.depth_correction, state=state)
+                def is_current(board=state):
+                    with self._lock:
+                        return self._current(board)
+                future = self.detector.submit_registration(self.registration_pool, state.registration_inputs,
+                    piece_id, entry, state.depth, piece, state.depth_correction, timings,
+                    dict(board_id=state.board_id, piece_id=piece_id, request_id=state.request_id), is_current)
+                self._track_joint_job(future)
                 future.add_done_callback(lambda result, box=piece, source=entry, ts=timings, begin=started:
                     self._registered(state, box, source, ts, begin, result))
             except Exception as exc:
@@ -384,6 +410,10 @@ class BoardPipeline:
         if not self._current(state):
             return
         self._boards.pop(state.board_id)
+        try:
+            state.registration_inputs.close()
+        except Exception as error:
+            response = self._failure(state.board_id, "registration_shared_memory_cleanup_failed", str(error))
         if state.completion is not None and not state.completion.done():
             state.completion.set_result(response)
 

@@ -81,28 +81,43 @@ C# 方法和字段不增加。`SolderMeasurements[].Mask3DLocal` 是实际内缩
   "worker_budget": 80,
   "cpu_workers": 15,
   "registration_workers": 4,
+  "registration_affinity": {
+    "enabled": true,
+    "physical_cores": 4
+  },
   "joint_workers": 2,
   "early_joint_workers": 2,
   "instance_workers": 20
 }
 ```
 
-- `registration_workers`：独立配准池，执行3D平台掩码、粗配准和仿射；4路是待实测起点，不改变Powell、评分及停止条件。
+- `registration_workers`：正式流式配准的常驻进程数，同时限制父进程共享区准备线程数；4路是待实测起点。配准子进程执行3D平台掩码、粗配准和仿射，未改变Powell、评分及停止条件。正式流程没有thread模式或静默线程回退。
+- `registration_affinity.enabled`：Windows物理核分区，当前开启。读取真实物理核/SMT拓扑，优先选择EfficiencyClass较高的核；同核超线程整体分配。配准进程与主进程使用互不重叠的逻辑CPU集合。关闭该项仍使用进程配准，只取消核分区。
+- `registration_affinity.physical_cores`：保留给配准的物理核数，当前4；至少等于进程数，并且必须留下至少一个物理核给主进程。当前每个配准进程对应一个完整物理核；保留更多核时按进程均分。核不足、亲和性设置失败或多处理器组不支持时明确初始化失败，不猜CPU编号或静默降级。
 - `joint_workers`：独立后续池，只执行掩码映射、参考面、测高和结果整理；一片配准完成便可进入此池，不要求凑齐其它片。
 - `early_joint_workers`：全部2D诊断完成前，允许进入联合链路但尚未完成的片数上限，计数覆盖配准、测高和中间排队；不是配准线程数。独立配准池模式下可以大于单个池的并发数；旧共享模式仍校验不超过joint_workers。全部2D完成后由两个池各自限制并发。
-- `cpu_workers`：图像/深度输入准备和2D几何，不再占用该池等待独立配准和测高。
+- `cpu_workers`：图像/深度输入准备和2D几何，不占用该池等待配准进程或测高完成。
 - `instance_workers`：整个检测器共享的实例任务池，供实例映射、引线、焊脚和公开2D几何复用；不为每片另建一套。
-- `worker_budget`：桥接层独立池预算，包含CPU、GPU、postprocess、silver、registration、joint；别名池只算一次，不包括instance、Pitch和底层库内部线程。当前桥接池总额66；初始化响应的`threading.effective_workers`记录实际预算内总额。
+- `worker_budget`：父进程桥接线程池预算，包含CPU、GPU、postprocess、silver、registration共享区准备、joint；别名池只算一次，不包括配准子进程、instance、Pitch和底层库内部线程。当前父进程桥接池总额66，另有4个常驻配准进程；初始化响应的`threading.effective_workers`记录预算内线程总额。
 
-旧配置没有`registration_workers`时，配准池别名到joint池，不消耗额外预算，仍通过回调交接两个阶段；可用环境变量`BRIDGE_REGISTRATION_WORKERS`显式启用，JSON优先。新配置已独立启用。注册池不等待测高Future，测高池也不向自身提交片级父任务；关闭、失败或释放后，尚未执行的旧代3D任务会跳过。同步缓存整板及旧批量接口保留原调用方式，使用相同配准/测高函数，独立池调度作用于`BoardPipeline`正式流式入口。
+旧配置缺少`registration_workers`时，共享区准备池别名到joint池，不额外消耗父线程预算，进程数继承该数量；仍然执行进程配准。可用`BRIDGE_REGISTRATION_WORKERS`指定，JSON优先。旧配置缺少整个`registration_affinity`时不绑核，新配置已开启。准备线程仅复制/发布共享输入和异步投递，不等待子进程或测高Future；测高池不向自身提交片级父任务。
 
-修改线程参数后需要重新初始化；验证台配置变化会重建检测器。可先固定`joint_workers=2`，分别试`registration_workers=4/6/8`，再固定较优配准并发试`joint_workers=2/4`。比较整板完成时间和长尾，不仅比较单片仿射；检查矩阵、分区损失、掩码及测高结果一致。
+每板的补偿后深度只复制到共享内存一次，每片gray和平台mask各复制一次；子进程只接收共享区描述、当前片行范围和数值配置，不传模型、检测器、CUDA或整幅数组。一个全宽深度共享区供所有片只读，子进程计算输出独立持有。板失败/释放后不再开始后续测高；已经投递的进程工作可完成，最后一个真实进程Future结束前共享区不会被提前释放，取消公开Future也不能提前释放其输入。重载前排空旧代联合工作，关停/重载恢复原主进程CPU范围。
+
+初始化预先启动全部常驻进程并加载依赖，Windows使用基础解释器的pythonw.exe及虚拟环境配置，避免重定向启动器句柄错误与额外CMD；需要正常的Windows/Python3.10环境。每个子进程OpenCV/OMP/MKL/OpenBLAS均设为1，不加载Torch、YOLO或EfficientAD。启动失败或工作进程异常会明确报错，不回退线程；崩溃后需重新初始化。初始化快照`threading.registration_execution`记录worker PID、CPU集合、版本、实际OpenCV线程、未加载Torch、核分区以及启动耗时；每片`registration.registration_worker`记录执行worker的启动快照。请检查main_cpus与registration_cpus无交集。
+
+核分区仅约束本Bridge及其子进程，内存带宽、末级缓存和系统其它进程仍然共享，不承诺固定单片耗时。只作用于正式`BoardPipeline`流式入口；配准台、同步缓存整板和旧批量接口保持直接求解方式，复用同一函数，不是正式流程的备用thread模式。
+
+修改参数后需要重新初始化；验证台配置变化会重建检测器。先按4进程/4物理核、2路测高、early在途2片测试；增加进程时同步调整physical_cores且给主进程留核，再比较测高2/4路。每组整板预热1次，至少稳定测试3次。比较整板完成时间和长尾，不仅比较单片仿射；检查矩阵、分区损失、掩码及测高结果一致。仅比较算法结果时忽略timings、registration_worker等执行诊断字段。
 
 新增计时字段位于每片`timings`：
 
 |字段|含义|
 |---|---|
-|`registration_queue_ms` / `registration_phase_ms`|配准池排队 / 平台掩码+粗配准+仿射阶段墙钟|
+|`registration_queue_ms` / `registration_phase_ms`|提交到子进程开始的延迟（含准备、复制、IPC、入队）/ 子进程共享区挂接、平台掩码、粗配准及仿射墙钟|
+|`registration_dispatch_queue_ms` / `registration_shared_memory_ms`|父准备线程排队 / 本次共享区准备复制；均是registration_queue_ms的子项|
+|`registration_result_transfer_ms` / `registration_log_relay_ms`|子进程结束到父进程接收回调的延迟（含清理、传输和调度）/ 父进程转发诊断日志|
+|`registration_process_roundtrip_ms`|提交到父进程收到子进程结果，不含后续测高；与上面计时嵌套|
 |`joint_measurement_queue_ms` / `joint_measurement_phase_ms`|映射测高池排队 / 映射、测高和整理墙钟|
 |`joint_pipeline_ms`|本片提交配准到测高完成，包含两个队列与交接开销|
 |`joint_queue_ms`|兼容原字段，等于`registration_queue_ms`，不代表全部排队|

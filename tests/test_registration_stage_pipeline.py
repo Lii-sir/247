@@ -312,6 +312,29 @@ class RegistrationSchedulingTests(unittest.TestCase):
         self.assertEqual("joint_detection_failed", result["error"])
         self.assertIn("bad measurement", result["message"])
 
+    def test_released_board_work_drains_before_model_reload(self):
+        self.prepared()
+        gate, started, drained = self.gate(), threading.Event(), threading.Event()
+        original = self.detector.measure_registered_piece
+        def measure(*args):
+            started.set()
+            if not gate.wait(3):
+                raise TimeoutError("reload drain gate")
+            return original(*args)
+        self.detector.measure_registered_piece = measure
+        board = self.pipeline.submit_3d(dict(board_id="A"))
+        self.assertTrue(started.wait(2))
+        self.pipeline.release_board("A")
+        self.assertEqual("board_released", board.result(2)["error"])
+        thread = threading.Thread(target=lambda: (self.pipeline.drain_joint_jobs(), drained.set()))
+        thread.start()
+        try:
+            self.assertFalse(drained.wait(.05))
+        finally:
+            gate.set()
+            thread.join(3)
+        self.assertTrue(drained.is_set())
+
     def test_registration_submission_failure_completes_board(self):
         self.prepared()
         with patch.object(self.registration, "submit", side_effect=RuntimeError("registration pool unavailable")):

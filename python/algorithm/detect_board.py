@@ -770,22 +770,21 @@ class DetectBoard:
                                depth: np.ndarray, piece: Dict[str, Any],
                                pitch_correction: Dict[str, Any] | None = None) -> Dict[str, Any]:
         """Fit one piece's matrix without waiting for mapping or height work."""
-        y1, y2 = int(piece["y1"]), int(piece["y2"])
-        local_depth = depth[y1:y2]
-        depth_mask = timed_call("platform_mask_3d_ms", platform_mask_3d, local_depth, self.registration_config)
-        registration = timed_call("coarse_registration_ms", register_platform_masks,
-            entry["registration_mask"],
-            depth_mask,
-            self.registration_config,
-        )
-        registration = timed_call("affine_registration_ms", refine_affine_registration,
-            entry["gray_image"],
-            local_depth,
-            registration,
-            self.dynamic_affine_config,
-            context=affine_coordinate_context(entry["gray_image"].shape, local_depth.shape, pitch_correction),
-        )
-        return registration
+        from algorithm.registration_worker import register_arrays
+        return register_arrays(entry["gray_image"], entry["registration_mask"],
+            depth[int(piece["y1"]):int(piece["y2"])], self.registration_config,
+            self.dynamic_affine_config, pitch_correction,
+            operations=(platform_mask_3d, register_platform_masks, refine_affine_registration))
+
+    def submit_registration(self, preparation_pool, inputs, piece_id, entry, depth, piece,
+                            correction, timings, metadata, is_current):
+        """Formal streaming registration always executes in model-free processes."""
+        service = getattr(self, "registration_process", None)
+        if service is None:
+            raise RuntimeError("registration processes must be initialized before board detection")
+        return service.submit(preparation_pool, inputs, piece_id, entry, depth, piece,
+            correction, self.registration_config, self.dynamic_affine_config, timings,
+            metadata, is_current, log=self.log)
 
     def measure_registered_piece(self, piece_id: int, entry: Dict[str, Any],
                                  depth: np.ndarray, piece: Dict[str, Any],

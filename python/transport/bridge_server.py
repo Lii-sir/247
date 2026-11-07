@@ -38,6 +38,7 @@ class AlgorithmServer:
         self.silver_pool = None
         self.joint_pool = None
         self.registration_pool = None
+        self.registration_process = None
         self.gpu_pool = None
         self.pipeline = None
         self.threading_info = {}
@@ -76,7 +77,10 @@ class AlgorithmServer:
                 str(req.get("config_path") or "") or None,
             )
             settings = self._thread_settings(config)
+            if self.pipeline is not None and self.pipeline.has_pending:
+                raise RuntimeError("algorithm initialization requires an idle detector")
             if stage == "board":
+                self._stop_registration_process()
                 board = timed_call("init_board_import_and_construct_ms", self.get_board)
                 configure_gpu_workers = getattr(board, "configure_gpu_worker_count", None)
                 if callable(configure_gpu_workers):
@@ -86,6 +90,11 @@ class AlgorithmServer:
                 response = board.handle_init(req)
                 if response.get("ok"):
                     self._configure_thread_pools(settings, source="stage_config")
+                    try:
+                        self._configure_registration_process(settings)
+                    except Exception:
+                        board.release()
+                        raise
                     response["threading"] = self.threading_info
             elif stage == "2d":
                 if settings["gpu_workers"] > 1:
@@ -190,6 +199,13 @@ class AlgorithmServer:
             joint = cpu
         if registration_pool_shared:
             registration = joint
+        affinity = values_3d.get("registration_affinity", {"enabled": False})
+        if not isinstance(affinity, dict) or type(affinity.get("enabled", False)) is not bool:
+            raise ValueError("registration_affinity.enabled must be boolean")
+        affinity = dict(enabled=affinity.get("enabled", False), physical_cores=self._thread_count(
+            "registration_affinity.physical_cores", affinity.get("physical_cores", registration)))
+        if affinity["enabled"] and registration > affinity["physical_cores"]:
+            raise ValueError("registration_workers cannot exceed registration_affinity.physical_cores")
         early_joint = self._thread_count(
             "early_joint_workers", values_3d.get("early_joint_workers", joint)
         )
@@ -225,6 +241,7 @@ class AlgorithmServer:
             "joint_pool_shared": joint_pool_shared,
             "registration_workers": registration,
             "registration_pool_shared": registration_pool_shared,
+            "registration_affinity": affinity,
             "effective_workers": effective_total,
             "early_joint_workers": early_joint,
         }
@@ -301,6 +318,26 @@ class AlgorithmServer:
         }
         if self.pipeline is not None:
             self.pipeline.early_joint_workers = settings["early_joint_workers"]
+
+    def _configure_registration_process(self, settings):
+        """Initialize once per detector load, never lazily during a measured request."""
+        from algorithm.registration_process import RegistrationProcesses
+        self._stop_registration_process()
+        self.board.registration_process = None
+        self.threading_info["registration_execution"] = {"ready": False, "backend": "process"}
+        service = RegistrationProcesses(settings["registration_workers"], settings["registration_affinity"])
+        self.registration_process = service
+        self.board.registration_process = service
+        self.threading_info["registration_execution"] = dict(ready=True, **service.info)
+
+    def _stop_registration_process(self):
+        if self.registration_process is not None:
+            self.registration_process.close()
+            self.registration_process = None
+        if self.board is not None:
+            self.board.registration_process = None
+        if self.pipeline is not None:
+            self.pipeline.drain_joint_jobs()
 
     def handle_detect(self, req: Dict[str, Any]) -> Dict[str, Any]:
         stage = str(req.get("stage", "board")).lower()
@@ -506,10 +543,17 @@ class AlgorithmServer:
             pending = list(self._pending)
         if pending:
             wait(pending)
-        for pool in {id(pool): pool for pool in (
-                self.gpu_pool, self.silver_pool, self.postprocess_pool,
-                self.registration_pool, self.joint_pool, self.cpu_pool) if pool is not None}.values():
-            pool.shutdown(wait=True)
+        try:
+            for pool in {id(pool): pool for pool in (
+                    self.gpu_pool, self.silver_pool, self.postprocess_pool,
+                    self.registration_pool, self.joint_pool, self.cpu_pool) if pool is not None}.values():
+                pool.shutdown(wait=True)
+        finally:
+            if self.registration_process is not None:
+                self.registration_process.close()
+                self.registration_process = None
+                if self.board is not None:
+                    self.board.registration_process = None
 
     def run(self):
         self.log("python bridge concurrent protocol server started")

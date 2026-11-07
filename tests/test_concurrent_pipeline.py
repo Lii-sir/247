@@ -300,10 +300,15 @@ class ThreadBudgetTests(unittest.TestCase):
             server.board = fake
             try:
                 pipeline = server.get_pipeline()
-                response = server.handle_init_algorithm({
-                    "stage": "board",
-                    "config_text": json.dumps(config),
-                })
+                # This test deliberately clears all OS environment variables
+                # to isolate pool settings. Real spawn is covered by the
+                # process integration tests with a valid Windows environment.
+                with patch.object(server, "_configure_registration_process") as configure_process:
+                    response = server.handle_init_algorithm({
+                        "stage": "board",
+                        "config_text": json.dumps(config),
+                    })
+                configure_process.assert_called_once_with(server._thread_settings(config))
                 self.assertTrue(response["ok"], response)
                 self.assertEqual(response["threading"]["worker_budget"], 14)
                 self.assertEqual(response["threading"]["cpu_workers"], 7)
