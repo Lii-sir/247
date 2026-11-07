@@ -217,15 +217,15 @@ def build_flows():
     n('r-source','仿射评分准备','灰度阈值化；源2D再按preview_scale缩放',1,3,
       '原2D灰度>threshold_2d后变为0/1|源掩码按preview_scale做nearest缩放|目标depth>0保持原始3D分片画幅|两侧按仿射morphology_kernel_size闭运算|裁出所选R1/R2/R3目标掩码供评分复用',pool='joint',src=(R,'refine_affine_registration'),params=('dynamic_affine_3d.parameters',))
     n('r-initial','粗矩阵换算6参数初值','sx sy kxy kyx cx cy',1,4,
-      '矩阵线性项除preview_scale得到内部sx/sy/交叉项|内部参考点固定为缩小2D中的(1000,400)|cx/ cy是该参考点映到3D后的坐标|当前粗矩阵交叉项为0；未自动使用上次求解矩阵作初值|围绕本片初值建立scale/shear/translation边界',pool='joint',src=(R,'_affine_parameters_from_matrix'),params=('dynamic_affine_3d.parameters.scale_delta','dynamic_affine_3d.parameters.shear_limit','dynamic_affine_3d.parameters.translation_delta'))
+      '矩阵线性项除preview_scale得到内部sx/sy/交叉项|内部参考点固定为缩小2D中的(1000,400)|cx/ cy是该参考点映到3D后的坐标|默认使用粗配准；可选标定profile只复用线性四项，保留本片中心位置|始终保留原粗配准的scale/shear/translation边界，候选须在范围内且完整评分改善',pool='joint',src=(R,'_affine_parameters_from_matrix'),params=('dynamic_affine_3d.parameters.scale_delta','dynamic_affine_3d.parameters.shear_limit','dynamic_affine_3d.parameters.translation_delta'))
     n('r-score','单次评分','原生warpAffine → 区域差异 → 惩罚',1,5,
-      '由6参数生成缩小源→3D片局部仿射矩阵|full路径用原生warpAffine生成完整目标图|只比较选定评分框的二值不一致比例|分区等权平均，不按区域面积再加权|加penalty_weight×[(kxy/shear_limit)²+(kyx/shear_limit)²]|每次评分更新调用次数和累计评分耗时',pool='joint',src=(R,'refine_affine_registration'),times=('affine_score_total_ms',))
+      '由6参数生成缩小源→3D片局部仿射矩阵|full路径用原生warpAffine生成完整目标图|只比较选定评分框的二值不一致比例|分区等权平均，不按区域面积再加权|加penalty_weight×[(kxy/shear_limit)²+(kyx/shear_limit)²]|可启用精确6参数缓存，仅保留标量和各区损失；每个分辨率独立缓存并分别统计实际变换次数',pool='joint',src=(R,'refine_affine_registration'),times=('affine_score_total_ms',))
     n('r-powell','Powell方向搜索','单条优化链内串行依赖',1,6,
-      '依次沿各方向做有界线搜索|每次尝试参数都调用评分函数|后一方向使用前一方向更新后的参数|一轮可评分多次，maxiter不是评分次数|当前没有并行候选筛选或多起点模块',pool='joint',src=(R,'refine_affine_registration'))
+      '依次沿各方向做有界线搜索|每次尝试参数都调用评分函数|后一方向使用前一方向更新后的参数|一轮可评分多次，maxiter不是评分次数|当前没有并行候选搜索；可选multiscale按低分辨率搜索→完整精修顺序执行，默认关闭',pool='joint',src=(R,'refine_affine_registration'))
     n('r-stop','是否停止优化','改善足够小 / 迭代上限 / 数值异常',1,7,
-      '整轮改善按ftol判定：2×(旧损失−新损失) ≤ ftol×(abs旧+abs新)+极小量|达到maxiter也停止|xtol用于方向搜索精度，不直接表示像素误差|当前未接入maxfev或毫秒超时|触及参数边界本身不会自动回退',pool='joint',kind='decision',src=(R,'refine_affine_registration'),params=('dynamic_affine_3d.parameters.maxiter','dynamic_affine_3d.parameters.xtol','dynamic_affine_3d.parameters.ftol'))
+      '整轮改善按ftol判定：2×(旧损失−新损失) ≤ ftol×(abs旧+abs新)+极小量|达到maxiter也停止|xtol用于方向搜索精度，不直接表示像素误差|maxfev可限制每级调用，total_maxfev限制总调用；均默认null，无毫秒超时|单级触边不自动回退；多级精修窗口触边会尝试原范围回退，总预算耗尽时明确记录未运行',pool='joint',kind='decision',src=(R,'refine_affine_registration'),params=('dynamic_affine_3d.parameters.maxiter','dynamic_affine_3d.parameters.xtol','dynamic_affine_3d.parameters.ftol'))
     n('r-verdict','完整评分与最终质量标记','独立于优化器停止状态',1,8,
-      '对最终参数再评分并输出各区损失|换回原始2D→3D片局部2×3矩阵及3×3表示|矩阵全部有限且最终损失≤max_score才affine_valid|未配置max_score时默认0.25|不要求optimizer.success=True；迭代触顶仍可能质量达标|保留nfev/次数/均耗/停止原因供排查',pool='joint',src=(R,'refine_affine_registration'),times=('affine_registration_ms',))
+      '对最终参数再评分并输出各区损失|换回原始2D→3D片局部2×3矩阵及3×3表示|矩阵全部有限且最终损失≤max_score才affine_valid|未配置max_score时默认0.25|不要求optimizer.success=True；迭代触顶仍可能质量达标|记录缓存/真实warp/逐级nfev/均耗/预算/回退；预算截断时保留本阶段最佳有限试探，最终仍用完整评分',pool='joint',src=(R,'refine_affine_registration'),times=('affine_registration_ms',))
     n('r-map','逐实例并行映射','共享只读H；独立目标缓冲',1,9,
       '原crop局部掩码先加crop左上角变成原图坐标|实际矩阵为H_full×T_crop_to_full|nearest映射到完整片局部深度画幅|各实例提取2D/3D几何，字典和输出由任务独立持有|父线程按原实例顺序汇总|一片左右及全部类别都使用同一个矩阵',pool='instance',kind='parallel',src=(R,'align_crop_mask_to_depth'),times=('mask_alignment_ms','instance_alignment_work_ms'))
     n('r-height','进入参考面与全实例测高','已对齐实例 + 深度片',1,10,
