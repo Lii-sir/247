@@ -64,14 +64,14 @@
         "end2end": false
       },
       "threading": {
-        "cpu_process_workers": 8,
+        "cpu_process_workers": 2,
         "cpu_process_affinity": {
           "enabled": true,
-          "physical_cores": 8
+          "physical_cores": 2
         },
-        "postprocess_workers": 15,
-        "silver_workers": 15,
-        "gpu_workers": 15
+        "postprocess_workers": 4,
+        "silver_workers": 2,
+        "gpu_workers": 2
       }
     }
   },
