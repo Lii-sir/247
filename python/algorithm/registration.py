@@ -575,6 +575,11 @@ class _AffineScore:
         self.score_mode, self.cache_enabled = score_mode, cache_enabled
         self.grids = [_affine_roi_grid(box) for box in rois] if score_mode == "roi" else None
         self.targets = [target[y0:y1,x0:x1] for x0,y0,x1,y1 in rois]
+        # A scorer belongs to one piece/resolution and Powell calls it serially.
+        # Keep these private: different pieces and multiscale levels must not
+        # overwrite each other's warp or comparison output.
+        self._warp_buffer = np.empty(target.shape, dtype=source.dtype) if score_mode == "full" else None
+        self._difference_buffers = [np.empty(item.shape, dtype=np.bool_) for item in self.targets]
         self.cache = {}
         self.calls = self.hits = self.misses = self.warps = 0
         self.seconds = self.compute_seconds = 0.
@@ -600,10 +605,10 @@ class _AffineScore:
                 patches = _warp_affine_rois(self.source, matrix, self.rois, self.grids, self.target.shape[1])
             else:
                 warped = cv2.warpAffine(self.source, matrix, (self.target.shape[1],self.target.shape[0]),
-                    flags=cv2.INTER_NEAREST,borderMode=cv2.BORDER_CONSTANT,borderValue=0)
+                    dst=self._warp_buffer, flags=cv2.INTER_NEAREST,borderMode=cv2.BORDER_CONSTANT,borderValue=0)
                 patches = (warped[y0:y1,x0:x1] for x0,y0,x1,y1 in self.rois)
-            zones = tuple(float(np.count_nonzero(patch != target) / target.size)
-                          for patch,target in zip(patches,self.targets))
+            zones = tuple(float(np.count_nonzero(np.not_equal(patch, target, out=difference)) / target.size)
+                          for patch,target,difference in zip(patches,self.targets,self._difference_buffers))
             penalty = self.penalty_weight * ((parameters[2]/max(self.shear_limit,1e-6))**2
                                             +(parameters[3]/max(self.shear_limit,1e-6))**2)
             value = float(np.mean(zones)+penalty)

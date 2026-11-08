@@ -248,7 +248,7 @@ def build_flows():
     n('r-initial','粗矩阵换算6参数初值','sx sy kxy kyx cx cy',1,4,
       '矩阵线性项除preview_scale得到内部sx/sy/交叉项|内部参考点固定为缩小2D中的(1000,400)|cx/ cy是该参考点映到3D后的坐标|默认使用粗配准；可选标定profile只复用线性四项，保留本片中心位置|始终保留原粗配准的scale/shear/translation边界，候选须在范围内且完整评分改善',pool='joint_measurement_process',src=(R,'_affine_parameters_from_matrix'),params=('dynamic_affine_3d.parameters.scale_delta','dynamic_affine_3d.parameters.shear_limit','dynamic_affine_3d.parameters.translation_delta'))
     n('r-score','单次评分','原生warpAffine → 区域差异 → 惩罚',1,5,
-      '由6参数生成缩小源→3D片局部仿射矩阵|full路径用原生warpAffine生成完整目标图|只比较选定评分框的二值不一致比例|分区等权平均，不按区域面积再加权|加penalty_weight×[(kxy/shear_limit)²+(kyx/shear_limit)²]|可启用精确6参数缓存，仅保留标量和各区损失；每个分辨率独立缓存并分别统计实际变换次数',pool='joint_measurement_process',src=(R,'refine_affine_registration'),times=('affine_score_total_ms',))
+      '由6参数生成缩小源→3D片局部仿射矩阵|full路径用原生warpAffine写入本片预分配目标缓冲，保持nearest与零边界|复用各评分框布尔缓冲，比较二值不一致比例|分区等权平均，不按区域面积再加权|加penalty_weight×[(kxy/shear_limit)²+(kyx/shear_limit)²]|可启用精确6参数缓存，仅保留标量和各区损失；各片各分辨率独立持有缓存及缓冲',pool='joint_measurement_process',src=(R,'refine_affine_registration'),times=('affine_score_total_ms',))
     n('r-powell','Powell方向搜索','单条优化链内串行依赖',1,6,
       '依次沿各方向做有界线搜索|每次尝试参数都调用评分函数|后一方向使用前一方向更新后的参数|一轮可评分多次，maxiter不是评分次数|当前没有并行候选搜索；可选multiscale按低分辨率搜索→完整精修顺序执行，默认关闭',pool='joint_measurement_process',src=(R,'refine_affine_registration'))
     n('r-stop','是否停止优化','改善足够小 / 迭代上限 / 数值异常',1,7,
