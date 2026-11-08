@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 from PIL import Image
@@ -18,13 +19,15 @@ lab = importlib.util.module_from_spec(spec);spec.loader.exec_module(lab)
 
 
 class FakeClient:
-    def __init__(self, *args):
+    def __init__(self, *args, **kwargs):
+        self.env_overrides=kwargs.get('env_overrides',{})
         self.process=SimpleNamespace(pid=123,poll=lambda:None)
         self.timeline=[];self.log=io.StringIO();self.requests=[];self.closed=False
         self.condition=threading.Condition();self.pieces={};self.released=set();self.fail_piece=None
-    def request(self, q, timeout):
+    def request(self, q, timeout, *, on_sent=None):
         with self.condition:
             self.requests.append(q);self.timeline.append({'cmd':q['cmd'],'piece_id':q.get('piece_id'),'duration_ms':1})
+            if on_sent is not None:on_sent('fake-'+str(len(self.requests)),time.perf_counter())
             board=q.get('board_id');cmd=q['cmd']
             response=dict(ok=True,cmd=cmd,board_id=board,timings={})
             if cmd=='detect_2d_piece':
@@ -38,7 +41,7 @@ class FakeClient:
             if cmd=='release_board':
                 self.released.add(board);self.pieces.pop(board,None);self.condition.notify_all()
             return response
-    def close(self):self.closed=True
+    def close(self, *, force=False):self.closed=True
 
 
 def init_request(*args):
@@ -77,8 +80,8 @@ class ValidationTests(unittest.TestCase):
 
     def make_runner(self, fail=None):
         clients=[]
-        def factory(*args):
-            c=FakeClient();c.fail_piece=fail;clients.append(c);return c
+        def factory(*args, **kwargs):
+            c=FakeClient(**kwargs);c.fail_piece=fail;clients.append(c);return c
         def mapper(stack,path,kind,piece_id=None):
             return dict(shm_name=path.name,**({'piece_id':piece_id,'image_size':3} if kind=='2d' else {'data_size':3}))
         def reporter(doc,path,**kwargs):path.write_text('<html>report</html>',encoding='utf-8')

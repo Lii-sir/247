@@ -5,10 +5,14 @@ async function api(url,options){const r=await fetch(url,options),d=await r.json(
 function status(text,error=false){$('progress').textContent=text;$('progress').className=error?'error':'';}
 function assess(){
  const d=Pairing.check(files,$('board').value,$('mode').value,config?.piece_count||0);
- $('checks').textContent=d.message;$('checks').className=d.ok?'good':'bad';$('run').disabled=!config||!d.ok||busy||uploading;
+ const paced=$('submissionMode').value==='paced',raw=$('requestInterval').value.trim(),interval=Number(raw),max=config?.max_request_interval_ms??3600000;
+ const valid=!paced||(raw!==''&&Number.isFinite(interval)&&interval>=0&&interval<=max);
+ $('checks').textContent=valid?d.message:'请求间隔须为0～'+max+'毫秒的有限数值';$('checks').className=d.ok&&valid?'good':'bad';$('run').disabled=!config||!d.ok||!valid||busy||uploading;
+ $('requestInterval').disabled=busy||uploading||!paced;
+ $('submissionHint').textContent=paced?'按片号升序发送2D'+($('mode').value==='joint'?'，最后发送3D':'')+'；不等待上一张检测完成。间隔按相邻请求开始发送计，0ms仍保持顺序；实际发送时刻保存到结果JSON。':'并发发送所选板的请求，间隔设置不生效。';
  $('demo').disabled=busy||uploading;$('clear').disabled=busy||uploading;
- for(const id of ['upload2','upload3','board','mode'])$(id).disabled=busy||uploading;
- return d;
+ for(const id of ['upload2','upload3','board','mode','submissionMode'])$(id).disabled=busy||uploading;
+ return {...d,ok:d.ok&&valid};
 }
 function boardList(){const old=$('board').value;$('board').replaceChildren();for(const id of Pairing.boards(files)){const o=document.createElement('option');o.value=id;o.textContent='板 '+id;$('board').append(o);}if(Pairing.boards(files).includes(old))$('board').value=old;else $('board').value=Pairing.boards(files)[0]||'';$('counts').textContent='共 '+files.length+'个文件 · '+Pairing.boards(files).length+'个已编号板号'+(files.some(r=>!Pairing.board(r.board_id))?' · 有文件尚未指定板号':'');assess();}
 function renderFiles(){
@@ -31,17 +35,19 @@ for(const [id,kind] of [['upload2','2d'],['upload3','3d']])$(id).onchange=async 
 $('demo').onclick=()=>{files=structuredClone(config.samples);revision++;renderFiles();status('项目旧命名样本明确归为 demo 板，片号为1～'+config.piece_count+'，可手动修改。');};
 $('clear').onclick=()=>{files=[];revision++;renderFiles();status('清单已清空，磁盘文件与已生成报告保留。');};
 $('board').onchange=$('mode').onchange=assess;
+$('requestInterval').value=$('requestInterval').value||'100';
+$('submissionMode').onchange=$('requestInterval').oninput=()=>{revision++;assess();};
 function links(id){for(const [key,file] of [['reportLink','report.html'],['jsonLink','result.json'],['csvLink','timings.csv'],['logLink','python.log']])$(key).href='/runs/'+id+'/'+file;$('links').hidden=false;}
 function showResult(id,job){
  links(id);$('resultEmpty').hidden=true;$('report').hidden=false;$('report').src='/runs/'+id+'/report.html';
  const r=job.result;
- $('summary').textContent=r?'板 '+r.board_id+' · '+(r.ok?(r.product_is_ok?'检测完成 · OK':'检测完成 · NG（算法判定）'):'检测请求失败')+' · '+r.pieces+'片 · '+(r.total_wall_ms/1000).toFixed(2)+'秒 · '+(r.model_reused?'复用已加载模型':'本次初始化模型')+(r.error?'\n'+r.error:'')+'\n输出：'+r.output_dir:'验证失败：'+(job.error||'未知错误');
+ $('summary').textContent=r?'板 '+r.board_id+' · '+(r.ok?(r.product_is_ok?'检测完成 · OK':'检测完成 · NG（算法判定）'):'检测请求失败')+' · '+r.pieces+'片 · '+(r.total_wall_ms/1000).toFixed(2)+'秒 · '+(r.model_reused?'复用已加载模型':'本次初始化模型')+(r.submission_mode==='paced'?' · 按间隔提交 '+r.request_interval_ms+'ms':r.submission_mode==='concurrent'?' · 并发提交':'')+(r.error?'\n'+r.error:'')+'\n输出：'+r.output_dir:'验证失败：'+(job.error||'未知错误');
 }
 async function history(){const list=await api('/api/history');const old=$('history').value;$('history').replaceChildren();const blank=document.createElement('option');blank.value='';blank.textContent='历史验证记录';$('history').append(blank);for(const j of list){const o=document.createElement('option');o.value=j.id;o.textContent='板 '+j.board_id+' · '+(j.status==='done'?'完成':j.status==='failed'?'失败':'运行中');$('history').append(o);}if(list.some(j=>j.id===old))$('history').value=old;}
 $('history').onchange=async()=>{if(!$('history').value)return;try{const id=$('history').value,j=await api('/api/jobs/'+id);if(j.status==='running'){status('该记录仍在运行');return;}showResult(id,j);status('正在查看历史结果；当前文件清单不会改变该报告。');}catch(e){status(e.message,true);}};
 $('run').onclick=async()=>{
  if(!assess().ok||busy||uploading||!config)return;
- const snapshot=revision,request={files:structuredClone(files),board_id:$('board').value,mode:$('mode').value};
+ const snapshot=revision,request={files:structuredClone(files),board_id:$('board').value,mode:$('mode').value,submission_mode:$('submissionMode').value,request_interval_ms:$('submissionMode').value==='paced'?Number($('requestInterval').value):0};
  busy=true;renderFiles();assess();status('正在提交验证…');
  try{
   const {id}=await api('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(request)});

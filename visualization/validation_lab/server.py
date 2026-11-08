@@ -7,6 +7,8 @@ from contextlib import ExitStack
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
+import os
 from pathlib import Path
 import re
 import shutil
@@ -22,6 +24,7 @@ from PIL import Image
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 SERVICE_NAME = "detection-validation-lab"
+MAX_REQUEST_INTERVAL_MS = 3600000
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(ROOT / "python"))
 from detect_and_view import ProtocolClient, algorithm_request, mapped_file, save_timing_csv
@@ -42,6 +45,16 @@ def guess_numbers(name, kind):
         return dict(board_id=stem, piece_id=None)
     match = re.fullmatch(r"(.+)_(\d+)", stem)
     return dict(board_id=match[1], piece_id=int(match[2])) if match else dict(board_id="", piece_id=None)
+
+
+def submission_options(submission_mode="concurrent", request_interval_ms=0):
+    if not isinstance(submission_mode, str) or submission_mode not in {"concurrent", "paced"}:
+        raise ValueError("提交模式须为concurrent或paced")
+    if (isinstance(request_interval_ms, bool) or not isinstance(request_interval_ms, (int, float))
+            or not math.isfinite(request_interval_ms) or not 0 <= request_interval_ms <= MAX_REQUEST_INTERVAL_MS):
+        raise ValueError(f"请求间隔须为0～{MAX_REQUEST_INTERVAL_MS}毫秒的有限数值")
+    return dict(submission_mode=submission_mode,
+                request_interval_ms=float(request_interval_ms) if submission_mode == "paced" else 0.)
 
 
 def board_inputs(rows, board_id, mode, count):
@@ -120,10 +133,11 @@ class Runner:
             self._stopping.set()
             self.close(force=True)
 
-    def _ensure(self, request, progress):
+    def _ensure(self, request, progress, *, board_timeout_seconds=None):
         stamps = {p: [Path(p).stat().st_mtime_ns, Path(p).stat().st_size]
                   for p in request.get("model_path", {}).values()}
-        fingerprint = hashlib.sha256(json.dumps([request, stamps], sort_keys=True).encode()).hexdigest()
+        overrides = {"BRIDGE_BOARD_TIMEOUT_SECONDS": str(board_timeout_seconds)} if board_timeout_seconds is not None else {}
+        fingerprint = hashlib.sha256(json.dumps([request, stamps, overrides], sort_keys=True).encode()).hexdigest()
         with self._state_lock:
             if self._stopping.is_set():
                 raise RuntimeError("验证台正在停止")
@@ -131,7 +145,8 @@ class Runner:
                 return dict(model_reused=True, process_pid=self.client.process.pid)
             self.close()
             progress("初始化模型（首次需要加载CUDA模型）")
-            self.client = self.client_factory(Path(sys.executable), ROOT / "python/transport/bridge_server.py", self.folder / "python.log")
+            args = (Path(sys.executable), ROOT / "python/transport/bridge_server.py", self.folder / "python.log")
+            self.client = self.client_factory(*args, **({"env_overrides": overrides} if overrides else {}))
             client = self.client
         for req in ({"cmd": "init"}, request):
             reply = client.request(req, 900)
@@ -143,16 +158,23 @@ class Runner:
             self.fingerprint = fingerprint
         return dict(model_reused=False, process_pid=client.process.pid)
 
-    def run(self, rows, board_id, mode, count, folder, progress):
+    def run(self, rows, board_id, mode, count, folder, progress, *,
+            submission_mode="concurrent", request_interval_ms=0):
+        options = submission_options(submission_mode, request_interval_ms)
         board_id, images, depth = board_inputs(rows, board_id, mode, count)
         folder = Path(folder)
         envelope = dict(viewer_version=1, mode="stream", board_id=board_id,
                         title=f"板 {board_id} · {'联合检测' if mode == 'joint' else '2D验证'}",
                         images_2d=[dict(piece_id=r["piece_id"], path=r["path"], name=r.get("name")) for r in images],
-                        responses_2d=[], response={}, warnings=[])
+                        responses_2d=[], response={}, warnings=[],
+                        submission={**options, "requests": [], "planned_count": len(images)+bool(depth),
+                                    "interval_basis": "minimum_start_to_start_no_response_wait"})
         if depth:
             envelope["image_3d"] = depth["path"]
-        started, startup = time.perf_counter(), {}
+        envelope["title"] += (f" · 按间隔提交 {options['request_interval_ms']:g}ms"
+                              if options["submission_mode"] == "paced" else " · 并发提交")
+        started, startup, client, timeline_start, release_sent = time.perf_counter(), {}, None, 0, False
+        first_error = None
         try:
             if self._stopping.is_set():
                 raise RuntimeError("验证台正在停止")
@@ -185,21 +207,50 @@ class Runner:
                 init["config_text"] = json.dumps(config, ensure_ascii=True)
             height = config["height_measurement_3d"]["parameters"]
             production_pitch_parameters(config, float(height.get("gray_offset", 32768)), float(height.get("vertical_resolution_mm", .00105)))
-            startup = self._ensure(init, progress)
-            timeline_start = len(self.client.timeline)
+            cache_timeout = float(os.environ.get("BRIDGE_BOARD_TIMEOUT_SECONDS", "90"))
+            if not math.isfinite(cache_timeout) or cache_timeout <= 0:
+                raise ValueError("BRIDGE_BOARD_TIMEOUT_SECONDS须为正的有限数值")
+            schedule_span = (len(images)+bool(depth)-1)*options["request_interval_ms"]/1000
+            needed_timeout = max(cache_timeout, schedule_span+30.) if schedule_span > 0 else cache_timeout
+            startup = self._ensure(init, progress,
+                board_timeout_seconds=needed_timeout if needed_timeout > cache_timeout else None)
+            envelope["submission"]["board_cache_timeout_seconds"] = needed_timeout
+            with self._state_lock:
+                if self._stopping.is_set():
+                    raise RuntimeError("验证台正在停止")
+                client = self.client
+            timeline_start = len(client.timeline)
             progress("准备共享内存")
             with ExitStack() as stack, ThreadPoolExecutor(max_workers=min(len(images)+1, 16)) as pool:
                 inputs = [(r, self.mapper(stack, Path(r["path"]), "2d", r["piece_id"])) for r in images]
-                futures = {}
-                if depth:
-                    desc = self.mapper(stack, Path(depth["path"]), "3d")
-                    future = pool.submit(self.client.request, dict(cmd="detect_3d_board", stage="3d", board_id=board_id, **desc), 900)
-                    futures[future] = None
-                for row, desc in inputs:
-                    future = pool.submit(self.client.request, dict(cmd="detect_2d_piece", stage="2d", board_id=board_id, **desc), 900)
-                    futures[future] = row["piece_id"]
-                finished, release_sent, first_error = 0, False, None
-                for future in as_completed(futures):
+                depth_request = (dict(cmd="detect_3d_board", stage="3d", board_id=board_id,
+                    **self.mapper(stack, Path(depth["path"]), "3d")) if depth else None)
+                requests = [dict(cmd="detect_2d_piece", stage="2d", board_id=board_id, **desc) for row, desc in inputs]
+                if options["submission_mode"] == "paced":
+                    if depth_request:
+                        requests.append(depth_request)
+                elif depth_request:
+                    requests.insert(0, depth_request)
+                futures, consumed = {}, set()
+                finished = 0
+                submission_started = time.perf_counter()
+                submission_lock, last_sent = threading.Lock(), [None]
+
+                def release():
+                    nonlocal release_sent
+                    if release_sent or self._stopping.is_set():
+                        return
+                    release_sent = True
+                    try:
+                        client.request(dict(cmd="release_board", board_id=board_id), 15)
+                    except Exception:
+                        self.close(force=True)
+
+                def consume(future):
+                    nonlocal finished, first_error
+                    if future in consumed:
+                        return
+                    consumed.add(future)
                     reply = future.result()
                     piece = futures[future]
                     if piece is None:
@@ -208,11 +259,70 @@ class Runner:
                         envelope["responses_2d"].append(reply)
                         finished += 1
                     progress(f"已完成2D {finished}/{len(images)}" + (" · 等待/处理整板3D" if depth else ""))
-                    if not reply.get("ok") and not release_sent:
+                    if not reply.get("ok") and first_error is None:
                         details = [str(reply[k]) for k in ("error", "message") if reply.get(k)]
                         first_error = (f"第{piece}片：" if piece is not None else "整板3D：") + "；".join(dict.fromkeys(details) or ["请求失败"])
-                        self.client.request(dict(cmd="release_board", board_id=board_id), 15)
-                        release_sent = True
+                        release()
+
+                def collect_ready():
+                    for future in list(futures):
+                        if future.done() and future not in consumed:
+                            consume(future)
+
+                def wait_until(deadline, sent_event=None, sender=None):
+                    while True:
+                        if self._stopping.is_set():
+                            raise RuntimeError("验证台正在停止")
+                        collect_ready()
+                        if first_error is not None:
+                            return False
+                        remaining = deadline-time.perf_counter() if deadline is not None else .05
+                        if sent_event is not None:
+                            if sent_event.is_set():
+                                return True
+                            if sender.done():
+                                sender.result()
+                                raise RuntimeError("请求未确认发送")
+                        elif remaining <= 0:
+                            return True
+                        if sent_event is not None:
+                            sent_event.wait(.01)
+                        else:
+                            self._stopping.wait(min(.05, max(.001, remaining)))
+
+                previous_sent = None
+                try:
+                    for request in requests:
+                        if options["submission_mode"] == "paced" and previous_sent is not None:
+                            if not wait_until(previous_sent+options["request_interval_ms"]/1000):
+                                break
+                        collect_ready()
+                        if first_error is not None:
+                            break
+                        if self._stopping.is_set():
+                            raise RuntimeError("验证台正在停止")
+                        event, sent_at = threading.Event(), []
+                        def on_sent(request_id, sent, req=request, event=event, sent_at=sent_at):
+                            with submission_lock:
+                                records = envelope["submission"]["requests"]
+                                records.append(dict(order=len(records)+1, cmd=req["cmd"], piece_id=req.get("piece_id"),
+                                    request_id=request_id, sent_ms=round((sent-submission_started)*1000, 3),
+                                    gap_ms=round((sent-last_sent[0])*1000, 3) if last_sent[0] is not None else None))
+                                last_sent[0] = sent
+                                sent_at.append(sent)
+                            event.set()
+                        future = pool.submit(client.request, request, 900, on_sent=on_sent)
+                        futures[future] = request.get("piece_id")
+                        if options["submission_mode"] == "paced":
+                            if not wait_until(None, event, future):
+                                break
+                            previous_sent = sent_at[0]
+                            progress(f"已发送 {'整板3D' if request['cmd']=='detect_3d_board' else '2D第'+str(request['piece_id'])+'片'} · 间隔{options['request_interval_ms']:g}ms")
+                    for future in as_completed(futures):
+                        consume(future)
+                except Exception:
+                    release()
+                    raise
                 envelope["responses_2d"].sort(key=lambda r: r.get("piece_id", 0))
             if mode == "2d":
                 envelope["response"] = dict(ok=all(r.get("ok") for r in envelope["responses_2d"]),
@@ -221,13 +331,15 @@ class Runner:
                 envelope["response"]["ok"] = False
                 envelope["response"]["error"] = first_error
                 envelope["response"]["message"] = "验证因上述错误停止；缓存释放属于后续清理。"
-            envelope["timeline"] = self.client.timeline[timeline_start:]
         except Exception as exc:
-            envelope["response"] = dict(ok=False, board_id=board_id, error=str(exc))
+            envelope["response"] = dict(ok=False, board_id=board_id, error=first_error or str(exc))
         finally:
-            if self.client is not None and not self._stopping.is_set():
+            if client is not None:
+                envelope["timeline"] = client.timeline[timeline_start:]
+            envelope["submission"]["aborted"] = len(envelope["submission"]["requests"]) < envelope["submission"]["planned_count"]
+            if client is not None and not release_sent and not self._stopping.is_set():
                 try:
-                    self.client.request(dict(cmd="release_board", board_id=board_id), 15)
+                    client.request(dict(cmd="release_board", board_id=board_id), 15)
                 except (OSError, RuntimeError, TimeoutError):
                     self.close()
         envelope["benchmark"] = dict(total_wall_ms=round((time.perf_counter()-started)*1000, 2), **startup)
@@ -246,6 +358,7 @@ class Runner:
         board = envelope["response"].get("results_board", {})
         product = board.get("is_ok") if mode == "joint" else all(r.get("results_2d", {}).get("is_ok") is True for r in envelope["responses_2d"])
         return dict(ok=ok, product_is_ok=product if ok else None, board_id=board_id,
+                    **options,
                     pieces=len(envelope["responses_2d"]), model_reused=startup.get("model_reused", False),
                     error=envelope["response"].get("error"), output_dir=str(folder),
                     total_wall_ms=envelope["benchmark"]["total_wall_ms"])
@@ -281,7 +394,8 @@ def defaults():
                for i, p in enumerate(sorted((ROOT / "demodatasets/2D").glob("*.png")), 1)]
     samples += [dict(kind="3d", name=p.name, path=str(p), board_id="demo", piece_id=None)
                 for p in sorted((ROOT / "demodatasets/3D").glob("*.png"))]
-    return dict(piece_count=count, samples=samples, pitch=cfg.get("smartray_pitch_3d", {}).get("parameters", {}))
+    return dict(piece_count=count, samples=samples, pitch=cfg.get("smartray_pitch_3d", {}).get("parameters", {}),
+                max_request_interval_ms=MAX_REQUEST_INTERVAL_MS)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -354,6 +468,9 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path != "/api/run":
                 return self.send(404, {"error": "接口不存在"})
             request = json.loads(self.rfile.read(size))
+            if not isinstance(request, dict):
+                raise ValueError("验证请求须为JSON对象")
+            options = submission_options(request.get("submission_mode", "concurrent"), request.get("request_interval_ms", 0))
             count = defaults()["piece_count"]
             board, images, depth = board_inputs(request.get("files"), request.get("board_id"), request.get("mode"), count)
             rows = images + ([depth] if depth else [])
@@ -370,7 +487,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.server.jobs[key].update(values)
             def execute():
                 try:
-                    result = self.server.runner.run(rows, board, request["mode"], count, folder, lambda phase:update(phase=phase))
+                    result = self.server.runner.run(rows, board, request["mode"], count, folder,
+                        lambda phase:update(phase=phase), **options)
                     update(status="done" if result["ok"] else "failed", result=result, error=result.get("error"))
                 except Exception as exc:
                     update(status="failed", error=str(exc))

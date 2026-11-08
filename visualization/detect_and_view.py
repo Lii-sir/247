@@ -25,14 +25,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ProtocolClient:
-    def __init__(self, python: Path, server: Path, log_path: Path):
+    def __init__(self, python: Path, server: Path, log_path: Path, *, env_overrides=None):
         python = Path(python)
         if python.name.casefold() == "pythonw.exe":
             # The UI can run without a console; the protocol worker still
             # needs Python's standard streams, redirected to our private pipes.
             python = python.with_name("python.exe")
         self.log = log_path.open("w", encoding="utf-8")
-        env = {**os.environ, "PYTHONUTF8": "1", "PYTHONDONTWRITEBYTECODE": "1"}
+        env = {**os.environ, **(env_overrides or {}), "PYTHONUTF8": "1", "PYTHONDONTWRITEBYTECODE": "1"}
         try:
             self.process = subprocess.Popen(
                 [str(python), "-u", str(server)], cwd=str(server.parent),
@@ -88,7 +88,7 @@ class ProtocolClient:
             except queue.Full:
                 pass
 
-    def request(self, value: dict, timeout: float) -> dict:
+    def request(self, value: dict, timeout: float, *, on_sent=None) -> dict:
         request_id = uuid.uuid4().hex
         request = {**value, "request_id": request_id}
         waiter: queue.Queue[dict | BaseException] = queue.Queue(maxsize=1)
@@ -101,6 +101,8 @@ class ProtocolClient:
                 sent = time.perf_counter()
                 self.process.stdin.write(json.dumps(request, ensure_ascii=True) + "\n")
                 self.process.stdin.flush()
+                if on_sent is not None:
+                    on_sent(request_id, sent)
         except BaseException:
             with self.pending_lock:
                 self.pending.pop(request_id, None)
