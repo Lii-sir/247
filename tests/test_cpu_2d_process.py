@@ -213,7 +213,7 @@ class CpuPoolPartitionTests(unittest.TestCase):
                 server.board = FakeDetector()
                 available, starts, stops = list(range(12)), [], []
                 def factory(role):
-                    def create(count, affinity):
+                    def create(count, affinity, **kwargs):
                         original = list(available)
                         assigned = original[:count] if affinity["enabled"] else original
                         if affinity["enabled"]:
@@ -237,6 +237,7 @@ class CpuPoolPartitionTests(unittest.TestCase):
                 try:
                     with patch("algorithm.registration_process.RegistrationProcesses", side_effect=factory("registration")), \
                             patch("algorithm.cpu_2d_process.Cpu2DProcesses", side_effect=factory("cpu_2d")), \
+                            patch("algorithm.joint_process.JointMeasurementProcesses", side_effect=factory("joint_measurement")), \
                             patch("algorithm.cpu_partition.current_cpus", side_effect=lambda: list(available)):
                         server._configure_cpu_processes(settings)
                     reg = server.threading_info["registration_execution"]["workers"][0]["cpu_ids"]

@@ -40,6 +40,7 @@ class AlgorithmServer:
         self.registration_pool = None
         self.registration_process = None
         self.cpu_2d_process = None
+        self.joint_measurement_process = None
         self._cpu_process_order = []
         self.gpu_pool = None
         self.pipeline = None
@@ -217,6 +218,14 @@ class AlgorithmServer:
             "cpu_process_affinity.physical_cores", raw_cpu_affinity.get("physical_cores", cpu_2d)))
         if cpu_affinity["enabled"] and cpu_2d > cpu_affinity["physical_cores"]:
             raise ValueError("cpu_process_workers cannot exceed cpu_process_affinity.physical_cores")
+        raw_joint_affinity = values_3d.get("joint_affinity", {"enabled": affinity["enabled"]})
+        if not isinstance(raw_joint_affinity, dict) or type(raw_joint_affinity.get("enabled", False)) is not bool:
+            raise ValueError("joint_affinity.enabled must be boolean")
+        joint_affinity = dict(enabled=raw_joint_affinity.get("enabled", False), physical_cores=self._thread_count(
+            "joint_affinity.physical_cores", raw_joint_affinity.get("physical_cores", joint)))
+        if joint_affinity["enabled"] and joint > joint_affinity["physical_cores"]:
+            raise ValueError("joint_workers cannot exceed joint_affinity.physical_cores")
+        instance_workers = self._thread_count("instance_workers", values_3d.get("instance_workers", 1))
         early_joint = self._thread_count(
             "early_joint_workers", values_3d.get("early_joint_workers", joint)
         )
@@ -255,6 +264,8 @@ class AlgorithmServer:
             "registration_affinity": affinity,
             "cpu_process_workers": cpu_2d,
             "cpu_process_affinity": cpu_affinity,
+            "joint_affinity": joint_affinity,
+            "instance_workers": instance_workers,
             "effective_workers": effective_total,
             "early_joint_workers": early_joint,
         }
@@ -336,20 +347,24 @@ class AlgorithmServer:
         """Initialize once per detector load, never lazily during a measured request."""
         from algorithm.registration_process import RegistrationProcesses
         from algorithm.cpu_2d_process import Cpu2DProcesses
+        from algorithm.joint_process import JointMeasurementProcesses
         self._stop_cpu_processes()
         self.board.registration_process = None
         self.threading_info["registration_execution"] = {"ready": False, "backend": "process"}
         self.threading_info["cpu_2d_execution"] = {"ready": False, "backend": "process"}
+        self.threading_info["joint_measurement_execution"] = {"ready": False, "backend": "process"}
         # Pin enabled pools before starting unpinned pools, so the latter
         # inherit the remaining CPU set instead of overlapping reserved cores.
         specifications = [
             ("registration", RegistrationProcesses, settings["registration_workers"], settings["registration_affinity"]),
             ("cpu_2d", Cpu2DProcesses, settings["cpu_process_workers"], settings["cpu_process_affinity"]),
+            ("joint_measurement", JointMeasurementProcesses, settings["joint_workers"], settings["joint_affinity"]),
         ]
         specifications.sort(key=lambda item: not item[3]["enabled"])
         try:
             for role, factory, count, affinity in specifications:
-                service = factory(count, affinity)
+                service = (factory(count, affinity, instance_workers=settings["instance_workers"])
+                           if role == "joint_measurement" else factory(count, affinity))
                 self._cpu_process_order.append(service)
                 setattr(self, role+"_process", service)
                 setattr(self.board, role+"_process", service)
@@ -369,14 +384,15 @@ class AlgorithmServer:
                 service.close()
             except Exception as error:
                 errors.append(error)
-        self.registration_process = self.cpu_2d_process = None
-        for role in ("registration", "cpu_2d"):
+        self.registration_process = self.cpu_2d_process = self.joint_measurement_process = None
+        for role in ("registration", "cpu_2d", "joint_measurement"):
             snapshot = self.threading_info.get(role+"_execution")
             if isinstance(snapshot, dict):
                 snapshot["ready"] = False
         if self.board is not None:
             self.board.registration_process = None
             self.board.cpu_2d_process = None
+            self.board.joint_measurement_process = None
         if self.pipeline is not None:
             self.pipeline.drain_joint_jobs()
         if errors:

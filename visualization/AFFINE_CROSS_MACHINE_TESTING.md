@@ -1,10 +1,10 @@
 # Windows 仿射配准：跨机器完整测试流程
 
-当前版本新增独立2D CPU后处理进程，正式整板A/B必须同时记录`cpu_2d_execution`、`main_cpu_ids`及2D每片`cpu_2d_*`/`cpu_postprocess_pipeline_ms`，避免只看仿射变快而忽略2D。默认配准4核＋2D后处理2核；增加保留核会减少主进程范围，仍需整体节拍验证。旧直接CPU配准基准不覆盖这两个进程池的竞争和IPC。
+当前正式实现已拆为三组常驻进程：配准、2D后处理、3D映射测高，均无thread回退。针对32物理核，默认三组各8核/8进程，主进程剩余8核；每个测高进程instance_workers默认1。旧4/2及主进程共享实例池20/64线程建议已不适用于当前执行方式。详见config/3D/README.md。
 
-更新：正式流式流程已拆成配准池（`registration_workers`）和映射测高池（`joint_workers`）。本文CPU基准仍只测配准函数，不模拟其它阶段竞争；正式复验请分别调整两项，先固定测高2路比较配准4/6/8路，再比较测高2/4路。保持`early_joint_workers`和其它参数一致。每片同时比较`joint_pipeline_ms`、两个池的queue/phase和原仿射子计时，整板节拍以`total_detect_ms`为准。详见config/3D/README.md“线程配置”。
+整板验收同时保存初始化registration_execution、cpu_2d_execution、joint_measurement_execution、最终main_cpu_ids，并记录全部片的三个worker诊断及queue/shared/phase/transfer/pipeline。增加保留核会减少主进程范围；仅按CPU总核数放大并发不能证明最优。benchmark_affine.py仍只直接测求解函数，不能证明完整进程隔离与整板收益。
 
-最新正式实现固定为常驻进程配准，默认4进程并启用Windows 4物理核分区。增加registration_workers时须同步增加registration_affinity.physical_cores并给主进程留核。CPU基准脚本仍直接运行求解器，不能用于证明进程隔离收益；实际收益需通过正式整板测试验证，并保存初始化registration_execution（PID/CPU分区/启动时间）和全部片的registration_worker及共享区/返回延迟。没有thread模式开关；需要旧版A/B时使用独立旧提交工作副本，不覆盖当前配置。
+需要旧版A/B时使用独立旧提交工作副本并核对同输入/同标定/同冷热状态，不覆盖当前配置。实际性能和测高容差由用户在目标机验证，本机仅合成回归。
 
 目标是解释配准台单片不到200ms、正式整板中单片约1800ms的差异，并验证已有优化开关。先测同一算法在不同并发下的表现，再比较算法开关。不要先修改生产线程数、标定或容差。
 

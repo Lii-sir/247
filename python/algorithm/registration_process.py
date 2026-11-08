@@ -99,7 +99,8 @@ class SharedBoardInputs:
 
 class RegistrationProcesses:
     """Parent preparation threads never wait for computation in child processes."""
-    def __init__(self, workers, affinity, *, startup_timeout=60, worker_module=registration_worker, role="registration"):
+    def __init__(self, workers, affinity, *, startup_timeout=60, worker_module=registration_worker,
+                 role="registration", worker_options=None):
         self._lock = threading.RLock()
         self._pending = set()
         self._closed = False
@@ -140,8 +141,11 @@ class RegistrationProcesses:
                             raise RuntimeError("pythonw.exe is required for hidden registration workers")
                         os.environ["__PYVENV_LAUNCHER__"] = str(Path(sys.executable).with_name("pythonw.exe"))
                     mp.set_executable(str(executable))
+                    initargs = (assignments, assignment_index, ready, gate, role)
+                    if worker_options is not None:
+                        initargs += (worker_options,)
                     self._executor = ProcessPoolExecutor(max_workers=workers, mp_context=ctx,
-                        initializer=worker_module.initialize, initargs=(assignments, assignment_index, ready, gate, role))
+                        initializer=worker_module.initialize, initargs=initargs)
                     warmups = [self._executor.submit(worker_module.warmup) for _ in range(workers)]
                     deadline, metadata = time.monotonic()+startup_timeout, []
                     for _ in range(workers):

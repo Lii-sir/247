@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
-import torch
-import torch.nn.functional as torch_functional
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    import torch
 
 
 def prepare_masks_gpu(masks: torch.Tensor, allowed: np.ndarray) -> torch.Tensor:
     """Resize model masks and apply the allowed ROI without leaving the tensor device."""
+    import torch
+    import torch.nn.functional as torch_functional
     if not masks.is_cuda:
         raise RuntimeError("2D mask post-processing requires a CUDA tensor")
     allowed_gpu = torch.as_tensor(allowed, device=masks.device, dtype=torch.bool)
@@ -22,6 +25,7 @@ def prepare_masks_gpu(masks: torch.Tensor, allowed: np.ndarray) -> torch.Tensor:
 
 def merge_masks_gpu(masks: torch.Tensor, iou_threshold: float = 0.2) -> tuple[torch.Tensor, list[int]]:
     """Transitively merge overlapping masks while pixel operations stay on the tensor device."""
+    import torch
     merged: list[torch.Tensor] = []
     source_indices: list[int] = []
     for source_index, mask in enumerate(masks):
@@ -49,6 +53,7 @@ def transfer_mask_crops(masks: torch.Tensor, source_indices: list[int],
                         padding: int = 5) -> list[tuple[int, np.ndarray, tuple[int, int]]]:
     """Copy only each mask's nonzero bounding region to CPU memory."""
     crops = []
+    import torch
     height, width = masks.shape[-2:]
     for mask, source_index in zip(masks, source_indices):
         rows = torch.nonzero(torch.any(mask, dim=1)).flatten()

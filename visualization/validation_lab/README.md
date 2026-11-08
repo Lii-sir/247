@@ -60,13 +60,15 @@ Windows若不希望保留命令窗口，可直接运行：
 
 ## 正式流程与模型生命周期
 
-2D银浆检测和公开实例几何固定走独立CPU进程，配置位于`common_2d.parameters.threading.cpu_process_workers/cpu_process_affinity`，当前2进程、2物理核；配准仍默认4进程、4核。初始化的`cpu_2d_execution`及每片2D响应的`cpu_2d_worker`可核对实际PID/核范围。读取解码与GPU阶段保持原路径，早期3D不会等待2D重诊断。仅2D验证会在本次内存配置关闭空闲配准池的核预留，保留2D CPU进程的核策略，不写回磁盘。
+正式流式固定使用三组常驻CPU进程：配准、2D重后处理、3D映射测高；没有thread回退。针对32物理核，当前三组各8进程/8物理核，给主进程留8核。3D的joint/instance计算不再留在主进程：每个测高进程拥有本地实例执行器，instance_workers默认1，不是全板共享20/64线程池。实际节拍需在目标机复验。
 
-正式流式联合链路已拆为独立配准池→映射测高池，回调交接、不占线程等待下一阶段。`config/3D/config.json`的`common_3d.parameters.threading.registration_workers`控制配准（当前4），`joint_workers`控制映射和测高（当前2），`early_joint_workers`控制2D诊断尚未完成时在途联合片数（当前2）。修改后重新验证会按配置重建；真实节拍需实测。每片新增`registration_*`、`joint_measurement_*`及`joint_pipeline_ms`，两个池的排队分别报告；原`joint_phase_ms`为两个执行阶段之和，不含中间排队。
+配置：2D组由common_2d.parameters.threading.cpu_process_workers/cpu_process_affinity控制；3D文件的registration_workers/registration_affinity控制配准，joint_workers/joint_affinity控制映射测高，early_joint_workers控制2D诊断未齐时在途联合片数。增加进程时要同时分配对应物理核并给主进程留核。三组核分区关闭仍使用进程，关闭按分配逆序恢复原CPU范围。
 
-配准现在固定使用常驻子进程，无thread模式。当前开启`registration_affinity`，给4个配准进程划分4个真实物理核，主进程使用剩余核；核不足或设置失败会报初始化错误。只想关闭绑核可设`registration_affinity.enabled=false`，仍是进程配准。共享区准备、传输计时与纯子进程计算分开；查看初始化响应`threading.registration_execution`与每片`registration.registration_worker`核对PID、核集合和Torch未加载。配准台的直接求解时间不能代表正式多进程整板节拍。
+查看初始化threading.registration_execution、cpu_2d_execution、joint_measurement_execution各自workers[].cpu_ids及threading.main_cpu_ids，核对集合不重叠。2D响应cpu_2d_worker和联合片joint_measurement_worker记录实际PID/CPU/无Torch/局部实例数。joint_measurement_queue_ms含共享区准备与IPC，phase_ms为测高进程计算；joint_pipeline_ms覆盖配准提交到高度结果完成，不能只看某个阶段变小。
 
-复用`detect_and_view.ProtocolClient`、命名共享内存与正式`bridge_server.py`，逐片发送实际`board_id/piece_id`，整板3D与2D并发提交；不替换算法或伪造检测结果。模型按当前配置初始化一次，相同配置和模型文件时间/尺寸不变时复用；配置或模型文件变化时关闭旧服务重新初始化。
+整板补偿深度共享一次，配准与测高复用；测高共享原2D实例mask，保持实例ID、顺序、轮廓、P95和坐标转换。最终在主进程等待所有2D诊断后合并，不因3D先完成而漏判。仅2D验证的内存配置取消空闲配准和测高组的核预留，保留2D CPU策略，不写回磁盘。
+
+复用`detect_and_view.ProtocolClient`、命名共享内存与正式`bridge_server.py`，逐片发送实际`board_id/piece_id`，根据提交模式并发发送，或按间隔依次2D、最后3D；不替换算法或伪造检测结果。模型按当前配置初始化一次，相同配置和模型文件时间/尺寸不变时复用；配置或模型文件变化时关闭旧服务重新初始化。
 
 参数来自`config/2D/config.json`与`config/3D/config.json`。页面显示当前片数和Pitch概况，不写回生产配置。当前正式配准为粗配准+仿射，Pitch只处理深度。模型初始化或检测失败会记录错误并尝试生成失败报告；产品NG与接口失败分别显示。
 

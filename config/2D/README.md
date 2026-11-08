@@ -97,16 +97,16 @@ ROI 外部分不参与测高，thin 焊脚仍从完整掩码的两端划分。
 `common_2d.parameters.threading`新增：
 
 ```json
-"cpu_process_workers": 2,
+"cpu_process_workers": 8,
 "cpu_process_affinity": {
   "enabled": true,
-  "physical_cores": 2
+  "physical_cores": 8
 }
 ```
 
-`cpu_process_workers`是2D CPU后处理进程数，环境变量`BRIDGE_2D_CPU_PROCESSES`可作为缺项默认值；JSON优先。`cpu_process_affinity`控制该进程组的Windows物理核分区，进程数不能超过保留核数。当前默认与配准4进程/4物理核一起使用，共预留6个物理核，至少还应给主进程保留1个；建议先按配准4＋2D后处理2复验，不要直接沿用10＋10的大并发。关闭亲和性仍使用进程计算，没有thread回退。
+`cpu_process_workers`是2D CPU后处理进程数，环境变量`BRIDGE_2D_CPU_PROCESSES`可作为缺项默认值；JSON优先。`cpu_process_affinity`控制该进程组的Windows物理核分区，进程数不能超过保留核数。针对32物理核，当前与配准8核、3D映射测高8核一起使用，三组预留24核，给主进程留8核。该布局待目标机器实测，至少给主进程保留1个可用物理核。关闭亲和性仍使用进程计算，没有thread回退。
 
-CPU组先从已有可用范围划分，后一个池从剩余范围选择；启用亲和性的池优先启动，关闭时逆序恢复。两组均开启时，配准、2D后处理与主进程CPU集合互不重叠。检查初始化响应的`threading.registration_execution.workers[].cpu_ids`、`threading.cpu_2d_execution.workers[].cpu_ids`与`threading.main_cpu_ids`。只修改Bridge及其子进程，不改系统其它进程；缓存和内存带宽仍然共享。
+CPU组先从已有可用范围划分，后一个池从剩余范围选择；启用亲和性的池优先启动，关闭时逆序恢复。三组均开启时，配准、2D后处理、3D映射测高与主进程CPU集合互不重叠。检查初始化响应的`threading.registration_execution.workers[].cpu_ids`、`threading.cpu_2d_execution.workers[].cpu_ids`、`threading.joint_measurement_execution.workers[].cpu_ids`与`threading.main_cpu_ids`。只修改Bridge及其子进程，不改系统其它进程；缓存和内存带宽仍然共享。
 
 每片只把实例mask复制到只读共享区，传递必要的标量/公开字段和已准备的银浆Boundary；不传GPU模型、Tensor、整张照片或检测器，不重复SIFT边界准备。子进程OpenCV/BLAS=1，无Torch。进程内按原顺序完成溢出、断连与各实例几何，不修改父进程实例；父进程轻量合并诊断与返回结果。mask实例顺序、编号、轮廓精度、crop偏移及OK/NG保持。
 

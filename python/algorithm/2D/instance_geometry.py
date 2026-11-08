@@ -6,6 +6,28 @@ PUBLIC_INSTANCE_FIELDS = ("instance_id", "class_id", "class_name", "confidence",
                           "bending_2d", "chip_alignment", "chip_anomaly_2d", "is_ok")
 
 
+def share_instances(instances, inputs, *, arrays=None, cache_keys=None, cache_prefix=None):
+    """Whitelist public metadata and share pixels, never pickle their Tensor base."""
+    arrays, records = dict(arrays or {}), []
+    cache_keys = dict(cache_keys or {})
+    for index, instance in enumerate(instances):
+        record = dict(fields={key: instance[key] for key in PUBLIC_INSTANCE_FIELDS if key in instance})
+        mask = instance.get("mask")
+        if isinstance(mask, np.ndarray):
+            if mask.size:
+                name = f"mask_{index}"
+                arrays[name] = mask
+                if cache_prefix is not None:
+                    cache_keys[name] = (*cache_prefix, index)
+                record["mask_key"] = name
+            else:
+                record["empty_mask"] = [list(mask.shape), mask.dtype.str]
+        else:
+            record["mask_value"] = mask
+        records.append(record)
+    return inputs.prepare_named(arrays, cache_keys), records
+
+
 def mask_geometry(mask, offset, epsilon):
     source = np.asarray(mask)
     binary = source if source.dtype == np.uint8 else (source > 0).astype(np.uint8)

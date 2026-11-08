@@ -204,6 +204,9 @@ class Runner:
                     threading_2d.setdefault("cpu_process_affinity", dict(enabled=affinity.get("enabled", False),
                         physical_cores=threading_2d.get("cpu_process_workers", 2)))
                     affinity["enabled"] = False
+                joint_affinity = threading_3d.get("joint_affinity")
+                if isinstance(joint_affinity, dict):
+                    joint_affinity["enabled"] = False
                 init["config_text"] = json.dumps(config, ensure_ascii=True)
             height = config["height_measurement_3d"]["parameters"]
             production_pitch_parameters(config, float(height.get("gray_offset", 32768)), float(height.get("vertical_resolution_mm", .00105)))

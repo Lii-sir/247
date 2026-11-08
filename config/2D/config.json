@@ -64,10 +64,10 @@
         "end2end": false
       },
       "threading": {
-        "cpu_process_workers": 2,
+        "cpu_process_workers": 8,
         "cpu_process_affinity": {
           "enabled": true,
-          "physical_cores": 2
+          "physical_cores": 8
         },
         "postprocess_workers": 15,
         "silver_workers": 15,

@@ -75,8 +75,9 @@ def make_document():
         ['cpu_2d_process',int(t2.get('cpu_process_workers',2)),'常驻进程：银胶溢出/断连、公开2D几何','额外进程；与配准分组；无Torch；本片串行，不同片跨进程并行'],
         ['registration',registration,'父线程：准备共享区、异步派发','不执行正式配准，不等待worker结果；缺项别名到joint'],
         ['registration_process',registration,'常驻进程：平台掩码、粗配准、仿射','额外进程数不计父线程预算；默认按物理核分区；OpenCV/BLAS=1，无Torch'],
-        ['joint',joint,'每片掩码映射、参考面与高度阶段','独立限制并发；接收同片求得的矩阵；不重复配准'],
-        ['instance',instance,'3D实例映射、各根引线及各个焊脚','额外池，不计入桥接worker_budget；正式2D公开几何不再使用它'],
+        ['joint',joint,'父线程：复用深度共享区并派发实例mask','不执行映射或测高，不等待子进程'],
+        ['joint_measurement_process',joint,'第三组常驻进程：映射、参考面、全实例高度','独立核组，无Torch；结果回主进程合并完整2D诊断'],
+        ['instance',instance,'每个3D测高进程内部的本地实例工作位','默认1，随当前worker执行；非主进程全板共享池；更多线程需给每进程更多核'],
         ['pitch',pitch,'独立条带投影与碰撞处理','额外池；分非扫描轴，输出缓冲互不写冲突']]
     coords = [
         ['原始2D','整张相机照片','圆心、灰度图、H_full输入','照片不做SmartRay Pitch'],
@@ -133,7 +134,8 @@ def make_document():
         ['联合','registration_queue_ms / registration_phase_ms','提交到worker开始的延迟 / 子进程执行墙钟','前者含准备复制/IPC/队列；后者含共享区挂接、平台掩码、粗配准和仿射'],
         ['联合','registration_shared_memory_ms','父准备线程本次共享区复制','每板深度一次，每片gray/mask一次；嵌套在queue中'],
         ['联合','registration_result_transfer_ms / registration_log_relay_ms','worker结束到父接收 / 父日志转发','包含返回传输、清理、调度；不属于纯仿射计算'],
-        ['联合','joint_measurement_queue_ms / joint_measurement_phase_ms','测高池排队 / 执行墙钟','映射、测高和结果整理'],
+        ['联合','joint_measurement_queue_ms / joint_measurement_phase_ms','提交到测高worker开始 / worker执行墙钟','queue含共享mask准备和IPC；phase含映射、平面、高度和结果整理'],
+        ['联合','joint_measurement_shared_memory_ms / joint_measurement_result_transfer_ms','复用深度并准备mask / 返回调度延迟','子进程工作、队列和IPC分别记录'],
         ['联合','joint_pipeline_ms','本片提交配准到测高完成','含两个队列和交接开销'],
         ['联合','affine_registration_ms','准备、全部评分和优化器整段','nfev/均耗/停止原因在registration对象中'],
         ['联合','mask_alignment_ms','全部实例映射与几何完成墙钟','instance_alignment_work_ms是子任务工作和'],

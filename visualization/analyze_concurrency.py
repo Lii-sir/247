@@ -21,7 +21,7 @@ STAGES = {
     "joint_phase_ms": "Joint 3D",
     "registration_phase_ms": "Registration stage",
     "affine_registration_ms": "Affine registration",
-    "joint_measurement_phase_ms": "Mapping and height",
+    "joint_measurement_phase_ms": "3D height process",
 }
 
 

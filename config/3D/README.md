@@ -72,60 +72,68 @@ C# 方法和字段不增加。`SolderMeasurements[].Mask3DLocal` 是实际内缩
 不会原地改写共享 bond/实例掩码。局部像素坐标恢复至分片坐标后再读取深度、计算参考面及输出几何，
 最后按原流程转换整板测点。形态学核与引线处理共用缓存。
 
-## 线程配置
+## 线程配置与32物理核布局
 
-2D重后处理现另有独立常驻CPU进程与核组，默认2进程/2物理核，见config/2D/README.md。默认与配准4核合计预留6核，主进程使用剩余CPU；初始化/重载先关闭2D与配准进程并排空旧代工作，按分配的逆序恢复亲和性。两池共用同一进程生命周期和共享区租约实现，正式流程均无thread回退。
+正式流式现在有三组独立常驻CPU进程：配准、2D重后处理、3D映射测高。主进程仅保留输入准备、GPU提交、早期2D几何及最终汇合。3D映射、参考面拟合、引线/焊脚测高不再由主进程joint/instance池执行。无thread回退；旧同步接口仍可直接调用同一CPU核心，不是正式备用执行方式。
 
-`common_3d.parameters.threading`控制正式流式调度。当前配置：
+针对用户的32个可用物理核，当前起点为：配准8核＋2D后处理8核＋3D映射测高8核，给主进程留8核。2D组配置在config/2D/config.json。CPU组按真实物理核/SMT拓扑从剩余范围分配，同核超线程不拆给不同组；三组均启用亲和性时与主进程互不重叠。少于25个可用物理核需降低分区数或显式关闭部分亲和性，不能把逻辑线程数当物理核数；仍只支持单处理器组。
+
+`common_3d.parameters.threading`当前配置：
 
 ```json
 {
   "worker_budget": 80,
   "cpu_workers": 15,
-  "registration_workers": 4,
-  "registration_affinity": {
-    "enabled": true,
-    "physical_cores": 4
-  },
-  "joint_workers": 2,
-  "early_joint_workers": 2,
-  "instance_workers": 20
+  "registration_workers": 8,
+  "registration_affinity": {"enabled": true, "physical_cores": 8},
+  "joint_workers": 8,
+  "joint_affinity": {"enabled": true, "physical_cores": 8},
+  "early_joint_workers": 8,
+  "instance_workers": 1
 }
 ```
 
-- `registration_workers`：正式流式配准的常驻进程数，同时限制父进程共享区准备线程数；4路是待实测起点。配准子进程执行3D平台掩码、粗配准和仿射，未改变Powell、评分及停止条件。正式流程没有thread模式或静默线程回退。
-- `registration_affinity.enabled`：Windows物理核分区，当前开启。读取真实物理核/SMT拓扑，优先选择EfficiencyClass较高的核；同核超线程整体分配。配准进程与主进程使用互不重叠的逻辑CPU集合。关闭该项仍使用进程配准，只取消核分区。
-- `registration_affinity.physical_cores`：保留给配准的物理核数，当前4；至少等于进程数，并且必须留下至少一个物理核给主进程。当前每个配准进程对应一个完整物理核；保留更多核时按进程均分。核不足、亲和性设置失败或多处理器组不支持时明确初始化失败，不猜CPU编号或静默降级。
-- `joint_workers`：独立后续池，只执行掩码映射、参考面、测高和结果整理；一片配准完成便可进入此池，不要求凑齐其它片。
-- `early_joint_workers`：全部2D诊断完成前，允许进入联合链路但尚未完成的片数上限，计数覆盖配准、测高和中间排队；不是配准线程数。独立配准池模式下可以大于单个池的并发数；旧共享模式仍校验不超过joint_workers。全部2D完成后由两个池各自限制并发。
-- `cpu_workers`：图像/深度输入准备和2D几何，不占用该池等待配准进程或测高完成。
-- `instance_workers`：整个检测器共享的实例任务池，供实例映射、引线、焊脚和公开2D几何复用；不为每片另建一套。
-- `worker_budget`：父进程桥接线程池预算，包含CPU、GPU、postprocess、silver、registration共享区准备、joint；别名池只算一次，不包括配准子进程、instance、Pitch和底层库内部线程。当前父进程桥接池总额66，另有4个常驻配准进程；初始化响应的`threading.effective_workers`记录预算内线程总额。
+- `registration_workers`：常驻配准进程数，同时限制父进程共享区准备线程。执行平台掩码、粗配准与仿射；Powell、评分及停止条件保持。
+- `registration_affinity`：配准组保留物理核数，至少等于进程数。关闭enabled仍进程计算，只取消绑核。
+- `joint_workers`：常驻3D映射测高进程数，同时控制父进程的轻量准备池。矩阵确定后立即异步交接，不要求凑齐其它片，不占父线程等待子进程。
+- `joint_affinity`：第三组专用核，默认8物理核；至少等于joint_workers。映射、平台/芯片面、引线与焊脚均在此组完成。
+- `instance_workers`：**每个3D测高进程内部**的本地实例工作位，默认1。现在不是主进程全板共用的20/64/128线程池。每进程只分1个物理核时应设1；增加实例并发需要相应增加每进程分配的物理核，不是把线程数直接放大。旧同步接口的兼容实例执行器仍按此值配置，但正式流式不会在主进程调用它。
+- `early_joint_workers`：所有2D诊断完成前，进入联合链路但未结束的在途片数上限；覆盖配准、测高和中间排队。2D齐全后由进程池各自限并发。
+- `cpu_workers`：主进程输入、深度准备与早期2D几何线程；不执行正式映射测高。
+- `worker_budget`：只校验父进程桥接线程槽位（当前76），不包括24个常驻CPU进程、各子进程本地实例执行器或Pitch池。不是操作系统线程/核心总上限。
 
-旧配置缺少`registration_workers`时，共享区准备池别名到joint池，不额外消耗父线程预算，进程数继承该数量；仍然执行进程配准。可用`BRIDGE_REGISTRATION_WORKERS`指定，JSON优先。旧配置缺少整个`registration_affinity`时不绑核，新配置已开启。准备线程仅复制/发布共享输入和异步投递，不等待子进程或测高Future；测高池不向自身提交片级父任务。
+旧配置缺项时：joint_workers仍继承旧的父池数量；joint_affinity缺失继承registration_affinity的enabled，物理核数默认joint_workers；instance_workers缺失默认1。CPU进程始终存在，没有线程回退。推荐同步迁移两份配置，不沿用此前instance_workers=64/128的共享池建议。
 
-每板的补偿后深度只复制到共享内存一次，每片gray和平台mask各复制一次；子进程只接收共享区描述、当前片行范围和数值配置，不传模型、检测器、CUDA或整幅数组。一个全宽深度共享区供所有片只读，子进程计算输出独立持有。板失败/释放后不再开始后续测高；已经投递的进程工作可完成，最后一个真实进程Future结束前共享区不会被提前释放，取消公开Future也不能提前释放其输入。重载前排空旧代联合工作，关停/重载恢复原主进程CPU范围。
+### 数据所有权与算法一致性
 
-初始化预先启动全部常驻进程并加载依赖，Windows使用基础解释器的pythonw.exe及虚拟环境配置，避免重定向启动器句柄错误与额外CMD；需要正常的Windows/Python3.10环境。每个子进程OpenCV/OMP/MKL/OpenBLAS均设为1，不加载Torch、YOLO或EfficientAD。启动失败或工作进程异常会明确报错，不回退线程；崩溃后需重新初始化。初始化快照`threading.registration_execution`记录worker PID、CPU集合、版本、实际OpenCV线程、未加载Torch、核分区以及启动耗时；每片`registration.registration_worker`记录执行worker的启动快照。请检查main_cpus与registration_cpus无交集。
+每板的补偿后整板深度只发布一份到共享内存，配准与测高复用同一个depth块；当前片只按y1:y2取全宽视图。测高额外共享原2D实例mask与必要标量字段，不把GPU模型、检测器、Tensor或全幅输出数组通过pickle传递。mask在worker只读，映射输出和测量掩码各自持有，原始父实例不会被改写。
 
-核分区仅约束本Bridge及其子进程，内存带宽、末级缓存和系统其它进程仍然共享，不承诺固定单片耗时。只作用于正式`BoardPipeline`流式入口；配准台、同步缓存整板和旧批量接口保持直接求解方式，复用同一函数，不是正式流程的备用thread模式。
+测高核心抽取为无模型的JointGeometry，旧同步和新子进程共用同一方法。实例ID、顺序、thin一次分段、参考面、P95代表点与边缘剔除、坐标转换保持。height_points_to_board仍仅执行一次；整板最终在主进程合并完整2D诊断，3D先完成不能提前给最终OK。
 
-修改参数后需要重新初始化；验证台配置变化会重建检测器。先按4进程/4物理核、2路测高、early在途2片测试；增加进程时同步调整physical_cores且给主进程留核，再比较测高2/4路。每组整板预热1次，至少稳定测试3次。比较整板完成时间和长尾，不仅比较单片仿射；检查矩阵、分区损失、掩码及测高结果一致。仅比较算法结果时忽略timings、registration_worker等执行诊断字段。
+板关闭/失败后真实进程任务结束前租约保留共享块；未开始准备的旧代工作跳过。重新初始化前排空旧工作，三组进程逆序关闭并恢复原CPU范围。任一组初始化失败清理之前已创建的组；进程异常明确失败，不静默回退。GPU助手按需导入Torch，CPU清理与3D worker不依赖Torch。
 
-新增计时字段位于每片`timings`：
+### 核对运行状态
+
+初始化响应保存`registration_execution`、`cpu_2d_execution`、`joint_measurement_execution`（均位于threading）。检查各组workers[].cpu_ids与最终threading.main_cpu_ids无交集。每片联合结果新增joint_measurement_worker，含PID、CPU集合、OpenCV/BLAS线程和instance_workers；默认每个测高进程1物理核、1实例工作位，OpenCV/BLAS=1，无Torch。
+
+启动使用常驻pythonw，不另开CMD。仅2D验证的内存配置取消空闲配准与测高组的核预留，保留2D组策略；不写磁盘。核分区只约束本程序，缓存、内存带宽与系统其它程序仍共享。
+
+### 计时与实图复验
 
 |字段|含义|
 |---|---|
-|`registration_queue_ms` / `registration_phase_ms`|提交到子进程开始的延迟（含准备、复制、IPC、入队）/ 子进程共享区挂接、平台掩码、粗配准及仿射墙钟|
-|`registration_dispatch_queue_ms` / `registration_shared_memory_ms`|父准备线程排队 / 本次共享区准备复制；均是registration_queue_ms的子项|
-|`registration_result_transfer_ms` / `registration_log_relay_ms`|子进程结束到父进程接收回调的延迟（含清理、传输和调度）/ 父进程转发诊断日志|
-|`registration_process_roundtrip_ms`|提交到父进程收到子进程结果，不含后续测高；与上面计时嵌套|
-|`joint_measurement_queue_ms` / `joint_measurement_phase_ms`|映射测高池排队 / 映射、测高和整理墙钟|
-|`joint_pipeline_ms`|本片提交配准到测高完成，包含两个队列与交接开销|
-|`joint_queue_ms`|兼容原字段，等于`registration_queue_ms`，不代表全部排队|
-|`joint_phase_ms`|两个执行阶段墙钟之和，不含中间排队；不能当作新流水线端到端延迟|
+|registration_queue_ms / registration_phase_ms|配准准备、入队及IPC延迟 / 配准进程计算|
+|joint_measurement_dispatch_queue_ms / joint_measurement_shared_memory_ms|父准备线程排队 / 复用深度并准备实例mask|
+|joint_measurement_queue_ms|从提交测高到worker开始，含上述准备与IPC|
+|joint_measurement_phase_ms|测高进程挂接输入、映射、参考面、全部高度及公开结果|
+|joint_measurement_result_transfer_ms / joint_measurement_log_relay_ms|结果返回与调度 / 父进程转发日志|
+|joint_measurement_process_roundtrip_ms|提交测高到父进程收到结果|
+|mask_alignment_ms / height_measurement_ms|原函数边界的子进程计算；instance等work字段是本进程局部累计工作|
+|joint_phase_ms|配准与映射测高两个计算阶段之和，不含队列与IPC|
+|joint_pipeline_ms|本片提交配准到完整测高结果就绪，包含两个队列、复制与IPC|
+|joint_queue_ms|兼容原字段，等于registration_queue_ms，不代表整条链路全部等待|
 
-`affine_registration_ms`、`mask_alignment_ms`和各测高子计时保持原函数边界。不要把这些嵌套字段重复相加。初始化快照新增`threading.opencv_threads`，仅记录已加载OpenCV的实际值，不在初始化快照阶段改变线程设置。
+先使用8/8/8核布局在目标32核电脑预热后复验。比较整板total_detect_ms及长尾，检查全部片矩阵、轮廓、ROI、采样点、高度和NG一致；对照时剔除timings及worker执行诊断字段。此配置是资源布局起点，真实节拍尚未验证，不承诺固定耗时。
 
 ## 正式流程：Pitch → 分片 → 粗配准 → 仿射 → 测高
 

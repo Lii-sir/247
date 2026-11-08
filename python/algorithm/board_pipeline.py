@@ -378,10 +378,13 @@ class BoardPipeline:
                 if not self._current(state):
                     return
                 piece_id = int(piece["piece_id"])
-                measured = self._submit_timed(self.joint_pool, "joint_measurement", timings,
-                    state.board_id, piece_id, state.request_id, self.detector.measure_registered_piece,
-                    piece_id, entry, state.depth, piece, registration, state.depth_correction, state=state)
-                measured.add_done_callback(lambda result: self._measured(
+                def is_current():
+                    with self._lock:
+                        return self._current(state)
+                measured = self.detector.submit_joint_measurement(self.joint_pool, state.registration_inputs,
+                    piece_id, entry, state.depth, piece, registration, state.depth_correction, timings,
+                    dict(board_id=state.board_id, piece_id=piece_id, request_id=state.request_id), is_current)
+                self._track_joint_job(measured).add_done_callback(lambda result: self._measured(
                     state, piece_id, result, timings=timings, started=started))
         except Exception as exc:
             with self._lock:

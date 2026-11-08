@@ -135,6 +135,20 @@ class FakeDetector:
     def measure_registered_piece(self, piece_id, entry, depth, piece, registration, pitch_correction=None):
         return self.measure_prepared_piece(piece_id, entry, depth, piece, pitch_correction)
 
+    def submit_joint_measurement(self, pool, inputs, piece_id, entry, depth, piece, registration,
+                                 correction, timings, metadata, is_current):
+        # Scheduling stub. Formal DetectBoard always uses its process service.
+        from algorithm.timing import timing_context, measure
+        queued = time.perf_counter()
+        def invoke():
+            if not is_current():
+                raise RuntimeError("board was released before queued 3D work started")
+            with timing_context(timings, phase="joint_measurement", **metadata):
+                timings["joint_measurement_queue_ms"] = (time.perf_counter()-queued)*1000
+                with measure("joint_measurement_phase_ms"):
+                    return self.measure_registered_piece(piece_id, entry, depth, piece, registration, correction)
+        return pool.submit(invoke)
+
     def measure_prepared_piece(self, piece_id, entry, depth, piece, pitch_correction=None):
         time.sleep(self.delay)
         if entry.get("fail_joint"):

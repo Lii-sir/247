@@ -22,6 +22,9 @@ RW = 'python/algorithm/registration_worker.py'
 D2 = 'python/algorithm/cpu_2d_worker.py'
 P2 = 'python/algorithm/cpu_2d_process.py'
 IG = 'python/algorithm/2D/instance_geometry.py'
+J = 'python/algorithm/joint_geometry.py'
+JW = 'python/algorithm/joint_worker.py'
+JP = 'python/algorithm/joint_process.py'
 
 
 def build_flows():
@@ -78,22 +81,24 @@ def build_flows():
       '父准备线程复制并发布共享区|整板补偿后深度所有片复用|只向常驻子进程发送描述和数值配置|租约保护取消/释放期间的真实任务输入', pool='registration', times=('registration_shared_memory_ms',), src=(RP, 'prepare'))
     n('o-registration', '常驻进程独立配准', '粗配准 → 仿射；专用物理核组', 2, 7,
       '按registration_workers限制进程数|不加载Torch和模型，原生线程均为1|主进程与配准使用不同物理核组|只读共享区，每片拟合一个全局矩阵|矩阵和诊断返回后立即投递测高', pool='registration_process', times=('registration_phase_ms',), src=(RW, 'register_arrays'))
-    n('o-joint', '掩码映射与全实例测高', '接收同一矩阵；joint池', 2, 8,
-      '按joint_workers独立限制并发|实例映射由共享instance池处理|拟合参考平面后依次处理引线、焊脚|所有wire/thin/bond参与测高，不再用2D引线ROI筛选', pool='joint', times=('joint_measurement_phase_ms',), src=(B, 'measure_registered_piece'))
+    n('o-jointprep', '测高共享输入与派发', '复用整板深度＋原2D实例mask', 2, 8,
+      '深度复用配准发布的同一共享块|追加当前片只读原2D实例mask|仅发送高度配置、几何元数据和当前矩阵|父joint线程不等待测高进程', pool='joint', src=(JP,'submit_piece'),times=('joint_measurement_shared_memory_ms',))
+    n('o-joint', '独立进程映射与全实例测高', '第三核组；本进程实例执行器', 2, 9,
+      '按joint_workers限制进程数|映射、参考面、引线及焊脚都在worker完成|instance_workers仅属于当前测高进程，默认1|不加载Torch，主进程不执行实例或测高任务|全部wire/thin/bond参与，CPU结果回主进程最后合并2D诊断', pool='joint_measurement_process', times=('joint_measurement_phase_ms',), src=(J, 'measure_registered_piece'))
     n('o-2ddone', '本片2D响应 / entry就绪', '2D请求独立返回', 0, 9,
       '输出2D检查、公开掩码和阶段耗时|记录完整entry|尝试推进整板汇合', kind='data', src=(P, 'submit_2d'))
-    n('o-3ddone', '本片联合结果就绪', '几何 / 平面 / 高度 / 配准', 2, 9,
+    n('o-3ddone', '本片联合结果就绪', '几何 / 平面 / 高度 / 配准', 2, 10,
       '保存结果到state.results[piece_id]|将高度点转换到整板坐标|掩码轮廓仍为片局部坐标|后续仍会合并完整2D诊断', kind='data', src=(P, '_measured'))
-    n('o-all', '整板最终汇合', 'N个entries + N个results + 无inflight', 1, 10,
+    n('o-all', '整板最终汇合', 'N个entries + N个results + 无inflight', 1, 11,
       '必须收齐所有2D诊断和联合结果|按片号排序|再次合并银胶、外观等晚到诊断|单片NG与接口错误分别处理', kind='gate', src=(P, '_complete_if_ready'))
-    n('o-return', '整板JSON响应与释放', 'request_id匹配；stdout单行', 1, 11,
+    n('o-return', '整板JSON响应与释放', 'request_id匹配；stdout单行', 1, 12,
       '整板registration_ok与is_ok分别汇总|返回released板信息|删除本板缓存并完成Future|桥接层写JSON响应并归还请求容量', kind='data', src=(T, '_accept'))
     for a,b,label,kind in [('o-entry','o-2d','逐片提交','fork'),('o-entry','o-depth','整板提交','fork'),
         ('o-2d','o-fork','','serial'),('o-fork','o-gpu','','fork'),('o-fork','o-boundary','','fork'),
         ('o-depth','o-pitch','','serial'),('o-pitch','o-slices','','serial'),('o-gpu','o-geometry','','serial'),
         ('o-geometry','o-postgate','','wait'),('o-boundary','o-postgate','','wait'),
         ('o-geometry','o-joingate','提前发布','data'),('o-slices','o-joingate','','wait'),
-        ('o-postgate','o-post','','serial'),('o-joingate','o-shared','','serial'),('o-shared','o-registration','跨进程描述','data'),('o-registration','o-joint','回调交接','data'),('o-post','o-cpu2d','共享mask','data'),('o-cpu2d','o-finalize2d','结果回传','data'),('o-finalize2d','o-2ddone','','serial'),
+        ('o-postgate','o-post','','serial'),('o-joingate','o-shared','','serial'),('o-shared','o-registration','跨进程描述','data'),('o-registration','o-jointprep','回调交接','data'),('o-jointprep','o-joint','共享输入','data'),('o-post','o-cpu2d','共享mask','data'),('o-cpu2d','o-finalize2d','结果回传','data'),('o-finalize2d','o-2ddone','','serial'),
         ('o-joint','o-3ddone','','serial'),('o-2ddone','o-all','','wait'),('o-3ddone','o-all','','wait'),('o-all','o-return','','serial')]:e(a,b,label,kind)
 
     scene('initialization', '初始化与资源', '协议初始化、算法初始化、模型副本和线程池', [
@@ -113,8 +118,8 @@ def build_flows():
       '为每个GPU工作资源构造独立YOLO|为该资源加载独立EfficientAD预测器|建立独立锁和可用CUDA流|资源进入槽位队列，推理完成后归还',pool='gpu',src=(B,'_load_gpu_worker_replicas'))
     n('i-pools','应用正式执行器并建立pipeline','只有算法初始化成功才切换',1,6,
       '校验各独立池总数不超过worker_budget，独立registration池也计入|缺省silver池可别名到postprocess，joint可别名到cpu，registration可别名到joint|只有空闲时允许重配线程池|BoardPipeline持有这些执行器并按事件调度',kind='parallel',src=(T,'_configure_thread_pools'))
-    n('i-process','预热配准与2D CPU进程','spawn + pythonw，无thread回退',1,7,
-      '分别初始化配准和2D后处理全部worker，OpenCV/BLAS为1且无Torch|按真实物理核/SMT拓扑划分独立核组|启用亲和性的池优先分配，另一池从剩余CPU启动|主进程使用剩余范围，关停按逆序恢复|返回两组PID/亲和性/版本，任一池失败清理全部已创建池',kind='parallel',pool='registration_process',src=(T,'_configure_cpu_processes'),params=('common_3d.parameters.threading.registration_affinity','common_2d.parameters.threading.cpu_process_affinity'))
+    n('i-process','预热三组CPU进程','32核起点：8＋8＋8，主进程留8',1,7,
+      '分别初始化配准、2D后处理和3D测高全部worker，无Torch|按真实物理核/SMT拓扑划分三组独立范围|启用亲和性的池优先分配，其余从剩余CPU启动|每个测高进程有自己的实例执行器，默认1工作位|主进程使用剩余范围，关停逆序恢复|任一池失败清理全部已创建池',kind='parallel',pool='registration_process',src=(T,'_configure_cpu_processes'),params=('common_3d.parameters.threading.registration_affinity','common_2d.parameters.threading.cpu_process_affinity','common_3d.parameters.threading.joint_affinity'))
     n('i-ready','返回算法初始化成功','模型驻留，等待输入',1,8,
       '返回模型加载耗时和线程配置|同配置/同模型的验证台任务可复用检测进程|配置或模型文件指纹改变后重新初始化|退出时关闭自有池并释放模型',kind='data',src=(V,'_ensure'))
     for a,b in zip(['i-init','i-config','i-board','i-cuda','i-ad','i-replicas','i-pools','i-process'],['i-config','i-board','i-cuda','i-ad','i-replicas','i-pools','i-process','i-ready']):e(a,b)
@@ -235,21 +240,21 @@ def build_flows():
     n('r-worker','子进程挂接只读共享区','CPU专用核组；不加载模型',1,1,
       '常驻worker取到本片描述|挂接gray/mask/整板深度并设只读|按y1:y2取全宽深度视图|执行与直接求解相同的register_arrays|此处开始记录registration_phase_ms',pool='registration_process',src=(RW,'run'),times=('registration_queue_ms','registration_phase_ms'))
     n('r-platform','构造3D平台掩码','depth_piece > 0并闭运算',1,1,
-      '对片深度的非零像素二值化|按registration_3d.morphology_kernel_size闭运算|2D平台掩码此前已在准备阶段生成|两幅掩码进入固定尺度模板匹配',pool='joint',src=(R,'platform_mask_3d'),times=('platform_mask_3d_ms',))
+      '对片深度的非零像素二值化|按registration_3d.morphology_kernel_size闭运算|2D平台掩码此前已在准备阶段生成|两幅掩码进入固定尺度模板匹配',pool='joint_measurement_process',src=(R,'platform_mask_3d'),times=('platform_mask_3d_ms',))
     n('r-coarse','粗配准模板匹配','TM_CCOEFF_NORMED',1,2,
-      '从3D掩码裁roi_3d作模板，底部保留安全边界|从缩放2D掩码裁search_2d_scaled作搜索区|matchTemplate取最高相关位置|结合模板与搜索框偏移得到tx/ty|构造原始2D→片局部矩阵：scale对角项+平移|粗分数与minimum_score给粗有效标记',pool='joint',src=(R,'register_platform_masks'),params=('registration_3d.parameters',),times=('coarse_registration_ms',))
+      '从3D掩码裁roi_3d作模板，底部保留安全边界|从缩放2D掩码裁search_2d_scaled作搜索区|matchTemplate取最高相关位置|结合模板与搜索框偏移得到tx/ty|构造原始2D→片局部矩阵：scale对角项+平移|粗分数与minimum_score给粗有效标记',pool='joint_measurement_process',src=(R,'register_platform_masks'),params=('registration_3d.parameters',),times=('coarse_registration_ms',))
     n('r-source','仿射评分准备','灰度阈值化；源2D再按preview_scale缩放',1,3,
-      '原2D灰度>threshold_2d后变为0/1|源掩码按preview_scale做nearest缩放|目标depth>0保持原始3D分片画幅|两侧按仿射morphology_kernel_size闭运算|裁出所选R1/R2/R3目标掩码供评分复用',pool='joint',src=(R,'refine_affine_registration'),params=('dynamic_affine_3d.parameters',))
+      '原2D灰度>threshold_2d后变为0/1|源掩码按preview_scale做nearest缩放|目标depth>0保持原始3D分片画幅|两侧按仿射morphology_kernel_size闭运算|裁出所选R1/R2/R3目标掩码供评分复用',pool='joint_measurement_process',src=(R,'refine_affine_registration'),params=('dynamic_affine_3d.parameters',))
     n('r-initial','粗矩阵换算6参数初值','sx sy kxy kyx cx cy',1,4,
-      '矩阵线性项除preview_scale得到内部sx/sy/交叉项|内部参考点固定为缩小2D中的(1000,400)|cx/ cy是该参考点映到3D后的坐标|默认使用粗配准；可选标定profile只复用线性四项，保留本片中心位置|始终保留原粗配准的scale/shear/translation边界，候选须在范围内且完整评分改善',pool='joint',src=(R,'_affine_parameters_from_matrix'),params=('dynamic_affine_3d.parameters.scale_delta','dynamic_affine_3d.parameters.shear_limit','dynamic_affine_3d.parameters.translation_delta'))
+      '矩阵线性项除preview_scale得到内部sx/sy/交叉项|内部参考点固定为缩小2D中的(1000,400)|cx/ cy是该参考点映到3D后的坐标|默认使用粗配准；可选标定profile只复用线性四项，保留本片中心位置|始终保留原粗配准的scale/shear/translation边界，候选须在范围内且完整评分改善',pool='joint_measurement_process',src=(R,'_affine_parameters_from_matrix'),params=('dynamic_affine_3d.parameters.scale_delta','dynamic_affine_3d.parameters.shear_limit','dynamic_affine_3d.parameters.translation_delta'))
     n('r-score','单次评分','原生warpAffine → 区域差异 → 惩罚',1,5,
-      '由6参数生成缩小源→3D片局部仿射矩阵|full路径用原生warpAffine生成完整目标图|只比较选定评分框的二值不一致比例|分区等权平均，不按区域面积再加权|加penalty_weight×[(kxy/shear_limit)²+(kyx/shear_limit)²]|可启用精确6参数缓存，仅保留标量和各区损失；每个分辨率独立缓存并分别统计实际变换次数',pool='joint',src=(R,'refine_affine_registration'),times=('affine_score_total_ms',))
+      '由6参数生成缩小源→3D片局部仿射矩阵|full路径用原生warpAffine生成完整目标图|只比较选定评分框的二值不一致比例|分区等权平均，不按区域面积再加权|加penalty_weight×[(kxy/shear_limit)²+(kyx/shear_limit)²]|可启用精确6参数缓存，仅保留标量和各区损失；每个分辨率独立缓存并分别统计实际变换次数',pool='joint_measurement_process',src=(R,'refine_affine_registration'),times=('affine_score_total_ms',))
     n('r-powell','Powell方向搜索','单条优化链内串行依赖',1,6,
-      '依次沿各方向做有界线搜索|每次尝试参数都调用评分函数|后一方向使用前一方向更新后的参数|一轮可评分多次，maxiter不是评分次数|当前没有并行候选搜索；可选multiscale按低分辨率搜索→完整精修顺序执行，默认关闭',pool='joint',src=(R,'refine_affine_registration'))
+      '依次沿各方向做有界线搜索|每次尝试参数都调用评分函数|后一方向使用前一方向更新后的参数|一轮可评分多次，maxiter不是评分次数|当前没有并行候选搜索；可选multiscale按低分辨率搜索→完整精修顺序执行，默认关闭',pool='joint_measurement_process',src=(R,'refine_affine_registration'))
     n('r-stop','是否停止优化','改善足够小 / 迭代上限 / 数值异常',1,7,
-      '整轮改善按ftol判定：2×(旧损失−新损失) ≤ ftol×(abs旧+abs新)+极小量|达到maxiter也停止|xtol用于方向搜索精度，不直接表示像素误差|maxfev可限制每级调用，total_maxfev限制总调用；均默认null，无毫秒超时|单级触边不自动回退；多级精修窗口触边会尝试原范围回退，总预算耗尽时明确记录未运行',pool='joint',kind='decision',src=(R,'refine_affine_registration'),params=('dynamic_affine_3d.parameters.maxiter','dynamic_affine_3d.parameters.xtol','dynamic_affine_3d.parameters.ftol'))
+      '整轮改善按ftol判定：2×(旧损失−新损失) ≤ ftol×(abs旧+abs新)+极小量|达到maxiter也停止|xtol用于方向搜索精度，不直接表示像素误差|maxfev可限制每级调用，total_maxfev限制总调用；均默认null，无毫秒超时|单级触边不自动回退；多级精修窗口触边会尝试原范围回退，总预算耗尽时明确记录未运行',pool='joint_measurement_process',kind='decision',src=(R,'refine_affine_registration'),params=('dynamic_affine_3d.parameters.maxiter','dynamic_affine_3d.parameters.xtol','dynamic_affine_3d.parameters.ftol'))
     n('r-verdict','完整评分与最终质量标记','独立于优化器停止状态',1,8,
-      '对最终参数再评分并输出各区损失|换回原始2D→3D片局部2×3矩阵及3×3表示|矩阵全部有限且最终损失≤max_score才affine_valid|未配置max_score时默认0.25|不要求optimizer.success=True；迭代触顶仍可能质量达标|记录缓存/真实warp/逐级nfev/均耗/预算/回退；预算截断时保留本阶段最佳有限试探，最终仍用完整评分',pool='joint',src=(R,'refine_affine_registration'),times=('affine_registration_ms',))
+      '对最终参数再评分并输出各区损失|换回原始2D→3D片局部2×3矩阵及3×3表示|矩阵全部有限且最终损失≤max_score才affine_valid|未配置max_score时默认0.25|不要求optimizer.success=True；迭代触顶仍可能质量达标|记录缓存/真实warp/逐级nfev/均耗/预算/回退；预算截断时保留本阶段最佳有限试探，最终仍用完整评分',pool='joint_measurement_process',src=(R,'refine_affine_registration'),times=('affine_registration_ms',))
     # Only input preparation runs in parent threads; all solver steps run in
     # persistent model-free processes, before returning to the joint executor.
     for node in current['nodes']:
@@ -257,52 +262,52 @@ def build_flows():
             node['pool'] = 'registration_process'
             if node['id'] != 'r-worker':
                 node['row'] += 1
-    n('r-handoff','返回矩阵并提交测高队列','父回调转发worker诊断日志',1,10,
-      '子进程关闭本次共享区挂接|父进程接收同一个矩阵和评分/计时诊断|真实进程Future结束才释放租约|joint池独立限制映射测高并发|已释放或失败的板不再开始测高',kind='data',src=(P,'_registered'),times=('registration_result_transfer_ms','joint_measurement_queue_ms'))
+    n('r-handoff','返回矩阵并提交第三组进程','复用深度；不占父线程等待',1,10,
+      '父进程接收矩阵和评分诊断|复用整板深度共享块并追加本片实例mask|只向测高worker发送描述和高度参数|真实Future结束才释放输入租约|已释放或失败的板不再开始测高',kind='data',src=(P,'_registered'),times=('registration_result_transfer_ms','joint_measurement_queue_ms'))
     n('r-map','逐实例并行映射','共享只读H；独立目标缓冲',1,11,
       '原crop局部掩码先加crop左上角变成原图坐标|实际矩阵为H_full×T_crop_to_full|nearest映射到完整片局部深度画幅|各实例提取2D/3D几何，字典和输出由任务独立持有|父线程按原实例顺序汇总|一片左右及全部类别都使用同一个矩阵',pool='instance',kind='parallel',src=(R,'align_crop_mask_to_depth'),times=('mask_alignment_ms','instance_alignment_work_ms'))
     n('r-height','进入参考面与全实例测高','已对齐实例 + 深度片',1,12,
-      '语义掩码用于参考面排除|完整实例用于chip/bond归属等|wire/thin测高会另按清理/分段构造测量掩码|不按2D引线ROI筛选测高对象',pool='joint',src=(B,'_measure_piece'))
+      '语义掩码用于参考面排除|完整实例用于chip/bond归属等|wire/thin测高会另按清理/分段构造测量掩码|不按2D引线ROI筛选测高对象',pool='joint_measurement_process',src=(J, '_measure_piece'))
     chain=['r-gate','r-worker','r-platform','r-coarse','r-source','r-initial','r-score','r-powell','r-stop','r-verdict','r-handoff','r-map','r-height']
     for a,b in zip(chain,chain[1:]):e(a,b)
     e('r-stop','r-score','继续搜索','loop')
 
-    scene('height','全实例测高','参考面准备串行 → 引线内部并行 → 焊脚内部并行',[
+    scene('height','全实例测高','测高进程内：参考面 → 引线 → 焊脚；默认串行，不同片跨进程并行',[
         '最新代码已删除测高目标选择ROI：全部已检测wire/thin/bond参与，清理后为空也保留无效引线记录。',
-        '引线和焊脚是两个先后阶段；每个阶段内部使用instance池并行。芯片平面拟合循环目前仍在父任务中逐chip执行。',
+        '映射与测高都在独立进程；引线、焊脚按先后阶段使用本进程实例执行器，默认1工作位。芯片面在当前进程逐chip准备，不占主进程。',
         '代表点按原始深度P95选取，不是对“相对参考面的高度差”求P95，也不是简单取最大值。'])
     n('h-union','建立完整语义排除掩码','所有对齐YOLO实例的union',1,0,
-      '按像素合并所有完整对齐实例|按semantic_exclusion_dilation_px膨胀|此处不使用内缩后的测高掩码|防止线、焊点等进入平台平面采样',pool='joint',src=(B,'_semantic_exclusion_mask'),times=('height_semantic_exclusion_ms',))
+      '按像素合并所有完整对齐实例|按semantic_exclusion_dilation_px膨胀|此处不使用内缩后的测高掩码|防止线、焊点等进入平台平面采样',pool='joint_measurement_process',src=(J, '_semantic_exclusion_mask'),times=('height_semantic_exclusion_ms',))
     n('h-platformroi','映射引脚平台采样ROI','2D圆相对标定 → 深度片',1,1,
-      '圆心/半径结合platform_roi_offsets生成原图矩形|使用当前片仿射矩阵映射多边形|采样区域减去完整语义排除掩码|排除invalid_values深度|没有标定、圆或有效配准时平台面标记invalid',pool='joint',src=(H,'map_platform_rois'),params=('height_measurement_3d.parameters.platform_roi_offsets','height_measurement_3d.parameters.invalid_values'))
+      '圆心/半径结合platform_roi_offsets生成原图矩形|使用当前片仿射矩阵映射多边形|采样区域减去完整语义排除掩码|排除invalid_values深度|没有标定、圆或有效配准时平台面标记invalid',pool='joint_measurement_process',src=(H,'map_platform_rois'),params=('height_measurement_3d.parameters.platform_roi_offsets','height_measurement_3d.parameters.invalid_values'))
     n('h-platformfit','拟合全局引脚平台面','平面z=a·x+b·y+c',1,2,
-      '提取有效平台采样点|按stride=max(1,N//30000)降采样，非严格3万点上限|先保留plane_percentile对应的较低深度点|最多5轮最小二乘和残差MAD剔除|残差阈值取max(50灰度,4.4478×MAD)|点数不足时标记无效，不伪造平面',pool='joint',src=(H,'_fit_plane_points'),params=('height_measurement_3d.parameters.plane_percentile','height_measurement_3d.parameters.plane_min_valid_points'),times=('height_fit_platform_plane_ms',))
+      '提取有效平台采样点|按stride=max(1,N//30000)降采样，非严格3万点上限|先保留plane_percentile对应的较低深度点|最多5轮最小二乘和残差MAD剔除|残差阈值取max(50灰度,4.4478×MAD)|点数不足时标记无效，不伪造平面',pool='joint_measurement_process',src=(H,'_fit_plane_points'),params=('height_measurement_3d.parameters.plane_percentile','height_measurement_3d.parameters.plane_min_valid_points'),times=('height_fit_platform_plane_ms',))
     n('h-chipcache','准备芯片归属缓存','父线程统一构造，只读共享',1,3,
-      '对各chip的原2D掩码取填充外部区域|填充芯片轮廓内孔洞供归属判断|缓存区域面积|后续焊脚工作线程只读，不懒写共享缓存|此缓存不作为芯片平面实际采样掩码',pool='joint',src=(B,'_prepare_chip_regions'),times=('height_prepare_chip_regions_ms',))
+      '对各chip的原2D掩码取填充外部区域|填充芯片轮廓内孔洞供归属判断|缓存区域面积|后续焊脚工作线程只读，不懒写共享缓存|此缓存不作为芯片平面实际采样掩码',pool='joint_measurement_process',src=(J, '_prepare_chip_regions'),times=('height_prepare_chip_regions_ms',))
     n('h-chipfit','逐chip拟合芯片参考面','保留本chip，排除其它实例',1,4,
-      '为当前chip重建“除它以外”的语义union|不能在全局union上清空chip区域，否则会恢复重叠焊点|chip掩码内排除其它语义和无效深度|检查chip_min_valid_points|采用同一稳健平面拟合，但不先做低百分位筛选|失败则该chip平面None，不悄悄替换参考',pool='joint',src=(H,'fit_chip_plane'),params=('height_measurement_3d.parameters.chip_min_valid_points',),times=('height_fit_chip_plane_ms',))
+      '为当前chip重建“除它以外”的语义union|不能在全局union上清空chip区域，否则会恢复重叠焊点|chip掩码内排除其它语义和无效深度|检查chip_min_valid_points|采用同一稳健平面拟合，但不先做低百分位筛选|失败则该chip平面None，不悄悄替换参考',pool='joint_measurement_process',src=(H,'fit_chip_plane'),params=('height_measurement_3d.parameters.chip_min_valid_points',),times=('height_fit_chip_plane_ms',))
     n('h-thin','thin一次分段准备','主轴SVD：两端 + 中段',1,5,
-      '在原2D thin掩码前景坐标上做主轴SVD|按投影长度划分start/end端部|中间部分作为引线，端部分别作为焊脚|父线程保存本次分段结果供两个阶段复用|不使用2D引线ROI裁剪这些区域',pool='joint',src=(B,'_prepare_thin_parts'),params=('height_measurement_3d.parameters.thin_solder_end_ratio',),times=('height_prepare_thin_ms',))
+      '在原2D thin掩码前景坐标上做主轴SVD|按投影长度划分start/end端部|中间部分作为引线，端部分别作为焊脚|父线程保存本次分段结果供两个阶段复用|不使用2D引线ROI裁剪这些区域',pool='joint_measurement_process',src=(J, '_prepare_thin_parts'),params=('height_measurement_3d.parameters.thin_solder_end_ratio',),times=('height_prepare_thin_ms',))
     n('h-wirejobs','全部wire/thin逐根并行','ROI外目标也必须返回记录',1,6,
-      '枚举每个wire和thin，保持输入顺序|wire使用完整掩码；thin使用准备好的中间段|在包围框和形态学halo内清理|不做ROI存在性判断，也不再裁剪ROI|已有bending_2d仅携带展示，3D不重新计算弯曲',pool='instance',kind='parallel',src=(B,'_measure_wire_regions'),times=('height_wire_regions_ms','height_wire_work_ms'))
+      '枚举每个wire和thin，保持输入顺序|wire使用完整掩码；thin使用准备好的中间段|在包围框和形态学halo内清理|不做ROI存在性判断，也不再裁剪ROI|已有bending_2d仅携带展示，3D不重新计算弯曲',pool='instance',kind='parallel',src=(J, '_measure_wire_regions'),times=('height_wire_regions_ms','height_wire_work_ms'))
     n('h-wiremask','每根：映射、内缩与有效点','3D像素半径定义',1,7,
-      '将局部清理偏移合入crop到原图变换|映射得到独立引线测高掩码|按wire或thin_measurement_erode_px内缩|只修改自有测量掩码，不修改语义掩码|空/无有效深度或无平台面时保留无效记录',pool='instance',src=(B,'_measure_wire_region'),params=('height_measurement_3d.parameters.wire_measurement_erode_px','height_measurement_3d.parameters.thin_measurement_erode_px'))
+      '将局部清理偏移合入crop到原图变换|映射得到独立引线测高掩码|按wire或thin_measurement_erode_px内缩|只修改自有测量掩码，不修改语义掩码|空/无有效深度或无平台面时保留无效记录',pool='instance',src=(J, '_measure_wire_region'),params=('height_measurement_3d.parameters.wire_measurement_erode_px','height_measurement_3d.parameters.thin_measurement_erode_px'))
     n('h-wirepoint','每根：P95点与平台高度差','原始灰度分位 → 最近实际像素',1,8,
       '枚举测量掩码内有效深度|计算height_percentile分位值|选与该分位值最接近的实际像素，按行序处理平局|在同一个(x,y)计算参考平面深度|高度差=(点灰度−平面灰度)×vertical_resolution_mm|严格小于max_wire_platform_height_mm才OK',pool='instance',src=(H,'measure_mask_height'),params=('height_measurement_3d.parameters.height_percentile','height_measurement_3d.parameters.max_wire_platform_height_mm'))
     n('h-wirejoin','引线结果有序汇合','等待该片全部引线任务',1,9,
-      '按原输入顺序连续分配region_id|每个wire/thin有独立height_3d记录|高度有效性与2D弯曲结论分开|准备焊脚任务列表',kind='gate',src=(B,'_measure_wire_regions'))
+      '按原输入顺序连续分配region_id|每个wire/thin有独立height_3d记录|高度有效性与2D弯曲结论分开|准备焊脚任务列表',kind='gate',src=(J, '_measure_wire_regions'))
     n('h-solderjobs','全部bond与thin端点并行','每个端点独立任务',1,10,
-      'thin的start/end使用已分好的原2D端部掩码|端部映射到3D后先膨胀搜索范围|bond直接使用完整对齐实例掩码|保持实例顺序以及start/end顺序|任务只返回结果，结束前不写共享实例字段',pool='instance',kind='parallel',src=(B,'_measure_solder_task'),params=('height_measurement_3d.parameters.thin_solder_search_dilation_px',),times=('height_solder_wall_ms','height_solder_work_ms'))
+      'thin的start/end使用已分好的原2D端部掩码|端部映射到3D后先膨胀搜索范围|bond直接使用完整对齐实例掩码|保持实例顺序以及start/end顺序|任务只返回结果，结束前不写共享实例字段',pool='instance',kind='parallel',src=(J, '_measure_solder_task'),params=('height_measurement_3d.parameters.thin_solder_search_dilation_px',),times=('height_solder_wall_ms','height_solder_work_ms'))
     n('h-ownership','每焊脚：归属芯片或平台','2D掩码重心，不按3D最高点判断',1,11,
-      '计算焊脚原2D掩码前景平均坐标|判断其是否位于填充chip外部区域内|重叠多chip时选包含它且面积最小的chip|在chip上时使用该chip平面和芯片焊脚阈值|chip平面不可用则测高无效，不退成平台焊脚',pool='instance',kind='decision',src=(B,'_matching_chip'))
+      '计算焊脚原2D掩码前景平均坐标|判断其是否位于填充chip外部区域内|重叠多chip时选包含它且面积最小的chip|在chip上时使用该chip平面和芯片焊脚阈值|chip平面不可用则测高无效，不退成平台焊脚',pool='instance',kind='decision',src=(J, '_matching_chip'))
     n('h-localplane','平台焊脚：局部环形平面','局部失败才回退全局平台面',0,12,
       '对原焊脚区域构造外膨胀环减内膨胀区|去掉完整语义排除和无效深度|仅在bbox+halo内计算环形采样|有效点足够时拟合local_wire_platform|局部拟合失败时才回退全局wire_platform平面',pool='instance',src=(H,'fit_local_platform_plane'),params=('height_measurement_3d.parameters.platform_local_ring_px',))
     n('h-chipplane','芯片焊脚：使用既有芯片面','不另拟合局部平台',2,12,
-      '从chip_planes取归属芯片平面|reference=chip，保存reference_instance_id|使用max_solder_chip_height_mm|缺少有效芯片平面时保留无效height_3d',pool='instance',src=(B,'_measure_solder'))
+      '从chip_planes取归属芯片平面|reference=chip，保存reference_instance_id|使用max_solder_chip_height_mm|缺少有效芯片平面时保留无效height_3d',pool='instance',src=(J, '_measure_solder'))
     n('h-solderpoint','每焊脚：内缩、P95与高度差','归属先确定；测量再内缩',1,13,
-      '按bond或thin_solder_measurement_erode_px内缩独立bbox|不修改共享完整实例掩码|使用与引线相同的实际P95代表点方法|按芯片/平台对应阈值判定高度|记录reference/location/measurement_id及2D/3D测量区域',pool='instance',src=(B,'_measure_solder'),params=('height_measurement_3d.parameters.bond_measurement_erode_px','height_measurement_3d.parameters.thin_solder_measurement_erode_px','height_measurement_3d.parameters.max_solder_chip_height_mm','height_measurement_3d.parameters.max_solder_platform_height_mm'),times=('height_solder_ms',))
+      '按bond或thin_solder_measurement_erode_px内缩独立bbox|不修改共享完整实例掩码|使用与引线相同的实际P95代表点方法|按芯片/平台对应阈值判定高度|记录reference/location/measurement_id及2D/3D测量区域',pool='instance',src=(J, '_measure_solder'),params=('height_measurement_3d.parameters.bond_measurement_erode_px','height_measurement_3d.parameters.thin_solder_measurement_erode_px','height_measurement_3d.parameters.max_solder_chip_height_mm','height_measurement_3d.parameters.max_solder_platform_height_mm'),times=('height_solder_ms',))
     n('h-merge','父线程汇总高度与实例字段','所有子任务结束后再写回',1,14,
-      '将引线结果按instance_id关联|将bond高度和芯片归属写回实例|chip保存plane_3d，非测高类别height_3d=None|高度组件is_ok只看高度，不再AND弯曲|整体联合结论仍会合并2D ROI与诊断|失败任务先取消未运行任务、等待运行中的兄弟任务再抛错',pool='joint',src=(B,'_measure_piece'),times=('height_measurement_ms',))
+      '将引线结果按instance_id关联|将bond高度和芯片归属写回实例|chip保存plane_3d，非测高类别height_3d=None|高度组件is_ok只看高度，不再AND弯曲|整体联合结论仍会合并2D ROI与诊断|失败任务先取消未运行任务、等待运行中的兄弟任务再抛错',pool='joint_measurement_process',src=(J, '_measure_piece'),times=('height_measurement_ms',))
     chain=['h-union','h-platformroi','h-platformfit','h-chipcache','h-chipfit','h-thin','h-wirejobs','h-wiremask','h-wirepoint','h-wirejoin','h-solderjobs','h-ownership']
     for a,b in zip(chain,chain[1:]):e(a,b)
     e('h-ownership','h-localplane','不在chip');e('h-ownership','h-chipplane','在chip')
@@ -312,7 +317,7 @@ def build_flows():
         '仿射矩阵映射完整原图2D坐标到本片局部深度坐标；不是crop局部矩阵，也未包含整板行偏移。',
         'Pitch开启后，整板高度点属于补偿后栅格；不能直接叠到原始未矫正深度PNG上。'])
     n('u-crop','crop局部 → 完整2D','加crop左上角',0,0,
-      'YOLO掩码在检测crop局部坐标中|输出mask_2d几何时加crop原点|若清理用bbox，再额外加mask_offset|不要再把同一crop偏移加第二次',kind='data',src=(B,'_align_instance'))
+      'YOLO掩码在检测crop局部坐标中|输出mask_2d几何时加crop原点|若清理用bbox，再额外加mask_offset|不要再把同一crop偏移加第二次',kind='data',src=(J, '_align_instance'))
     n('u-affine','完整2D → 3D片局部','全片一个H',1,1,
       '完整原图点乘H_full得到片局部点|crop掩码使用H_full×T_crop_to_full|输出mask_3d_local、参考平面和采样区均保留片局部坐标|不因为存在多个评分ROI而分开扭曲图像',kind='data',src=(R,'align_crop_mask_to_depth'))
     n('u-global','片局部高度点 → 整板高度点','x不变，y加depth_start_row',1,2,

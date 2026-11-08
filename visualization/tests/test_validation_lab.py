@@ -129,7 +129,7 @@ class ValidationTests(unittest.TestCase):
         runner,clients=self.make_runner();self.addCleanup(runner.close)
         cfg=json.loads(init_request()['config_text'])
         cfg['smartray_pitch_3d']={'description':'test','parameters':{'enabled_3d':True,'scan_pitch_mm':0}}
-        cfg['common_3d']['parameters']['threading']={'registration_affinity':{'enabled':True,'physical_cores':4}}
+        cfg['common_3d']['parameters']['threading']={'registration_affinity':{'enabled':True,'physical_cores':8},'joint_affinity':{'enabled':True,'physical_cores':8}}
         runner.init_builder=lambda *args:dict(cmd='init_algorithm',config_text=json.dumps(cfg))
         folder=self.root/'two-only';folder.mkdir()
         result=runner.run(self.rows[:1],'2','2d',2,folder,lambda x:None)
@@ -138,8 +138,10 @@ class ValidationTests(unittest.TestCase):
         self.assertFalse(json.loads(request['config_text'])['smartray_pitch_3d']['parameters']['enabled_3d'])
         effective=json.loads(request['config_text'])
         self.assertFalse(effective['common_3d']['parameters']['threading']['registration_affinity']['enabled'])
+        self.assertFalse(effective['common_3d']['parameters']['threading']['joint_affinity']['enabled'])
         self.assertTrue(effective['common_2d']['parameters']['threading']['cpu_process_affinity']['enabled'])
         self.assertTrue(cfg['common_3d']['parameters']['threading']['registration_affinity']['enabled'])
+        self.assertTrue(cfg['common_3d']['parameters']['threading']['joint_affinity']['enabled'])
 
     def test_http_uploads_defaults_and_rejects_bad_pairing_before_model_load(self):
         server=lab.Server(0,self.root/'output');threading.Thread(target=server.serve_forever,daemon=True).start()

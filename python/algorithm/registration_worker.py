@@ -25,7 +25,7 @@ def register_arrays(gray, mask_2d, depth_piece, registration_config, affine_conf
                       coarse, affine_config, context=affine_coordinate_context(gray.shape, depth_piece.shape, correction))
 
 
-def initialize(assignments, assignment_index, ready, warmup_gate, role="registration", extra_imports=()):
+def initialize(assignments, assignment_index, ready, warmup_gate, role="registration", extra_imports=(), extra_info=None):
     global _startup, _warmup_gate
     try:
         # Set before importing numerical libraries; no inherited model imports are allowed.
@@ -58,6 +58,7 @@ def initialize(assignments, assignment_index, ready, warmup_gate, role="registra
                         native_threads={key: os.environ[key] for key in
                                         ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS")},
                         numpy=numpy.__version__, scipy=scipy.__version__, opencv=cv2.__version__)
+        _startup.update(extra_info or {})
         _warmup_gate = warmup_gate
         ready.put(dict(ok=True, **_startup))
     except BaseException as error:
