@@ -12,6 +12,8 @@ def share_instances(instances, inputs, *, arrays=None, cache_keys=None, cache_pr
     cache_keys = dict(cache_keys or {})
     for index, instance in enumerate(instances):
         record = dict(fields={key: instance[key] for key in PUBLIC_INSTANCE_FIELDS if key in instance})
+        if instance.get("_mask_binary_255") is True:
+            record["fields"]["_mask_binary_255"] = True
         mask = instance.get("mask")
         if isinstance(mask, np.ndarray):
             if mask.size:

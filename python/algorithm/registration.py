@@ -515,8 +515,14 @@ def align_crop_mask_to_depth(
     crop_roi: Sequence[int],
     depth_shape: tuple[int, int],
     registration: Dict[str, Any],
+    *,
+    binary_255: bool = False,
 ) -> np.ndarray:
-    """Warp a fixed-ROI mask into local coordinates of its matched depth piece."""
+    """Warp a crop mask; binary_255 trusts a producer's uint8 0/255 contract.
+
+    Unmarked compatibility inputs retain positive-value binarization. Neither
+    path modifies its source, including read-only shared-memory views.
+    """
     x0, y0, _, _ = (int(value) for value in crop_roi)
     scale = float(registration["scale"])
     tx = float(registration["tx"])
@@ -543,8 +549,11 @@ def align_crop_mask_to_depth(
             dtype=np.float64,
         )
     height, width = depth_shape
+    source = np.asarray(crop_mask)
+    if not binary_255 or source.dtype != np.uint8:
+        source = (source > 0).astype(np.uint8) * 255
     return cv2.warpPerspective(
-        (np.asarray(crop_mask) > 0).astype(np.uint8) * 255,
+        source,
         transform,
         (width, height),
         flags=cv2.INTER_NEAREST,

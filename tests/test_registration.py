@@ -13,6 +13,59 @@ sys.path.insert(0, str(ROOT / "python"))
 from algorithm import registration
 
 
+class MaskMappingInputTests(unittest.TestCase):
+    def test_normalized_readonly_masks_reuse_source_and_match_legacy_pixels(self):
+        base = np.zeros((18, 30), np.uint8)
+        base[3:14, 6:25] = 255
+        for source in (base, base[:, ::2]):
+            original = source.copy()
+            source.setflags(write=False)
+            for matrix in (None, [[.91, .02, -2.5], [-.01, .95, 1.5], [.0002, -.0001, 1.]]):
+                values = dict(scale=.9, tx=-2.5, ty=1.5)
+                if matrix is not None:
+                    values['homography_2d_to_3d'] = matrix
+                expected = registration.align_crop_mask_to_depth(source, (4, 6, 34, 24), (24, 38), values)
+                with patch.object(cv2, 'warpPerspective', wraps=cv2.warpPerspective) as warp:
+                    actual = registration.align_crop_mask_to_depth(
+                        source, (4, 6, 34, 24), (24, 38), values, binary_255=True)
+                self.assertIs(warp.call_args.args[0], source)
+                np.testing.assert_array_equal(actual, expected)
+                np.testing.assert_array_equal(source, original)
+
+    def test_unmarked_uint8_and_other_formats_keep_positive_value_contract(self):
+        examples = [np.array([[0, 1, 2], [17, 254, 255]], np.uint8),
+                    np.array([[True, False], [False, True]]),
+                    np.array([[-3, 0], [1, 256]], np.int16),
+                    np.array([[np.nan, -1.], [0., .2]], np.float32)]
+        values = dict(scale=1., tx=0., ty=0.)
+        for source in examples:
+            for trusted in (False, True) if source.dtype != np.uint8 else (False,):
+                actual = registration.align_crop_mask_to_depth(
+                    source, (0, 0, 3, 2), source.shape, values, binary_255=trusted)
+                np.testing.assert_array_equal(actual, (source > 0).astype(np.uint8)*255)
+
+    def test_formal_producer_marks_masks_and_shared_payload_preserves_internal_flag(self):
+        from importlib import import_module
+        from algorithm.detect_board import DetectBoard
+        from algorithm.registration_process import SharedBoardInputs
+        import torch
+        detector = DetectBoard.__new__(DetectBoard)
+        detector.min_component_area = 1
+        result = SimpleNamespace(masks=SimpleNamespace(data=torch.tensor([[[0., .8], [1., .3]]])),
+            boxes=SimpleNamespace(cls=torch.tensor([1]), conf=torch.tensor([.9])), names={1: 'wire'})
+        instance = detector._extract_instances(result, (2, 2))[0]
+        self.assertIs(instance['_mask_binary_255'], True)
+        np.testing.assert_array_equal(instance['mask'], np.array([[0, 255], [255, 0]], np.uint8))
+        geometry = import_module('algorithm.2D.instance_geometry')
+        owner = SharedBoardInputs()
+        try:
+            _, records = geometry.share_instances([instance], owner)
+            self.assertIs(records[0]['fields']['_mask_binary_255'], True)
+            self.assertNotIn('_mask_binary_255', geometry.public_instance(instance, (0, 0, 2, 2)))
+        finally:
+            owner.close()
+
+
 class AffineScoreTests(unittest.TestCase):
     def test_only_selected_regions_contribute_to_objective(self):
         gray=np.zeros((20,30),np.uint8)

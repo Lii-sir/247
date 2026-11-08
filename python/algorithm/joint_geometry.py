@@ -85,7 +85,8 @@ class JointGeometry:
         crop_mask = instance["mask"]
         crop_box = tuple(crop_box or self.crop_roi)
         aligned = self._joint_ops.align_crop_mask_to_depth(
-            crop_mask, crop_box, depth_shape, registration
+            crop_mask, crop_box, depth_shape, registration,
+            binary_255=instance.get("_mask_binary_255") is True,
         )
         return {
             **instance,
@@ -271,7 +272,9 @@ class JointGeometry:
         if endpoint == "bond":
             mask_3d = instance["_mask_3d_array"]
         else:
-            mask_3d = self._joint_ops.align_crop_mask_to_depth(mask_2d, crop_box, depth.shape, registration)
+            # split_thin_mask creates its own uint8 0/255 endpoint masks.
+            mask_3d = self._joint_ops.align_crop_mask_to_depth(
+                mask_2d, crop_box, depth.shape, registration, binary_255=True)
             # Expand after mapping: this radius is measured in depth pixels.
             mask_3d = self._joint_ops.dilate_mask(mask_3d, self.height_config.thin_solder_search_dilation_px)
         return timed_call("height_solder_ms", self._measure_solder,
@@ -405,7 +408,7 @@ class JointGeometry:
         local_crop = (int(full_offset[0]), int(full_offset[1]),
                       int(full_offset[0] + cleaned.shape[1]), int(full_offset[1] + cleaned.shape[0]))
         aligned = self._joint_ops.align_crop_mask_to_depth(cleaned.astype(np.uint8) * 255,
-                                           local_crop, depth.shape, registration)
+                                           local_crop, depth.shape, registration, binary_255=True)
         erode_px = (self.height_config.thin_measurement_erode_px if class_name == "thin"
                     else self.height_config.wire_measurement_erode_px)
         if erode_px:

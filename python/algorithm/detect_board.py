@@ -1225,6 +1225,7 @@ class DetectBoard(JointGeometry):
                     "class_name": str(class_name),
                     "confidence": float(confidences[index]) if index < len(confidences) else 1.0,
                     "mask": mask,
+                    "_mask_binary_255": True,
                     "rectangle": None,
                     "rectangle_ratio": 1.0,
                     "is_ok": True,

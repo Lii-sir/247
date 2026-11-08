@@ -113,6 +113,14 @@ class JointProcessTests(unittest.TestCase):
         self.assertEqual(first['joint_measurement_worker']['pid'], second['joint_measurement_worker']['pid'])
         self.assertEqual(first['wire_measurements'], second['wire_measurements'])
 
+    def test_normalized_mask_fast_path_matches_compatible_path_across_process(self):
+        expected = self.submit().result(20)
+        for item in self.entry['instances']:
+            item['_mask_binary_255'] = True
+        actual = self.submit().result(20)
+        self.assertEqual(expected, actual)
+        self.assertTrue(all('_mask_binary_255' not in item for item in actual['masks']))
+
     def test_invalid_rows_and_released_board_fail_and_release_lease(self):
         with self.assertRaisesRegex(RuntimeError, 'row bounds'):
             self.submit(piece=dict(y1=0,y2=999)).result(20)
@@ -189,13 +197,13 @@ class JointProcessStructureTests(unittest.TestCase):
                                 env={**os.environ,'PYTHONDONTWRITEBYTECODE':'1'})
         self.assertEqual(0,result.returncode,result.stderr)
 
-    def test_32_core_partition_leaves_eight_main_cores_and_restores_in_reverse(self):
+    def test_24_core_partition_leaves_ten_main_cores_and_restores_in_reverse(self):
         from algorithm.cpu_partition import choose_partition
         server = AlgorithmServer()
         self.addCleanup(server.close)
         server.board = FakeDetector()
-        cores = [dict(logical_cpus=[2*i,2*i+1], efficiency_class=0) for i in range(32)]
-        available, starts, stops = list(range(64)), [], []
+        cores = [dict(logical_cpus=[2*i,2*i+1], efficiency_class=0) for i in range(24)]
+        available, starts, stops = list(range(48)), [], []
         def factory(role):
             def create(count, affinity, **kwargs):
                 original = list(available)
@@ -221,12 +229,12 @@ class JointProcessStructureTests(unittest.TestCase):
         groups = [set(server.threading_info[role+'_execution']['workers'][0]['cpu_ids'])
                   for role in ('registration','cpu_2d','joint_measurement')]
         groups.append(set(server.threading_info['main_cpu_ids']))
-        self.assertEqual([16]*4, [len(group) for group in groups])
+        self.assertEqual([8,4,16,20], [len(group) for group in groups])
         for i, group in enumerate(groups):
             self.assertTrue(all(group.isdisjoint(other) for other in groups[i+1:]))
         server._stop_cpu_processes()
         self.assertEqual(list(reversed(starts)),stops)
-        self.assertEqual(list(range(64)),available)
+        self.assertEqual(list(range(48)),available)
 
     def test_joint_options_validate_without_starting_processes(self):
         server = AlgorithmServer.__new__(AlgorithmServer)
