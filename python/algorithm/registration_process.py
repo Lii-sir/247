@@ -97,6 +97,32 @@ class SharedBoardInputs:
             return result
 
 
+class JointSharedInputs:
+    """Lease board depth and per-piece masks together without copying masks again."""
+    def __init__(self, board_inputs, mask_inputs):
+        self.board_inputs, self.mask_inputs = board_inputs, mask_inputs
+
+    def acquire(self):
+        self.board_inputs.acquire()
+        try:
+            self.mask_inputs.acquire()
+        except BaseException:
+            self.board_inputs.release()
+            raise
+
+    def release(self):
+        try:
+            self.mask_inputs.release()
+        finally:
+            self.board_inputs.release()
+
+    def prepare_named(self, arrays, cache_keys=None, *, kinds="buif"):
+        depth = {name: value for name, value in arrays.items() if name == "depth"}
+        masks = {name: value for name, value in arrays.items() if name != "depth"}
+        return {**self.board_inputs.prepare_named(depth, cache_keys, kinds=kinds),
+                **self.mask_inputs.prepare_named(masks, cache_keys, kinds=kinds)}
+
+
 class RegistrationProcesses:
     """Parent preparation threads never wait for computation in child processes."""
     def __init__(self, workers, affinity, *, startup_timeout=60, worker_module=registration_worker,

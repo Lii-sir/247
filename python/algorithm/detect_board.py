@@ -790,12 +790,12 @@ class DetectBoard(JointGeometry):
             correction, self.registration_config, self.dynamic_affine_config, timings,
             metadata, is_current, log=self.log)
 
-    def submit_2d_postprocess(self, preparation_pool, prepared, timings, metadata, is_current):
+    def submit_2d_postprocess(self, preparation_pool, inputs, prepared, timings, metadata, is_current):
         service = getattr(self, "cpu_2d_process", None)
         if service is None:
             raise RuntimeError("2D CPU processes must be initialized before streaming detection")
         return service.submit_piece(preparation_pool, prepared, self.silver_config,
-            self._silver_config_base_dir(), timings, metadata, is_current, self.log)
+            self._silver_config_base_dir(), timings, metadata, is_current, self.log, shared_inputs=inputs)
 
     def submit_joint_measurement(self, preparation_pool, inputs, piece_id, entry, depth,
                                  piece, registration, correction, timings, metadata, is_current):

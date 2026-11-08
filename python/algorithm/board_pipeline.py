@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from algorithm.tilt_correction import depth_coordinate_space
 from algorithm.timing import timing_context, measure, record_duration, timed_call, note
-from algorithm.registration_process import SharedBoardInputs
+from algorithm.registration_process import SharedBoardInputs, JointSharedInputs
 
 
 @dataclass
@@ -30,6 +30,7 @@ class _Board:
     depth_ready_at: float = 0.0
     request_id: str | None = None
     registration_inputs: SharedBoardInputs = field(default_factory=SharedBoardInputs)
+    mask_inputs: dict = field(default_factory=dict)
 
 
 class BoardPipeline:
@@ -136,6 +137,10 @@ class BoardPipeline:
                     raise ValueError("piece is already being processed; use a new board_id for a new scan")
                 # A completed, unclaimed piece can be replaced. Do not pair a
                 # new 3D scan with its previous generation while reprocessing.
+                previous_masks = state.mask_inputs.get(piece_id)
+                if previous_masks is not None:
+                    previous_masks.close()
+                mask_inputs = state.mask_inputs[piece_id] = SharedBoardInputs()
                 state.entries.pop(piece_id, None)
                 state.joint_entries.pop(piece_id, None)
                 state.inflight.add(piece_id)
@@ -238,7 +243,7 @@ class BoardPipeline:
                         return self._current(state)
                 try:
                     value_post_started[0] = time.perf_counter()
-                    job = self.detector.submit_2d_postprocess(self.postprocess_pool, value, detail_timings,
+                    job = self.detector.submit_2d_postprocess(self.postprocess_pool, mask_inputs, value, detail_timings,
                         dict(board_id=board_id, piece_id=piece_id, request_id=req.get("request_id")), is_current)
                     self._track_joint_job(job).add_done_callback(computed)
                 except Exception as exc:
@@ -381,7 +386,8 @@ class BoardPipeline:
                 def is_current():
                     with self._lock:
                         return self._current(state)
-                measured = self.detector.submit_joint_measurement(self.joint_pool, state.registration_inputs,
+                inputs = JointSharedInputs(state.registration_inputs, state.mask_inputs[piece_id])
+                measured = self.detector.submit_joint_measurement(self.joint_pool, inputs,
                     piece_id, entry, state.depth, piece, registration, state.depth_correction, timings,
                     dict(board_id=state.board_id, piece_id=piece_id, request_id=state.request_id), is_current)
                 self._track_joint_job(measured).add_done_callback(lambda result: self._measured(
@@ -438,10 +444,14 @@ class BoardPipeline:
         if not self._current(state):
             return
         self._boards.pop(state.board_id)
-        try:
-            state.registration_inputs.close()
-        except Exception as error:
-            response = self._failure(state.board_id, "registration_shared_memory_cleanup_failed", str(error))
+        errors = []
+        for inputs in (state.registration_inputs, *state.mask_inputs.values()):
+            try:
+                inputs.close()
+            except Exception as error:
+                errors.append(error)
+        if errors:
+            response = self._failure(state.board_id, "registration_shared_memory_cleanup_failed", str(errors[0]))
         if state.completion is not None and not state.completion.done():
             state.completion.set_result(response)
 

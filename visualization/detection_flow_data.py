@@ -263,7 +263,7 @@ def build_flows():
             if node['id'] != 'r-worker':
                 node['row'] += 1
     n('r-handoff','返回矩阵并提交第三组进程','复用深度；不占父线程等待',1,10,
-      '父进程接收矩阵和评分诊断|复用整板深度共享块并追加本片实例mask|只向测高worker发送描述和高度参数|真实Future结束才释放输入租约|已释放或失败的板不再开始测高',kind='data',src=(P,'_registered'),times=('registration_result_transfer_ms','joint_measurement_queue_ms'))
+      '父进程接收矩阵和评分诊断|复用整板深度与本片实例mask共享块，2D后处理与3D测高只发布一份mask|只向测高worker发送描述和高度参数|真实Future结束才释放深度及mask租约|已释放或失败的板不再开始测高',kind='data',src=(P,'_registered'),times=('registration_result_transfer_ms','joint_measurement_queue_ms'))
     n('r-map','逐实例并行映射','共享只读H；独立目标缓冲',1,11,
       '原crop局部掩码先加crop左上角变成原图坐标|实际矩阵为H_full×T_crop_to_full|nearest映射到完整片局部深度画幅|各实例提取2D/3D几何，字典和输出由任务独立持有|父线程按原实例顺序汇总|一片左右及全部类别都使用同一个矩阵',pool='instance',kind='parallel',src=(R,'align_crop_mask_to_depth'),times=('mask_alignment_ms','instance_alignment_work_ms'))
     n('r-height','进入参考面与全实例测高','已对齐实例 + 深度片',1,12,

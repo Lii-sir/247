@@ -18,7 +18,7 @@ class JointMeasurementProcesses(RegistrationProcesses):
         def payload():
             arrays, instances = import_module("algorithm.2D.instance_geometry").share_instances(
                 entry["instances"], inputs, arrays=dict(depth=depth), cache_keys=dict(depth="depth"),
-                cache_prefix=("joint_mask", piece_id))
+                cache_prefix=("instance_mask", piece_id))
             return dict(arrays=arrays, instances=instances, piece_id=piece_id, piece=dict(piece),
                 registration=registration, correction=correction, height_config=asdict(height_config),
                 min_component_area=min_component_area, crop_roi=tuple(crop_roi), wire_rois=list(wire_rois),

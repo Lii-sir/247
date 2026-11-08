@@ -82,7 +82,7 @@ class FakeDetector:
     def prepare_joint_piece(prepared):
         return dict(prepared)
 
-    def submit_2d_postprocess(self, pool, prepared, timings, metadata, is_current):
+    def submit_2d_postprocess(self, pool, inputs, prepared, timings, metadata, is_current):
         # Only a scheduling stub. Production dispatches to CPU-only processes.
         from algorithm.timing import timing_context, measure
         queued = time.perf_counter()
