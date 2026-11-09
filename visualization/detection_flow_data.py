@@ -53,8 +53,8 @@ def build_flows():
       '读取一行JSON请求并检查并发容量|按board_id建立或定位板缓存|2D片号由调用方指定，不按到达顺序编号|2D与3D请求可任意先后到达', kind='data', src=(T, '_accept'))
     n('o-2d', '每片2D输入', 'N片可并发准备', 0, 1,
       '校验板号和片号|读取共享内存图像|圆定位并裁剪检测图|构造粗配准平台掩码', pool='cpu', src=(B, 'prepare_2d_piece'))
-    n('o-depth', '3D整板输入', '单张原始深度PNG', 2, 1,
-      '按board_id接收整板深度|读取共享内存与PNG解码|保留整数深度，禁止用彩色预览替代', pool='cpu', src=(P, 'submit_3d'))
+    n('o-depth', '3D整板输入', '完整原始uint16数组', 2, 1,
+      '按board_id接收完整整板深度及宽高|读取packed小端uint16共享内存，无PNG解码|保留全部16位像素值，禁止用彩色预览替代', pool='cpu', src=(P, 'submit_3d'))
     n('o-fork', '2D准备完成，投递两支', 'GPU支路 + 银胶边界支路', 0, 2,
       '同一prepared对象由两个只读/受控分支消费|投递silver_prepare和gpu任务|回调计数器保护分支生命周期|不占用工作线程等待尚未到达的输入', pool='cpu', kind='parallel', src=(P, 'submit_2d'))
     n('o-gpu', 'YOLO → 掩码 → EfficientAD', '同一资源内顺序调用', 0, 3,
@@ -207,8 +207,8 @@ def build_flows():
     scene('depth','3D深度与分片','先整板Pitch补偿，后按片号给出深度视图',[
         'Pitch只矫正深度，同栅格强度图可在独立测试函数里同步；正式2D相机照片不使用Pitch公式。',
         'fixed_rois是已补偿整板上的固定分片矩形；它和已删除的“测高目标选择ROI”是不同用途。'])
-    n('z-input','深度共享内存与解码','保留单通道整数数据',1,0,
-      '校验shm_name、data_size与板号|读取完整编码深度字节|decode_depth_png验证PNG与单通道整数类型|颜色预览、截图或raw uint16缺尺寸输入不能替代原深度',pool='cpu',src=(B,'_read_3d'),times=('depth_shared_memory_read_ms','depth_image_decode_ms','depth_read_decode_ms'))
+    n('z-input','深度共享内存与数组视图','原始单通道uint16数据',1,0,
+      '校验shm_name、板号及正整数image_width/image_height|要求data_format=uint16，data_size严格等于宽×高×2|读取完整原始深度字节，不接受PNG压缩流|按小端uint16建立二维视图，不解码、不拉伸灰度|行按顺序紧密排列，无行尾对齐填充；保留0/65535原值',pool='cpu',src=(B,'_read_3d'),times=('depth_shared_memory_read_ms','depth_array_view_ms','depth_read_ms'))
     n('z-switch','是否启用正式Pitch','enabled_3d开关',1,1,
       '正式API按未补偿原始深度解释输入|enabled_3d=False时原数组返回|启用时要求原始uint16、有效角度和正扫描步距|z_step_mm/gray_offset须与测高校准一致|原input_state不是正式配置开关；测试台另有SDK已补偿状态',kind='decision',src=(Z,'production_pitch_parameters'),params=('smartray_pitch_3d.parameters',))
     n('z-strips','沿非扫描轴分条带','rows分列；columns分行',1,2,
@@ -342,7 +342,7 @@ def build_flows():
     n('f-piece','2D支路失败','圆/模型范围/编码/分支异常',0,1,
       '清理该片inflight与joint_entry|未被联合认领时先返回片级失败，允许调用方处理|若该片已claimed，终止相应整板|释放原图owner，避免共享内存被永久持有|不把异常转换成正常产品OK',src=(P,'submit_2d'))
     n('f-board','深度或联合失败','整板Future进入失败终态',0,2,
-      'PNG/补偿/分片错误返回3d_board_failed|联合函数异常返回joint_detection_failed|删除本板缓存并完成等待中的整板Future|已在运行的任务用_current检查避免污染下一板',src=(P,'_terminate'))
+      '原始深度格式/尺寸/补偿/分片错误返回3d_board_failed|联合函数异常返回joint_detection_failed|删除本板缓存并完成等待中的整板Future|已在运行的任务用_current检查避免污染下一板',src=(P,'_terminate'))
     n('f-validate','验证台看到任一失败','显式release_board',0,3,
       '记录最初失败原因，不用后续board released覆盖|发送release_board解除等待|仅2D模式结束也释放本板缓存|验证报告区分产品NG和请求失败',src=(V,'run'))
     n('f-expire','等待缺失输入的空闲超时','当前90秒；活跃任务不误删',0,4,

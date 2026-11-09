@@ -7,15 +7,14 @@ from algorithm.tilt_correction import correct_smartray_depth, production_pitch_p
 from algorithm.config import feature_parameters, load_runtime_config
 from algorithm.instance_tasks import InstanceTasks
 from transport.shared_memory import read_shared_memory
+from transport.depth_input import validate_depth_input, depth_from_uint16
 
 
 # 具体算法存放在 3D 目录；数字目录名不能用于常规 from ... import 语法。
 _segment = import_module("algorithm.3D.segment")
 _wire_height = import_module("algorithm.3D.wire_height")
-DepthImageDecodeError = _segment.DepthImageDecodeError
 PieceCountMismatchError = _segment.PieceCountMismatchError
 SegmentationConfig = _segment.SegmentationConfig
-decode_depth_png = _segment.decode_depth_png
 segment_depth_image = _segment.segment_depth_image
 measure_depth = _wire_height.measure
 configure_measurement = _wire_height.configure
@@ -78,25 +77,30 @@ class Detect3D:
         }
 
     def handle_detect(self, req: Dict[str, Any]) -> Dict[str, Any]:
-        shm_name = str(req.get("shm_name", ""))
-        data_size = int(req.get("data_size", req.get("image_size", 0)))
-        data_format = str(req.get("data_format", "uint16"))
-        return self.detect(shm_name, data_size, data_format)
+        return self.detect(req.get("shm_name"), req.get("data_size"), req.get("data_format", "uint16"),
+                           req.get("image_width"), req.get("image_height"), req.get("image_stride", 0))
 
     def detect(
         self,
         shm_name: str,
         data_size: int,
         data_format: str,
+        image_width: int | None = None,
+        image_height: int | None = None,
+        image_stride: int = 0,
     ) -> Dict[str, Any]:
         start_time = time.perf_counter()
 
-        if not shm_name or data_size <= 0:
+        try:
+            shm_name, data_size, image_width, image_height = validate_depth_input(dict(
+                shm_name=shm_name, data_size=data_size, data_format=data_format,
+                image_width=image_width, image_height=image_height, image_stride=image_stride))
+        except ValueError as exc:
             return {
                 "ok": False,
                 "cmd": "detect",
                 "stage": "3d",
-                "error": "invalid 3D shared memory data",
+                "error": f"invalid 3D shared memory data: {exc}",
             }
 
         try:
@@ -113,9 +117,9 @@ class Detect3D:
 
         try:
             algorithm_start = time.perf_counter()
-            decode_start = time.perf_counter()
-            depth = decode_depth_png(data, data_format)
-            decode_ms = self.elapsed_ms(decode_start)
+            view_start = time.perf_counter()
+            depth = depth_from_uint16(data, image_width, image_height)
+            view_ms = self.elapsed_ms(view_start)
             pitch_start = time.perf_counter()
             depth, pitch_correction = correct_smartray_depth(depth, self.pitch_config, tasks=self._pitch_tasks)
             pitch_ms = self.elapsed_ms(pitch_start)
@@ -140,7 +144,7 @@ class Detect3D:
                 "message": str(exc),
                 "results_3d": {"is_ok": False, "pieces": []},
             }
-        except (DepthImageDecodeError, ValueError, OSError) as exc:
+        except (ValueError, OSError) as exc:
             return {
                 "ok": False,
                 "cmd": "detect",
@@ -160,7 +164,7 @@ class Detect3D:
             "timings": {
                 "shared_memory_read_ms": shared_memory_read_ms,
                 "algorithm_detect_ms": algorithm_detect_ms,
-                "decode_ms": decode_ms,
+                "depth_array_view_ms": view_ms,
                 "smartray_pitch_ms": pitch_ms,
                 "segmentation_ms": segmentation_ms,
                 "measurement_ms": measurement_ms,
@@ -169,7 +173,7 @@ class Detect3D:
             },
             "message": (
                 f"segmented {len(pieces)} pieces from {depth.shape[1]}x{depth.shape[0]} "
-                f"depth PNG, dtype={depth.dtype}"
+                f"raw depth, dtype={depth.dtype}"
             ),
         }
 

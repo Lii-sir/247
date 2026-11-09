@@ -3,6 +3,8 @@ using System.Diagnostics;
 using System.IO.MemoryMappedFiles;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
 
 static class Program
 {
@@ -43,12 +45,17 @@ static class Program
                 return 0;
             }
             ThreadPool.SetMinThreads(16, 16);
-            using var depth = Mapping(new byte[] { 1, 2, 3 });
+            ushort[] depthValues = Enumerable.Range(0, 300).Select(i =>
+                i / 3 % 10 < 5 ? (ushort)(33000 + i) : (ushort)0).ToArray();
+            depthValues[0] = 1; depthValues[1] = 256; depthValues[2] = 32768; depthValues[3] = 65535;
+            byte[] depthBytes = new byte[600];
+            Buffer.BlockCopy(depthValues, 0, depthBytes, 0, depthBytes.Length);
+            using var depth = Mapping(depthBytes);
             var inputs = Enumerable.Range(1, 10).Select(pid => Mapping(new byte[] { (byte)pid, 2, 3 })).ToArray();
             try
             {
                 // A depth request arrives first, yet all ten camera calls must keep progressing.
-                var scan = bridge.ThreeD.DetectBoardSharedMemoryAsync("test-board", depth.Name, 3);
+                var scan = bridge.ThreeD.DetectBoardSharedMemoryAsync("test-board", depth.Name, 600, 3, 100);
                 Thread.Sleep(50);
                 Check(!scan.IsCompleted, "3D must wait for matching pieces, not fail early.");
                 var images = inputs.Select((mapping, index) =>
@@ -69,7 +76,7 @@ static class Program
                     scan.Result.ResultsBoard.PitchCorrection.TryGetValue("applied", out var applied) && !applied.GetBoolean(),
                     "Pitch correction metadata was lost during DTO mapping.");
 
-                var orphan = bridge.ThreeD.DetectBoardSharedMemoryAsync("orphan-board", depth.Name, 3);
+                var orphan = bridge.ThreeD.DetectBoardSharedMemoryAsync("orphan-board", depth.Name, 600, 3, 100);
                 Thread.Sleep(50);
                 Check(bridge.ReleaseBoard("orphan-board").Ok, "Explicit release failed.");
                 Check(orphan.Wait(5000) && !orphan.Result.Ok, "Released pending request remained blocked.");
@@ -94,7 +101,10 @@ static class Program
                         return file;
                     }).ToArray();
                     string depthFile = Path.Combine(temp, "depth.png");
-                    File.WriteAllBytes(depthFile, new byte[] { 1, 2, 3 });
+                    var source = BitmapSource.Create(3, 100, 96, 96, PixelFormats.Gray16, null, depthValues, 6);
+                    var encoder = new PngBitmapEncoder();
+                    encoder.Frames.Add(BitmapFrame.Create(source));
+                    using (var file = File.Create(depthFile)) encoder.Save(file);
                     DetectResponse joined = bridge.Board.DetectStreamingFilesAsync(
                         files, depthFile, "high-level-board").GetAwaiter().GetResult();
                     Check(joined.Ok && joined.ResultsBoard?.Pieces.Count == 10,
@@ -102,9 +112,21 @@ static class Program
                 }
                 finally { Directory.Delete(temp, recursive: true); }
 
+                var sdk = bridge.ThreeD.DetectBoardAsync("sdk-array", depthValues, 3, 100);
+                // The SDK is allowed to overwrite the original after submission.
+                Array.Clear(depthValues, 0, depthValues.Length);
+                var sdkImages = Enumerable.Range(1, 10).Select(pid =>
+                    bridge.TwoD.DetectPieceSharedMemoryAsync("sdk-array", pid, inputs[0].Name, 3, 1, 1, 3, "bgr8")).ToArray();
+                Check(Task.WaitAll(sdkImages, 10000) && sdk.Wait(10000) && sdk.Result.Ok,
+                    "SDK ushort array submission or its synchronous snapshot failed.");
+                bool rejected = false;
+                try { bridge.ThreeD.DetectBoardSharedMemory("bad-size", depth.Name, 599, 3, 100); }
+                catch (ArgumentException) { rejected = true; }
+                Check(rejected, "Raw shared depth size mismatch was not rejected.");
+
                 bridge.RequestTimeoutMilliseconds = 150;
                 bool timedOut = false;
-                try { bridge.ThreeD.DetectBoardSharedMemory("never-complete", depth.Name, 3); }
+                try { bridge.ThreeD.DetectBoardSharedMemory("never-complete", depth.Name, 600, 3, 100); }
                 catch (TimeoutException) { timedOut = true; }
                 Check(timedOut, "Request timeout did not terminate a stalled worker.");
                 bridge.RequestTimeoutMilliseconds = 120000;

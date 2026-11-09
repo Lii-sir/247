@@ -134,7 +134,9 @@ def prepare(config, inputs, depth_path):
     height = config.get("height_measurement_3d", {}).get("parameters", {})
     pitch = production_pitch_parameters(config, height.get("gray_offset", 32768.),
                                         height.get("vertical_resolution_mm", .00105))
-    raw = segment.decode_depth_png(depth_path.read_bytes(), "png")
+    raw = cv2.imdecode(np.fromfile(str(depth_path), dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    if raw is None or raw.ndim != 2 or raw.dtype != np.uint16:
+        raise ValueError("depth sample must be an original single-channel uint16 image")
     depth, correction = correct_smartray_depth(raw, pitch)
     segmentation = segment.SegmentationConfig.from_dict(config["segmentation_3d"]["parameters"])
     boxes = {box["piece_id"]: box for box in segment.segment_depth_image(depth, segmentation)}

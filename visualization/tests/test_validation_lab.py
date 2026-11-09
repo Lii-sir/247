@@ -83,7 +83,8 @@ class ValidationTests(unittest.TestCase):
         def factory(*args, **kwargs):
             c=FakeClient(**kwargs);c.fail_piece=fail;clients.append(c);return c
         def mapper(stack,path,kind,piece_id=None):
-            return dict(shm_name=path.name,**({'piece_id':piece_id,'image_size':3} if kind=='2d' else {'data_size':3}))
+            return dict(shm_name=path.name,**({'piece_id':piece_id,'image_size':3} if kind=='2d' else
+                {'data_size':32,'data_format':'uint16','image_width':4,'image_height':4}))
         def reporter(doc,path,**kwargs):path.write_text('<html>report</html>',encoding='utf-8')
         return lab.Runner(self.root,factory,init_request,mapper,reporter),clients
 

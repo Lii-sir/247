@@ -1,16 +1,7 @@
 from dataclasses import dataclass
-from io import BytesIO
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
-from PIL import Image, UnidentifiedImageError
-
-
-PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-
-
-class DepthImageDecodeError(ValueError):
-    pass
 
 
 class PieceCountMismatchError(ValueError):
@@ -88,37 +79,6 @@ class SegmentationConfig:
             raise ValueError("max_internal_gap_height must be non-negative")
         if self.padding_x < 0 or self.padding_y < 0:
             raise ValueError("piece padding must be non-negative")
-
-
-def decode_depth_png(data: bytes, data_format: str) -> np.ndarray:
-    normalized_format = data_format.strip().lower()
-    is_png = data.startswith(PNG_SIGNATURE)
-
-    if not is_png:
-        if normalized_format in {"uint16", "raw_uint16"}:
-            raise DepthImageDecodeError(
-                "raw uint16 data requires image_width and image_height; "
-                "send encoded PNG bytes for the first-stage segmenter"
-            )
-        raise DepthImageDecodeError("3D input is not a PNG depth image")
-
-    try:
-        with Image.open(BytesIO(data)) as image:
-            image.load()
-            depth = np.asarray(image)
-    except (UnidentifiedImageError, OSError, ValueError) as exc:
-        raise DepthImageDecodeError(f"failed to decode PNG depth image: {exc}") from exc
-
-    if depth.ndim != 2:
-        raise DepthImageDecodeError(
-            f"depth PNG must have one channel, actual shape={depth.shape}"
-        )
-    if depth.dtype.kind not in {"u", "i"}:
-        raise DepthImageDecodeError(
-            f"depth PNG must contain integer pixels, actual dtype={depth.dtype}"
-        )
-
-    return depth
 
 
 def segment_depth_image(

@@ -60,10 +60,8 @@ _silver_inspection = import_module("algorithm.2D.silver_inspection")
 _chip_alignment = import_module("algorithm.2D.chip_alignment")
 _chip_anomaly = import_module("algorithm.2D.chip_anomaly")
 _wire_roi_presence = import_module("algorithm.2D.wire_roi_presence")
-DepthImageDecodeError = _segment.DepthImageDecodeError
 PieceCountMismatchError = _segment.PieceCountMismatchError
 SegmentationConfig = _segment.SegmentationConfig
-decode_depth_png = _segment.decode_depth_png
 segment_depth_image = _segment.segment_depth_image
 
 
@@ -739,7 +737,7 @@ class DetectBoard(JointGeometry):
                 },
                 "elapsed_ms": total_ms,
                 "timings": {
-                    "shared_memory_read_decode_ms": read_decode_ms,
+                    "shared_memory_read_ms": read_decode_ms,
                     "smartray_pitch_ms": pitch_ms,
                     "segmentation_3d_ms": segmentation_ms,
                     "registration_and_mask_alignment_ms": alignment_ms,
@@ -1048,7 +1046,7 @@ class DetectBoard(JointGeometry):
             }
         except PieceCountMismatchError as exc:
             return self._failure("piece_count_mismatch", str(exc))
-        except (DepthImageDecodeError, ValueError, OSError, RuntimeError) as exc:
+        except (ValueError, OSError, RuntimeError) as exc:
             return self._failure("board_detection_failed", str(exc))
 
     def _validate_descriptors(self, value: Any) -> list[Dict[str, Any]]:
@@ -1098,13 +1096,10 @@ class DetectBoard(JointGeometry):
 
     @staticmethod
     def _read_3d(descriptor: Dict[str, Any]) -> np.ndarray:
-        size = int(descriptor.get("data_size", 0))
-        name = str(descriptor.get("shm_name", ""))
-        if not name or size <= 0:
-            raise ValueError("image_3d requires shm_name and data_size")
+        from transport.depth_input import validate_depth_input, depth_from_uint16
+        name, size, width, height = validate_depth_input(descriptor)
         data = timed_call("depth_shared_memory_read_ms", read_shared_memory, name, size)
-        return timed_call("depth_image_decode_ms", decode_depth_png,
-                          data, str(descriptor.get("data_format", "png")))
+        return timed_call("depth_array_view_ms", depth_from_uint16, data, width, height)
 
     def _fixed_crop(self, image: np.ndarray) -> np.ndarray:
         x1, y1, x2, y2 = self.crop_roi

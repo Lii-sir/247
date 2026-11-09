@@ -13,6 +13,44 @@
 板级接口会把 `config/2D/config.json` 的 2D 结果缓存与本文件的 3D 参数组合；
 收到同一 `board_id` 的整板 3D 数据后完成配准、测高并释放十张 2D 缓存。
 
+## 原始16位深度输入接口
+
+3D算法入口仅接收原始深度像素，不再接收PNG压缩字节。流式`detect_3d_board`、批量`detect_board.image_3d`及独立`detect(stage=3d)`使用相同布局：
+
+```json
+{
+  "cmd": "detect_3d_board",
+  "stage": "3d",
+  "board_id": "2",
+  "shm_name": "camera_depth_2",
+  "data_format": "uint16",
+  "image_width": 1200,
+  "image_height": 10000,
+  "data_size": 24000000
+}
+```
+
+共享内存内按行排列小端无符号16位整数，严格`data_size = image_width × image_height × 2`。不包含文件头、行头或行尾填充；有行对齐填充时由提交方先去掉。尺寸必须为正整数，PNG/file格式、长度不符或未填宽高直接拒绝。像素0、65535及全部16位数值原样保留；后续Pitch、分片、配准和测高不变。
+
+SDK接入请在确认**整幅采集完成**后提交，并检查`zMap.Length == width * height`。数组长度正确不代表采集已经完成，不应把`GetLastImageData()`中的半幅结果直接提交。C#新接口：
+
+```csharp
+// ushort[] zMap，width/height取自完整采集结果；无需PNG保存或编码。
+Task<DetectResponse> pending = bridge.ThreeD.DetectBoardAsync(boardId, zMap, width, height);
+// 此方法返回Task前已复制快照，允许SDK随后复用原数组。
+DetectResponse result = await pending;
+
+// 若上位机已经维护原始共享内存，用此入口并持有映射直到响应完成：
+result = await bridge.ThreeD.DetectBoardSharedMemoryAsync(
+    boardId, shmName, checked(width * height * 2), width, height);
+```
+
+同步SDK数组入口为`ThreeD.DetectBoard(boardId, zMap, width, height)`，独立3D入口为`ThreeD.Detect3D(zMap, width, height)`。原共享内存方法现需增加宽高参数；C# DTO `Detect3DRequest`及`BoardImage3DInput`也新增`ImageWidth/ImageHeight`。需同时更新Bridge.dll、Python代码与调用方。
+
+验证台与C# `DetectBoardFile`/批量文件辅助方法仍允许选择原始16位PNG样本：**调用侧**读取像素后以uint16写入共享内存，算法不再解码。8位/彩色预览不能作为深度样本。样本读取在请求前，不计入算法耗时；实时SDK数组路径完全不经过PNG。
+
+流式计时用`depth_read_ms`（共享内存读取及视图准备）、`depth_shared_memory_read_ms`、`depth_array_view_ms`及板级`shared_memory_read_ms`；不再输出`depth_image_decode_ms`。仍存在共享内存到bytes的复制，不能将本次改动称为整条链路零拷贝。
+
 ## 联合测高的引线边缘剔除
 
 参数位于 `height_measurement_3d.parameters`，按类别独立设置：

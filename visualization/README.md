@@ -289,6 +289,8 @@ HTML 中展开“配准、参考平面与阶段耗时”可查看选中片的 2D
 
 `matching_input_wait_ms` 表示一方数据已就绪后等待另一方的时间，不占用工作线程。`silver_prepare_phase_ms` 是与 GPU 推理并行的图像边界准备分支；`silver_total_ms` 是银浆边界准备与掩码判断工作的累计值，不是单独的后处理墙钟时间。
 `shared_memory_read_decode_ms` 现在仅统计实际输入读取/解码，不再把 ROI/平台掩码算入其中。
+
+3D接口已改为原始小端uint16数组及宽高，算法中移除PNG解码；3D流式输入改看`depth_read_ms`、`depth_shared_memory_read_ms`、`depth_array_view_ms`及板级`shared_memory_read_ms`。`detect_and_view.py`和验证台仍可选择原始16位PNG样本，文件解码在客户端输入准备阶段完成，发送给算法的是紧密排列的原始像素；这部分读文件时间不属于算法计时。2D及包含2D读图的批量`shared_memory_read_decode_ms`保留原含义。
 所有计时单位为毫秒；父阶段包含子阶段、多片可能重叠，不能将全部字段相加。
 YOLO 框架返回的三项耗时不一定覆盖首次 warmup/初始化等整个 `predict()` 调用开销；
 若 `yolo_predict_wall_ms` 很长而 `yolo_reported_*` 很小，应优先检查框架调用的额外开销。

@@ -306,12 +306,12 @@ class BoardPipeline:
         except (ValueError, TypeError) as exc:
             return self._completed(self._failure(board_id, "invalid_board", str(exc)))
 
-        def decode():
+        def read_depth():
             # Import only when needed so unit tests can use a CPU-only fake detector.
             from importlib import import_module
             segment = import_module("algorithm.3D.segment")
             start = time.perf_counter()
-            depth = timed_call("depth_read_decode_ms", self.detector._read_3d, req)
+            depth = timed_call("depth_read_ms", self.detector._read_3d, req)
             read_ms = (time.perf_counter() - start) * 1000
             depth, correction = self.detector.prepare_3d_depth(depth)
             start = time.perf_counter()
@@ -330,7 +330,7 @@ class BoardPipeline:
                         state.depth, state.pieces = depth, pieces
                         state.depth_correction = correction
                         state.depth_ready_at = time.perf_counter()
-                        state.timings.update(shared_memory_read_decode_ms=read_ms,
+                        state.timings.update(shared_memory_read_ms=read_ms,
                                              segmentation_3d_ms=segment_ms)
                         self._schedule_ready(state)
             except Exception as exc:
@@ -339,7 +339,7 @@ class BoardPipeline:
                     self._terminate(state, self._failure(board_id, "3d_board_failed", str(exc)))
 
         self._submit_timed(self.cpu_pool, "depth", state.timings, board_id, None,
-                           req.get("request_id"), decode).add_done_callback(decoded)
+                           req.get("request_id"), read_depth).add_done_callback(decoded)
         return state.completion
 
     def _schedule_ready(self, state):

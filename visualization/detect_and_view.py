@@ -220,7 +220,16 @@ def threshold_request(threshold: float | dict[str, float] | None) -> dict:
 
 
 def mapped_file(stack: ExitStack, path: Path, kind: str, piece_id: int | None = None) -> dict:
-    raw = path.read_bytes()
+    if kind == "3d":
+        import cv2
+        import numpy as np
+        depth = cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+        if depth is None or depth.ndim != 2 or depth.dtype != np.uint16:
+            raise ValueError(f"3D sample must be an original single-channel uint16 image: {path}")
+        height, width = depth.shape
+        raw = depth.astype("<u2", copy=False).tobytes(order="C")
+    else:
+        raw = path.read_bytes()
     if not raw:
         raise ValueError(f"Empty input image: {path}")
     name = "result_viewer_" + uuid.uuid4().hex
@@ -229,7 +238,8 @@ def mapped_file(stack: ExitStack, path: Path, kind: str, piece_id: int | None = 
     mapping.write(raw)
     if kind == "2d":
         return {"piece_id": piece_id, "shm_name": name, "image_size": len(raw), "image_format": "encoded"}
-    return {"shm_name": name, "data_size": len(raw), "data_format": "png"}
+    return {"shm_name": name, "data_size": len(raw), "data_format": "uint16",
+            "image_width": width, "image_height": height}
 
 
 def save_timing_csv(envelope: dict, path: Path) -> None:
