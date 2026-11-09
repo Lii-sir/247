@@ -122,6 +122,19 @@ class RawDepthInputTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     mapped_file(stack, path, '3d')
 
+    def test_offline_pitch_prepares_pixels_before_algorithm_reads_shared_input(self):
+        from algorithm.depth_preprocessing import prepare_depth_for_detection
+        original=np.zeros((50,3),np.uint16);original[20:35]=32958
+        settings=dict(model='smartray_pitch',enabled_3d=True,angle_deg=30,scan_pitch_mm=.01)
+        expected,info=prepare_depth_for_detection(original,settings)
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as stack:
+            path=Path(folder)/'raw.png';cv2.imwrite(str(path),original)
+            descriptor=mapped_file(stack,path,'3d',pitch_settings=settings)
+            actual=DetectBoard._read_3d(descriptor)
+            np.testing.assert_array_equal(actual,expected)
+            self.assertEqual(info,descriptor['pitch_correction'])
+            np.testing.assert_array_equal(cv2.imread(str(path),cv2.IMREAD_UNCHANGED),original)
+
 
 if __name__ == '__main__':
     unittest.main()

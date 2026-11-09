@@ -219,7 +219,7 @@
     }
   },
   "smartray_pitch_3d": {
-    "description": "整板深度分片前的SmartRay Pitch补偿；enabled_3d控制开关，按未补偿输入处理",
+    "description": "调用侧提交前的SmartRay Pitch预处理参数；检测算法不执行矫正、不计矫正耗时；SDK使用独立DLL先矫正再提交",
     "parameters": {
       "enabled_3d": true,
       "projection_workers": 8,

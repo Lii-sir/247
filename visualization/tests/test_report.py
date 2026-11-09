@@ -90,6 +90,12 @@ class ReportTests(unittest.TestCase):
         rgb, limits = report._depth_rgb(expected)
         self.assertEqual(result['pieces'][0]['preview_3d']['url'],report._data_url(rgb,'PNG')['url'])
         self.assertEqual(result['pieces'][0]['preview_3d']['gray_range'],limits)
+        # A caller may reference an already prepared file instead of the raw
+        # source: keep its coordinates without applying Pitch a second time.
+        Image.fromarray(expected).save(self.depth)
+        result=report.build_payload({'response':self.response,'image_3d_preprocessed':True},
+                                    base_dir=self.root,depth_path=self.depth)
+        self.assertEqual(result['pieces'][0]['preview_3d']['url'],report._data_url(rgb,'PNG')['url'])
 
     def test_json_escape(self):
         encoded = report.safe_script_json({"name": "</script><img onerror='alert(1)'>"})

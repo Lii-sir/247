@@ -9,7 +9,7 @@ from algorithm.height_measurement import (HeightConfig, dilate_mask, erode_wire_
     erode_measurement_mask_crop, fit_chip_plane, fit_local_platform_plane, fit_platform_plane,
     height_points_to_board, map_platform_rois, measure_mask_height, split_thin_mask)
 from algorithm.registration import align_crop_mask_to_depth
-from algorithm.tilt_correction import depth_coordinate_space
+from transport.depth_input import depth_coordinate_space
 from algorithm.instance_tasks import InstanceTasks
 from algorithm.timing import timed_call
 _geometry = import_module("algorithm.2D.defect_geometry")

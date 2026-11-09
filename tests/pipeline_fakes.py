@@ -103,9 +103,6 @@ class FakeDetector:
         with self.lock:
             self.closed_inputs += 1
 
-    def prepare_3d_depth(self, depth):
-        return depth, {"applied": False, "reason": "disabled"}
-
     def _read_3d(self, req):
         self.depth_started.set()
         if req.get("fail_3d"):

@@ -113,7 +113,7 @@ def build_payload(document: Any, *, base_dir: Path, images_2d: Path | None = Non
             if depth.ndim != 2 or depth.dtype.kind not in "ui":
                 raise ValueError("Depth must be a single-channel integer image")
             correction = board.get("pitch_correction") or (response.get("results_3d") or {}).get("pitch_correction") or {}
-            if correction.get("applied"):
+            if correction.get("applied") and not envelope.get("image_3d_preprocessed", False):
                 import sys
                 sys.path.insert(0, str(HERE.parent / "python"))
                 from algorithm.tilt_correction import correct_smartray_pitch

@@ -6,7 +6,7 @@
 - `segmentation_3d`：一张整板深度图分成十片的参数。
 - `registration_3d`：初始尺度模板匹配参数。
 - `dynamic_affine_3d`：每片运行时仿射优化参数。
-- `smartray_pitch_3d`：分片前的SmartRay Pitch补偿，默认关闭；确认SDK状态和标定后，通过`enabled_3d`启用。
+- `smartray_pitch_3d`：调用侧提交前的SmartRay Pitch预处理参数；验证台使用，检测程序不执行。上位机使用独立矫正DLL先准备数据。
 - `height_measurement_3d`：芯片/引脚平台平面、焊脚和引线高度阈值。引脚平台 ROI 在 2D 图片上由 ROI 工具画定，以该片圆心/半径归一化后保存在本文件；每片处理时使用其透视矩阵映射到 3D，再排除所有对齐后的 YOLO 掩码拟合平台平面。未画 ROI 时平台参考面无效，不会退回固定 3D AOI。
 - `wire_height_3d`：独立 3D 接口的引线中心线 P95 参数。
 
@@ -30,7 +30,7 @@
 }
 ```
 
-共享内存内按行排列小端无符号16位整数，严格`data_size = image_width × image_height × 2`。不包含文件头、行头或行尾填充；有行对齐填充时由提交方先去掉。尺寸必须为正整数，PNG/file格式、长度不符或未填宽高直接拒绝。像素0、65535及全部16位数值原样保留；后续Pitch、分片、配准和测高不变。
+共享内存内按行排列小端无符号16位整数，严格`data_size = image_width × image_height × 2`。不包含文件头、行头或行尾填充；有行对齐填充时由提交方先去掉。尺寸必须为正整数，PNG/file格式、长度不符或未填宽高直接拒绝。检测端按传入像素原样分片、配准、测高，不再执行Pitch矫正。
 
 SDK接入请在确认**整幅采集完成**后提交，并检查`zMap.Length == width * height`。数组长度正确不代表采集已经完成，不应把`GetLastImageData()`中的半幅结果直接提交。C#新接口：
 
@@ -175,11 +175,11 @@ C# 方法和字段不增加。`SolderMeasurements[].Mask3DLocal` 是实际内缩
 
 先使用8/8/8核布局在目标32核电脑预热后复验。比较整板total_detect_ms及长尾，检查全部片矩阵、轮廓、ROI、采样点、高度和NG一致；对照时剔除timings及worker执行诊断字段。此配置是资源布局起点，真实节拍尚未验证，不承诺固定耗时。
 
-## 正式流程：Pitch → 分片 → 粗配准 → 仿射 → 测高
+## 提交前Pitch预处理；检测流程从分片开始
 
 透视配准阶段已移除，旧`perspective_registration_3d`块不再读取，不再输出对应的求解耗时；`homography_2d_to_3d`仍以3×3齐次矩阵表示仿射映射，底行为[0,0,1]。这不影响芯片外观裁剪等其他功能使用OpenCV的几何映射。
 
-新增可选功能块`smartray_pitch_3d`，只由`enabled_3d`控制是否执行。缺少整个块时关闭；启用后始终按未补偿的原始输入处理。启用前至少确认：
+`smartray_pitch_3d`现在只供调用侧预处理使用，不再由DetectBoard/Detect3D读取，也不会在算法初始化时创建Pitch池。验证台在发送请求前按此块的`enabled_3d`开关矫正；上位机先调用独立`SmartRay.PitchCorrection.dll`，再调用Bridge。已由SDK矫正的数据直接提交，不要重复矫正。启用前至少确认：
 
 - 正式配置不再使用`input_state`。如果数据已由SDK补偿，请将`enabled_3d`设为`false`，否则会重复处理。旧`input_state`字段会被忽略，不再触发跳过。
 - `angle_deg`为实际Pitch角，`scan_axis=rows/columns`对应深度图扫描方向。
@@ -188,9 +188,25 @@ C# 方法和字段不增加。`SolderMeasurements[].Mask3DLocal` 是实际内缩
 - `gray_offset`、`z_step_mm`必须与测高配置的灰度零点、垂直分辨率一致；`z_origin_mm`是灰度零点对应的设备物理Z，并非旋转中心。
 - 此功能块仅包含3D参数；算法名在内部固定，配置不需要`model`、`enabled_2d`、`image_role`或`input_state`。旧配置中的默认2D字段可兼容读取，但尝试启用2D同步映射会报错。正式补偿返回信息也不再带2D映射字段。
 
-整板深度只补偿一次，随后分片、配准、参考面拟合和测高都使用这份数据。流式、同步缓存整板、批量板级和独立3D入口均已接入。无效/越界点与碰撞处理沿用测试算法，不写回共享内存或原始图像。
+检测端在流式、同步缓存整板、批量板级和独立3D入口均直接使用传入的数据，不因配置开关或元数据再做矫正。验证台与CLI在3D预处理结束后才启动检测计时；返回`elapsed_ms`、`total_detect_ms`及验证台检测总耗时不包含矫正，不再输出`smartray_pitch_ms`/`pitch_projection_*`等检测计时字段。原始矫正函数及独立配准台仍可单独试验，那里记录的是预处理本身的耗时。
 
-响应`results_board`/`results_3d`新增`pitch_correction`和`depth_coordinate_space`；联合单片也含对应元数据。关闭时为输入栅格`board_3d`；本工具实际补偿为`pitch_corrected_board_3d`，测高点标签同步，mask/平面仍为该栅格的分片局部坐标。无法把补偿坐标当原图坐标直接画在原始深度PNG上。离线报告会依据补偿元数据重建显示栅格；传入的应为原始采集深度文件。
+输入可携带`pitch_correction`元数据，只用于坐标标签、矩阵上下文和展示，不触发矫正。未携带时按收到的栅格标记为`board_3d`；携带`applied=true`时标记为`pitch_corrected_board_3d`。联合单片、测高点、mask和平面保持同一坐标空间。离线报告默认引用原始深度PNG，并依据元数据重建展示栅格；若报告引用的文件本身已经矫正，报告外层envelope设置`image_3d_preprocessed=true`，跳过展示阶段重复矫正，同时保留正确坐标标签。
+
+```csharp
+// 在调用检测接口之前执行；corrector来自独立SmartRay.PitchCorrection.dll。
+ushort[] corrected = corrector.Correct(zMap, width, height);
+var metadata = new Dictionary<string, object> {
+    ["applied"] = true, ["model"] = "smartray_pitch",
+    ["angle_deg"] = options.AngleDegrees, ["scan_pitch_mm"] = options.ScanPitchMm,
+    ["z_step_mm"] = options.ZStepMm, ["gray_offset"] = options.GrayOffset,
+    ["z_origin_mm"] = options.ZOriginMm,
+    ["scan_axis"] = options.Axis == ScanAxis.Rows ? "rows" : "columns",
+    ["transform_direction"] = options.Direction == TransformDirection.RecoverIdeal ? "recover_ideal" : "document_forward"
+};
+var result = await bridge.ThreeD.DetectBoardAsync(boardId, corrected, width, height, metadata);
+```
+
+C#数组/共享内存/文件辅助接口末尾可传可选`Dictionary<string, object> correction`；批量共享内存输入填`BoardImage3DInput.PitchCorrection`。C#文件辅助方法只读取像素，默认认为文件已由调用方准备，不再自动执行矫正。Python验证台/CLI文件适配器会按预处理配置先矫正，再发送像素和元数据。
 
 C# DTO新增元数据属性，现有测高点/掩码字段保持；源码已构建验证。上位机若继续引用旧DLL，新增属性不会出现在旧类型中，需要更新引用的构建产物。不要重复对SDK已矫正数据启用原始数据补偿。
 
@@ -264,8 +280,8 @@ C# DTO新增元数据属性，现有测高点/掩码字段保持；源码已构�
 
 ## Pitch条带并行
 
-`smartray_pitch_3d.parameters.projection_workers`默认配置为8，必须为正整数；设为1串行。省略该项的旧配置按1处理。统一板级和独立3D检测器各自在初始化时配置独立Pitch线程池，跨板复用，释放/重新初始化时关闭；它与joint及instance线程池分开，也不计入桥接层原有worker_budget。
+`smartray_pitch_3d.parameters.projection_workers`配置为8，必须为正整数；设为1串行。省略按1处理。此参数属于调用侧预处理；Python文件适配器使用临时私有池并在提交前关闭，检测器不再拥有Pitch池。SDK侧使用独立DLL的`ProjectionWorkers`。
 
 按非扫描轴分条带：rows扫描分列，columns扫描分行。每个条带覆盖整个扫描方向，投影和碰撞聚合仅写自己的缓冲，父线程按条带顺序合并，因此跨行的大位移不会造成并发写冲突。投影公式、np.rint取整、0/65535无效值、越界过滤、碰撞取最大矫正深度保持不变。同栅格强度图复用本次投影点，平局仍取最大的原始源索引，不再二次投影。
 
-`smartray_pitch_ms`仍是整体墙钟；新增`pitch_projection_work_ms`为各条带工作耗时之和（有计时上下文时记录）。补偿元数据中的`projection_workers`是本次实际条带数，受非扫描方向尺寸和可用线程数限制。独立函数/配准台未传入持久池时使用一次性私有池并在结束时关闭；不开补偿或SDK已补偿时仍原样跳过。
+`smartray_pitch_ms`和`pitch_projection_work_ms`等仅属于独立预处理实验，正式检测响应不再输出这些计时。矫正算法的投影、取整与碰撞规则保持；本次仅调整执行位置和计时边界。

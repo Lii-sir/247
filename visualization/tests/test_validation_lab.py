@@ -8,6 +8,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 from PIL import Image
 import numpy as np
 from urllib.error import HTTPError
@@ -45,7 +46,7 @@ class FakeClient:
 
 
 def init_request(*args):
-    return dict(cmd='init_algorithm',config_text=json.dumps({'common_3d':{'parameters':{'input':{'piece_count':2}}},'height_measurement_3d':{'parameters':{}}}))
+    return dict(cmd='init_algorithm',config_text=json.dumps({'common_3d':{'parameters':{'input':{'piece_count':2}}},'height_measurement_3d':{'description':'synthetic height settings','parameters':{}}}))
 
 
 class ValidationTests(unittest.TestCase):
@@ -82,7 +83,7 @@ class ValidationTests(unittest.TestCase):
         clients=[]
         def factory(*args, **kwargs):
             c=FakeClient(**kwargs);c.fail_piece=fail;clients.append(c);return c
-        def mapper(stack,path,kind,piece_id=None):
+        def mapper(stack,path,kind,piece_id=None,**kwargs):
             return dict(shm_name=path.name,**({'piece_id':piece_id,'image_size':3} if kind=='2d' else
                 {'data_size':32,'data_format':'uint16','image_width':4,'image_height':4}))
         def reporter(doc,path,**kwargs):path.write_text('<html>report</html>',encoding='utf-8')
@@ -103,6 +104,24 @@ class ValidationTests(unittest.TestCase):
         requests=[q for q in clients[0].requests if q['cmd']=='detect_2d_piece']
         self.assertTrue(all(q['board_id']=='2' for q in requests))
         self.assertEqual([q['piece_id'] for q in requests],[1,2,1,2])
+
+    def test_submission_preprocessing_completes_before_detection_clock_starts(self):
+        runner,clients=self.make_runner();self.addCleanup(runner.close)
+        original=runner.mapper
+        clock=[1.0]
+        def mapper(stack,path,kind,piece_id=None,**kwargs):
+            if kind=='3d':
+                self.assertIn('pitch_settings',kwargs)
+                clock[0]+=50.0  # Deterministic preprocessing duration, no sleep/benchmark.
+            return original(stack,path,kind,piece_id,**kwargs)
+        runner.mapper=mapper
+        folder=self.root/'preprocessed';folder.mkdir()
+        with patch.object(lab.time,'perf_counter',side_effect=lambda:clock[0]):
+            result=runner.run(self.rows,'2','joint',2,folder,lambda _:None)
+        self.assertTrue(result['ok'],result)
+        self.assertEqual(0.,result['total_wall_ms'])
+        report=json.loads((folder/'result.json').read_text(encoding='utf-8'))
+        self.assertTrue(report['benchmark']['excludes_depth_preprocessing'])
 
     def test_partial_2d_and_failure_release_board(self):
         for mode,fail,rows in [('2d',None,self.rows[:1]),('joint',1,self.rows)]:
@@ -136,7 +155,7 @@ class ValidationTests(unittest.TestCase):
         result=runner.run(self.rows[:1],'2','2d',2,folder,lambda x:None)
         self.assertTrue(result['ok']);self.assertTrue(cfg['smartray_pitch_3d']['parameters']['enabled_3d'])
         request=next(q for q in clients[0].requests if q['cmd']=='init_algorithm')
-        self.assertFalse(json.loads(request['config_text'])['smartray_pitch_3d']['parameters']['enabled_3d'])
+        self.assertNotIn('smartray_pitch_3d',json.loads(request['config_text']))
         effective=json.loads(request['config_text'])
         self.assertFalse(effective['common_3d']['parameters']['threading']['registration_affinity']['enabled'])
         self.assertFalse(effective['common_3d']['parameters']['threading']['joint_affinity']['enabled'])

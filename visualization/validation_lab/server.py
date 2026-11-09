@@ -29,7 +29,7 @@ sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(ROOT / "python"))
 from detect_and_view import ProtocolClient, algorithm_request, mapped_file, save_timing_csv
 from generate_report import render_report
-from algorithm.tilt_correction import production_pitch_parameters
+from algorithm.depth_preprocessing import preprocessing_parameters
 
 
 def board_number(value):
@@ -173,7 +173,7 @@ class Runner:
             envelope["image_3d"] = depth["path"]
         envelope["title"] += (f" · 按间隔提交 {options['request_interval_ms']:g}ms"
                               if options["submission_mode"] == "paced" else " · 并发提交")
-        started, startup, client, timeline_start, release_sent = time.perf_counter(), {}, None, 0, False
+        started, startup, client, timeline_start, release_sent = None, {}, None, 0, False
         first_error = None
         try:
             if self._stopping.is_set():
@@ -208,8 +208,9 @@ class Runner:
                 if isinstance(joint_affinity, dict):
                     joint_affinity["enabled"] = False
                 init["config_text"] = json.dumps(config, ensure_ascii=True)
-            height = config["height_measurement_3d"]["parameters"]
-            production_pitch_parameters(config, float(height.get("gray_offset", 32768)), float(height.get("vertical_resolution_mm", .00105)))
+            pitch_settings = preprocessing_parameters(config)
+            config.pop('smartray_pitch_3d', None)
+            init['config_text'] = json.dumps(config, ensure_ascii=True)
             cache_timeout = float(os.environ.get("BRIDGE_BOARD_TIMEOUT_SECONDS", "90"))
             if not math.isfinite(cache_timeout) or cache_timeout <= 0:
                 raise ValueError("BRIDGE_BOARD_TIMEOUT_SECONDS须为正的有限数值")
@@ -223,11 +224,12 @@ class Runner:
                     raise RuntimeError("验证台正在停止")
                 client = self.client
             timeline_start = len(client.timeline)
-            progress("准备共享内存")
+            progress("提交前准备深度及Pitch矫正（不计入算法耗时）" if depth else "准备共享内存")
             with ExitStack() as stack, ThreadPoolExecutor(max_workers=min(len(images)+1, 16)) as pool:
                 inputs = [(r, self.mapper(stack, Path(r["path"]), "2d", r["piece_id"])) for r in images]
                 depth_request = (dict(cmd="detect_3d_board", stage="3d", board_id=board_id,
-                    **self.mapper(stack, Path(depth["path"]), "3d")) if depth else None)
+                    **self.mapper(stack, Path(depth["path"]), "3d", pitch_settings=pitch_settings)) if depth else None)
+                started = time.perf_counter()
                 requests = [dict(cmd="detect_2d_piece", stage="2d", board_id=board_id, **desc) for row, desc in inputs]
                 if options["submission_mode"] == "paced":
                     if depth_request:
@@ -345,7 +347,8 @@ class Runner:
                     client.request(dict(cmd="release_board", board_id=board_id), 15)
                 except (OSError, RuntimeError, TimeoutError):
                     self.close()
-        envelope["benchmark"] = dict(total_wall_ms=round((time.perf_counter()-started)*1000, 2), **startup)
+        envelope["benchmark"] = dict(total_wall_ms=round((time.perf_counter()-started)*1000, 2)
+            if started is not None else 0., excludes_depth_preprocessing=True, **startup)
         (folder / "result.json").write_text(json.dumps(envelope, ensure_ascii=False, indent=2), encoding="utf-8")
         save_timing_csv(envelope, folder / "timings.csv")
         if self._stopping.is_set():

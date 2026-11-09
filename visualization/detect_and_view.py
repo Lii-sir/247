@@ -219,7 +219,7 @@ def threshold_request(threshold: float | dict[str, float] | None) -> dict:
     return {"threshold": threshold} if threshold is not None else {}
 
 
-def mapped_file(stack: ExitStack, path: Path, kind: str, piece_id: int | None = None) -> dict:
+def mapped_file(stack: ExitStack, path: Path, kind: str, piece_id: int | None = None, *, pitch_settings=None) -> dict:
     if kind == "3d":
         import cv2
         import numpy as np
@@ -227,6 +227,10 @@ def mapped_file(stack: ExitStack, path: Path, kind: str, piece_id: int | None = 
         if depth is None or depth.ndim != 2 or depth.dtype != np.uint16:
             raise ValueError(f"3D sample must be an original single-channel uint16 image: {path}")
         height, width = depth.shape
+        correction = None
+        if pitch_settings is not None:
+            from algorithm.depth_preprocessing import prepare_depth_for_detection
+            depth, correction = prepare_depth_for_detection(depth, pitch_settings)
         raw = depth.astype("<u2", copy=False).tobytes(order="C")
     else:
         raw = path.read_bytes()
@@ -238,8 +242,11 @@ def mapped_file(stack: ExitStack, path: Path, kind: str, piece_id: int | None = 
     mapping.write(raw)
     if kind == "2d":
         return {"piece_id": piece_id, "shm_name": name, "image_size": len(raw), "image_format": "encoded"}
-    return {"shm_name": name, "data_size": len(raw), "data_format": "uint16",
-            "image_width": width, "image_height": height}
+    descriptor = {"shm_name": name, "data_size": len(raw), "data_format": "uint16",
+                  "image_width": width, "image_height": height}
+    if correction is not None:
+        descriptor['pitch_correction'] = correction
+    return descriptor
 
 
 def save_timing_csv(envelope: dict, path: Path) -> None:
@@ -263,12 +270,13 @@ def save_timing_csv(envelope: dict, path: Path) -> None:
 
 
 def detect_batch(client: ProtocolClient, args, paths: list[Path], depth: Path,
-                 envelope: dict) -> None:
+                 envelope: dict, *, pitch_settings=None) -> None:
     """Run one board on an already initialized service; never reload models."""
     board_id = envelope["board_id"]
-    started = time.perf_counter()
+    started = None
     timeline_index = len(client.timeline)
     input_prepare_ms = 0.0
+    depth_stack = ExitStack()
 
     def send(request):
         response = client.request(request, args.timeout)
@@ -287,12 +295,18 @@ def detect_batch(client: ProtocolClient, args, paths: list[Path], depth: Path,
 
     def map_image(stack, path, kind, piece_id=None):
         nonlocal input_prepare_ms
+        if kind == '3d':
+            return prepared_depth
         start = time.perf_counter()
         value = mapped_file(stack, path, kind, piece_id)
         input_prepare_ms += (time.perf_counter() - start) * 1000
         return value
 
     try:
+        # Depth file decoding and Pitch complete before any detection request
+        # or detection benchmark starts. Keep its mapping through the reply.
+        prepared_depth = mapped_file(depth_stack, depth, '3d', pitch_settings=pitch_settings)
+        started = time.perf_counter()
         if args.mode == "stream" and args.parallel:
             print("Parallel stream: submit 10 2D pieces and 1 3D board scan...", flush=True)
             with ExitStack() as stack, ThreadPoolExecutor(max_workers=11) as pool:
@@ -339,12 +353,14 @@ def detect_batch(client: ProtocolClient, args, paths: list[Path], depth: Path,
         envelope["response"] = {"ok": False, "board_id": board_id, "error": str(exc)}
         print(f"Detection did not complete: {exc}", file=sys.stderr)
     finally:
+        elapsed = (time.perf_counter() - started) * 1000 if started is not None else 0.
+        depth_stack.close()
         envelope["responses_2d"].sort(key=lambda item: int(item.get("piece_id") or 0))
         envelope["timeline"] = [dict(item) for item in client.timeline[timeline_index:]
                                 if item["cmd"] in {"detect_2d_piece", "detect_3d_board", "detect_board"}]
         entries = envelope["timeline"]
         envelope["benchmark"] = {
-            "batch_wall_ms": (time.perf_counter() - started) * 1000,
+            "batch_wall_ms": elapsed,
             "input_prepare_ms": input_prepare_ms,
             "request_window_ms": (max(item["received_ms"] for item in entries)
                                   - min(item["sent_ms"] for item in entries)) if entries else None,
@@ -407,6 +423,12 @@ def main() -> int:
                 raise ValueError(f"Unknown threshold model names: {', '.join(sorted(unknown))}")
         init_req = algorithm_request(args.score_mode, args.score_pool_kernel,
                                      args.silver_calibration)
+        sys.path.insert(0, str(ROOT / 'python'))
+        from algorithm.depth_preprocessing import preprocessing_parameters
+        client_config = json.loads(init_req['config_text'])
+        pitch_settings = preprocessing_parameters(client_config)
+        client_config.pop('smartray_pitch_3d', None)
+        init_req['config_text'] = json.dumps(client_config, ensure_ascii=True)
         board_id = args.board_id or "board-" + datetime.now().strftime("%Y%m%d-%H%M%S")
         folder = args.output_dir or Path(__file__).parent / "output" / (datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6])
         folder = folder.resolve()
@@ -467,7 +489,7 @@ def main() -> int:
                                            "method": "sift_ransac"}
             print(f"\nBatch {index}/{args.repeat}: {current_id} | "
                   f"{'first inference' if index == 1 else 'reuse loaded models, NO initialization'}", flush=True)
-            detect_batch(client, args, paths, depth, envelope)
+            detect_batch(client, args, paths, depth, envelope, pitch_settings=pitch_settings)
             benchmark = envelope["benchmark"]
             benchmark.update(batch_index=index, process_pid=client.process.pid,
                              model_reused=index > 1,
@@ -476,7 +498,7 @@ def main() -> int:
             if args.repeat > 1:
                 envelope["title"] = f"连续检测第 {index}/{args.repeat} 批 · {'首次推理' if index == 1 else '复用模型推理'}"
                 envelope["warnings"] = [
-                    f"同一服务 PID={client.process.pid}；模型初始化仅一次。本批检测（含输入准备）"
+                    f"同一服务 PID={client.process.pid}；模型初始化仅一次。本批检测（不含3D提交前预处理）"
                     f" {benchmark['batch_wall_ms'] / 1000:.3f} 秒；"
                     f"本批计入初始化 {benchmark['startup_charged_ms'] / 1000:.3f} 秒；"
                     f"合计 {benchmark['total_with_startup_ms'] / 1000:.3f} 秒。"

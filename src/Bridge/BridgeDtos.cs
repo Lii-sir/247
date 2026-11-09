@@ -100,6 +100,8 @@ public class Detect3DRequest
     [JsonPropertyName("image_height")]
     public int ImageHeight { get; set; }
 
+    [JsonPropertyName("pitch_correction")]
+    public Dictionary<string, object>? PitchCorrection { get; set; }
 }
 
 public class BoardImage2DInput
@@ -142,6 +144,9 @@ public class BoardImage3DInput
 
     [JsonPropertyName("image_height")]
     public int ImageHeight { get; set; }
+
+    [JsonPropertyName("pitch_correction")]
+    public Dictionary<string, object>? PitchCorrection { get; set; }
 }
 
 public class DetectBoardRequest

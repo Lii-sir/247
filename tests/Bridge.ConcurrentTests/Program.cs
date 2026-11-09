@@ -112,13 +112,26 @@ static class Program
                 }
                 finally { Directory.Delete(temp, recursive: true); }
 
-                var sdk = bridge.ThreeD.DetectBoardAsync("sdk-array", depthValues, 3, 100);
+                var correction = new Dictionary<string, object> {
+                    ["applied"] = true, ["model"] = "smartray_pitch", ["angle_deg"] = 6.0,
+                    ["scan_axis"] = "rows", ["scan_pitch_mm"] = .02,
+                    ["z_step_mm"] = .00105, ["gray_offset"] = 32768.0,
+                    ["z_origin_mm"] = 0.0, ["transform_direction"] = "recover_ideal"
+                };
+                var sdk = bridge.ThreeD.DetectBoardAsync("sdk-array", depthValues, 3, 100, correction);
+                correction["angle_deg"] = 59.0;
                 // The SDK is allowed to overwrite the original after submission.
                 Array.Clear(depthValues, 0, depthValues.Length);
                 var sdkImages = Enumerable.Range(1, 10).Select(pid =>
                     bridge.TwoD.DetectPieceSharedMemoryAsync("sdk-array", pid, inputs[0].Name, 3, 1, 1, 3, "bgr8")).ToArray();
                 Check(Task.WaitAll(sdkImages, 10000) && sdk.Wait(10000) && sdk.Result.Ok,
                     "SDK ushort array submission or its synchronous snapshot failed.");
+                Check(sdk.Result.ResultsBoard?.DepthCoordinateSpace == "pitch_corrected_board_3d",
+                    "Externally prepared depth coordinate metadata was lost.");
+                Check(sdk.Result.ResultsBoard!.PitchCorrection!["angle_deg"].GetDouble() == 6.0,
+                    "Async correction metadata was not snapshotted before returning.");
+                Check(sdk.Result.Timings != null && !sdk.Result.Timings.ContainsKey("smartray_pitch_ms"),
+                    "Detection time unexpectedly includes preprocessing.");
                 bool rejected = false;
                 try { bridge.ThreeD.DetectBoardSharedMemory("bad-size", depth.Name, 599, 3, 100); }
                 catch (ArgumentException) { rejected = true; }

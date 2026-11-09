@@ -127,21 +127,22 @@ class PitchParallelTests(unittest.TestCase):
             self.assertEqual(actual[0][destination],22)
             self.assertEqual(actual[2]['collision_points'],1)
 
-    def test_formal_and_standalone_configuration_reinitialization_and_release(self):
+    def test_external_preprocessor_owns_pitch_work_instead_of_detectors(self):
         board=DetectBoard(lambda _:None);standalone=Detect3D()
-        self.addCleanup(board._instance_tasks.close);self.addCleanup(board._pitch_tasks.close);self.addCleanup(standalone._pitch_tasks.close)
+        self.addCleanup(board.release);self.addCleanup(standalone.release)
         config=load_runtime_config((ROOT/'config/config.json').read_text(encoding='utf-8-sig'),str(ROOT/'config/config.json'))
         config['smartray_pitch_3d']['parameters'].update(projection_workers=3,enabled_3d=True)
         board._load_config(json.dumps(config))
-        self.assertEqual(board._pitch_tasks.workers,3)
+        self.assertFalse(hasattr(board,'_pitch_tasks'))
         response=standalone.handle_init(dict(config_text=json.dumps(config)))
-        self.assertTrue(response['ok']);self.assertEqual(standalone._pitch_tasks.workers,3)
-        executor=standalone._pitch_tasks._pool
-        standalone.release();self.assertTrue(executor._shutdown)
+        self.assertTrue(response['ok']);self.assertFalse(hasattr(standalone,'_pitch_tasks'))
+        standalone.release()
         self.assertTrue(standalone.handle_init(dict(config_text=json.dumps(config)))['ok'])
         depth=np.full((25,30),33000,np.uint16)
-        actual=board.prepare_3d_depth(depth)[0]
-        expected=reference(None,depth,{**board.pitch_config,'input_state':'uncorrected'})[1]
+        from algorithm.depth_preprocessing import preprocessing_parameters, prepare_depth_for_detection
+        settings=preprocessing_parameters(config)
+        actual=prepare_depth_for_detection(depth,settings)[0]
+        expected=reference(None,depth,{**settings,'input_state':'uncorrected'})[1]
         np.testing.assert_array_equal(actual,expected)
 
     def test_bad_workers_and_disabled_or_sdk_input(self):

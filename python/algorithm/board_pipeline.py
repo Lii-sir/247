@@ -6,7 +6,7 @@ import time
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
 from typing import Any
-from algorithm.tilt_correction import depth_coordinate_space
+from transport.depth_input import depth_coordinate_space, input_depth_correction
 from algorithm.timing import timing_context, measure, record_duration, timed_call, note
 from algorithm.registration_process import SharedBoardInputs, JointSharedInputs
 
@@ -313,7 +313,7 @@ class BoardPipeline:
             start = time.perf_counter()
             depth = timed_call("depth_read_ms", self.detector._read_3d, req)
             read_ms = (time.perf_counter() - start) * 1000
-            depth, correction = self.detector.prepare_3d_depth(depth)
+            correction = input_depth_correction(req)
             start = time.perf_counter()
             pieces = timed_call("depth_segmentation_ms", segment.segment_depth_image,
                                 depth, self.detector.segmentation_config)

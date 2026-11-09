@@ -14,6 +14,7 @@ A = 'python/algorithm/2D/chip_anomaly.py'
 G = 'python/algorithm/2D/defect_geometry.py'
 C = 'python/algorithm/2D/circle_roi.py'
 Z = 'python/algorithm/tilt_correction.py'
+DP = 'python/algorithm/depth_preprocessing.py'
 SEG = 'python/algorithm/3D/segment.py'
 I = 'python/algorithm/instance_tasks.py'
 V = 'visualization/validation_lab/server.py'
@@ -61,8 +62,8 @@ def build_flows():
       '借用GPU模型资源槽位|YOLO分割后批量传回CPU掩码|逐个芯片进行EfficientAD|归还该资源的CUDA流和模型槽位', pool='gpu', src=(B, 'infer_2d_piece'))
     n('o-boundary', '银胶允许边界准备', '当前：检测crop四边内缩', 1, 3,
       '仅依赖图像/crop/圆定位，不依赖YOLO掩码|当前roi_inset模式生成允许矩形|可与YOLO和EfficientAD重叠|可选旧模板模式另走SIFT标定分支', pool='silver', src=(B, 'prepare_silver_boundary'))
-    n('o-pitch', 'Pitch补偿', '非扫描轴条带并行', 2, 2,
-      '启用时先矫正整板，再分片|按不发生位移的轴切条带|各条带独立投影、处理碰撞|父线程合并，更新深度坐标空间', pool='pitch', kind='parallel', times=('smartray_pitch_ms',), src=(Z, 'correct_smartray_pitch'))
+    n('o-pitch', '调用侧提交前Pitch矫正', '不计入检测耗时', 2, 0,
+      'SDK调用独立DLL，验证台在提交前准备深度|启用时仅矫正一次|矫正后的uint16像素和元数据一起提交|检测程序只分片、配准、测高，不再次矫正', pool='pitch', kind='parallel', src=(DP, 'prepare_depth_for_detection'))
     n('o-slices', '3D整板分片', '当前fixed；上到下1…N', 2, 3,
       'fixed模式直接验证并读取配置矩形|不扫描整图有效值|联合路径只按y1:y2取全宽深度视图|发布depth和pieces', pool='cpu', times=('depth_segmentation_ms',), src=(SEG, 'segment_depth_image'))
     n('o-geometry', '2D几何 + joint_entry', '弯曲 / 缺线 / 旋转 / 灰度', 0, 4,
@@ -95,7 +96,7 @@ def build_flows():
       '整板registration_ok与is_ok分别汇总|返回released板信息|删除本板缓存并完成Future|桥接层写JSON响应并归还请求容量', kind='data', src=(T, '_accept'))
     for a,b,label,kind in [('o-entry','o-2d','逐片提交','fork'),('o-entry','o-depth','整板提交','fork'),
         ('o-2d','o-fork','','serial'),('o-fork','o-gpu','','fork'),('o-fork','o-boundary','','fork'),
-        ('o-depth','o-pitch','','serial'),('o-pitch','o-slices','','serial'),('o-gpu','o-geometry','','serial'),
+        ('o-pitch','o-depth','矫正后才提交3D','serial'),('o-depth','o-slices','','serial'),('o-gpu','o-geometry','','serial'),
         ('o-geometry','o-postgate','','wait'),('o-boundary','o-postgate','','wait'),
         ('o-geometry','o-joingate','提前发布','data'),('o-slices','o-joingate','','wait'),
         ('o-postgate','o-post','','serial'),('o-joingate','o-shared','','serial'),('o-shared','o-registration','跨进程描述','data'),('o-registration','o-jointprep','回调交接','data'),('o-jointprep','o-joint','共享输入','data'),('o-post','o-cpu2d','共享mask','data'),('o-cpu2d','o-finalize2d','结果回传','data'),('o-finalize2d','o-2ddone','','serial'),
@@ -204,21 +205,21 @@ def build_flows():
     for chain in [['s-boundary','s-union','s-overflow','s-labels','s-sectors','s-summary'],['a-chip','a-rectify','a-route','a-infer','a-score','a-boxes']]:
         for a,b in zip(chain,chain[1:]):e(a,b)
 
-    scene('depth','3D深度与分片','先整板Pitch补偿，后按片号给出深度视图',[
+    scene('depth','提交前预处理与3D分片','Pitch在请求与检测计时之外执行',[
         'Pitch只矫正深度，同栅格强度图可在独立测试函数里同步；正式2D相机照片不使用Pitch公式。',
         'fixed_rois是已补偿整板上的固定分片矩形；它和已删除的“测高目标选择ROI”是不同用途。'])
-    n('z-input','深度共享内存与数组视图','原始单通道uint16数据',1,0,
+    n('z-input','检测入口：共享内存与数组视图','接收已准备的单通道uint16',1,5,
       '校验shm_name、板号及正整数image_width/image_height|要求data_format=uint16，data_size严格等于宽×高×2|读取完整原始深度字节，不接受PNG压缩流|按小端uint16建立二维视图，不解码、不拉伸灰度|行按顺序紧密排列，无行尾对齐填充；保留0/65535原值',pool='cpu',src=(B,'_read_3d'),times=('depth_shared_memory_read_ms','depth_array_view_ms','depth_read_ms'))
-    n('z-switch','是否启用正式Pitch','enabled_3d开关',1,1,
-      '正式API按未补偿原始深度解释输入|enabled_3d=False时原数组返回|启用时要求原始uint16、有效角度和正扫描步距|z_step_mm/gray_offset须与测高校准一致|原input_state不是正式配置开关；测试台另有SDK已补偿状态',kind='decision',src=(Z,'production_pitch_parameters'),params=('smartray_pitch_3d.parameters',))
-    n('z-strips','沿非扫描轴分条带','rows分列；columns分行',1,2,
+    n('z-switch','调用侧：是否启用Pitch','检测算法不读取此开关',1,0,
+      '验证台在提交前消费smartray_pitch_3d参数|SDK由上位机独立DLL负责矫正|关闭时提交原始像素，开启时提交矫正像素|元数据只描述坐标，不触发检测端矫正|不得对已矫正的SDK数据重复执行预处理',kind='decision',src=(DP,'preprocessing_parameters'),params=('smartray_pitch_3d.parameters',))
+    n('z-strips','调用侧：沿非扫描轴分条带','rows分列；columns分行',1,1,
       '条带数取配置线程数、可用池容量和非扫描轴尺寸的最小值|每条带覆盖完整扫描轴|独立Pitch池运行条带任务|输入只读，每条带分配独立输出|大位移仍不会跨条带写同一目标像素',pool='pitch',kind='parallel',src=(Z,'correct_smartray_pitch'),params=('smartray_pitch_3d.parameters.projection_workers',))
-    n('z-project','每条带：投影深度点','有效值 → 毫米 → 平移与Z修正',1,3,
+    n('z-project','调用侧每条带：投影深度点','有效值 → 毫米 → 平移与Z修正',1,2,
       '仅枚举0 < raw < 65535的输入点|设备Z=(raw−gray_offset)×z_step_mm+z_origin_mm|还原公式：Z=Z′/cosβ，扫描坐标位移=−Z′tanβ|文档正向：Z′=Zcosβ，扫描位移=Zsinβ|位移除scan_pitch_mm后加到扫描行/列并np.rint|Z换回整数灰度，再过滤空间越界和灰度1…65534范围',pool='pitch',src=(Z,'correct_smartray_pitch'))
-    n('z-collision','每条带：解决投影碰撞','np.maximum.at；深度越大获胜',1,4,
-      '同一目标像素多个投影时保留最大矫正深度|统计输入、投影、输出点数量|独立测试的强度图复用同一批投影点|矫正深度平局时取最大源索引对应强度|不插值填洞，空位保持0',pool='pitch',src=(Z,'correct_smartray_pitch'),times=('pitch_projection_work_ms',))
-    n('z-merge','父线程合并补偿结果','统一补偿后整板栅格',1,5,
-      '按条带顺序回填独立缓冲|累加discarded_points和collision_points等统计|启用时坐标空间变为pitch_corrected_board_3d|正式2D照片保持原样|后续配准和参考面全部使用此补偿后深度',pool='cpu',src=(Z,'depth_coordinate_space'),times=('smartray_pitch_ms',))
+    n('z-collision','调用侧每条带：解决投影碰撞','np.maximum.at；深度越大获胜',1,3,
+      '同一目标像素多个投影时保留最大矫正深度|独立测试的强度图复用同一批投影点|矫正深度平局时取最大源索引对应强度|不插值填洞，空位保持0|这些计算不属于检测请求或其计时',pool='pitch',src=(Z,'correct_smartray_pitch'))
+    n('z-merge','调用侧合并后提交深度','像素与坐标元数据一起传入',1,4,
+      '按条带顺序回填独立缓冲|附带pitch_correction元数据供坐标标签与展示使用|正式2D照片保持原样|预处理结束后才提交3D请求并开始检测计时|后续只分片配准和测高',pool='cpu',src=(DP,'prepare_depth_for_detection'))
     n('z-mode','选择分片模式','当前配置见参数表',1,6,
       '读取segmentation_3d.parameters|expected_piece_count必须和板片数一致|fixed和auto走不同边界定位路径|配置或边界错误直接抛错，不静默改变片数',kind='decision',src=(SEG,'segment_depth_image'),params=('segmentation_3d.parameters',))
     n('z-fixed','fixed：直接取标定矩形','不读像素有效性统计',0,7,
@@ -227,8 +228,8 @@ def build_flows():
       'depth > min_valid_depth生成有效掩码|统计每行有效占比并填短断口|筛选满足最小片高的带区间|初始阈值不满足片数时尝试观测到的更高占比|每片按列有效占比取X边界并加padding|检测片数不符返回piece_count_mismatch',pool='cpu',src=(SEG,'segment_depth_image'))
     n('z-ready','发布整板深度和片描述','depth_ready_at',1,8,
       '整板深度仍只有一份|联合路径实际取depth[y1:y2, :]，X保留全宽|不复制每片深度数组|记录本板深度就绪时刻|尝试为已有joint_entry调度对应片',kind='data',src=(P,'submit_3d'))
-    e('z-input','z-switch');e('z-switch','z-strips','启用');e('z-switch','z-mode','关闭：原样跳过','optional')
-    for a,b in zip(['z-strips','z-project','z-collision','z-merge'],['z-project','z-collision','z-merge','z-mode']):e(a,b)
+    e('z-switch','z-strips','提交前启用');e('z-switch','z-input','关闭：原样提交','optional')
+    for a,b in zip(['z-strips','z-project','z-collision','z-merge','z-input'],['z-project','z-collision','z-merge','z-input','z-mode']):e(a,b)
     e('z-mode','z-fixed','fixed');e('z-mode','z-auto','auto');e('z-fixed','z-ready');e('z-auto','z-ready')
 
     scene('registration','配准与掩码映射','每片一套矩阵；评分区不代表分别变换',[
@@ -355,7 +356,7 @@ def build_flows():
       '同配置、模型时间与大小不变时复用|配置或模型文件指纹改变先关闭旧进程|重新发送init和init_algorithm|改变参数后需重新初始化才进入运行配置',src=(V,'_ensure'))
     n('f-stop','停止验证台','Ctrl+C 或 --stop',2,3,
       '停止命令先核对本机服务身份|同源shutdown接口结束HTTP循环|先强制关闭自有检测进程并唤醒请求|再取消未开始验证、等待当前线程结束|不能先join任务池再close子进程，否则可能等满900秒',src=(V,'server_close'))
-    n('f-resources','释放资源与保留报告','实例池 / Pitch池 / 模型 / 缓存',2,4,
+    n('f-resources','释放资源与保留报告','实例池 / 模型 / 缓存',2,4,
       '关闭pipeline并终止未完成板Future|关闭桥接执行器及检测器自有池|释放模型、槽位和缓存|保留已保存输入与报告|关闭浏览器本身不等于停止后台服务',src=(B,'release'))
     for a,b in zip(['f-check','f-piece','f-board','f-validate','f-expire'],['f-piece','f-board','f-validate','f-expire','f-request']):e(a,b,'可能路径','optional')
     e('f-start','f-model');e('f-model','f-stop','手动停止','optional');e('f-stop','f-resources')

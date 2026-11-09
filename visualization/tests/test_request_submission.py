@@ -196,7 +196,7 @@ for line in sys.stdin:
                 path = root/name
                 (Image.fromarray(np.full((4,4),33000,np.uint16)) if kind=='3d' else Image.new('RGB',(4,4))).save(path)
                 rows.append(dict(kind=kind, name=name, path=str(path), board_id='2', piece_id=piece))
-            def mapper(stack, path, kind, piece_id=None):
+            def mapper(stack, path, kind, piece_id=None, **kwargs):
                 return dict(shm_name=path.name, **({'piece_id':piece_id,'image_size':3} if kind=='2d' else {'data_size':3}))
             def factory(python, ignored_server, log, **kwargs):
                 return ProtocolClient(python, worker, log, **kwargs)

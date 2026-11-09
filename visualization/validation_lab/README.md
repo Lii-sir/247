@@ -74,6 +74,8 @@ Windows若不希望保留命令窗口，可直接运行：
 
 参数来自`config/2D/config.json`与`config/3D/config.json`。页面显示当前片数和Pitch概况，不写回生产配置。当前正式配准为粗配准+仿射，Pitch只处理深度。模型初始化或检测失败会记录错误并尝试生成失败报告；产品NG与接口失败分别显示。
 
+Pitch已移到提交前预处理：验证台先按配置准备深度，再开始发送检测请求与计时。页面及结果的`total_wall_ms`现在从输入准备完成后计算，不含模型初始化、深度读文件或Pitch矫正；报告另存`excludes_depth_preprocessing=true`。算法响应不再含`smartray_pitch_ms`或`pitch_projection_*`。独立配准测试台仍可单独测量矫正本身。
+
 只在文件格式和配对检查通过后加载模型。任一2D请求失败会释放板缓存，使等待中的整板请求尽快结束；仅2D验证完成后也释放缓存，避免下次同板号混入旧结果。检测服务超时为900秒。运行中不接受第二次验证请求。
 
 输出在`visualization/output/validation-lab/session-*/`：`uploads/`保留上传文件；各次验证UUID子目录含`result.json`、`report.html`、`timings.csv`、`python.log`。结果中的路径引用这些持久输入；关闭/重启后仍可从磁盘打开自包含报告。清空页面清单不删除磁盘文件。

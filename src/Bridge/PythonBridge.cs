@@ -442,7 +442,7 @@ public sealed class PythonBridge : IDisposable
         }
     }
 
-    internal DetectResponse Detect3DFile(string dataPath)
+    internal DetectResponse Detect3DFile(string dataPath, Dictionary<string, object>? correction = null)
     {
         if (string.IsNullOrWhiteSpace(dataPath))
         {
@@ -452,13 +452,13 @@ public sealed class PythonBridge : IDisposable
         byte[] dataBytes = PackedDepthInput.ReadFile(dataPath, out int width, out int height);
         var request = new Detect3DRequest
         {
-            ImageWidth = width, ImageHeight = height
+            ImageWidth = width, ImageHeight = height, PitchCorrection = correction
         };
 
         return Detect3D(dataBytes, request, "3d_file");
     }
 
-    internal DetectResponse Detect3DBoardFile(string boardId, string dataPath)
+    internal DetectResponse Detect3DBoardFile(string boardId, string dataPath, Dictionary<string, object>? correction = null)
     {
         if (string.IsNullOrWhiteSpace(boardId))
         {
@@ -482,7 +482,7 @@ public sealed class PythonBridge : IDisposable
             {
                 Cmd = "detect_3d_board",
                 BoardId = boardId,
-                ImageWidth = width, ImageHeight = height
+                ImageWidth = width, ImageHeight = height, PitchCorrection = correction
             },
             $"stream_3d_{boardId}",
             imageReadWatch.Elapsed.TotalMilliseconds);
@@ -533,7 +533,8 @@ public sealed class PythonBridge : IDisposable
     internal DetectResponse DetectBoardFiles(
         IReadOnlyList<string> image2DPaths,
         string data3DPath,
-        string batchId)
+        string batchId,
+        Dictionary<string, object>? correction = null)
     {
         EnsureInitialized();
         ValidateBoardFileInputs(image2DPaths, data3DPath);
@@ -573,7 +574,7 @@ public sealed class PythonBridge : IDisposable
             {
                 ShmName = depthBuffer.Name,
                 DataSize = depthBytes.Length,
-                ImageWidth = depthWidth, ImageHeight = depthHeight
+                ImageWidth = depthWidth, ImageHeight = depthHeight, PitchCorrection = correction
             };
             fileReadWatch.Stop();
 
@@ -1180,18 +1181,25 @@ public sealed class BridgeBoard
         _bridge = bridge;
     }
 
+    public DetectResponse DetectFiles(IReadOnlyList<string> images2D, string depthPath, string batchId = "")
+        => DetectFiles(images2D, depthPath, batchId, null);
+
+    public Task<DetectResponse> DetectStreamingFilesAsync(IReadOnlyList<string> images2D,
+        string depthPath, string boardId, object? threshold = null)
+        => DetectStreamingFilesAsync(images2D, depthPath, boardId, threshold, null);
+
     public DetectResponse DetectFiles(
         IReadOnlyList<string> image2DPaths,
         string data3DPath,
-        string batchId = "")
+        string batchId, Dictionary<string, object>? correction)
     {
-        return _bridge.DetectBoardFiles(image2DPaths, data3DPath, batchId);
+        return _bridge.DetectBoardFiles(image2DPaths, data3DPath, batchId, correction);
     }
 
     /// <summary>Runs ten per-piece 2D requests and the single 3D scan concurrently, then returns the joined board result.</summary>
     public async Task<DetectResponse> DetectStreamingFilesAsync(
         IReadOnlyList<string> image2DPaths, string data3DPath, string boardId,
-        object? threshold = null)
+        object? threshold, Dictionary<string, object>? correction)
     {
         if (image2DPaths == null || image2DPaths.Count != 10)
             throw new ArgumentException("Streaming board detection requires exactly ten 2D images.", nameof(image2DPaths));
@@ -1200,7 +1208,7 @@ public sealed class BridgeBoard
         if (string.IsNullOrWhiteSpace(data3DPath) || !File.Exists(data3DPath))
             throw new FileNotFoundException("3D board image not found.", data3DPath);
 
-        Task<DetectResponse> scan = _bridge.ThreeD.DetectBoardFileAsync(boardId, data3DPath);
+        Task<DetectResponse> scan = _bridge.ThreeD.DetectBoardFileAsync(boardId, data3DPath, correction);
         try
         {
             DetectResponse[] pieces = await Task.WhenAll(image2DPaths.Select(
@@ -1450,24 +1458,49 @@ public sealed class Bridge3D
         _bridge = bridge;
     }
 
-    public Task<DetectResponse> DetectBoardFileAsync(string boardId, string dataPath)
-        => Task.Run(() => DetectBoardFile(boardId, dataPath));
+    // Keep existing CLR signatures for already compiled callers. Metadata
+    // overloads only describe externally prepared pixels; none correct them.
+    public Task<DetectResponse> DetectBoardFileAsync(string boardId, string path)
+        => DetectBoardFileAsync(boardId, path, null);
+    public Task<DetectResponse> DetectBoardSharedMemoryAsync(string boardId, string name, int size, int width, int height)
+        => DetectBoardSharedMemoryAsync(boardId, name, size, width, height, null);
+    public DetectResponse DetectBoard(string boardId, ushort[] depth, int width, int height)
+        => DetectBoard(boardId, depth, width, height, null);
+    public Task<DetectResponse> DetectBoardAsync(string boardId, ushort[] depth, int width, int height)
+        => DetectBoardAsync(boardId, depth, width, height, null);
+    public DetectResponse Detect3D(ushort[] depth, int width, int height)
+        => Detect3D(depth, width, height, null);
+    public DetectResponse Detect3DFile(string path) => Detect3DFile(path, null);
+    public DetectResponse DetectBoardFile(string boardId, string path) => DetectBoardFile(boardId, path, null);
+    public DetectResponse Detect3DSharedMemory(string name, int size, int width, int height)
+        => Detect3DSharedMemory(name, size, width, height, null);
+    public DetectResponse DetectBoardSharedMemory(string boardId, string name, int size, int width, int height)
+        => DetectBoardSharedMemory(boardId, name, size, width, height, null);
+
+    public Task<DetectResponse> DetectBoardFileAsync(string boardId, string dataPath, Dictionary<string, object>? correction)
+    {
+        var metadata = correction == null ? null : new Dictionary<string, object>(correction);
+        return Task.Run(() => DetectBoardFile(boardId, dataPath, metadata));
+    }
 
     public Task<DetectResponse> DetectBoardSharedMemoryAsync(
-        string boardId, string shmName, int dataSize, int width, int height)
-        => Task.Run(() => DetectBoardSharedMemory(boardId, shmName, dataSize, width, height));
+        string boardId, string shmName, int dataSize, int width, int height, Dictionary<string, object>? correction)
+    {
+        var metadata = correction == null ? null : new Dictionary<string, object>(correction);
+        return Task.Run(() => DetectBoardSharedMemory(boardId, shmName, dataSize, width, height, metadata));
+    }
 
     /// <summary>Submit a complete SDK depth array. Copies directly into request-owned shared memory.</summary>
-    public DetectResponse DetectBoard(string boardId, ushort[] depth, int width, int height)
+    public DetectResponse DetectBoard(string boardId, ushort[] depth, int width, int height, Dictionary<string, object>? correction)
     {
         if (string.IsNullOrWhiteSpace(boardId))
             throw new ArgumentException("Board ID is empty.", nameof(boardId));
         return _bridge.Detect3DValues(depth, new Detect3DRequest {
-            Cmd = "detect_3d_board", BoardId = boardId }, width, height);
+            Cmd = "detect_3d_board", BoardId = boardId, PitchCorrection = correction }, width, height);
     }
 
     /// <summary>Snapshot synchronously so the SDK may reuse its array after this method returns.</summary>
-    public Task<DetectResponse> DetectBoardAsync(string boardId, ushort[] depth, int width, int height)
+    public Task<DetectResponse> DetectBoardAsync(string boardId, ushort[] depth, int width, int height, Dictionary<string, object>? correction)
     {
         int size = PackedDepthInput.ByteCount(width, height);
         if (depth == null || depth.LongLength * sizeof(ushort) != size)
@@ -1475,13 +1508,14 @@ public sealed class Bridge3D
         if (string.IsNullOrWhiteSpace(boardId))
             throw new ArgumentException("Board ID is empty.", nameof(boardId));
         var snapshot = (ushort[])depth.Clone();
-        return Task.Run(() => DetectBoard(boardId, snapshot, width, height));
+        var metadata = correction == null ? null : new Dictionary<string, object>(correction);
+        return Task.Run(() => DetectBoard(boardId, snapshot, width, height, metadata));
     }
 
-    public DetectResponse Detect3D(ushort[] depth, int width, int height)
-        => _bridge.Detect3DValues(depth, new Detect3DRequest(), width, height);
+    public DetectResponse Detect3D(ushort[] depth, int width, int height, Dictionary<string, object>? correction)
+        => _bridge.Detect3DValues(depth, new Detect3DRequest { PitchCorrection = correction }, width, height);
 
-    public DetectResponse Detect3DFile(string dataPath)
+    public DetectResponse Detect3DFile(string dataPath, Dictionary<string, object>? correction)
     {
         if (string.IsNullOrWhiteSpace(dataPath))
         {
@@ -1493,11 +1527,11 @@ public sealed class Bridge3D
             throw new FileNotFoundException("3D data file not found.", dataPath);
         }
 
-        return _bridge.Detect3DFile(dataPath);
+        return _bridge.Detect3DFile(dataPath, correction);
     }
 
     // 新流程：提交一张包含整板十片的 3D 数据，并触发该 board 的合并。
-    public DetectResponse DetectBoardFile(string boardId, string dataPath)
+    public DetectResponse DetectBoardFile(string boardId, string dataPath, Dictionary<string, object>? correction)
     {
         if (string.IsNullOrWhiteSpace(boardId))
         {
@@ -1507,14 +1541,14 @@ public sealed class Bridge3D
         {
             throw new FileNotFoundException("3D board data file not found.", dataPath);
         }
-        return _bridge.Detect3DBoardFile(boardId, dataPath);
+        return _bridge.Detect3DBoardFile(boardId, dataPath, correction);
     }
 
     public DetectResponse Detect3DSharedMemory(
         string shmName,
         int dataSize,
         int width,
-        int height)
+        int height, Dictionary<string, object>? correction)
     {
         if (string.IsNullOrWhiteSpace(shmName))
         {
@@ -1530,7 +1564,7 @@ public sealed class Bridge3D
         {
             ShmName = shmName,
             DataSize = dataSize,
-            ImageWidth = width, ImageHeight = height
+            ImageWidth = width, ImageHeight = height, PitchCorrection = correction
         });
     }
 
@@ -1540,7 +1574,7 @@ public sealed class Bridge3D
         string shmName,
         int dataSize,
         int width,
-        int height)
+        int height, Dictionary<string, object>? correction)
     {
         if (string.IsNullOrWhiteSpace(boardId))
         {
@@ -1560,7 +1594,7 @@ public sealed class Bridge3D
             BoardId = boardId,
             ShmName = shmName,
             DataSize = dataSize,
-            ImageWidth = width, ImageHeight = height
+            ImageWidth = width, ImageHeight = height, PitchCorrection = correction
         });
     }
 }

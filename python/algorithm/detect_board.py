@@ -45,7 +45,7 @@ from algorithm.registration import (
     refine_affine_registration,
     register_platform_masks,
 )
-from algorithm.tilt_correction import correct_smartray_depth, production_pitch_parameters, depth_coordinate_space
+from transport.depth_input import depth_coordinate_space, input_depth_correction
 from transport.shared_memory import read_shared_memory, SharedImage
 from algorithm.timing import timed_call, measure, note, record_duration, current_timings
 from algorithm.instance_tasks import InstanceTasks
@@ -87,7 +87,6 @@ class DetectBoard(JointGeometry):
         self.registration_config = RegistrationConfig()
         self.height_config = HeightConfig()
         self.dynamic_affine_config: Dict[str, Any] = {}
-        self.pitch_config: Dict[str, Any] = {}
         # The streaming 2D path uses the same circle-relative crop as the
         # standalone 2D detector.  ``crop_roi`` remains the explicit fallback
         # for callers that do not provide the circle configuration.
@@ -103,12 +102,11 @@ class DetectBoard(JointGeometry):
         self._piece_cache_lock = threading.RLock()
         self._inference_lock = threading.RLock()
         self._instance_tasks = InstanceTasks()
-        self._pitch_tasks = InstanceTasks(thread_name_prefix="pitch")
 
     def handle_init(self, req: Dict[str, Any]) -> Dict[str, Any]:
         start = time.perf_counter()
         if (self.model is not None or self.chip_anomaly_inspector is not None
-                or self._instance_tasks.workers > 1 or self._pitch_tasks.workers > 1):
+                or self._instance_tasks.workers > 1):
             self.release()
         self.config_path = str(req.get("config_path") or "") or None
         raw_model_paths = req.get("model_path")
@@ -342,11 +340,8 @@ class DetectBoard(JointGeometry):
         self.dynamic_affine_config = dict(
             feature_parameters(config, "dynamic_affine_3d") or {}
         )
-        self.pitch_config = production_pitch_parameters(config, self.height_config.gray_offset,
-                                                        self.height_config.vertical_resolution_mm)
         threading_values = _dict(common_3d.get("threading", {}), "common_3d.parameters.threading")
         self._instance_tasks.configure(threading_values.get("instance_workers", 16))
-        self._pitch_tasks.configure(self.pitch_config.get("projection_workers", 1))
 
     def _validate_gpu_requirement(self) -> None:
         if not torch.cuda.is_available():
@@ -693,9 +688,7 @@ class DetectBoard(JointGeometry):
             read_start = time.perf_counter()
             depth = self._read_3d(req)
             read_decode_ms = self.elapsed_ms(read_start)
-            pitch_start = time.perf_counter()
-            depth, pitch_correction = self.prepare_3d_depth(depth)
-            pitch_ms = self.elapsed_ms(pitch_start)
+            pitch_correction = input_depth_correction(req)
 
             segment_start = time.perf_counter()
             depth_pieces = segment_depth_image(depth, self.segmentation_config)
@@ -738,7 +731,6 @@ class DetectBoard(JointGeometry):
                 "elapsed_ms": total_ms,
                 "timings": {
                     "shared_memory_read_ms": read_decode_ms,
-                    "smartray_pitch_ms": pitch_ms,
                     "segmentation_3d_ms": segmentation_ms,
                     "registration_and_mask_alignment_ms": alignment_ms,
                     "total_detect_ms": total_ms,
@@ -952,9 +944,7 @@ class DetectBoard(JointGeometry):
                 gray_images.append(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
             depth = self._read_3d(depth_descriptor)
             shared_memory_read_decode_ms = self.elapsed_ms(read_start)
-            pitch_start = time.perf_counter()
-            depth, pitch_correction = self.prepare_3d_depth(depth)
-            pitch_ms = self.elapsed_ms(pitch_start)
+            pitch_correction = input_depth_correction(depth_descriptor)
 
             segment_start = time.perf_counter()
             depth_pieces = segment_depth_image(depth, self.segmentation_config)
@@ -1036,7 +1026,6 @@ class DetectBoard(JointGeometry):
                 "elapsed_ms": elapsed_ms,
                 "timings": {
                     "shared_memory_read_decode_ms": shared_memory_read_decode_ms,
-                    "smartray_pitch_ms": pitch_ms,
                     "segmentation_3d_ms": segmentation_ms,
                     "yolo_batch_inference_ms": inference_ms,
                     "registration_and_mask_alignment_ms": alignment_ms,
@@ -1089,10 +1078,6 @@ class DetectBoard(JointGeometry):
         if image is None:
             raise ValueError(f"unable to decode 2D image for piece {descriptor.get('piece_id')}")
         return image
-
-    def prepare_3d_depth(self, depth: np.ndarray):
-        return timed_call("smartray_pitch_ms", correct_smartray_depth, depth, self.pitch_config,
-                          tasks=self._pitch_tasks)
 
     @staticmethod
     def _read_3d(descriptor: Dict[str, Any]) -> np.ndarray:
@@ -1302,7 +1287,6 @@ class DetectBoard(JointGeometry):
 
     def release(self) -> None:
         self._instance_tasks.close()
-        self._pitch_tasks.close()
         for resource in self._gpu_worker_resources[1:]:
             resource["inspector"].release()
         self._gpu_worker_resources = []
@@ -1317,7 +1301,6 @@ class DetectBoard(JointGeometry):
         self.chip_alignment_config = {}
         self.chip_anomaly_config = {"configured": False}
         self.dynamic_affine_config = {}
-        self.pitch_config = {}
         if self.chip_anomaly_inspector is not None:
             self.chip_anomaly_inspector.release()
         self.chip_anomaly_inspector = None

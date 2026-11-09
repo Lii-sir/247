@@ -7,6 +7,7 @@ import time
 import numpy as np
 from algorithm.instance_tasks import InstanceTasks
 from algorithm.timing import record_duration, timed_call, note, current_timings
+from transport.depth_input import depth_coordinate_space
 
 MODEL = 'smartray_pitch'
 
@@ -39,10 +40,6 @@ def correct_smartray_depth(depth, settings, *, tasks=None):
     _, corrected, info = correct_smartray_pitch(None, depth, internal, tasks=tasks)
     hidden = {'enabled_2d', 'requested_2d', 'image_role', 'image_transform_original_to_corrected', 'input_state'}
     return corrected, {key: value for key, value in info.items() if key not in hidden}
-
-
-def depth_coordinate_space(correction):
-    return 'pitch_corrected_board_3d' if correction.get('applied') else 'board_3d'
 
 
 def _number(settings, key, default):

@@ -78,7 +78,7 @@ def make_document():
         ['joint',joint,'父线程：复用深度共享区并派发实例mask','不执行映射或测高，不等待子进程'],
         ['joint_measurement_process',joint,'第三组常驻进程：映射、参考面、全实例高度','独立核组，无Torch；结果回主进程合并完整2D诊断'],
         ['instance',instance,'每个3D测高进程内部的本地实例工作位','默认1，随当前worker执行；非主进程全板共享池；更多线程需给每进程更多核'],
-        ['pitch',pitch,'独立条带投影与碰撞处理','额外池；分非扫描轴，输出缓冲互不写冲突']]
+        ['pitch',pitch,'提交前独立预处理，不属于检测线程池','调用侧分非扫描轴；输出缓冲互不写冲突；检测不含其耗时']]
     coords = [
         ['原始2D','整张相机照片','圆心、灰度图、H_full输入','照片不做SmartRay Pitch'],
         ['crop局部2D','检测ROI左上角为(0,0)','YOLO原始掩码','公开mask_2d加crop偏移；bbox清理还需加mask_offset'],
@@ -152,7 +152,7 @@ def make_document():
         'height_wire_regions_ms':33.6691,'height_solder_wall_ms':58.1687,'joint_phase_ms':2238.7497}
     return dict(meta=dict(revision=revision,node_count=len(seen),step_count=sum(len(n['steps']) for s in scenes for n in s['nodes']),
         config_sha256=hashlib.sha256(json.dumps(config,sort_keys=True).encode()).hexdigest(),piece_count=three['common_3d']['parameters']['input']['piece_count'],
-        scope='统一板级正式流式检测；旧接口单列说明',timing_note='用户此前提供的历史日志，早于全实例测高ROI删除；当前版本未重测，不作为当前性能承诺。'),
+        scope='统一板级正式流式检测；旧接口单列说明',timing_note='用户此前提供的历史日志，早于Pitch移出检测及全实例测高ROI删除；旧记录包含Pitch，当前检测不含，未重测，不作为当前性能承诺。'),
         scenes=scenes,config=config,pools=pools,pool_budget=budget,pool_effective=effective,
         early_joint=t3.get('early_joint_workers',joint),coords=coords,roi=roi,endpoints=endpoints,classes=classes,timings=timing_rows,historical=historical)
 

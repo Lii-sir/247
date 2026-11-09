@@ -292,6 +292,8 @@ HTML 中展开“配准、参考平面与阶段耗时”可查看选中片的 2D
 
 3D接口已改为原始小端uint16数组及宽高，算法中移除PNG解码；3D流式输入改看`depth_read_ms`、`depth_shared_memory_read_ms`、`depth_array_view_ms`及板级`shared_memory_read_ms`。`detect_and_view.py`和验证台仍可选择原始16位PNG样本，文件解码在客户端输入准备阶段完成，发送给算法的是紧密排列的原始像素；这部分读文件时间不属于算法计时。2D及包含2D读图的批量`shared_memory_read_decode_ms`保留原含义。
 所有计时单位为毫秒；父阶段包含子阶段、多片可能重叠，不能将全部字段相加。
+
+Pitch也已移到提交前：`detect_and_view.py`及验证台先完成3D文件读取/矫正和共享输入准备，再开始检测计时；检测的`elapsed_ms/total_detect_ms`、CLI的`batch_wall_ms`及验证台的`total_wall_ms`不含此3D预处理。配置`smartray_pitch_3d`只由输入适配器消费，检测器不创建Pitch池、不再按开关重新矫正。SDK上位机先用独立DLL处理，再传入uint16和可选`pitch_correction`元数据。
 YOLO 框架返回的三项耗时不一定覆盖首次 warmup/初始化等整个 `predict()` 调用开销；
 若 `yolo_predict_wall_ms` 很长而 `yolo_reported_*` 很小，应优先检查框架调用的额外开销。
 单片重复操作（如多个芯片的 EfficientAD）在该片 JSON/CSV 中累加，日志保留每次调用。

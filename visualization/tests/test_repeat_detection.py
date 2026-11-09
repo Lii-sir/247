@@ -83,12 +83,12 @@ class RepeatDetectionTests(unittest.TestCase):
         self.fake = FakeClient(**failure)
         output = self.root / "output"
 
-        def mapping(stack, path, kind, piece_id=None):
+        def mapping(stack, path, kind, piece_id=None, **kwargs):
             self.mappings.append((path, kind, piece_id))
             stack.callback(self.closed_mappings.append, path)
             if kind == "2d":
                 return {"piece_id": piece_id, "shm_name": str(path), "image_size": 1}
-            return {"shm_name": str(path), "data_size": 1}
+            return {"shm_name": str(path), "data_size": 2, "data_format": "uint16", "image_width": 1, "image_height": 1}
 
         def render_report(document, path, **kwargs):
             self.assertEqual(self.fake.close_count, 1, "Render only after all inference and model release")
@@ -100,7 +100,7 @@ class RepeatDetectionTests(unittest.TestCase):
             argv.append("--parallel")
         with patch.object(sys, "argv", argv), \
                 patch.object(client_module, "image_files", return_value=self.paths), \
-                patch.object(client_module, "algorithm_request", return_value={"cmd": "init_algorithm", "stage": "board"}), \
+                patch.object(client_module, "algorithm_request", return_value={"cmd": "init_algorithm", "stage": "board", "config_text": "{}"}), \
                 patch.object(client_module, "ProtocolClient", return_value=self.fake) as factory, \
                 patch.object(client_module, "mapped_file", side_effect=mapping), \
                 patch.object(client_module, "render_report", side_effect=render_report) as render, \
