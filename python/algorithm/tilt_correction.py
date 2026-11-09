@@ -4,12 +4,54 @@ X is transport. Inverse: Z=Z'/cos(beta), X=X'-Z'*tan(beta).
 from __future__ import annotations
 import math
 import time
+from functools import lru_cache
 import numpy as np
 from algorithm.instance_tasks import InstanceTasks
 from algorithm.timing import record_duration, timed_call, note, current_timings
 from transport.depth_input import depth_coordinate_space
 
 MODEL = 'smartray_pitch'
+
+
+@lru_cache(maxsize=8)
+def _depth_lookup(angle, pitch, step, offset, origin, direction):
+    """Immutable per-calibration tables, using the original float operation order."""
+    cosine, sine = math.cos(math.radians(angle)), math.sin(math.radians(angle))
+    tangent = math.tan(math.radians(angle))
+    codes = np.arange(65536, dtype=np.float64)
+    with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
+        z = (codes-offset)*step + origin
+        if direction == 'recover_ideal':
+            shift, corrected_z = -z*tangent, z/cosine
+        else:
+            shift, corrected_z = z*sine, z*cosine
+        shifts = shift/pitch
+        raw = np.rint((corrected_z-origin)/step + offset)
+    valid = (codes > 0) & (codes < 65535) & (raw >= 1) & (raw <= 65534)
+    values = np.zeros(65536, np.uint16)
+    values[valid] = raw[valid].astype(np.uint16)
+    shifts.setflags(write=False)
+    values.setflags(write=False)
+    return shifts, values
+
+
+def _output_buffer(depth, out, image=None):
+    if out is None:
+        return np.empty(depth.shape, np.uint16)
+    if (not isinstance(out, np.ndarray) or out.dtype != np.uint16 or out.shape != depth.shape
+            or not out.flags.c_contiguous or not out.flags.writeable):
+        raise ValueError('Pitch输出须为同尺寸、可写、C连续的uint16数组')
+    if np.shares_memory(depth, out) or (isinstance(image, np.ndarray) and np.shares_memory(image, out)):
+        raise ValueError('Pitch输入输出不能共享像素内存')
+    return out
+
+
+def _unchanged_depth(depth, out, image):
+    if out is None:
+        return depth
+    target = _output_buffer(depth, out, image)
+    np.copyto(target, depth)
+    return target
 
 
 def production_pitch_parameters(config, gray_offset=32768., z_step_mm=.00105):
@@ -34,10 +76,10 @@ def production_pitch_parameters(config, gray_offset=32768., z_step_mm=.00105):
     return values
 
 
-def correct_smartray_depth(depth, settings, *, tasks=None):
+def correct_smartray_depth(depth, settings, *, tasks=None, out=None):
     """Production-only API: no 2D input, mapping or 2D metadata."""
     internal = {**(settings or {}), 'input_state': 'uncorrected'}
-    _, corrected, info = correct_smartray_pitch(None, depth, internal, tasks=tasks)
+    _, corrected, info = correct_smartray_pitch(None, depth, internal, tasks=tasks, out=out)
     hidden = {'enabled_2d', 'requested_2d', 'image_role', 'image_transform_original_to_corrected', 'input_state'}
     return corrected, {key: value for key, value in info.items() if key not in hidden}
 
@@ -49,7 +91,7 @@ def _number(settings, key, default):
     return value
 
 
-def correct_smartray_pitch(image, depth, settings, *, tasks=None):
+def correct_smartray_pitch(image, depth, settings, *, tasks=None, out=None):
     prepare_started = time.perf_counter()
     settings = settings or {}
     want2 = bool(settings.get('enabled_2d', False))
@@ -60,13 +102,13 @@ def correct_smartray_pitch(image, depth, settings, *, tasks=None):
                 image_transform_original_to_corrected=np.eye(3).tolist())
     if not want2 and not want3:
         info['reason'] = 'disabled'
-        return image, depth, info
+        return image, _unchanged_depth(depth, out, image), info
     if settings.get('model') != MODEL:
         raise ValueError('旧版旋转参数不能用于SmartRay；请重新设置SmartRay Pitch参数')
     state = settings.get('input_state', 'unknown')
     if state == 'sdk_corrected':
         info['reason'] = 'already_sdk_corrected'
-        return image, depth, info
+        return image, _unchanged_depth(depth, out, image), info
     if state != 'uncorrected':
         raise ValueError('请先确认输入是否已由Studio/SDK进行Pitch矫正')
     if want2 and not want3:
@@ -105,18 +147,24 @@ def correct_smartray_pitch(image, depth, settings, *, tasks=None):
     origin = _number(settings, 'z_origin_mm', 0)
     if pitch <= 0 or not math.isfinite(pitch) or step <= 0:
         raise ValueError('扫描步距(mm/profile)和Z分辨率必须大于0')
-    cosine, sine = math.cos(math.radians(angle)), math.sin(math.radians(angle))
-    tangent = math.tan(math.radians(angle))
     h, w = depth.shape
 
     workers = settings.get('projection_workers', 1)
     if type(workers) is not int or workers < 1:
         raise ValueError('projection_workers必须为正整数')
+    lookup_started = time.perf_counter()
+    shifts, values = _depth_lookup(angle, pitch, step, offset, origin, direction)
+    record_duration('pitch_lookup_prepare_ms', (time.perf_counter()-lookup_started)*1000)
+    allocate_started = time.perf_counter()
+    output = _output_buffer(depth, out, image)
+    output_flat = output.reshape(-1)
+    corrected_image = np.empty_like(image) if want2 else image
+    record_duration('pitch_output_allocate_ms', (time.perf_counter()-allocate_started)*1000)
     owned_tasks = tasks is None
     if owned_tasks:
         tasks = InstanceTasks(workers, thread_name_prefix="pitch")
     # Collisions can only happen along the scan axis. Each strip spans that
-    # entire axis and owns an independent output buffer; no concurrent scatter
+    # entire axis and owns a disjoint part of the output; no concurrent scatter
     # ever writes into another strip, even for very large depth shifts.
     extent = w if axis == 'rows' else h
     strip_count = min(workers, tasks.workers, extent)
@@ -135,55 +183,60 @@ def correct_smartray_pitch(image, depth, settings, *, tasks=None):
             tick = now
         left, right = span
         source = depth[:, left:right] if axis == 'rows' else depth[left:right, :]
+        target = output[:, left:right] if axis == 'rows' else output[left:right, :]
+        target.fill(0)
+        row_offset, col_offset = (0, left) if axis == 'rows' else (left, 0)
+        if want2:
+            image_target = corrected_image[:, left:right] if axis == 'rows' else corrected_image[left:right, :]
+            image_target.fill(0)
         th, tw = source.shape
-        checkpoint('pitch_strip_view_work_ms')
+        checkpoint('pitch_strip_clear_work_ms')
         rows, cols = np.nonzero((source > 0) & (source < 65535))
         input_count = len(rows)
         checkpoint('pitch_valid_points_work_ms')
-        z = (source[rows, cols].astype(float)-offset)*step + origin
-        checkpoint('pitch_z_decode_work_ms')
-        if direction == 'recover_ideal':
-            shift, corrected_z = -z*tangent, z/cosine
-        else:
-            shift, corrected_z = z*sine, z*cosine
-        checkpoint('pitch_transform_work_ms')
-        rr, cc = rows.copy(), cols.copy()
-        if axis == 'rows':
-            rr = np.rint(rows + shift/pitch).astype(np.int64)
-        else:
-            cc = np.rint(cols + shift/pitch).astype(np.int64)
-        raw = np.rint((corrected_z-origin)/step + offset)
+        codes = source[rows, cols]
+        mapped = shifts[codes]
+        raw = values[codes]
+        checkpoint('pitch_lookup_work_ms')
+        # Keep q + continuous shift before rint. Rounding only the shift would
+        # change half-pixel ties and coordinate-addition rounding.
+        np.add(mapped, rows if axis == 'rows' else cols, out=mapped)
+        np.rint(mapped, out=mapped)
         checkpoint('pitch_round_coordinates_work_ms')
-        valid = (rr >= 0) & (rr < th) & (cc >= 0) & (cc < tw) & (raw >= 1) & (raw <= 65534)
-        dst = rr[valid]*tw + cc[valid]
-        raw = raw[valid].astype(np.uint16)
+        valid = (mapped >= 0) & (mapped < (th if axis == 'rows' else tw)) & (raw != 0)
+        dst = mapped[valid].astype(np.intp)
+        if axis == 'rows':
+            dst *= w
+            dst += cols[valid] + col_offset
+        else:
+            dst += (rows[valid] + row_offset)*w
+        raw = raw[valid]
         checkpoint('pitch_filter_indices_work_ms')
-        output = np.zeros(th*tw, np.uint16)
-        checkpoint('pitch_strip_allocate_work_ms')
-        np.maximum.at(output, dst, raw)
+        np.maximum.at(output_flat, dst, raw)
         checkpoint('pitch_scatter_max_work_ms')
-        corrected_image = None
         if want2:
             # Reuse the same projected points instead of projecting a second
             # time. Ties choose the greatest source index along the scan axis,
             # exactly as in the original whole-board algorithm.
             src = rows[valid]*tw + cols[valid]
             winners = np.full(th*tw, -1, np.int64)
-            select = raw == output[dst]
-            np.maximum.at(winners, dst[select], src[select])
-            source_image = image[:, left:right] if axis == 'rows' else image[left:right, :]
-            corrected_image = np.zeros_like(source_image)
-            present = winners >= 0
-            flat_shape = (th*tw,) + image.shape[2:]
-            corrected_image.reshape(flat_shape)[present] = source_image.reshape(flat_shape)[winners[present]]
+            select = raw == output_flat[dst]
+            rr, cc = np.divmod(dst, w)
+            local_dst = (rr-row_offset)*tw + cc-col_offset
+            np.maximum.at(winners, local_dst[select], src[select])
+            target_rows, target_cols = np.nonzero(winners.reshape(th, tw) >= 0)
+            chosen = winners.reshape(th, tw)[target_rows, target_cols]
+            source_rows, source_cols = np.divmod(chosen, tw)
+            corrected_image[target_rows+row_offset, target_cols+col_offset] = image[
+                source_rows+row_offset, source_cols+col_offset]
         checkpoint('pitch_intensity_work_ms')
-        result = output.reshape(th, tw), corrected_image, input_count, len(dst), int(np.count_nonzero(output))
+        output_count = int(np.count_nonzero(target))
         checkpoint('pitch_output_count_work_ms')
-        return result, dict(span=[int(left), int(right)], timings=durations,
+        return dict(span=[int(left), int(right)], timings=durations,
                             wall_ms=(time.perf_counter()-started)*1000,
                             start_delay_ms=(started-dispatched)*1000,
                             input_valid_points=input_count, projected_points=len(dst),
-                            output_valid_points=result[4])
+                            output_valid_points=output_count)
 
     dispatched = time.perf_counter()
     work_before = current_timings().get('pitch_projection_work_ms', 0.)
@@ -194,24 +247,12 @@ def correct_smartray_pitch(image, depth, settings, *, tasks=None):
         if owned_tasks:
             timed_call('pitch_executor_close_ms', tasks.close)
     merge_started = time.perf_counter()
-    output = np.zeros_like(depth)
-    corrected_image = np.zeros_like(image) if want2 else image
-    record_duration('pitch_output_allocate_ms', (time.perf_counter()-merge_started)*1000)
-    merge_started = time.perf_counter()
-    input_count = projected_count = count = 0
-    for (left, right), (result, detail) in zip(spans, projected):
-        strip, intensity, valid_count, projected_size, output_count = result
-        if axis == 'rows':
-            output[:, left:right] = strip
-            if want2: corrected_image[:, left:right] = intensity
-        else:
-            output[left:right, :] = strip
-            if want2: corrected_image[left:right, :] = intensity
-        input_count += valid_count
-        projected_count += projected_size
-        count += output_count
+    # Workers already wrote their disjoint pixels. Only combine scalar stats.
+    input_count = sum(detail['input_valid_points'] for detail in projected)
+    projected_count = sum(detail['projected_points'] for detail in projected)
+    count = sum(detail['output_valid_points'] for detail in projected)
     record_duration('pitch_output_merge_ms', (time.perf_counter()-merge_started)*1000)
-    details = [detail for result, detail in projected]
+    details = projected
     if details:
         for stage in details[0]['timings']:
             record_duration(stage, sum(detail['timings'][stage] for detail in details))
@@ -232,4 +273,4 @@ def correct_smartray_pitch(image, depth, settings, *, tasks=None):
                 output_valid_points=count, discarded_points=input_count-projected_count,
                 collision_points=projected_count-count,
                 coordinate_mapping='depth_dependent_transport_shift')
-    return image, output.reshape(h,w), info
+    return image, output, info

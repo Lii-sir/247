@@ -29,7 +29,7 @@ sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(ROOT / "python"))
 from detect_and_view import ProtocolClient, algorithm_request, mapped_file, save_timing_csv
 from generate_report import render_report
-from algorithm.depth_preprocessing import preprocessing_parameters
+from algorithm.depth_preprocessing import preprocessing_parameters, DepthPreprocessor
 
 
 def board_number(value):
@@ -113,20 +113,39 @@ class Runner:
         self.mapper, self.reporter = mapper, reporter
         self.client = None
         self.fingerprint = None
+        self._depth_preprocessor = None
+        self._depth_settings_key = None
         self._state_lock = threading.RLock()
         self._stopping = threading.Event()
 
     def close(self, *, force=False):
         with self._state_lock:
-            if self.client is not None:
-                try:
+            try:
+                if self.client is not None:
                     if force:
                         self.client.close(force=True)
                     else:
                         self.client.close()
-                finally:
-                    self.client = None
-                    self.fingerprint = None
+            finally:
+                self.client = None
+                self.fingerprint = None
+                if self._depth_preprocessor is not None:
+                    self._depth_preprocessor.close()
+                    self._depth_preprocessor = None
+                    self._depth_settings_key = None
+
+    def _depth_runtime(self, settings):
+        key = json.dumps(settings, sort_keys=True)
+        with self._state_lock:
+            if self._stopping.is_set():
+                raise RuntimeError('验证台正在停止')
+            if self._depth_preprocessor is not None and key != self._depth_settings_key:
+                self._depth_preprocessor.close()
+                self._depth_preprocessor = None
+            if self._depth_preprocessor is None:
+                self._depth_preprocessor = DepthPreprocessor(settings)
+                self._depth_settings_key = key
+            return self._depth_preprocessor
 
     def stop(self):
         with self._state_lock:
@@ -228,7 +247,8 @@ class Runner:
             with ExitStack() as stack, ThreadPoolExecutor(max_workers=min(len(images)+1, 16)) as pool:
                 inputs = [(r, self.mapper(stack, Path(r["path"]), "2d", r["piece_id"])) for r in images]
                 depth_request = (dict(cmd="detect_3d_board", stage="3d", board_id=board_id,
-                    **self.mapper(stack, Path(depth["path"]), "3d", pitch_settings=pitch_settings)) if depth else None)
+                    **self.mapper(stack, Path(depth["path"]), "3d", pitch_settings=pitch_settings,
+                                  pitch_preprocessor=self._depth_runtime(pitch_settings))) if depth else None)
                 started = time.perf_counter()
                 requests = [dict(cmd="detect_2d_piece", stage="2d", board_id=board_id, **desc) for row, desc in inputs]
                 if options["submission_mode"] == "paced":

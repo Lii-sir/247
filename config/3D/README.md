@@ -280,7 +280,22 @@ C# DTO新增元数据属性，现有测高点/掩码字段保持；源码已构�
 
 ## Pitch条带并行
 
-`smartray_pitch_3d.parameters.projection_workers`配置为8，必须为正整数；设为1串行。省略按1处理。此参数属于调用侧预处理；Python文件适配器使用临时私有池并在提交前关闭，检测器不再拥有Pitch池。SDK侧使用独立DLL的`ProjectionWorkers`。
+`smartray_pitch_3d.parameters.projection_workers`配置为8，必须为正整数；设为1串行。省略按1处理。此参数属于调用侧预处理；验证台和连续CLI批次通过`DepthPreprocessor`复用独立线程池，配置改变或关闭时释放。检测器不拥有Pitch池。SDK侧使用独立DLL的`ProjectionWorkers`。
+
+Python按标定参数缓存65536项连续位移及深度编码表（最多8组，只读共享）；仍先把连续位移加到行/列坐标，再执行`np.rint`，不单独取整位移。各条带清零并直接写入整幅输出的独立区域，不再申请条带深度输出或复制合并。统计数据与同栅格强度图的碰撞平局规则保持。
+
+`correct_smartray_depth(..., out=buffer)`支持复用同尺寸、可写、C连续的uint16输出，输出不可与深度或强度图共享内存。关闭矫正时默认仍原样返回输入；显式提供输出时复制到输出。持续输入建议复用调用侧对象：
+
+```python
+from algorithm.depth_preprocessing import DepthPreprocessor
+with DepthPreprocessor(settings) as preprocessor:
+    for depth in frames:
+        raw_bytes, correction = preprocessor.encode(depth)
+        # 线程池和私有输出缓冲被复用；字节快照在锁内生成，后续帧不会改写它。
+        # 之后把raw_bytes及correction提交检测，预处理仍不计入检测耗时。
+```
+
+独立预处理细分计时中，`pitch_lookup_prepare_ms`表示查表获取/首次构建，`pitch_lookup_work_ms`表示条带查表，`pitch_strip_clear_work_ms`表示条带区域清零。`pitch_output_merge_ms`现在只汇总标量统计，不复制深度像素。
 
 按非扫描轴分条带：rows扫描分列，columns扫描分行。每个条带覆盖整个扫描方向，投影和碰撞聚合仅写自己的缓冲，父线程按条带顺序合并，因此跨行的大位移不会造成并发写冲突。投影公式、np.rint取整、0/65535无效值、越界过滤、碰撞取最大矫正深度保持不变。同栅格强度图复用本次投影点，平局仍取最大的原始源索引，不再二次投影。
 

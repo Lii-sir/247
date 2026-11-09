@@ -213,13 +213,13 @@ def build_flows():
     n('z-switch','调用侧：是否启用Pitch','检测算法不读取此开关',1,0,
       '验证台在提交前消费smartray_pitch_3d参数|SDK由上位机独立DLL负责矫正|关闭时提交原始像素，开启时提交矫正像素|元数据只描述坐标，不触发检测端矫正|不得对已矫正的SDK数据重复执行预处理',kind='decision',src=(DP,'preprocessing_parameters'),params=('smartray_pitch_3d.parameters',))
     n('z-strips','调用侧：沿非扫描轴分条带','rows分列；columns分行',1,1,
-      '条带数取配置线程数、可用池容量和非扫描轴尺寸的最小值|每条带覆盖完整扫描轴|独立Pitch池运行条带任务|输入只读，每条带分配独立输出|大位移仍不会跨条带写同一目标像素',pool='pitch',kind='parallel',src=(Z,'correct_smartray_pitch'),params=('smartray_pitch_3d.parameters.projection_workers',))
+      '条带数取配置线程数、可用池容量和非扫描轴尺寸的最小值|每条带覆盖完整扫描轴|连续验证复用调用侧Pitch池|各条带清零并直接写整幅输出的独立区域|大位移仍不会跨条带写同一目标像素',pool='pitch',kind='parallel',src=(Z,'correct_smartray_pitch'),params=('smartray_pitch_3d.parameters.projection_workers',))
     n('z-project','调用侧每条带：投影深度点','有效值 → 毫米 → 平移与Z修正',1,2,
-      '仅枚举0 < raw < 65535的输入点|设备Z=(raw−gray_offset)×z_step_mm+z_origin_mm|还原公式：Z=Z′/cosβ，扫描坐标位移=−Z′tanβ|文档正向：Z′=Zcosβ，扫描位移=Zsinβ|位移除scan_pitch_mm后加到扫描行/列并np.rint|Z换回整数灰度，再过滤空间越界和灰度1…65534范围',pool='pitch',src=(Z,'correct_smartray_pitch'))
+      '仅枚举0 < raw < 65535的输入点|按标定缓存65536项深度和连续位移查表|查表公式保留原来的Z解码、正向或还原以及编码计算顺序|每个点直接查到连续位移和有效深度编码|连续位移加到扫描行/列后才np.rint|过滤坐标越界和无效输出编码',pool='pitch',src=((Z,'_depth_lookup'),(Z,'correct_smartray_pitch')))
     n('z-collision','调用侧每条带：解决投影碰撞','np.maximum.at；深度越大获胜',1,3,
       '同一目标像素多个投影时保留最大矫正深度|独立测试的强度图复用同一批投影点|矫正深度平局时取最大源索引对应强度|不插值填洞，空位保持0|这些计算不属于检测请求或其计时',pool='pitch',src=(Z,'correct_smartray_pitch'))
     n('z-merge','调用侧合并后提交深度','像素与坐标元数据一起传入',1,4,
-      '按条带顺序回填独立缓冲|附带pitch_correction元数据供坐标标签与展示使用|正式2D照片保持原样|预处理结束后才提交3D请求并开始检测计时|后续只分片配准和测高',pool='cpu',src=(DP,'prepare_depth_for_detection'))
+      '条带已直接写入整幅输出，仅合并统计|在预处理锁内生成独立字节快照后再复用缓冲|附带pitch_correction元数据供坐标标签与展示使用|正式2D照片保持原样|预处理结束后才提交3D请求并开始检测计时|后续只分片配准和测高',pool='cpu',src=(DP,'encode'))
     n('z-mode','选择分片模式','当前配置见参数表',1,6,
       '读取segmentation_3d.parameters|expected_piece_count必须和板片数一致|fixed和auto走不同边界定位路径|配置或边界错误直接抛错，不静默改变片数',kind='decision',src=(SEG,'segment_depth_image'),params=('segmentation_3d.parameters',))
     n('z-fixed','fixed：直接取标定矩形','不读像素有效性统计',0,7,

@@ -219,7 +219,8 @@ def threshold_request(threshold: float | dict[str, float] | None) -> dict:
     return {"threshold": threshold} if threshold is not None else {}
 
 
-def mapped_file(stack: ExitStack, path: Path, kind: str, piece_id: int | None = None, *, pitch_settings=None) -> dict:
+def mapped_file(stack: ExitStack, path: Path, kind: str, piece_id: int | None = None, *,
+                pitch_settings=None, pitch_preprocessor=None) -> dict:
     if kind == "3d":
         import cv2
         import numpy as np
@@ -228,10 +229,14 @@ def mapped_file(stack: ExitStack, path: Path, kind: str, piece_id: int | None = 
             raise ValueError(f"3D sample must be an original single-channel uint16 image: {path}")
         height, width = depth.shape
         correction = None
-        if pitch_settings is not None:
+        if pitch_preprocessor is not None:
+            raw, correction = pitch_preprocessor.encode(depth)
+        elif pitch_settings is not None:
             from algorithm.depth_preprocessing import prepare_depth_for_detection
             depth, correction = prepare_depth_for_detection(depth, pitch_settings)
-        raw = depth.astype("<u2", copy=False).tobytes(order="C")
+            raw = depth.astype("<u2", copy=False).tobytes(order="C")
+        else:
+            raw = depth.astype("<u2", copy=False).tobytes(order="C")
     else:
         raw = path.read_bytes()
     if not raw:
@@ -270,7 +275,7 @@ def save_timing_csv(envelope: dict, path: Path) -> None:
 
 
 def detect_batch(client: ProtocolClient, args, paths: list[Path], depth: Path,
-                 envelope: dict, *, pitch_settings=None) -> None:
+                 envelope: dict, *, pitch_settings=None, pitch_preprocessor=None) -> None:
     """Run one board on an already initialized service; never reload models."""
     board_id = envelope["board_id"]
     started = None
@@ -305,7 +310,8 @@ def detect_batch(client: ProtocolClient, args, paths: list[Path], depth: Path,
     try:
         # Depth file decoding and Pitch complete before any detection request
         # or detection benchmark starts. Keep its mapping through the reply.
-        prepared_depth = mapped_file(depth_stack, depth, '3d', pitch_settings=pitch_settings)
+        prepared_depth = mapped_file(depth_stack, depth, '3d', pitch_settings=pitch_settings,
+                                    pitch_preprocessor=pitch_preprocessor)
         started = time.perf_counter()
         if args.mode == "stream" and args.parallel:
             print("Parallel stream: submit 10 2D pieces and 1 3D board scan...", flush=True)
@@ -424,7 +430,7 @@ def main() -> int:
         init_req = algorithm_request(args.score_mode, args.score_pool_kernel,
                                      args.silver_calibration)
         sys.path.insert(0, str(ROOT / 'python'))
-        from algorithm.depth_preprocessing import preprocessing_parameters
+        from algorithm.depth_preprocessing import preprocessing_parameters, DepthPreprocessor
         client_config = json.loads(init_req['config_text'])
         pitch_settings = preprocessing_parameters(client_config)
         client_config.pop('smartray_pitch_3d', None)
@@ -441,6 +447,7 @@ def main() -> int:
                 "images_2d": [{"piece_id": i + 1, "path": str(p)} for i, p in enumerate(paths)],
                 "image_3d": str(depth), "responses_2d": [], "response": {}}
     client = None
+    depth_preprocessor = None
     startup = {"process_pid": None, "initialization_count": 0,
                "profiling": {"log_enabled": os.environ.get("BRIDGE_TIMING_LOG", "1").lower() in {"1", "true", "yes", "on"},
                              "cuda_sync_debug": os.environ.get("BRIDGE_TIMING_CUDA_SYNC", "0").lower() in {"1", "true", "yes", "on"}}}
@@ -476,6 +483,7 @@ def main() -> int:
         print(f"Service PID={client.process.pid}; initialized once in "
               f"{startup['startup_wall_ms'] / 1000:.3f}s. Running {args.repeat} batch(es).", flush=True)
         (folder / "startup.json").write_text(json.dumps(startup, ensure_ascii=False, indent=2), encoding="utf-8")
+        depth_preprocessor = DepthPreprocessor(pitch_settings)
         for index in range(1, args.repeat + 1):
             current_id = board_id if args.repeat == 1 else f"{board_id}-run-{index:02d}"
             batch_folder = folder if args.repeat == 1 else folder / f"batch-{index:02d}"
@@ -489,7 +497,8 @@ def main() -> int:
                                            "method": "sift_ransac"}
             print(f"\nBatch {index}/{args.repeat}: {current_id} | "
                   f"{'first inference' if index == 1 else 'reuse loaded models, NO initialization'}", flush=True)
-            detect_batch(client, args, paths, depth, envelope, pitch_settings=pitch_settings)
+            detect_batch(client, args, paths, depth, envelope, pitch_settings=pitch_settings,
+                         pitch_preprocessor=depth_preprocessor)
             benchmark = envelope["benchmark"]
             benchmark.update(batch_index=index, process_pid=client.process.pid,
                              model_reused=index > 1,
@@ -522,6 +531,11 @@ def main() -> int:
         if envelope["response"].get("ok") or not envelope["response"]:
             envelope["response"] = {"ok": False, "board_id": board_id, "error": str(exc)}
     finally:
+        if depth_preprocessor is not None:
+            try:
+                depth_preprocessor.close()
+            except RuntimeError as exc:
+                summary['cleanup_error'] = str(exc)
         if client is not None:
             try:
                 client.close()  # Release models only AFTER all requested batches.
