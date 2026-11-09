@@ -5,6 +5,7 @@ import math
 import shutil
 import subprocess
 import sys
+import importlib.util
 
 import numpy as np
 
@@ -13,6 +14,10 @@ PROJECT = HERE.parent
 ROOT = PROJECT.parent
 sys.path.insert(0, str(ROOT / 'python'))
 from algorithm.tilt_correction import correct_smartray_depth
+reference_spec = importlib.util.spec_from_file_location('frozen_pitch_reference',
+    ROOT / 'visualization/tests/fixtures/pitch_reference.py')
+reference = importlib.util.module_from_spec(reference_spec)
+reference_spec.loader.exec_module(reference)
 
 
 def run(*args):
@@ -54,15 +59,25 @@ def main():
         cases.append((np.full((8, 9), 32769, np.uint16),
                       dict(scan_axis=axis, angle_deg=6., scan_pitch_mm=half_pitch,
                            projection_workers=3)))
+        # Adjacent floats around the tie and larger integer coordinates catch
+        # invalid optimizations that pre-round the shift rather than q+shift.
+        shape = (301, 9) if axis == 'rows' else (9, 301)
+        for pitch in (half_pitch, np.nextafter(half_pitch, 0.), np.nextafter(half_pitch, np.inf)):
+            cases.append((np.full(shape, 32769, np.uint16), dict(scan_axis=axis,
+                angle_deg=6., scan_pitch_mm=float(pitch), projection_workers=4)))
     for index, (source, overrides) in enumerate(cases):
         config = dict(model='smartray_pitch', enabled_3d=True, scan_axis='rows',
             transform_direction='recover_ideal', angle_deg=6., scan_pitch_mm=.02,
             z_step_mm=.00105, gray_offset=32768., z_origin_mm=0., projection_workers=1)
         config.update(overrides)
-        # Expected result is serial production Python, independent of DLL threads.
+        # Compare both optimized implementations with a frozen pre-optimization
+        # formula, so a matching regression in Python and DLL cannot pass.
         reference_config = {**config, 'projection_workers': 1}
         with np.errstate(over='ignore', invalid='ignore'):
-            expected, info = correct_smartray_depth(source, reference_config)
+            expected = reference.correct_smartray_pitch(None, source,
+                {**reference_config, 'input_state': 'uncorrected'})[1]
+            optimized, info = correct_smartray_depth(source, reference_config)
+        np.testing.assert_array_equal(expected, optimized, err_msg=f'Python case {index}: {config}')
         input_path, output_path = work / 'input.raw', work / 'output.raw'
         source.astype('<u2').tofile(input_path)
         run(runner, input_path, output_path, source.shape[1], source.shape[0],

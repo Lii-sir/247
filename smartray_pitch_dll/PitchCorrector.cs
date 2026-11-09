@@ -46,6 +46,7 @@ namespace SmartRay.PitchCorrection
         private readonly int workers;
         private readonly double[] shifts;
         private readonly ushort[] values;
+        private readonly ParallelOptions parallelOptions;
 
         public PitchCorrector(PitchOptions options)
         {
@@ -67,6 +68,7 @@ namespace SmartRay.PitchCorrection
             if (axis != ScanAxis.Rows && axis != ScanAxis.Columns) throw new ArgumentOutOfRangeException("Axis");
             if (direction != TransformDirection.RecoverIdeal && direction != TransformDirection.DocumentForward)
                 throw new ArgumentOutOfRangeException("Direction");
+            parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = workers };
 
             double radians = angle * (Math.PI / 180.0);
             double cosine = Math.Cos(radians), sine = Math.Sin(radians), tangent = Math.Tan(radians);
@@ -102,7 +104,8 @@ namespace SmartRay.PitchCorrection
         {
             int length = CheckInput(input, width, height);
             ushort[] output = new ushort[length];
-            CorrectInto(input, output, width, height);
+            // CLR already zero-initializes new arrays. Do not clear it again.
+            Project(input, output, width, height, false);
             return output;
         }
 
@@ -113,26 +116,47 @@ namespace SmartRay.PitchCorrection
             if (output == null) throw new ArgumentNullException("output");
             if (output.Length != length) throw new ArgumentException("Output length must equal width * height.", "output");
             if (Object.ReferenceEquals(input, output)) throw new ArgumentException("Input and output must be different arrays.", "output");
+            Project(input, output, width, height, true);
+        }
+
+        private void Project(ushort[] input, ushort[] output, int width, int height, bool clearOutput)
+        {
+            int length = input.Length;
             if (!enabled)
             {
                 Array.Copy(input, output, length);
                 return;
             }
-            Array.Clear(output, 0, length);
             // Each strip owns the entire scan axis: even large shifts and
             // collisions cannot cross into another worker's destination pixels.
             int extent = axis == ScanAxis.Rows ? width : height;
             int count = Math.Min(workers, extent);
+            if (clearOutput && count == 1)
+            {
+                // One worker can use the contiguous bulk clear directly.
+                Array.Clear(output, 0, length);
+                clearOutput = false;
+            }
             Action<int> project = delegate(int index)
             {
                 int begin = (int)((long)extent * index / count);
                 int end = (int)((long)extent * (index + 1) / count);
                 if (axis == ScanAxis.Rows)
                 {
+                    if (clearOutput)
+                    {
+                        // Clear every row in our columns before projecting any
+                        // source row: large shifts may target later rows.
+                        for (int rowBase = 0; rowBase < length; rowBase += width)
+                            Array.Clear(output, rowBase + begin, end - begin);
+                    }
+                    int sourceRow = 0;
                     for (int row = 0; row < height; ++row)
+                    {
+                        int sourceIndex = sourceRow + begin;
                         for (int col = begin; col < end; ++col)
                         {
-                            ushort source = input[row * width + col];
+                            ushort source = input[sourceIndex++];
                             ushort value = values[source];
                             if (value == 0) continue;
                             double mapped = Math.Round(row + shifts[source], MidpointRounding.ToEven);
@@ -140,24 +164,32 @@ namespace SmartRay.PitchCorrection
                             int target = (int)mapped * width + col;
                             if (value > output[target]) output[target] = value;
                         }
+                        sourceRow += width;
+                    }
                 }
                 else
                 {
+                    int sourceRow = begin * width;
+                    if (clearOutput) Array.Clear(output, sourceRow, (end - begin) * width);
                     for (int row = begin; row < end; ++row)
+                    {
+                        int sourceIndex = sourceRow;
                         for (int col = 0; col < width; ++col)
                         {
-                            ushort source = input[row * width + col];
+                            ushort source = input[sourceIndex++];
                             ushort value = values[source];
                             if (value == 0) continue;
                             double mapped = Math.Round(col + shifts[source], MidpointRounding.ToEven);
                             if (!(mapped >= 0 && mapped < width)) continue;
-                            int target = row * width + (int)mapped;
+                            int target = sourceRow + (int)mapped;
                             if (value > output[target]) output[target] = value;
                         }
+                        sourceRow += width;
+                    }
                 }
             };
             if (count == 1) project(0);
-            else Parallel.For(0, count, new ParallelOptions { MaxDegreeOfParallelism = count }, project);
+            else Parallel.For(0, count, parallelOptions, project);
         }
 
         private static int CheckInput(ushort[] input, int width, int height)

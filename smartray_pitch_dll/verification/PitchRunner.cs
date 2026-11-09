@@ -65,7 +65,14 @@ internal static class PitchRunner
         System.Threading.Tasks.Parallel.For(0, 3, delegate(int job)
         {
             ushort[] parallel = correctorInstance.Correct(input, width, height);
-            for (int i = 0; i < parallel.Length; ++i) Require(parallel[i] == actual[i]);
+            ushort[] parallelReused = new ushort[input.Length];
+            for (int i = 0; i < parallelReused.Length; ++i) parallelReused[i] = 65535;
+            correctorInstance.CorrectInto(input, parallelReused, width, height);
+            for (int i = 0; i < parallel.Length; ++i)
+            {
+                Require(parallel[i] == actual[i]);
+                Require(parallelReused[i] == actual[i]);
+            }
         });
         // Reusing a prefilled buffer for a different frame must clear old pixels.
         ushort[] zero = new ushort[input.Length];
