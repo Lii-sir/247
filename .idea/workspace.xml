@@ -4,7 +4,12 @@
     <option name="autoReloadType" value="ALL" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="f45a9d93-da79-4d4c-b621-f1da0bf4d833" name="更改" comment="" />
+    <list default="true" id="f45a9d93-da79-4d4c-b621-f1da0bf4d833" name="更改" comment="">
+      <change beforePath="$PROJECT_DIR$/.idea/modules.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/modules.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/yinxkj.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/yinxkj.iml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/config/3D/config.json" beforeDir="false" afterPath="$PROJECT_DIR$/config/3D/config.json" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -33,23 +38,23 @@
   </component>
   <component name="NextEditCompletionFeaturesState">
     <decayedCancelled>
-      <entry key="MS100" value="1.3655084530136994" />
-      <entry key="MS500" value="2.8030612937183457" />
-      <entry key="S2" value="4.471935363610688" />
-      <entry key="S5" value="8.642308883755355" />
-      <entry key="S10" value="15.237653843231552" />
-      <entry key="S30" value="33.52167087281448" />
-      <entry key="S60" value="53.18526529592956" />
-      <entry key="M2" value="80.15160946401939" />
-      <entry key="M5" value="124.31288524790216" />
-      <entry key="M10" value="162.28609333066345" />
-      <entry key="M15" value="187.90081431301758" />
-      <entry key="M30" value="238.3844842875467" />
-      <entry key="H1" value="303.49318037352646" />
-      <entry key="H2" value="389.6901742167425" />
-      <entry key="H4" value="486.8651244053779" />
-      <entry key="D1" value="822.052149226609" />
-      <entry key="W1" value="1020.6841369853923" />
+      <entry key="MS100" value="1.0" />
+      <entry key="MS500" value="1.0" />
+      <entry key="S2" value="1.0000000000007583" />
+      <entry key="S5" value="1.0000141876975213" />
+      <entry key="S10" value="1.003766836533549" />
+      <entry key="S30" value="1.1612430074953832" />
+      <entry key="S60" value="1.4699093504706464" />
+      <entry key="M2" value="1.9626558194640098" />
+      <entry key="M5" value="3.9431730838716783" />
+      <entry key="M10" value="7.230666544702931" />
+      <entry key="M15" value="9.759262673904368" />
+      <entry key="M30" value="16.680910703241963" />
+      <entry key="H1" value="34.55139451777452" />
+      <entry key="H2" value="81.82160080191902" />
+      <entry key="H4" value="200.5716890984347" />
+      <entry key="D1" value="889.6996840322977" />
+      <entry key="W1" value="1350.2689965203801" />
     </decayedCancelled>
     <decayedSelected>
       <entry key="MS100" value="0.0" />
@@ -57,37 +62,37 @@
       <entry key="S2" value="0.0" />
       <entry key="S5" value="0.0" />
       <entry key="S10" value="0.0" />
-      <entry key="S30" value="0.0" />
-      <entry key="S60" value="0.0" />
-      <entry key="M2" value="0.0" />
-      <entry key="M5" value="0.0" />
-      <entry key="M10" value="0.0" />
-      <entry key="M15" value="0.0" />
-      <entry key="M30" value="0.0" />
-      <entry key="H1" value="0.0" />
-      <entry key="H2" value="0.0" />
-      <entry key="H4" value="0.0" />
-      <entry key="D1" value="0.0" />
-      <entry key="W1" value="0.0" />
+      <entry key="S30" value="6.28778694990607E-130" />
+      <entry key="S60" value="2.5075460015533184E-65" />
+      <entry key="M2" value="5.007540315916903E-33" />
+      <entry key="M5" value="1.2018486694401098E-13" />
+      <entry key="M10" value="3.467148225660031E-7" />
+      <entry key="M15" value="4.946297198645832E-5" />
+      <entry key="M30" value="0.007384195341338704" />
+      <entry key="H1" value="0.10697194433434025" />
+      <entry key="H2" value="0.49437615938947443" />
+      <entry key="H4" value="1.1696027557842061" />
+      <entry key="D1" value="2.5491029464435107" />
+      <entry key="W1" value="2.9305799771198617" />
     </decayedSelected>
     <decayedShown>
-      <entry key="MS100" value="1.3036072859196213" />
-      <entry key="MS500" value="2.756093750530699" />
-      <entry key="S2" value="4.437431855580703" />
-      <entry key="S5" value="8.594827980860385" />
-      <entry key="S10" value="15.19597386220149" />
-      <entry key="S30" value="33.497995122377624" />
-      <entry key="S60" value="53.163948961658384" />
-      <entry key="M2" value="80.128679765031" />
-      <entry key="M5" value="124.29481374159197" />
-      <entry key="M10" value="162.2737274738012" />
-      <entry key="M15" value="187.8912155940904" />
-      <entry key="M30" value="238.3784922500054" />
-      <entry key="H1" value="303.4895543302031" />
-      <entry key="H2" value="389.68799727750525" />
-      <entry key="H4" value="486.86383729914144" />
-      <entry key="D1" value="822.051848290013" />
-      <entry key="W1" value="1020.6840878986411" />
+      <entry key="MS100" value="0.9526379980439373" />
+      <entry key="MS500" value="0.9903428719330246" />
+      <entry key="S2" value="0.9975769252652101" />
+      <entry key="S5" value="0.9990442346459696" />
+      <entry key="S10" value="1.0032793998447578" />
+      <entry key="S30" value="1.1610245691172014" />
+      <entry key="S60" value="1.4696245859494375" />
+      <entry key="M2" value="1.96221641492401" />
+      <entry key="M5" value="3.942179141450577" />
+      <entry key="M10" value="7.229431428869995" />
+      <entry key="M15" value="9.758111075357998" />
+      <entry key="M30" value="16.68724084733022" />
+      <entry key="H1" value="34.65739119767671" />
+      <entry key="H2" value="82.31496179152691" />
+      <entry key="H4" value="201.74022983614307" />
+      <entry key="D1" value="892.2482465966004" />
+      <entry key="W1" value="1353.1994739299262" />
     </decayedShown>
   </component>
   <component name="ProjectColorInfo">{
@@ -99,20 +104,25 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent"><![CDATA[{
-  "keyToString": {
-    "ModuleVcsDetector.initialDetectionPerformed": "true",
-    "RunOnceActivity.ShowReadmeOnStart": "true",
-    "RunOnceActivity.git.unshallow": "true",
-    "RunOnceActivity.typescript.service.memoryLimit.init": "true",
-    "codeWithMe.voiceChat.enabledByDefault": "false",
-    "git-widget-placeholder": "work-from-4d652155",
-    "ignore.virus.scanning.warn.message": "true",
-    "last_opened_file_path": "D:/projects/247-likai",
-    "nodejs_package_manager_path": "npm",
-    "python.packages.toolwindow.project.migrated.to.right.top.v2": "true"
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.typescript.service.memoryLimit.init&quot;: &quot;true&quot;,
+    &quot;codeWithMe.voiceChat.enabledByDefault&quot;: &quot;false&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;yinxkj&quot;,
+    &quot;ignore.virus.scanning.warn.message&quot;: &quot;true&quot;,
+    &quot;last_opened_file_path&quot;: &quot;D:/projects/247-likai&quot;,
+    &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
+    &quot;node.js.detected.package.tslint&quot;: &quot;true&quot;,
+    &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
+    &quot;node.js.selected.package.tslint&quot;: &quot;(autodetect)&quot;,
+    &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
+    &quot;python.packages.toolwindow.project.migrated.to.right.top.v2&quot;: &quot;true&quot;,
+    &quot;settings.editor.selected.configurable&quot;: &quot;advanced.settings&quot;
   }
-}]]></component>
+}</component>
   <component name="RunManager">
     <configuration name="main" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
       <module name="yinxkj" />
@@ -127,9 +137,9 @@
       <option name="IS_MODULE_SDK" value="true" />
       <option name="ADD_CONTENT_ROOTS" value="true" />
       <option name="ADD_SOURCE_ROOTS" value="true" />
-      <option name="DEBUG_JUST_MY_CODE" value="false" />
       <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
       <option name="RUN_TOOL" value="" />
+      <option name="RUN_AS_SCRIPT" value="" />
       <option name="SCRIPT_NAME" value="$PROJECT_DIR$/main.py" />
       <option name="PARAMETERS" value="" />
       <option name="SHOW_COMMAND_LINE" value="false" />
@@ -143,7 +153,7 @@
   <component name="SharedIndexes">
     <attachedChunks>
       <set>
-        <option value="bundled-python-sdk-ebb3072d7bdf-5bd6d13a2a75-com.jetbrains.pycharm.pro.sharedIndexes.bundled-PY-262.11879.98" />
+        <option value="bundled-python-sdk-34611be1ca5a-e0583fc556d1-com.jetbrains.pycharm.pro.sharedIndexes.bundled-PY-263.7307.206" />
       </set>
     </attachedChunks>
   </component>
@@ -162,6 +172,13 @@
       <workItem from="1793931648681" duration="7673000" />
       <workItem from="1793947107670" duration="8126000" />
       <workItem from="1793957365872" duration="2332000" />
+      <workItem from="1793962064886" duration="604000" />
+      <workItem from="1794037003959" duration="28000" />
+      <workItem from="1794037114966" duration="11538000" />
+      <workItem from="1794053657425" duration="1888000" />
+      <workItem from="1794113410475" duration="8600000" />
+      <workItem from="1794126520608" duration="3501000" />
+      <workItem from="1794196452229" duration="6879000" />
     </task>
     <servers />
   </component>
@@ -177,6 +194,11 @@
         <entry key="Branch">
           <value>
             <list>
+              <RecentGroup>
+                <option name="FILTER_VALUES">
+                  <option value="origin/yinxkj" />
+                </option>
+              </RecentGroup>
               <RecentGroup>
                 <option name="FILTER_VALUES">
                   <option value="HEAD" />
