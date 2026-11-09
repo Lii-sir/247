@@ -8,18 +8,19 @@
       "threading": {
         "worker_budget": 80,
         "cpu_workers": 6,
-        "registration_workers": 10,
+        "main_reserved_physical_cores": 4,
+        "registration_workers": 4,
         "registration_affinity": {
           "enabled": true,
-          "physical_cores": 10
+          "physical_cores": 4
         },
-        "joint_workers": 10,
+        "joint_workers": 7,
         "joint_affinity": {
           "enabled": true,
-          "physical_cores": 10
+          "physical_cores": 14
         },
         "early_joint_workers": 10,
-        "instance_workers": 1
+        "instance_workers": 2
       }
     }
   },

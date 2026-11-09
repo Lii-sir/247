@@ -31,6 +31,7 @@ class FakeClient:
             if on_sent is not None:on_sent('fake-'+str(len(self.requests)),time.perf_counter())
             board=q.get('board_id');cmd=q['cmd']
             response=dict(ok=True,cmd=cmd,board_id=board,timings={})
+            if cmd=='init_algorithm':response['threading']={'main_cpu_ids':list(range(8)),'main_reserved_cpu_ids':list(range(8))}
             if cmd=='detect_2d_piece':
                 pid=q['piece_id'];response.update(piece_id=pid,results_2d={'is_ok':True})
                 if pid==self.fail_piece:return dict(response,ok=False,error='synthetic piece error',message='chip aspect ratio 1.9072 does not match configured range')
@@ -99,6 +100,8 @@ class ValidationTests(unittest.TestCase):
             self.assertTrue(result['ok']);self.assertFalse(result['product_is_ok'])
             self.assertEqual(result['model_reused'],n==1)
             self.assertTrue((folder/'report.html').exists());self.assertTrue((folder/'timings.csv').exists())
+            saved=json.loads((folder/'result.json').read_text(encoding='utf-8'))
+            self.assertEqual(list(range(8)),saved['benchmark']['threading']['main_reserved_cpu_ids'])
         self.assertEqual(len(clients),1)
         self.assertEqual(sum(q['cmd']=='init_algorithm' for q in clients[0].requests),1)
         requests=[q for q in clients[0].requests if q['cmd']=='detect_2d_piece']

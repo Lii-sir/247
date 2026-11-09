@@ -254,6 +254,24 @@ def mapped_file(stack: ExitStack, path: Path, kind: str, piece_id: int | None = 
     return descriptor
 
 
+def summarize_2d_latency(timeline, *, expected_count=None, target_ms=1000.):
+    """Observe real request RTTs; never change detection quality or discard work."""
+    rows = [row for row in timeline if row.get('cmd') == 'detect_2d_piece'
+            and type(row.get('duration_ms')) in (int, float)
+            and math.isfinite(row['duration_ms']) and row['duration_ms'] >= 0]
+    values = sorted(row['duration_ms'] for row in rows)
+    complete = expected_count is None or len(rows) == expected_count
+    successful = all(row.get('ok') is True for row in rows)
+    return dict(target_ms=target_ms, request_count=len(rows), expected_count=expected_count,
+        max_ms=max(values) if values else None,
+        p95_ms=values[max(0, math.ceil(.95*len(values))-1)] if values else None,
+        over_target_piece_ids=sorted({row['piece_id'] for row in rows
+            if row['duration_ms'] > target_ms and type(row.get('piece_id')) is int}),
+        complete=complete, all_requests_successful=successful,
+        meets_target=bool(complete and successful and max(values) <= target_ms) if values else None,
+        criterion='request_sent_to_response_received')
+
+
 def save_timing_csv(envelope: dict, path: Path) -> None:
     """Flatten existing measurements only; do not infer or add overlapping stages."""
     rows = []
@@ -371,6 +389,7 @@ def detect_batch(client: ProtocolClient, args, paths: list[Path], depth: Path,
             "request_window_ms": (max(item["received_ms"] for item in entries)
                                   - min(item["sent_ms"] for item in entries)) if entries else None,
         }
+        envelope['benchmark']['two_d_latency'] = summarize_2d_latency(entries, expected_count=len(paths))
 
 
 def main() -> int:

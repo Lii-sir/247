@@ -1,6 +1,6 @@
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),vm=require('node:vm');
 const dir=path.join(__dirname,'../validation_lab'),html=fs.readFileSync(path.join(dir,'index.html'),'utf8');
-async function boot(){
+async function boot(latency=null){
  const nodes=new Map(),requests=[],history=[];
  class Node{
   constructor(){this.value='';this.textContent='';this.hidden=false;this.disabled=false;this.children=[];}
@@ -16,7 +16,7 @@ async function boot(){
    if(url==='/api/defaults')data=config;
    else if(url==='/api/history')data=history;
    else if(url.startsWith('/api/upload?')){const kind=new URL(url,'http://local').searchParams.get('kind'),name=opt.body.name,m=name.match(/^(.+)_(\d+)\./);data={kind,name,path:'/uploads/'+name,board_id:kind==='3d'?name.split('.')[0]:m?.[1]||'',piece_id:kind==='2d'&&m?Number(m[2]):null};}
-   else if(url==='/api/run'){const q=JSON.parse(opt.body);requests.push(q);const id='a'.repeat(32);history.unshift({id,board_id:q.board_id,status:'done',result:{ok:true,product_is_ok:false,board_id:q.board_id,pieces:2,total_wall_ms:1000,output_dir:'/output',model_reused:false,submission_mode:q.submission_mode,request_interval_ms:q.request_interval_ms}});data={id};}
+   else if(url==='/api/run'){const q=JSON.parse(opt.body);requests.push(q);const id='a'.repeat(32);history.unshift({id,board_id:q.board_id,status:'done',result:{ok:true,product_is_ok:false,board_id:q.board_id,pieces:2,total_wall_ms:1000,output_dir:'/output',model_reused:false,submission_mode:q.submission_mode,request_interval_ms:q.request_interval_ms,two_d_latency:latency}});data={id};}
    else if(url.startsWith('/api/jobs/'))data=history[0];
    else throw Error(url);
    return {ok:true,json:async()=>data};
@@ -30,6 +30,17 @@ test('demo -> validation passes exact board/piece manifest and opens interactive
  assert.equal(requests[0].board_id,'2');assert.deepEqual(requests[0].files.filter(f=>f.kind==='2d').map(f=>f.piece_id),[1,2]);
  assert.equal(nodes.get('report').hidden,false);assert.match(nodes.get('report').src,/report.html$/);assert.match(nodes.get('summary').textContent,/NG/);
  assert.match(nodes.get('jsonLink').href,/result.json$/);
+});
+
+test('2D latency violation is visible without changing product NG',async()=>{
+ const {nodes}=await boot({target_ms:1000,max_ms:1079,meets_target:false,over_target_piece_ids:[10]});
+ nodes.get('demo').onclick();await nodes.get('run').onclick();
+ assert.match(nodes.get('summary').textContent,/2D请求≤1000ms：未达标/);
+ assert.match(nodes.get('summary').textContent,/1079\.0ms/);
+ assert.match(nodes.get('summary').textContent,/超标片号 10/);
+ assert.match(nodes.get('summary').textContent,/NG/);
+ assert.equal(nodes.get('progress').className,'error');
+ assert.match(nodes.get('progress').textContent,/未满足1秒目标/);
 });
 test('manual duplicate piece blocks submission and partial2D mode permits missing piece',async()=>{
  const {nodes,requests}=await boot();nodes.get('demo').onclick();

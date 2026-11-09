@@ -197,7 +197,7 @@ class JointProcessStructureTests(unittest.TestCase):
                                 env={**os.environ,'PYTHONDONTWRITEBYTECODE':'1'})
         self.assertEqual(0,result.returncode,result.stderr)
 
-    def test_24_core_partition_leaves_two_main_cores_and_restores_in_reverse(self):
+    def test_24_core_partition_reserves_four_fast_main_cores_and_restores_in_reverse(self):
         from algorithm.cpu_partition import choose_partition
         server = AlgorithmServer()
         self.addCleanup(server.close)
@@ -207,7 +207,8 @@ class JointProcessStructureTests(unittest.TestCase):
         def factory(role):
             def create(count, affinity, **kwargs):
                 original = list(available)
-                plan = choose_partition(cores, available, affinity['physical_cores'])
+                plan = choose_partition(cores, available, affinity['physical_cores'],
+                                        reserved_cpus=affinity.get('reserved_main_cpus',()))
                 available[:] = plan['main_cpus']
                 starts.append(role)
                 service = Mock()
@@ -224,12 +225,15 @@ class JointProcessStructureTests(unittest.TestCase):
         with patch('algorithm.registration_process.RegistrationProcesses',side_effect=factory('registration')), \
                 patch('algorithm.cpu_2d_process.Cpu2DProcesses',side_effect=factory('cpu_2d')), \
                 patch('algorithm.joint_process.JointMeasurementProcesses',side_effect=factory('joint_measurement')), \
+                patch('algorithm.cpu_partition.physical_cores',return_value=cores), \
                 patch('algorithm.cpu_partition.current_cpus',side_effect=lambda:list(available)):
             server._configure_cpu_processes(settings)
         groups = [set(server.threading_info[role+'_execution']['workers'][0]['cpu_ids'])
                   for role in ('registration','cpu_2d','joint_measurement')]
         groups.append(set(server.threading_info['main_cpu_ids']))
-        self.assertEqual([20,4,20,4], [len(group) for group in groups])
+        self.assertEqual([8,4,28,8], [len(group) for group in groups])
+        self.assertTrue(set(server.threading_info['main_reserved_cpu_ids']).issubset(groups[-1]))
+        self.assertEqual('cpu_2d',starts[0])
         for i, group in enumerate(groups):
             self.assertTrue(all(group.isdisjoint(other) for other in groups[i+1:]))
         server._stop_cpu_processes()

@@ -226,6 +226,9 @@ class AlgorithmServer:
         if joint_affinity["enabled"] and joint > joint_affinity["physical_cores"]:
             raise ValueError("joint_workers cannot exceed joint_affinity.physical_cores")
         instance_workers = self._thread_count("instance_workers", values_3d.get("instance_workers", 1))
+        main_reserved = values_3d.get("main_reserved_physical_cores", 0)
+        if type(main_reserved) is not int or main_reserved < 0:
+            raise ValueError("main_reserved_physical_cores must be a nonnegative integer")
         early_joint = self._thread_count(
             "early_joint_workers", values_3d.get("early_joint_workers", joint)
         )
@@ -266,6 +269,7 @@ class AlgorithmServer:
             "cpu_process_affinity": cpu_affinity,
             "joint_affinity": joint_affinity,
             "instance_workers": instance_workers,
+            "main_reserved_physical_cores": main_reserved,
             "effective_workers": effective_total,
             "early_joint_workers": early_joint,
         }
@@ -286,6 +290,8 @@ class AlgorithmServer:
             and self.threading_info.get("registration_workers") == settings["registration_workers"]
             and self.threading_info.get("registration_pool_shared") == settings["registration_pool_shared"]
             and self.threading_info.get("gpu_workers") == settings["gpu_workers"]
+            and self.threading_info.get("main_reserved_physical_cores", 0)
+            == settings.get("main_reserved_physical_cores", 0)
         )
         if not same_budget:
             old_pools = {
@@ -362,7 +368,22 @@ class AlgorithmServer:
         ]
         specifications.sort(key=lambda item: not item[3]["enabled"])
         try:
+            reserved_main = []
+            reserved_count = settings.get("main_reserved_physical_cores", 0)
+            self.threading_info["main_reserved_cores"] = []
+            self.threading_info["main_reserved_cpu_ids"] = []
+            if reserved_count:
+                from algorithm.cpu_partition import current_cpus, physical_cores, choose_partition
+                reservation = choose_partition(physical_cores(), current_cpus(), reserved_count)
+                reserved_main = reservation["registration_cpus"]
+                self.threading_info["main_reserved_cores"] = reservation["registration_cores"]
+                # Prefer the remaining fast cores for 2D postprocessing before
+                # 3D registration. No OS affinity is changed by planning this.
+                specifications.sort(key=lambda item: (not item[3]["enabled"], item[0] != "cpu_2d"))
+            self.threading_info["main_reserved_cpu_ids"] = list(reserved_main)
             for role, factory, count, affinity in specifications:
+                if affinity["enabled"] and reserved_main:
+                    affinity = {**affinity, "reserved_main_cpus": list(reserved_main)}
                 service = (factory(count, affinity, instance_workers=settings["instance_workers"])
                            if role == "joint_measurement" else factory(count, affinity))
                 self._cpu_process_order.append(service)
@@ -372,6 +393,8 @@ class AlgorithmServer:
             if os.name == "nt":
                 from algorithm.cpu_partition import current_cpus
                 self.threading_info["main_cpu_ids"] = current_cpus()
+                if not set(reserved_main).issubset(self.threading_info["main_cpu_ids"]):
+                    raise RuntimeError("CPU pools consumed reserved main-process cores")
         except BaseException:
             self._stop_cpu_processes()
             raise

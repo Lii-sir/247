@@ -77,7 +77,7 @@ def make_document():
         ['registration_process',registration,'常驻进程：平台掩码、粗配准、仿射','额外进程数不计父线程预算；默认按物理核分区；OpenCV/BLAS=1，无Torch'],
         ['joint',joint,'父线程：复用深度共享区并派发实例mask','不执行映射或测高，不等待子进程'],
         ['joint_measurement_process',joint,'第三组常驻进程：映射、参考面、全实例高度','独立核组，无Torch；结果回主进程合并完整2D诊断'],
-        ['instance',instance,'每个3D测高进程内部的本地实例工作位','默认1，随当前worker执行；非主进程全板共享池；更多线程需给每进程更多核'],
+        ['instance',instance,'每个3D测高进程内部的本地实例工作位','当前2，随当前worker执行；非主进程全板共享池；更多线程需给每进程更多核'],
         ['pitch',pitch,'提交前独立预处理，不属于检测线程池','调用侧分非扫描轴；输出缓冲互不写冲突；检测不含其耗时']]
     coords = [
         ['原始2D','整张相机照片','圆心、灰度图、H_full输入','照片不做SmartRay Pitch'],

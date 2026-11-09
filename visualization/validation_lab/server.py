@@ -27,7 +27,7 @@ SERVICE_NAME = "detection-validation-lab"
 MAX_REQUEST_INTERVAL_MS = 3600000
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(ROOT / "python"))
-from detect_and_view import ProtocolClient, algorithm_request, mapped_file, save_timing_csv
+from detect_and_view import ProtocolClient, algorithm_request, mapped_file, save_timing_csv, summarize_2d_latency
 from generate_report import render_report
 from algorithm.depth_preprocessing import preprocessing_parameters, DepthPreprocessor
 
@@ -113,6 +113,7 @@ class Runner:
         self.mapper, self.reporter = mapper, reporter
         self.client = None
         self.fingerprint = None
+        self._startup_threading = None
         self._depth_preprocessor = None
         self._depth_settings_key = None
         self._state_lock = threading.RLock()
@@ -129,6 +130,7 @@ class Runner:
             finally:
                 self.client = None
                 self.fingerprint = None
+                self._startup_threading = None
                 if self._depth_preprocessor is not None:
                     self._depth_preprocessor.close()
                     self._depth_preprocessor = None
@@ -161,7 +163,8 @@ class Runner:
             if self._stopping.is_set():
                 raise RuntimeError("验证台正在停止")
             if self.client is not None and self.client.process.poll() is None and fingerprint == self.fingerprint:
-                return dict(model_reused=True, process_pid=self.client.process.pid)
+                return dict(model_reused=True, process_pid=self.client.process.pid,
+                            threading=self._startup_threading)
             self.close()
             progress("初始化模型（首次需要加载CUDA模型）")
             args = (Path(sys.executable), ROOT / "python/transport/bridge_server.py", self.folder / "python.log")
@@ -171,11 +174,14 @@ class Runner:
             reply = client.request(req, 900)
             if not reply.get("ok"):
                 raise RuntimeError(reply.get("error") or reply.get("message") or "模型初始化失败")
+            if req['cmd'] == 'init_algorithm':
+                self._startup_threading = reply.get('threading')
         with self._state_lock:
             if self._stopping.is_set():
                 raise RuntimeError("验证台正在停止")
             self.fingerprint = fingerprint
-        return dict(model_reused=False, process_pid=client.process.pid)
+        return dict(model_reused=False, process_pid=client.process.pid,
+                    threading=self._startup_threading)
 
     def run(self, rows, board_id, mode, count, folder, progress, *,
             submission_mode="concurrent", request_interval_ms=0):
@@ -369,6 +375,8 @@ class Runner:
                     self.close()
         envelope["benchmark"] = dict(total_wall_ms=round((time.perf_counter()-started)*1000, 2)
             if started is not None else 0., excludes_depth_preprocessing=True, **startup)
+        latency = summarize_2d_latency(envelope.get('timeline', []), expected_count=len(images))
+        envelope['benchmark']['two_d_latency'] = latency
         (folder / "result.json").write_text(json.dumps(envelope, ensure_ascii=False, indent=2), encoding="utf-8")
         save_timing_csv(envelope, folder / "timings.csv")
         if self._stopping.is_set():
@@ -387,7 +395,7 @@ class Runner:
                     **options,
                     pieces=len(envelope["responses_2d"]), model_reused=startup.get("model_reused", False),
                     error=envelope["response"].get("error"), output_dir=str(folder),
-                    total_wall_ms=envelope["benchmark"]["total_wall_ms"])
+                    total_wall_ms=envelope["benchmark"]["total_wall_ms"], two_d_latency=latency)
 
 
 class Server(ThreadingHTTPServer):

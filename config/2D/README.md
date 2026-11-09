@@ -104,7 +104,7 @@ ROI 外部分不参与测高，thin 焊脚仍从完整掩码的两端划分。
 }
 ```
 
-`cpu_process_workers`是2D CPU后处理进程数，环境变量`BRIDGE_2D_CPU_PROCESSES`可作为缺项默认值；JSON优先。`cpu_process_affinity`控制该进程组的Windows物理核分区，进程数不能超过保留核数。目标24物理核配置为配准10核、2D后处理2核、3D映射测高10核，主进程留2核，以解除每板10片只有4个3D进程的分批限制。实际吞吐待目标机器验证，至少给主进程保留1个可用物理核。关闭亲和性仍使用进程计算，没有thread回退。
+`cpu_process_workers`是2D CPU后处理进程数，环境变量`BRIDGE_2D_CPU_PROCESSES`可作为缺项默认值；JSON优先。`cpu_process_affinity`控制该进程组的Windows物理核分区，进程数不能超过保留核数。目标14900KF布局先保护主进程4P，再给2D后处理2P，3D使用剩余2P＋16E（配准4核、测高14核）。`main_reserved_physical_cores=4`位于3D线程配置，防止3D先占完P核。2D以请求RTT不超过1000ms为首要验收目标，实际达标仍需目标机验证。关闭亲和性仍使用进程计算，没有thread回退。
 
 CPU组先从已有可用范围划分，后一个池从剩余范围选择；启用亲和性的池优先启动，关闭时逆序恢复。三组均开启时，配准、2D后处理、3D映射测高与主进程CPU集合互不重叠。检查初始化响应的`threading.registration_execution.workers[].cpu_ids`、`threading.cpu_2d_execution.workers[].cpu_ids`、`threading.joint_measurement_execution.workers[].cpu_ids`与`threading.main_cpu_ids`。只修改Bridge及其子进程，不改系统其它进程；缓存和内存带宽仍然共享。
 

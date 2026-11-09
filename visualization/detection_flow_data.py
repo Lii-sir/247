@@ -85,7 +85,7 @@ def build_flows():
     n('o-jointprep', '测高共享输入与派发', '复用整板深度＋原2D实例mask', 2, 8,
       '深度复用配准发布的同一共享块|追加当前片只读原2D实例mask|仅发送高度配置、几何元数据和当前矩阵|父joint线程不等待测高进程', pool='joint', src=(JP,'submit_piece'),times=('joint_measurement_shared_memory_ms',))
     n('o-joint', '独立进程映射与全实例测高', '第三核组；本进程实例执行器', 2, 9,
-      '按joint_workers限制进程数|映射、参考面、引线及焊脚都在worker完成|instance_workers仅属于当前测高进程，默认1|不加载Torch，主进程不执行实例或测高任务|全部wire/thin/bond参与，CPU结果回主进程最后合并2D诊断', pool='joint_measurement_process', times=('joint_measurement_phase_ms',), src=(J, 'measure_registered_piece'))
+      '按joint_workers限制进程数|映射、参考面、引线及焊脚都在worker完成|instance_workers仅属于当前测高进程，当前2|不加载Torch，主进程不执行实例或测高任务|全部wire/thin/bond参与，CPU结果回主进程最后合并2D诊断', pool='joint_measurement_process', times=('joint_measurement_phase_ms',), src=(J, 'measure_registered_piece'))
     n('o-2ddone', '本片2D响应 / entry就绪', '2D请求独立返回', 0, 9,
       '输出2D检查、公开掩码和阶段耗时|记录完整entry|尝试推进整板汇合', kind='data', src=(P, 'submit_2d'))
     n('o-3ddone', '本片联合结果就绪', '几何 / 平面 / 高度 / 配准', 2, 10,
@@ -119,8 +119,8 @@ def build_flows():
       '为每个GPU工作资源构造独立YOLO|为该资源加载独立EfficientAD预测器|建立独立锁和可用CUDA流|资源进入槽位队列，推理完成后归还',pool='gpu',src=(B,'_load_gpu_worker_replicas'))
     n('i-pools','应用正式执行器并建立pipeline','只有算法初始化成功才切换',1,6,
       '校验各独立池总数不超过worker_budget，独立registration池也计入|缺省silver池可别名到postprocess，joint可别名到cpu，registration可别名到joint|只有空闲时允许重配线程池|BoardPipeline持有这些执行器并按事件调度',kind='parallel',src=(T,'_configure_thread_pools'))
-    n('i-process','预热三组CPU进程','24核目标：配准10＋2D 2＋测高10，主进程留2',1,7,
-      '分别初始化配准、2D后处理和3D测高全部worker，无Torch|按真实物理核/SMT拓扑划分三组独立范围|启用亲和性的池优先分配，其余从剩余CPU启动|每个测高进程有自己的实例执行器，默认1工作位|主进程使用剩余范围，关停逆序恢复|任一池失败清理全部已创建池',kind='parallel',pool='registration_process',src=(T,'_configure_cpu_processes'),params=('common_3d.parameters.threading.registration_affinity','common_2d.parameters.threading.cpu_process_affinity','common_3d.parameters.threading.joint_affinity'))
+    n('i-process','预热三组CPU进程','14900KF：先留4P主进程，2D优先取快核',1,7,
+      '分别初始化配准、2D后处理和3D测高全部worker，无Torch|先按效率等级保护4个主进程物理核|2D后处理优先取得剩余快核|按真实物理核/SMT拓扑划分三组独立范围|启用亲和性的池优先分配，其余从剩余CPU启动|每个测高进程有自己的实例执行器，当前2工作位|主进程使用剩余范围，关停逆序恢复|任一池失败清理全部已创建池',kind='parallel',pool='registration_process',src=(T,'_configure_cpu_processes'),params=('common_3d.parameters.threading.registration_affinity','common_2d.parameters.threading.cpu_process_affinity','common_3d.parameters.threading.joint_affinity'))
     n('i-ready','返回算法初始化成功','模型驻留，等待输入',1,8,
       '返回模型加载耗时和线程配置|同配置/同模型的验证台任务可复用检测进程|配置或模型文件指纹改变后重新初始化|退出时关闭自有池并释放模型',kind='data',src=(V,'_ensure'))
     for a,b in zip(['i-init','i-config','i-board','i-cuda','i-ad','i-replicas','i-pools','i-process'],['i-config','i-board','i-cuda','i-ad','i-replicas','i-pools','i-process','i-ready']):e(a,b)
@@ -273,9 +273,9 @@ def build_flows():
     for a,b in zip(chain,chain[1:]):e(a,b)
     e('r-stop','r-score','继续搜索','loop')
 
-    scene('height','全实例测高','测高进程内：参考面 → 引线 → 焊脚；默认串行，不同片跨进程并行',[
+    scene('height','全实例测高','测高进程内：参考面 → 引线 → 焊脚；当前2工作位，片间进程并行',[
         '最新代码已删除测高目标选择ROI：全部已检测wire/thin/bond参与，清理后为空也保留无效引线记录。',
-        '映射与测高都在独立进程；引线、焊脚按先后阶段使用本进程实例执行器，默认1工作位。芯片面在当前进程逐chip准备，不占主进程。',
+        '映射与测高都在独立进程；引线、焊脚按先后阶段使用本进程实例执行器，当前2工作位。芯片面在当前进程逐chip准备，不占主进程。',
         '代表点按原始深度P95选取，不是对“相对参考面的高度差”求P95，也不是简单取最大值。'])
     n('h-union','建立完整语义排除掩码','所有对齐YOLO实例的union',1,0,
       '按像素合并所有完整对齐实例|按semantic_exclusion_dilation_px膨胀|此处不使用内缩后的测高掩码|防止线、焊点等进入平台平面采样',pool='joint_measurement_process',src=(J, '_semantic_exclusion_mask'),times=('height_semantic_exclusion_ms',))

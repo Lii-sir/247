@@ -10,7 +10,6 @@ import unittest
 ROOT=Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT/'python'),str(ROOT/'tests')]
 from algorithm.board_pipeline import BoardPipeline
-from algorithm.config import load_runtime_config
 from pipeline_fakes import FakeDetector
 from test_early_joint_pipeline import GatedDetector
 
@@ -74,11 +73,8 @@ class BoardQueueTests(unittest.TestCase):
         self.assertEqual(4,diagnostic['measurement_capacity'])
         self.assertEqual(10,len(response['results_board']['pieces']))
 
-    def test_project_configuration_admits_ten_pieces_to_each_stage_at_once(self):
-        path=ROOT/'config/config.json'
-        config=load_runtime_config(path.read_text(encoding='utf-8'),str(path))
-        options=config['common_3d']['parameters']['threading']
-        response=self.exercise(options['registration_workers'],options['joint_workers'],options['early_joint_workers'])
+    def test_explicit_ten_slot_configuration_admits_ten_pieces_to_each_stage_at_once(self):
+        response=self.exercise(10,10,10)
         diagnostic=response['results_board']['pipeline_diagnostics']
         self.assertEqual(10,diagnostic['registration_capacity'])
         self.assertEqual(10,diagnostic['measurement_capacity'])

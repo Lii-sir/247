@@ -84,14 +84,19 @@ def physical_cores():
     return parse_cores(buffer.raw[:length.value], ctypes.sizeof(ctypes.c_size_t))
 
 
-def choose_partition(cores, allowed, count):
+def choose_partition(cores, allowed, count, *, reserved_cpus=()):
     allowed = set(allowed)
     available = [dict(core, logical_cpus=sorted(set(core["logical_cpus"]) & allowed)) for core in cores]
     available = [core for core in available if core["logical_cpus"]]
     available.sort(key=lambda core: (-core["efficiency_class"], core["logical_cpus"][0]))
-    if type(count) is not int or count < 1 or count >= len(available):
+    reserved = set(reserved_cpus)
+    if not reserved.issubset(allowed):
+        raise ValueError("reserved main-process CPUs must belong to the current allowed CPU set")
+    selectable = [core for core in available if not reserved.intersection(core["logical_cpus"])]
+    if type(count) is not int or count < 1 or count >= len(available) or count > len(selectable):
         raise ValueError(f"registration_affinity.physical_cores must reserve at least one main-process physical core; available={len(available)}")
-    selected = available[:count]
+    selected = selectable[:count]
     registration = {cpu for core in selected for cpu in core["logical_cpus"]}
     return dict(original_cpus=sorted(allowed), main_cpus=sorted(allowed-registration),
-                registration_cores=selected, registration_cpus=sorted(registration))
+                registration_cores=selected, registration_cpus=sorted(registration),
+                reserved_main_cpus=sorted(reserved))

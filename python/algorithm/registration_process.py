@@ -158,7 +158,8 @@ class RegistrationProcesses:
         partition = None
         if affinity.get("enabled", False):
             from algorithm.cpu_partition import current_cpus, physical_cores, choose_partition
-            partition = choose_partition(physical_cores(), current_cpus(), affinity["physical_cores"])
+            partition = choose_partition(physical_cores(), current_cpus(), affinity["physical_cores"],
+                                         reserved_cpus=affinity.get("reserved_main_cpus", ()))
             if workers > len(partition["registration_cores"]):
                 raise ValueError("registration_workers cannot exceed registration_affinity.physical_cores")
         ctx = mp.get_context("spawn")

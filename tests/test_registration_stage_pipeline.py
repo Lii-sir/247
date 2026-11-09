@@ -98,14 +98,15 @@ class RegistrationSettingsTests(unittest.TestCase):
         from algorithm.config import load_runtime_config
         path = ROOT / "config/config.json"
         settings = self.server._thread_settings(load_runtime_config(path.read_text(encoding="utf-8"), str(path)))
-        self.assertEqual(10, settings["registration_workers"])
-        self.assertEqual(10, settings["registration_affinity"]["physical_cores"])
-        self.assertEqual(10, settings["joint_workers"])
+        self.assertEqual(4, settings["registration_workers"])
+        self.assertEqual(4, settings["registration_affinity"]["physical_cores"])
+        self.assertEqual(7, settings["joint_workers"])
         self.assertEqual(10, settings["early_joint_workers"])
         self.assertEqual(2, settings["cpu_process_workers"])
         self.assertEqual(2, settings["cpu_process_affinity"]["physical_cores"])
-        self.assertEqual(10, settings["joint_affinity"]["physical_cores"])
-        self.assertEqual(1, settings["instance_workers"])
+        self.assertEqual(14, settings["joint_affinity"]["physical_cores"])
+        self.assertEqual(2, settings["instance_workers"])
+        self.assertEqual(4, settings["main_reserved_physical_cores"])
 
 
 class RegistrationSchedulingTests(unittest.TestCase):

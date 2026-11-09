@@ -110,13 +110,24 @@ C# 方法和字段不增加。`SolderMeasurements[].Mask3DLocal` 是实际内缩
 不会原地改写共享 bond/实例掩码。局部像素坐标恢复至分片坐标后再读取深度、计算参考面及输出几何，
 最后按原流程转换整板测点。形态学核与引线处理共用缓存。
 
-## 线程配置与24物理核布局
+## 线程配置与14900KF混合核布局
 
 正式流式现在有三组独立常驻CPU进程：配准、2D重后处理、3D映射测高。主进程仅保留输入准备、GPU提交、早期2D几何及最终汇合。3D映射、参考面拟合、引线/焊脚测高不再由主进程joint/instance池执行。无thread回退；旧同步接口仍可直接调用同一CPU核心，不是正式备用执行方式。
 
-针对目标机器24个可用物理核、每板10片，当前配置为：配准10核/10进程＋2D后处理2核/2进程＋3D映射测高10核/10进程，给主进程留2核。每个测高进程1实例工作位。2D组配置在config/2D/config.json。这样各3D阶段具备同时运行10片的容量，解除此前4进程对10片造成的分批限制；单线程测高可能增加单片耗时，应比较整板与最慢片。实际吞吐仍须目标机验证。
+目标CPU i9-14900KF是8P＋16E、32逻辑线程，不能把24个物理核视为等性能核心。此前配准组先取10核，按性能排序会拿走全部P核，最终主进程只剩2个E核；2D读图、早期几何及GPU提交可能因此变慢。
 
-CPU组按真实物理核/SMT拓扑从剩余范围分配，同核超线程不拆给不同组；三组均启用亲和性时与主进程互不重叠。需要至少23个可用物理核以预留22核并留主进程核；不能把逻辑线程数当物理核数，仍只支持单处理器组。
+现在先保护2D的快核，再分配3D：
+
+|用途|14900KF默认布局|
+|---|---|
+|主进程：2D读图、几何、GPU提交、IPC|4个P核|
+|2D后处理|2个P核，2个进程|
+|配准|剩余2个P核＋2个E核，4个进程|
+|3D映射测高|14个E核，7个进程，每进程2个实例工作位|
+
+`main_reserved_physical_cores=4`表示先从Windows返回的拓扑中保护性能等级最高的4个物理核，不写死CPU编号。启用时2D后处理优先分配剩余快核，配准和测高随后分配；主进程仍可使用所有最终剩余核，在14900KF此布局下为4P。同核SMT不拆给不同组，三组启用亲和性时与主进程不重叠。其他CPU不保证同样的P/E组合；当前配置需要至少24个可用物理核，仍只支持单处理器组。
+
+目标是每张2D请求发出至响应不超过1000ms，再优化整板3D吞吐；静态配置不等于已保证所有请求达标，须以目标机实际RTT验收。3D允许分批，不能为了零排队耗尽2D快核。之前的共享发布解锁、逐片时间线和整板排队诊断继续保留。
 
 `common_3d.parameters.threading`当前配置：
 
@@ -124,23 +135,25 @@ CPU组按真实物理核/SMT拓扑从剩余范围分配，同核超线程不拆�
 {
   "worker_budget": 80,
   "cpu_workers": 6,
-  "registration_workers": 10,
-  "registration_affinity": {"enabled": true, "physical_cores": 10},
-  "joint_workers": 10,
-  "joint_affinity": {"enabled": true, "physical_cores": 10},
+  "main_reserved_physical_cores": 4,
+  "registration_workers": 4,
+  "registration_affinity": {"enabled": true, "physical_cores": 4},
+  "joint_workers": 7,
+  "joint_affinity": {"enabled": true, "physical_cores": 14},
   "early_joint_workers": 10,
-  "instance_workers": 1
+  "instance_workers": 2
 }
 ```
 
 - `registration_workers`：常驻配准进程数，同时限制父进程共享区准备线程。执行平台掩码、粗配准与仿射；Powell、评分及停止条件保持。
 - `registration_affinity`：配准组保留物理核数，至少等于进程数。关闭enabled仍进程计算，只取消绑核。
 - `joint_workers`：常驻3D映射测高进程数，同时控制父进程的轻量准备池。矩阵确定后立即异步交接，不要求凑齐其它片，不占父线程等待子进程。
-- `joint_affinity`：第三组专用核，当前10物理核；至少等于joint_workers。映射、平台/芯片面、引线与焊脚均在此组完成。
+- `main_reserved_physical_cores`：主进程优先保护的高性能物理核数，缺省0兼容旧策略。非负整数；保护完整物理核及其SMT。此策略只约束启用亲和性的子进程组，关闭亲和性的组仍可能共享主进程CPU。
+- `joint_affinity`：第三组专用核，当前14物理核；至少等于joint_workers。映射、平台/芯片面、引线与焊脚均在此组完成。
 - `instance_workers`：**每个3D测高进程内部**的本地实例工作位，默认1。现在不是主进程全板共用的20/64/128线程池。每进程只分1个物理核时应设1；增加实例并发需要相应增加每进程分配的物理核，不是把线程数直接放大。旧同步接口的兼容实例执行器仍按此值配置，但正式流式不会在主进程调用它。
 - `early_joint_workers`：所有2D诊断完成前，进入联合链路但未结束的在途片数上限；覆盖配准、测高和中间排队。2D齐全后由进程池各自限并发。
 - `cpu_workers`：主进程输入、深度准备与早期2D几何线程；不执行正式映射测高。
-- `worker_budget`：只校验父进程桥接线程槽位（当前34），不包括22个常驻CPU进程、各子进程本地实例执行器或调用侧Pitch池。不是操作系统线程/核心总上限。
+- `worker_budget`：只校验父进程桥接线程槽位（当前25），不包括13个常驻CPU进程、各子进程本地实例执行器或调用侧Pitch池。不是操作系统线程/核心总上限。
 
 旧配置缺项时：joint_workers仍继承旧的父池数量；joint_affinity缺失继承registration_affinity的enabled，物理核数默认joint_workers；instance_workers缺失默认1。CPU进程始终存在，没有线程回退。推荐同步迁移两份配置，不沿用此前instance_workers=64/128的共享池建议。
 
@@ -158,7 +171,7 @@ CPU组按真实物理核/SMT拓扑从剩余范围分配，同核超线程不拆�
 
 ### 核对运行状态
 
-初始化响应保存`registration_execution`、`cpu_2d_execution`、`joint_measurement_execution`（均位于threading）。检查各组workers[].cpu_ids与最终threading.main_cpu_ids无交集。每片联合结果新增joint_measurement_worker，含PID、CPU集合、OpenCV/BLAS线程和instance_workers；默认每个测高进程1物理核、1实例工作位，OpenCV/BLAS=1，无Torch。
+初始化响应保存`registration_execution`、`cpu_2d_execution`、`joint_measurement_execution`（均位于threading）。检查各组workers[].cpu_ids与最终threading.main_cpu_ids无交集；`main_reserved_cpu_ids`必须包含在main_cpu_ids内，`main_reserved_cores`包含其效率等级。每片联合结果的joint_measurement_worker含PID、CPU集合、OpenCV/BLAS线程和instance_workers；当前每个测高进程2物理核、2实例工作位，OpenCV/BLAS=1，无Torch。
 
 启动使用常驻pythonw，不另开CMD。仅2D验证的内存配置取消空闲配准与测高组的核预留，保留2D组策略；不写磁盘。核分区只约束本程序，缓存、内存带宽与系统其它程序仍共享。
 
@@ -198,7 +211,7 @@ CPU组按真实物理核/SMT拓扑从剩余范围分配，同核超线程不拆�
 
 每片`timeline`是**相对3D请求受理时刻的时间位置**，不是时长：输入就绪、准入、共享准备开始、进程投递、worker开始/结束、结果收到、片完成、2D诊断完成。早已就绪的2D时间位置可以为负值。不要把timeline各值相加。C# `ResultsBoard.PipelineDiagnostics`和`BoardPieceResult.Timeline`保留这些信息。
 
-新配置只解除单板10片的阶段容量限制，不保证整板等于原单片722ms；不同片计算量、异构CPU性能、主进程准备和跨板请求仍会影响耗时。检测算法、阈值、片号顺序和最终判定保持不变。
+新配置优先保护2D的P核，3D剩余工作位为4配准/7测高，整板仍会分批；不保证整板等于单片722ms。不同片计算量、异构CPU性能、主进程准备和跨板请求仍影响耗时。检测算法、阈值、片号顺序和最终判定保持不变。
 |joint_queue_ms|兼容原字段，等于registration_queue_ms，不代表整条链路全部等待|
 
 先使用8/8/8核布局在目标32核电脑预热后复验。比较整板total_detect_ms及长尾，检查全部片矩阵、轮廓、ROI、采样点、高度和NG一致；对照时剔除timings及worker执行诊断字段。此配置是资源布局起点，真实节拍尚未验证，不承诺固定耗时。

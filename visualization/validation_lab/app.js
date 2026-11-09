@@ -42,6 +42,8 @@ function showResult(id,job){
  links(id);$('resultEmpty').hidden=true;$('report').hidden=false;$('report').src='/runs/'+id+'/report.html';
  const r=job.result;
  $('summary').textContent=r?'板 '+r.board_id+' · '+(r.ok?(r.product_is_ok?'检测完成 · OK':'检测完成 · NG（算法判定）'):'检测请求失败')+' · '+r.pieces+'片 · '+(r.total_wall_ms/1000).toFixed(2)+'秒 · '+(r.model_reused?'复用已加载模型':'本次初始化模型')+(r.submission_mode==='paced'?' · 按间隔提交 '+r.request_interval_ms+'ms':r.submission_mode==='concurrent'?' · 并发提交':'')+(r.error?'\n'+r.error:'')+'\n输出：'+r.output_dir:'验证失败：'+(job.error||'未知错误');
+ const latency=r?.two_d_latency;
+ if(latency&&Number.isFinite(latency.max_ms))$('summary').textContent+='\n2D请求≤'+latency.target_ms+'ms：'+(latency.meets_target?'达标':'未达标')+' · 最大 '+latency.max_ms.toFixed(1)+'ms'+(latency.over_target_piece_ids?.length?' · 超标片号 '+latency.over_target_piece_ids.join(', '):'');
 }
 async function history(){const list=await api('/api/history');const old=$('history').value;$('history').replaceChildren();const blank=document.createElement('option');blank.value='';blank.textContent='历史验证记录';$('history').append(blank);for(const j of list){const o=document.createElement('option');o.value=j.id;o.textContent='板 '+j.board_id+' · '+(j.status==='done'?'完成':j.status==='failed'?'失败':'运行中');$('history').append(o);}if(list.some(j=>j.id===old))$('history').value=old;}
 $('history').onchange=async()=>{if(!$('history').value)return;try{const id=$('history').value,j=await api('/api/jobs/'+id);if(j.status==='running'){status('该记录仍在运行');return;}showResult(id,j);status('正在查看历史结果；当前文件清单不会改变该报告。');}catch(e){status(e.message,true);}};
@@ -51,7 +53,7 @@ $('run').onclick=async()=>{
  busy=true;renderFiles();assess();status('正在提交验证…');
  try{
   const {id}=await api('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(request)});
-  while(true){await new Promise(r=>setTimeout(r,800));const job=await api('/api/jobs/'+id);if(job.status==='running'){status(job.phase);continue;}links(id);if(job.result)showResult(id,job);else $('summary').textContent=job.error||'验证失败';await history();$('history').value=id;status(job.status==='done'?'验证完成，可在右侧交互查看。':job.error||'验证失败，请检查报告与服务日志。',job.status!=='done');if(snapshot!==revision)status('验证已完成；清单有变化，报告仍对应提交时的文件。');break;}
+  while(true){await new Promise(r=>setTimeout(r,800));const job=await api('/api/jobs/'+id);if(job.status==='running'){status(job.phase);continue;}links(id);if(job.result)showResult(id,job);else $('summary').textContent=job.error||'验证失败';await history();$('history').value=id;const latencyMiss=job.result?.two_d_latency?.meets_target===false;status(job.status==='done'?(latencyMiss?'验证完成；2D请求未满足1秒目标，请查看超标片号。':'验证完成，可在右侧交互查看。'):job.error||'验证失败，请检查报告与服务日志。',job.status!=='done'||latencyMiss);if(snapshot!==revision)status('验证已完成；清单有变化，报告仍对应提交时的文件。');break;}
  }catch(e){status(e.message,true);}finally{busy=false;renderFiles();assess();}
 };
 api('/api/defaults').then(d=>{config=d;$('pieceCount').textContent=d.piece_count;const p=d.pitch;$('config').textContent='每板 '+d.piece_count+'片 · 粗配准 + 仿射 · Pitch '+(p.enabled_3d?'启用，'+p.angle_deg+'°，步距'+p.scan_pitch_mm+' mm/profile':'关闭');renderFiles();status('就绪，请添加文件或载入项目样本。');return history();}).catch(e=>status('配置加载失败：'+e.message,true));
