@@ -197,7 +197,7 @@ class JointProcessStructureTests(unittest.TestCase):
                                 env={**os.environ,'PYTHONDONTWRITEBYTECODE':'1'})
         self.assertEqual(0,result.returncode,result.stderr)
 
-    def test_24_core_partition_leaves_ten_main_cores_and_restores_in_reverse(self):
+    def test_24_core_partition_leaves_two_main_cores_and_restores_in_reverse(self):
         from algorithm.cpu_partition import choose_partition
         server = AlgorithmServer()
         self.addCleanup(server.close)
@@ -229,7 +229,7 @@ class JointProcessStructureTests(unittest.TestCase):
         groups = [set(server.threading_info[role+'_execution']['workers'][0]['cpu_ids'])
                   for role in ('registration','cpu_2d','joint_measurement')]
         groups.append(set(server.threading_info['main_cpu_ids']))
-        self.assertEqual([8,4,16,20], [len(group) for group in groups])
+        self.assertEqual([20,4,20,4], [len(group) for group in groups])
         for i, group in enumerate(groups):
             self.assertTrue(all(group.isdisjoint(other) for other in groups[i+1:]))
         server._stop_cpu_processes()

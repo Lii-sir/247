@@ -277,6 +277,9 @@ public class DetectResponse : BridgeBaseResponse
 
 public class ResultsBoard
 {
+    [JsonPropertyName("pipeline_diagnostics")]
+    public Dictionary<string, JsonElement>? PipelineDiagnostics { get; set; }
+
     [JsonPropertyName("pitch_correction")]
     public Dictionary<string, JsonElement>? PitchCorrection { get; set; }
 
@@ -295,6 +298,9 @@ public class ResultsBoard
 
 public class BoardPieceResult
 {
+    [JsonPropertyName("timeline")]
+    public Dictionary<string, double> Timeline { get; set; } = new();
+
     [JsonPropertyName("pitch_correction")]
     public Dictionary<string, JsonElement>? PitchCorrection { get; set; }
 

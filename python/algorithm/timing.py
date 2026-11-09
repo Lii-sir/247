@@ -10,6 +10,14 @@ _context = ContextVar("bridge_timing", default=None)
 _log_lock = threading.Lock()
 
 
+class PipelineTimings(dict):
+    """Duration fields plus parent-only trace context, never sent to workers."""
+    def __init__(self, values, *, origin, timeline):
+        super().__init__(values)
+        self.origin = origin
+        self.timeline = timeline
+
+
 def _enabled(name, default="0"):
     return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
 

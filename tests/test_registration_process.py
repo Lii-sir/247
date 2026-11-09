@@ -128,6 +128,20 @@ class ProcessRegistrationTests(unittest.TestCase):
         self.assertFalse(first["registration_worker"]["torch_loaded"])
         self.assertEqual(1, first["registration_worker"]["opencv_threads"])
 
+    def test_process_queue_and_board_relative_timeline_are_separate_from_preparation(self):
+        from algorithm.timing import PipelineTimings
+        timeline={}
+        timings=PipelineTimings({},origin=time.perf_counter(),timeline=timeline)
+        self.submit(timings=timings).result(20)
+        keys=['registration_submitted_ms','registration_prepare_started_ms','registration_dispatched_ms',
+              'registration_worker_started_ms','registration_worker_finished_ms','registration_result_received_ms']
+        points=[timeline[key] for key in keys]
+        self.assertEqual(points,sorted(points))
+        self.assertAlmostEqual(timings['registration_process_wait_ms'],
+            timeline['registration_worker_started_ms']-timeline['registration_dispatched_ms'],places=6)
+        self.assertGreaterEqual(timings['registration_queue_ms'],timings['registration_process_wait_ms'])
+        self.assertNotIn('origin',timings)
+
     def test_worker_error_releases_lease_and_pool_remains_usable(self):
         with self.assertRaisesRegex(RuntimeError, "does not fit"):
             self.submit(registration_config=RegistrationConfig()).result(20)

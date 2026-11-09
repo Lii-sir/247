@@ -132,6 +132,8 @@ def make_document():
         ['联合','matching_input_wait_ms','两路就绪时刻之差的绝对值','不说明谁先到；不是额外计算或完整等待'],
         ['联合','joint_queue_ms','兼容字段，等于registration_queue_ms','不代表测高池排队'],
         ['联合','registration_queue_ms / registration_phase_ms','提交到worker开始的延迟 / 子进程执行墙钟','前者含准备复制/IPC/队列；后者含共享区挂接、平台掩码、粗配准和仿射'],
+        ['联合','registration_process_wait_ms / joint_measurement_process_wait_ms','投递进程池至worker真正开始','包含IPC及进程池排队，不含共享输入准备'],
+        ['联合','joint_admission_wait_ms','两路输入都就绪后至准入配准','用于发现提前窗口或父调度延迟，原joint_pipeline不含这段'],
         ['联合','registration_shared_memory_ms','父准备线程本次共享区复制','每板深度一次，每片gray/mask一次；嵌套在queue中'],
         ['联合','registration_result_transfer_ms / registration_log_relay_ms','worker结束到父接收 / 父日志转发','包含返回传输、清理、调度；不属于纯仿射计算'],
         ['联合','joint_measurement_queue_ms / joint_measurement_phase_ms','提交到测高worker开始 / worker执行墙钟','queue含共享mask准备和IPC；phase含映射、平面、高度和结果整理'],
@@ -143,6 +145,9 @@ def make_document():
         ['联合','height_wire_regions_ms','thin准备及所有引线完成墙钟','包含height_prepare_thin_ms；work不另加'],
         ['联合','height_solder_wall_ms','全部焊脚任务完成墙钟','work包含端点映射/膨胀；height_solder_ms是其内部累计工作'],
         ['联合','joint_phase_ms','配准与映射测高执行墙钟之和','不含中间排队，端到端看joint_pipeline_ms；各片不能相加当整板耗时'],
+        ['整板','board_max_registration_queue_ms / board_max_measurement_queue_ms','全板最大片提交等待','不要用第一片队列代表整板；另看process_wait剔除准备时间'],
+        ['整板','board_wait_2d_after_3d_ms','全部3D完成后仍等2D诊断','大于0说明最后汇合卡在2D；仍不能跳过其NG判定'],
+        ['整板','pipeline_diagnostics / pieces[].timeline','最后完成片、阶段容量及逐片事件位置','timeline从3D受理起算，2D早到可为负；不是可相加时长'],
         ['整板','total_detect_ms','3D整板请求受理到所有结果齐全','不一定从第一张2D采集开始；不等于2D+深度+联合简单相加']]
     historical = {'request_pipeline_ms':2348.8998,'cpu_prepare_phase_ms':529.793,'gpu_phase_ms':1447.2737,
         'yolo_predict_wall_ms':1251.9292,'mask_extract_to_cpu_ms':78.8593,'efficientad_total_ms':112.7374,

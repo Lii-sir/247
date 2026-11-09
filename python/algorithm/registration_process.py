@@ -22,6 +22,7 @@ class SharedBoardInputs:
     def __init__(self):
         self._lock = threading.RLock()
         self._blocks = {}
+        self._key_locks = {}
         self._closed = False
         self._leases = 0
 
@@ -47,6 +48,7 @@ class SharedBoardInputs:
         if not self._closed or self._leases:
             return
         blocks, self._blocks = self._blocks, {}
+        self._key_locks = {}
         errors = []
         for handle, descriptor, identity in blocks.values():
             try:
@@ -70,31 +72,49 @@ class SharedBoardInputs:
     def prepare_named(self, arrays, cache_keys=None, *, kinds="buif"):
         """Publish CPU arrays without pickling their pixel buffers."""
         import numpy as np
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("board shared inputs have been released")
-            result = {}
-            for name, source in arrays.items():
-                key = (cache_keys or {}).get(name, name)
-                if key not in self._blocks:
+        result = {}
+        for name, source in arrays.items():
+            key = (cache_keys or {}).get(name, name)
+            with self._lock:
+                if self._closed:
+                    raise RuntimeError("board shared inputs have been released")
+                key_lock = self._key_locks.get(key)
+                if key_lock is None:
+                    key_lock = self._key_locks[key] = threading.Lock()
+            # Serialize publishers of the same buffer only. Do not hold the
+            # lifetime lock during allocation/copy: acquire() is called under
+            # BoardPipeline's state lock and must not block on pixel copying.
+            with key_lock:
+                with self._lock:
+                    if self._closed:
+                        raise RuntimeError("board shared inputs have been released")
+                    existing = self._blocks.get(key)
+                if existing is None:
                     if not isinstance(source, np.ndarray) or source.ndim != 2 or not source.size or source.dtype.kind not in kinds:
                         raise ValueError(f"registration {name} must be a nonempty 2D integer array")
                     handle = SharedMemory(create=True, size=source.nbytes)
                     try:
                         target = np.ndarray(source.shape, dtype=source.dtype, buffer=handle.buf)
-                        target[:] = source
-                        del target
+                        try:
+                            np.copyto(target, source)
+                        finally:
+                            del target
                         descriptor = dict(name=handle.name, dtype=source.dtype.str, shape=list(source.shape))
-                        self._blocks[key] = (handle, descriptor, id(source))
+                        with self._lock:
+                            if self._closed:
+                                raise RuntimeError("board shared inputs have been released")
+                            existing = self._blocks[key] = (handle, descriptor, id(source))
                     except BaseException:
-                        handle.close()
-                        handle.unlink()
+                        try:
+                            handle.close()
+                        finally:
+                            handle.unlink()
                         raise
-                handle, descriptor, identity = self._blocks[key]
+                handle, descriptor, identity = existing
                 if identity != id(source):
                     raise ValueError("registration shared inputs changed within a board generation")
                 result[name] = descriptor
-            return result
+        return result
 
 
 class JointSharedInputs:
@@ -225,6 +245,15 @@ class RegistrationProcesses:
                     log=None, *, close_inputs=False):
         submitted, output, completion = time.perf_counter(), Future(), Future()
         role = self.role
+        timeline = getattr(timings, "timeline", None)
+        origin = getattr(timings, "origin", None)
+        dispatched_at = [None]
+
+        def trace(event, at):
+            if timeline is not None:
+                timeline[role+"_"+event+"_ms"] = (at-origin)*1000
+
+        trace("submitted", submitted)
         with self._lock:
             if self._closed:
                 raise RuntimeError(role+" process service is closed")
@@ -259,6 +288,10 @@ class RegistrationProcesses:
                 timings[role+"_queue_ms"] = (packet["started"]-submitted)*1000
                 timings[role+"_result_transfer_ms"] = (received_at-packet["finished"])*1000
                 timings[role+"_process_roundtrip_ms"] = (received_at-submitted)*1000
+                timings[role+"_process_wait_ms"] = max(0., (packet["started"]-dispatched_at[0])*1000)
+                trace("worker_started", packet["started"])
+                trace("worker_finished", packet["finished"])
+                trace("result_received", received_at)
                 relay_started = time.perf_counter()
                 if log is not None:
                     for line in packet["logs"]:
@@ -277,7 +310,9 @@ class RegistrationProcesses:
                 finish(result=result)
 
         def prepare():
-            timings[role+"_dispatch_queue_ms"] = (time.perf_counter()-submitted)*1000
+            prepare_started = time.perf_counter()
+            timings[role+"_dispatch_queue_ms"] = (prepare_started-submitted)*1000
+            trace("prepare_started", prepare_started)
             if not is_current():
                 raise RuntimeError("board was released before process registration preparation")
             started = time.perf_counter()
@@ -296,6 +331,8 @@ class RegistrationProcesses:
                 with self._lock:
                     if self._closed:
                         raise RuntimeError(role+" process service closed before dispatch")
+                    dispatched_at[0] = time.perf_counter()
+                    trace("dispatched", dispatched_at[0])
                     work = self._executor.submit(self.worker_module.run, payload)
                 work.add_done_callback(received)
             except Exception as error:

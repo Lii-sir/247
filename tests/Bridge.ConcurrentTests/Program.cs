@@ -70,6 +70,11 @@ static class Program
                     "Requests do not have unique correlation IDs.");
                 Check(scan.Result.Ok && scan.Result.ResultsBoard?.Pieces.Count == 10,
                     "Final board must contain exactly ten matching pieces.");
+                Check(scan.Result.ResultsBoard!.PipelineDiagnostics != null &&
+                    scan.Result.ResultsBoard.PipelineDiagnostics["piece_count"].GetInt32() == 10,
+                    "Board critical-path diagnostics were lost during DTO mapping.");
+                Check(scan.Result.ResultsBoard.Pieces.All(piece => piece.Timeline.ContainsKey("joint_completed_ms")),
+                    "Per-piece board-relative timeline was lost during DTO mapping.");
                 Check(scan.Result.ResultsBoard?.DepthCoordinateSpace == "board_3d",
                     "Board depth coordinate tag was lost during DTO mapping.");
                 Check(scan.Result.ResultsBoard?.PitchCorrection != null &&

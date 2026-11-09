@@ -7,7 +7,7 @@ from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
 from typing import Any
 from transport.depth_input import depth_coordinate_space, input_depth_correction
-from algorithm.timing import timing_context, measure, record_duration, timed_call, note
+from algorithm.timing import timing_context, measure, record_duration, timed_call, note, PipelineTimings
 from algorithm.registration_process import SharedBoardInputs, JointSharedInputs
 
 
@@ -31,6 +31,8 @@ class _Board:
     request_id: str | None = None
     registration_inputs: SharedBoardInputs = field(default_factory=SharedBoardInputs)
     mask_inputs: dict = field(default_factory=dict)
+    piece_timelines: dict = field(default_factory=dict)
+    diagnostics_ready_at: dict = field(default_factory=dict)
 
 
 class BoardPipeline:
@@ -143,6 +145,8 @@ class BoardPipeline:
                 mask_inputs = state.mask_inputs[piece_id] = SharedBoardInputs()
                 state.entries.pop(piece_id, None)
                 state.joint_entries.pop(piece_id, None)
+                state.piece_timelines.pop(piece_id, None)
+                state.diagnostics_ready_at.pop(piece_id, None)
                 state.inflight.add(piece_id)
         except (ValueError, TypeError) as exc:
             return self._completed(self._failure(board_id, "invalid_piece", str(exc), piece_id))
@@ -177,6 +181,7 @@ class BoardPipeline:
                         raise RuntimeError("board was released or expired during 2D processing")
                     state.inflight.discard(piece_id)
                     state.entries[piece_id] = entry
+                    state.diagnostics_ready_at[piece_id] = time.perf_counter()
                     state.touched = time.monotonic()
                     response["cache_state"] = self._cache_state(state)
                     self._schedule_ready(state)
@@ -358,9 +363,18 @@ class BoardPipeline:
                 break
             state.claimed.add(piece_id)
             entry = state.joint_entries[piece_id]
-            pair_wait = abs(state.depth_ready_at - entry.get("_2d_ready_at", state.depth_ready_at)) * 1000
-            timings = {"matching_input_wait_ms": pair_wait}
+            input_ready_at = entry.get("_2d_ready_at", state.depth_ready_at)
+            pair_wait = abs(state.depth_ready_at - input_ready_at) * 1000
             started = time.perf_counter()
+            paired_at = max(state.depth_ready_at, input_ready_at)
+            timeline = state.piece_timelines.setdefault(piece_id, {})
+            timeline.update(input_2d_ready_ms=(input_ready_at-state.started)*1000,
+                depth_ready_ms=(state.depth_ready_at-state.started)*1000,
+                inputs_ready_ms=(paired_at-state.started)*1000,
+                registration_admitted_ms=(started-state.started)*1000)
+            timings = PipelineTimings(dict(matching_input_wait_ms=pair_wait,
+                joint_admission_wait_ms=max(0., (started-paired_at)*1000)),
+                origin=state.started, timeline=timeline)
             try:
                 def is_current(board=state):
                     with self._lock:
@@ -383,6 +397,11 @@ class BoardPipeline:
                 if not self._current(state):
                     return
                 piece_id = int(piece["piece_id"])
+                timeline = state.piece_timelines[piece_id]
+                admitted_ms = (time.perf_counter()-state.started)*1000
+                timeline["measurement_admitted_ms"] = admitted_ms
+                timings["registration_to_measurement_handoff_ms"] = max(0., admitted_ms - timeline.get(
+                    "registration_result_received_ms", admitted_ms))
                 def is_current():
                     with self._lock:
                         return self._current(state)
@@ -409,6 +428,7 @@ class BoardPipeline:
                 if not self._current(state):
                     return
                 state.results[piece_id] = piece
+                state.piece_timelines[piece_id]["joint_completed_ms"] = (time.perf_counter()-state.started)*1000
                 state.touched = time.monotonic()
                 self._schedule_ready(state)
                 self._complete_if_ready(state)
@@ -422,8 +442,27 @@ class BoardPipeline:
         count = self.detector.expected_piece_count
         if len(state.results) != count or len(state.entries) != count or state.inflight:
             return
-        results = [self.detector.finalize_joint_piece(state.results[pid], state.entries[pid])
-                   for pid in sorted(state.results)]
+        finalize_started = time.perf_counter()
+        results = []
+        for pid in sorted(state.results):
+            timeline = state.piece_timelines[pid]
+            timeline["diagnostics_2d_ready_ms"] = (state.diagnostics_ready_at[pid]-state.started)*1000
+            piece = self.detector.finalize_joint_piece(state.results[pid], state.entries[pid])
+            piece["timeline"] = dict(timeline)
+            results.append(piece)
+        state.timings["board_finalization_ms"] = (time.perf_counter()-finalize_started)*1000
+        diagnostics = self._pipeline_diagnostics(state)
+        state.timings["board_wait_2d_after_3d_ms"] = diagnostics["wait_2d_after_3d_ms"]
+        state.timings.update(
+            board_max_admission_wait_ms=diagnostics["max_admission_wait_ms"],
+            board_max_registration_queue_ms=diagnostics["max_registration_queue_ms"],
+            board_max_measurement_queue_ms=diagnostics["max_measurement_queue_ms"],
+            board_max_registration_process_wait_ms=diagnostics["max_registration_process_wait_ms"],
+            board_max_measurement_process_wait_ms=diagnostics["max_measurement_process_wait_ms"],
+            board_slowest_joint_pipeline_ms=diagnostics["slowest_joint_pipeline_ms"],
+            board_last_3d_pipeline_ms=diagnostics["last_3d_joint_pipeline_ms"],
+            board_max_registration_phase_ms=diagnostics["max_registration_phase_ms"],
+            board_max_measurement_phase_ms=diagnostics["max_measurement_phase_ms"])
         elapsed = (time.perf_counter() - state.started) * 1000
         response = dict(ok=True, cmd="detect_3d_board", stage="3d",
                         board_id=state.board_id, batch_id=state.board_id,
@@ -438,7 +477,52 @@ class BoardPipeline:
                         elapsed_ms=elapsed,
                         timings={**state.timings, "total_detect_ms": elapsed},
                         message="concurrent board assembly complete")
+        response["results_board"]["pipeline_diagnostics"] = diagnostics
         self._terminate(state, response)
+
+    def _pipeline_diagnostics(self, state):
+        """Board-relative positions and real queues: do not infer a board from one piece."""
+        last_3d = max(state.piece_timelines, key=lambda pid: state.piece_timelines[pid]["joint_completed_ms"])
+        last_2d = max(state.diagnostics_ready_at, key=state.diagnostics_ready_at.get)
+        last_3d_ms = state.piece_timelines[last_3d]["joint_completed_ms"]
+        last_2d_ms = (state.diagnostics_ready_at[last_2d]-state.started)*1000
+        slowest = max(state.results, key=lambda pid: state.results[pid]["timings"]["joint_pipeline_ms"])
+
+        def capacity(service_name, pool):
+            info = getattr(getattr(self.detector, service_name, None), "info", {})
+            fallback = getattr(pool, "_max_workers", 0)
+            return info.get("process_workers", fallback) if isinstance(info, dict) else fallback
+
+        def maximum(key):
+            return max(piece["timings"].get(key, 0.) for piece in state.results.values())
+
+        last_piece = state.results[last_3d]
+        registration_worker = last_piece.get("registration", {}).get("registration_worker", {})
+        measurement_worker = last_piece.get("joint_measurement_worker", {})
+        return dict(piece_count=len(state.results),
+            registration_capacity=capacity("registration_process", self.registration_pool),
+            measurement_capacity=capacity("joint_measurement_process", self.joint_pool),
+            early_admission_limit=self.early_joint_workers,
+            depth_ready_ms=(state.depth_ready_at-state.started)*1000,
+            all_inputs_ready_ms=max(t["inputs_ready_ms"] for t in state.piece_timelines.values()),
+            all_2d_diagnostics_ready_ms=last_2d_ms, all_3d_results_ready_ms=last_3d_ms,
+            last_3d_piece_id=last_3d, last_2d_piece_id=last_2d,
+            last_3d_registration_pid=registration_worker.get("pid"),
+            last_3d_registration_cpu_ids=registration_worker.get("cpu_ids"),
+            last_3d_measurement_pid=measurement_worker.get("pid"),
+            last_3d_measurement_cpu_ids=measurement_worker.get("cpu_ids"),
+            completion_gate="2d_diagnostics" if last_2d_ms > last_3d_ms else "3d_results",
+            wait_2d_after_3d_ms=max(0., last_2d_ms-last_3d_ms),
+            slowest_piece_id=slowest,
+            slowest_joint_pipeline_ms=state.results[slowest]["timings"]["joint_pipeline_ms"],
+            last_3d_joint_pipeline_ms=state.results[last_3d]["timings"]["joint_pipeline_ms"],
+            max_admission_wait_ms=maximum("joint_admission_wait_ms"),
+            max_registration_process_wait_ms=maximum("registration_process_wait_ms"),
+            max_measurement_process_wait_ms=maximum("joint_measurement_process_wait_ms"),
+            max_registration_queue_ms=maximum("registration_queue_ms"),
+            max_measurement_queue_ms=maximum("joint_measurement_queue_ms"),
+            max_registration_phase_ms=maximum("registration_phase_ms"),
+            max_measurement_phase_ms=maximum("joint_measurement_phase_ms"))
 
     def _terminate(self, state, response):
         if not self._current(state):

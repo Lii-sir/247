@@ -91,7 +91,7 @@ def build_flows():
     n('o-3ddone', '本片联合结果就绪', '几何 / 平面 / 高度 / 配准', 2, 10,
       '保存结果到state.results[piece_id]|将高度点转换到整板坐标|掩码轮廓仍为片局部坐标|后续仍会合并完整2D诊断', kind='data', src=(P, '_measured'))
     n('o-all', '整板最终汇合', 'N个entries + N个results + 无inflight', 1, 11,
-      '必须收齐所有2D诊断和联合结果|按片号排序|再次合并银胶、外观等晚到诊断|单片NG与接口错误分别处理', kind='gate', src=(P, '_complete_if_ready'))
+      '必须收齐所有2D诊断和联合结果|按片号排序|再次合并银胶、外观等晚到诊断|单片NG与接口错误分别处理|标出最后完成片和汇合分支|汇总全板最大队列与最慢执行阶段', kind='gate', src=((P,'_complete_if_ready'),(P,'_pipeline_diagnostics')))
     n('o-return', '整板JSON响应与释放', 'request_id匹配；stdout单行', 1, 12,
       '整板registration_ok与is_ok分别汇总|返回released板信息|删除本板缓存并完成Future|桥接层写JSON响应并归还请求容量', kind='data', src=(T, '_accept'))
     for a,b,label,kind in [('o-entry','o-2d','逐片提交','fork'),('o-entry','o-depth','整板提交','fork'),
@@ -119,7 +119,7 @@ def build_flows():
       '为每个GPU工作资源构造独立YOLO|为该资源加载独立EfficientAD预测器|建立独立锁和可用CUDA流|资源进入槽位队列，推理完成后归还',pool='gpu',src=(B,'_load_gpu_worker_replicas'))
     n('i-pools','应用正式执行器并建立pipeline','只有算法初始化成功才切换',1,6,
       '校验各独立池总数不超过worker_budget，独立registration池也计入|缺省silver池可别名到postprocess，joint可别名到cpu，registration可别名到joint|只有空闲时允许重配线程池|BoardPipeline持有这些执行器并按事件调度',kind='parallel',src=(T,'_configure_thread_pools'))
-    n('i-process','预热三组CPU进程','32核起点：8＋8＋8，主进程留8',1,7,
+    n('i-process','预热三组CPU进程','24核目标：配准10＋2D 2＋测高10，主进程留2',1,7,
       '分别初始化配准、2D后处理和3D测高全部worker，无Torch|按真实物理核/SMT拓扑划分三组独立范围|启用亲和性的池优先分配，其余从剩余CPU启动|每个测高进程有自己的实例执行器，默认1工作位|主进程使用剩余范围，关停逆序恢复|任一池失败清理全部已创建池',kind='parallel',pool='registration_process',src=(T,'_configure_cpu_processes'),params=('common_3d.parameters.threading.registration_affinity','common_2d.parameters.threading.cpu_process_affinity','common_3d.parameters.threading.joint_affinity'))
     n('i-ready','返回算法初始化成功','模型驻留，等待输入',1,8,
       '返回模型加载耗时和线程配置|同配置/同模型的验证台任务可复用检测进程|配置或模型文件指纹改变后重新初始化|退出时关闭自有池并释放模型',kind='data',src=(V,'_ensure'))
@@ -237,9 +237,9 @@ def build_flows():
         'score_mode默认full，仍只在所选ROI计算损失。ROI自建坐标映射为手动试验路径，曾发生耗时回退。',
         '停止优化不等于对齐合格；当前合格逻辑不要求optimizer.success=True。'])
     n('r-gate','本片联合工作启动','depth + joint_entry已就绪',1,0,
-      '父准备线程构造共享输入并异步派发|整板深度仅复制一次，每片gray/mask各一次|只发送当前片行范围和数值配置，不发送检测器或模型|无需等银胶最终诊断',pool='registration',src=(B,'submit_registration'),times=('registration_dispatch_queue_ms','registration_shared_memory_ms','matching_input_wait_ms'))
+      '输入全就绪后的准入等待单独记录|父准备线程构造共享输入并异步派发|像素复制不持生命周期全局锁，不阻塞后续片租约|整板深度仅复制一次，每片gray/mask各一次|只发送当前片行范围和数值配置，不发送检测器或模型|无需等银胶最终诊断',pool='registration',src=(B,'submit_registration'),times=('joint_admission_wait_ms','registration_dispatch_queue_ms','registration_shared_memory_ms','matching_input_wait_ms'))
     n('r-worker','子进程挂接只读共享区','CPU专用核组；不加载模型',1,1,
-      '常驻worker取到本片描述|挂接gray/mask/整板深度并设只读|按y1:y2取全宽深度视图|执行与直接求解相同的register_arrays|此处开始记录registration_phase_ms',pool='registration_process',src=(RW,'run'),times=('registration_queue_ms','registration_phase_ms'))
+      '常驻worker取到本片描述|进程投递至执行的process_wait单列，不含共享准备|挂接gray/mask/整板深度并设只读|按y1:y2取全宽深度视图|执行与直接求解相同的register_arrays|此处开始记录registration_phase_ms',pool='registration_process',src=(RW,'run'),times=('registration_queue_ms','registration_process_wait_ms','registration_phase_ms'))
     n('r-platform','构造3D平台掩码','depth_piece > 0并闭运算',1,1,
       '对片深度的非零像素二值化|按registration_3d.morphology_kernel_size闭运算|2D平台掩码此前已在准备阶段生成|两幅掩码进入固定尺度模板匹配',pool='joint_measurement_process',src=(R,'platform_mask_3d'),times=('platform_mask_3d_ms',))
     n('r-coarse','粗配准模板匹配','TM_CCOEFF_NORMED',1,2,

@@ -288,6 +288,8 @@ HTML 中展开“配准、参考平面与阶段耗时”可查看选中片的 2D
 | 协议输出，仅日志 | `response_json_encode_ms`, `response_write_lock_wait_ms`, `response_pipe_write_ms` |
 
 `matching_input_wait_ms` 表示一方数据已就绪后等待另一方的时间，不占用工作线程。`silver_prepare_phase_ms` 是与 GPU 推理并行的图像边界准备分支；`silver_total_ms` 是银浆边界准备与掩码判断工作的累计值，不是单独的后处理墙钟时间。
+
+整板排队请同时看全部片：新增`board_max_*queue_ms`/`board_max_*process_wait_ms`、`board_max_admission_wait_ms`、`board_slowest_joint_pipeline_ms`及`board_wait_2d_after_3d_ms`。`results_board.pipeline_diagnostics`标出最后完成的片号和最终等待的分支，各片`timeline`给出相对3D受理时刻的事件位置（不是可累加的耗时）。当前24物理核配置采用10配准进程+10测高进程、测高每进程1工作位，让每个阶段可并行容纳整板10片；仅看一片722ms不能解释整板1355ms，具体字段见3D配置说明。
 `shared_memory_read_decode_ms` 现在仅统计实际输入读取/解码，不再把 ROI/平台掩码算入其中。
 
 3D接口已改为原始小端uint16数组及宽高，算法中移除PNG解码；3D流式输入改看`depth_read_ms`、`depth_shared_memory_read_ms`、`depth_array_view_ms`及板级`shared_memory_read_ms`。`detect_and_view.py`和验证台仍可选择原始16位PNG样本，文件解码在客户端输入准备阶段完成，发送给算法的是紧密排列的原始像素；这部分读文件时间不属于算法计时。2D及包含2D读图的批量`shared_memory_read_decode_ms`保留原含义。

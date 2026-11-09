@@ -110,23 +110,25 @@ C# 方法和字段不增加。`SolderMeasurements[].Mask3DLocal` 是实际内缩
 不会原地改写共享 bond/实例掩码。局部像素坐标恢复至分片坐标后再读取深度、计算参考面及输出几何，
 最后按原流程转换整板测点。形态学核与引线处理共用缓存。
 
-## 线程配置与32物理核布局
+## 线程配置与24物理核布局
 
 正式流式现在有三组独立常驻CPU进程：配准、2D重后处理、3D映射测高。主进程仅保留输入准备、GPU提交、早期2D几何及最终汇合。3D映射、参考面拟合、引线/焊脚测高不再由主进程joint/instance池执行。无thread回退；旧同步接口仍可直接调用同一CPU核心，不是正式备用执行方式。
 
-针对用户的32个可用物理核，当前起点为：配准8核＋2D后处理8核＋3D映射测高8核，给主进程留8核。2D组配置在config/2D/config.json。CPU组按真实物理核/SMT拓扑从剩余范围分配，同核超线程不拆给不同组；三组均启用亲和性时与主进程互不重叠。少于25个可用物理核需降低分区数或显式关闭部分亲和性，不能把逻辑线程数当物理核数；仍只支持单处理器组。
+针对目标机器24个可用物理核、每板10片，当前配置为：配准10核/10进程＋2D后处理2核/2进程＋3D映射测高10核/10进程，给主进程留2核。每个测高进程1实例工作位。2D组配置在config/2D/config.json。这样各3D阶段具备同时运行10片的容量，解除此前4进程对10片造成的分批限制；单线程测高可能增加单片耗时，应比较整板与最慢片。实际吞吐仍须目标机验证。
+
+CPU组按真实物理核/SMT拓扑从剩余范围分配，同核超线程不拆给不同组；三组均启用亲和性时与主进程互不重叠。需要至少23个可用物理核以预留22核并留主进程核；不能把逻辑线程数当物理核数，仍只支持单处理器组。
 
 `common_3d.parameters.threading`当前配置：
 
 ```json
 {
   "worker_budget": 80,
-  "cpu_workers": 15,
-  "registration_workers": 8,
-  "registration_affinity": {"enabled": true, "physical_cores": 8},
-  "joint_workers": 8,
-  "joint_affinity": {"enabled": true, "physical_cores": 8},
-  "early_joint_workers": 8,
+  "cpu_workers": 6,
+  "registration_workers": 10,
+  "registration_affinity": {"enabled": true, "physical_cores": 10},
+  "joint_workers": 10,
+  "joint_affinity": {"enabled": true, "physical_cores": 10},
+  "early_joint_workers": 10,
   "instance_workers": 1
 }
 ```
@@ -134,17 +136,19 @@ C# 方法和字段不增加。`SolderMeasurements[].Mask3DLocal` 是实际内缩
 - `registration_workers`：常驻配准进程数，同时限制父进程共享区准备线程。执行平台掩码、粗配准与仿射；Powell、评分及停止条件保持。
 - `registration_affinity`：配准组保留物理核数，至少等于进程数。关闭enabled仍进程计算，只取消绑核。
 - `joint_workers`：常驻3D映射测高进程数，同时控制父进程的轻量准备池。矩阵确定后立即异步交接，不要求凑齐其它片，不占父线程等待子进程。
-- `joint_affinity`：第三组专用核，默认8物理核；至少等于joint_workers。映射、平台/芯片面、引线与焊脚均在此组完成。
+- `joint_affinity`：第三组专用核，当前10物理核；至少等于joint_workers。映射、平台/芯片面、引线与焊脚均在此组完成。
 - `instance_workers`：**每个3D测高进程内部**的本地实例工作位，默认1。现在不是主进程全板共用的20/64/128线程池。每进程只分1个物理核时应设1；增加实例并发需要相应增加每进程分配的物理核，不是把线程数直接放大。旧同步接口的兼容实例执行器仍按此值配置，但正式流式不会在主进程调用它。
 - `early_joint_workers`：所有2D诊断完成前，进入联合链路但未结束的在途片数上限；覆盖配准、测高和中间排队。2D齐全后由进程池各自限并发。
 - `cpu_workers`：主进程输入、深度准备与早期2D几何线程；不执行正式映射测高。
-- `worker_budget`：只校验父进程桥接线程槽位（当前76），不包括24个常驻CPU进程、各子进程本地实例执行器或Pitch池。不是操作系统线程/核心总上限。
+- `worker_budget`：只校验父进程桥接线程槽位（当前34），不包括22个常驻CPU进程、各子进程本地实例执行器或调用侧Pitch池。不是操作系统线程/核心总上限。
 
 旧配置缺项时：joint_workers仍继承旧的父池数量；joint_affinity缺失继承registration_affinity的enabled，物理核数默认joint_workers；instance_workers缺失默认1。CPU进程始终存在，没有线程回退。推荐同步迁移两份配置，不沿用此前instance_workers=64/128的共享池建议。
 
 ### 数据所有权与算法一致性
 
 每板的补偿后整板深度只发布一份到共享内存，配准与测高复用同一个depth块；当前片只按y1:y2取全宽视图。每片原2D实例mask也只发布一份，2D后处理与3D测高复用同一共享块与必要标量字段，不把GPU模型、检测器、Tensor或全幅输出数组通过pickle传递。mask在worker只读，映射输出和测量掩码各自持有，原始父实例不会被改写。
+
+共享发布使用按数据块的锁：同一个depth/mask只复制一次，不同片的gray/mask可独立准备。像素分配和复制不再持有板共享输入的生命周期锁，因此后续片获取租约、调度提交及其它数据块准备不会被一次像素复制串行阻塞。板在复制期间释放时，尚未发布的块会被关闭/取消，已发布块仍由真实任务租约保护。
 
 正式YOLO批量转换产生的`uint8、0/255`掩码携带内部规范化标记，跨进程保留；映射直接读取原数组，省去再次比较、类型转换及乘255。thin拆分产生的端部掩码、测高前已转为0/255的清理掩码也复用规范输入。兼容入口未标记的掩码仍执行`>0`二值化，不能仅凭`uint8`类型跳过转换（它也可能是0/1或灰度掩码）。标记不出现在公开检测结果中，无需配置。
 
@@ -171,6 +175,30 @@ C# 方法和字段不增加。`SolderMeasurements[].Mask3DLocal` 是实际内缩
 |mask_alignment_ms / height_measurement_ms|原函数边界的子进程计算；instance等work字段是本进程局部累计工作|
 |joint_phase_ms|配准与映射测高两个计算阶段之和，不含队列与IPC|
 |joint_pipeline_ms|本片提交配准到完整测高结果就绪，包含两个队列、复制与IPC|
+
+### 定位整板比单片慢在哪里
+
+一片`joint_pipeline_ms=722`不能证明整板其余9片也在722ms内完成。此前4个配准进程/4个测高进程对10片会分批执行；还可能受提前准入窗口、晚到的2D输入或最终2D诊断影响。新增字段：
+
+|位置/字段|含义|
+|---|---|
+|每片`joint_admission_wait_ms`|两路输入都就绪后，等待调度准入的时间；旧窗口/父调度等待以前不在joint_pipeline内|
+|每片`registration_process_wait_ms`|配准实际投递进程池到worker开始，含进程队列与IPC；不含共享输入准备|
+|每片`joint_measurement_process_wait_ms`|测高实际投递进程池到worker开始；与上项同口径|
+|每片`registration_to_measurement_handoff_ms`|父进程接收到配准结果后，至提交测高之间的交接，含日志及父调度锁等待|
+|整板`board_max_registration_queue_ms / board_max_measurement_queue_ms`|该板全部片的最大提交等待（含共享准备），不能只看第一片|
+|整板`board_max_registration_process_wait_ms / board_max_measurement_process_wait_ms`|全部片中最大的进程队列/IPC等待|
+|整板`board_max_admission_wait_ms`|最大调度准入等待|
+|整板`board_max_registration_phase_ms / board_max_measurement_phase_ms`|最慢实际执行阶段，用于区分排队和慢片计算|
+|整板`board_slowest_joint_pipeline_ms / board_last_3d_pipeline_ms`|最慢片耗时/最后完成片自身耗时，不保证是同一片|
+|整板`board_wait_2d_after_3d_ms`|全部3D结果已完成后，仍等待2D最终诊断的时间；不跳过最终NG检查|
+|整板`board_finalization_ms`|最后的结果合并耗时|
+
+`results_board.pipeline_diagnostics`还给出`last_3d_piece_id`、`last_2d_piece_id`、`slowest_piece_id`、实际阶段容量、`completion_gate`及最后3D片的worker PID/CPU集合。`completion_gate=3d_results`表示最后就绪的是3D分支，`2d_diagnostics`表示3D已经完成而2D诊断较晚。
+
+每片`timeline`是**相对3D请求受理时刻的时间位置**，不是时长：输入就绪、准入、共享准备开始、进程投递、worker开始/结束、结果收到、片完成、2D诊断完成。早已就绪的2D时间位置可以为负值。不要把timeline各值相加。C# `ResultsBoard.PipelineDiagnostics`和`BoardPieceResult.Timeline`保留这些信息。
+
+新配置只解除单板10片的阶段容量限制，不保证整板等于原单片722ms；不同片计算量、异构CPU性能、主进程准备和跨板请求仍会影响耗时。检测算法、阈值、片号顺序和最终判定保持不变。
 |joint_queue_ms|兼容原字段，等于registration_queue_ms，不代表整条链路全部等待|
 
 先使用8/8/8核布局在目标32核电脑预热后复验。比较整板total_detect_ms及长尾，检查全部片矩阵、轮廓、ROI、采样点、高度和NG一致；对照时剔除timings及worker执行诊断字段。此配置是资源布局起点，真实节拍尚未验证，不承诺固定耗时。
