@@ -3,8 +3,10 @@ X is transport. Inverse: Z=Z'/cos(beta), X=X'-Z'*tan(beta).
 """
 from __future__ import annotations
 import math
+import time
 import numpy as np
 from algorithm.instance_tasks import InstanceTasks
+from algorithm.timing import record_duration, timed_call, note, current_timings
 
 MODEL = 'smartray_pitch'
 
@@ -51,6 +53,7 @@ def _number(settings, key, default):
 
 
 def correct_smartray_pitch(image, depth, settings, *, tasks=None):
+    prepare_started = time.perf_counter()
     settings = settings or {}
     want2 = bool(settings.get('enabled_2d', False))
     want3 = bool(settings.get('enabled_3d', False))
@@ -122,29 +125,46 @@ def correct_smartray_pitch(image, depth, settings, *, tasks=None):
     strip_count = min(workers, tasks.workers, extent)
     boundaries = np.linspace(0, extent, strip_count + 1, dtype=int)
     spans = list(zip(boundaries[:-1], boundaries[1:]))
+    record_duration('pitch_prepare_ms', (time.perf_counter()-prepare_started)*1000)
 
     def project_strip(span):
+        started = tick = time.perf_counter()
+        durations = {}
+        # Local clocks avoid a shared dictionary/log lock on every substep.
+        def checkpoint(name):
+            nonlocal tick
+            now = time.perf_counter()
+            durations[name] = (now-tick)*1000
+            tick = now
         left, right = span
         source = depth[:, left:right] if axis == 'rows' else depth[left:right, :]
         th, tw = source.shape
+        checkpoint('pitch_strip_view_work_ms')
         rows, cols = np.nonzero((source > 0) & (source < 65535))
         input_count = len(rows)
+        checkpoint('pitch_valid_points_work_ms')
         z = (source[rows, cols].astype(float)-offset)*step + origin
+        checkpoint('pitch_z_decode_work_ms')
         if direction == 'recover_ideal':
             shift, corrected_z = -z*tangent, z/cosine
         else:
             shift, corrected_z = z*sine, z*cosine
+        checkpoint('pitch_transform_work_ms')
         rr, cc = rows.copy(), cols.copy()
         if axis == 'rows':
             rr = np.rint(rows + shift/pitch).astype(np.int64)
         else:
             cc = np.rint(cols + shift/pitch).astype(np.int64)
         raw = np.rint((corrected_z-origin)/step + offset)
+        checkpoint('pitch_round_coordinates_work_ms')
         valid = (rr >= 0) & (rr < th) & (cc >= 0) & (cc < tw) & (raw >= 1) & (raw <= 65534)
         dst = rr[valid]*tw + cc[valid]
         raw = raw[valid].astype(np.uint16)
+        checkpoint('pitch_filter_indices_work_ms')
         output = np.zeros(th*tw, np.uint16)
+        checkpoint('pitch_strip_allocate_work_ms')
         np.maximum.at(output, dst, raw)
+        checkpoint('pitch_scatter_max_work_ms')
         corrected_image = None
         if want2:
             # Reuse the same projected points instead of projecting a second
@@ -159,17 +179,31 @@ def correct_smartray_pitch(image, depth, settings, *, tasks=None):
             present = winners >= 0
             flat_shape = (th*tw,) + image.shape[2:]
             corrected_image.reshape(flat_shape)[present] = source_image.reshape(flat_shape)[winners[present]]
-        return output.reshape(th, tw), corrected_image, input_count, len(dst), int(np.count_nonzero(output))
+        checkpoint('pitch_intensity_work_ms')
+        result = output.reshape(th, tw), corrected_image, input_count, len(dst), int(np.count_nonzero(output))
+        checkpoint('pitch_output_count_work_ms')
+        return result, dict(span=[int(left), int(right)], timings=durations,
+                            wall_ms=(time.perf_counter()-started)*1000,
+                            start_delay_ms=(started-dispatched)*1000,
+                            input_valid_points=input_count, projected_points=len(dst),
+                            output_valid_points=result[4])
 
+    dispatched = time.perf_counter()
+    work_before = current_timings().get('pitch_projection_work_ms', 0.)
     try:
-        projected = tasks.map(project_strip, spans, timing_stage='pitch_projection_work_ms')
+        projected = timed_call('pitch_projection_wall_ms', tasks.map,
+                               project_strip, spans, timing_stage='pitch_projection_work_ms')
     finally:
         if owned_tasks:
-            tasks.close()
+            timed_call('pitch_executor_close_ms', tasks.close)
+    merge_started = time.perf_counter()
     output = np.zeros_like(depth)
     corrected_image = np.zeros_like(image) if want2 else image
+    record_duration('pitch_output_allocate_ms', (time.perf_counter()-merge_started)*1000)
+    merge_started = time.perf_counter()
     input_count = projected_count = count = 0
-    for (left, right), (strip, intensity, valid_count, projected_size, output_count) in zip(spans, projected):
+    for (left, right), (result, detail) in zip(spans, projected):
+        strip, intensity, valid_count, projected_size, output_count = result
         if axis == 'rows':
             output[:, left:right] = strip
             if want2: corrected_image[:, left:right] = intensity
@@ -179,6 +213,17 @@ def correct_smartray_pitch(image, depth, settings, *, tasks=None):
         input_count += valid_count
         projected_count += projected_size
         count += output_count
+    record_duration('pitch_output_merge_ms', (time.perf_counter()-merge_started)*1000)
+    details = [detail for result, detail in projected]
+    if details:
+        for stage in details[0]['timings']:
+            record_duration(stage, sum(detail['timings'][stage] for detail in details))
+        work = current_timings().get('pitch_projection_work_ms', 0.)-work_before
+        measured = sum(sum(detail['timings'].values()) for detail in details)
+        record_duration('pitch_projection_other_work_ms', max(0., work-measured))
+        record_duration('pitch_projection_max_strip_ms', max(detail['wall_ms'] for detail in details))
+        record_duration('pitch_projection_start_delay_max_ms', max(detail['start_delay_ms'] for detail in details))
+        note('pitch_projection_details', strips=details)
     if want2:
         image = corrected_image
         info['image_transform_original_to_corrected'] = None

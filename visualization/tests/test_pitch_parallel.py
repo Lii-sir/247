@@ -18,6 +18,44 @@ from fixtures.pitch_reference import correct_smartray_pitch as reference
 
 
 class PitchParallelTests(unittest.TestCase):
+    def test_projection_subtimings_are_merged_and_keep_pixels_unchanged(self):
+        from algorithm.timing import timing_context, timed_call
+        depth=np.random.default_rng(51).integers(32000,34000,(33,17),dtype=np.uint16)
+        for workers in (1,3):
+            settings=self.settings(projection_workers=workers)
+            expected=reference(None,depth,settings)[1]
+            timings,logs={},[]
+            with timing_context(timings,phase='depth',log=logs.append):
+                _,actual,info=timed_call('smartray_pitch_ms',correct_smartray_pitch,None,depth,settings)
+            np.testing.assert_array_equal(actual,expected)
+            records=[json.loads(line.removeprefix('[TIMING] ')) for line in logs]
+            details=[row['strips'] for row in records if row['event']=='pitch_projection_details'][0]
+            self.assertEqual(workers,len(details))
+            self.assertEqual(info['input_valid_points'],sum(row['input_valid_points'] for row in details))
+            stages=details[0]['timings'].keys()
+            for stage in stages:
+                self.assertAlmostEqual(timings[stage],sum(row['timings'][stage] for row in details))
+                self.assertGreaterEqual(timings[stage],0)
+            self.assertAlmostEqual(timings['pitch_projection_work_ms'],
+                sum(timings[key] for key in stages)+timings['pitch_projection_other_work_ms'],places=7)
+            self.assertEqual(timings['pitch_projection_max_strip_ms'],max(row['wall_ms'] for row in details))
+            self.assertGreaterEqual(timings['smartray_pitch_ms'],timings['pitch_projection_wall_ms'])
+            self.assertIn('pitch_prepare_ms',timings)
+            self.assertIn('pitch_output_allocate_ms',timings)
+            self.assertIn('pitch_output_merge_ms',timings)
+
+    def test_timing_does_not_break_empty_depth_and_disabled_has_no_projection(self):
+        from algorithm.timing import timing_context
+        for shape in ((0,3),(3,0)):
+            depth=np.zeros(shape,np.uint16)
+            with timing_context({},phase='depth'):
+                _,actual,_=correct_smartray_pitch(None,depth,self.settings())
+            self.assertEqual(actual.shape,shape)
+        timings={}
+        with timing_context(timings,phase='depth'):
+            correct_smartray_depth(np.zeros((3,4),np.uint16),{})
+        self.assertEqual({},timings)
+
     def settings(self,**values):
         return dict(model='smartray_pitch',enabled_3d=True,input_state='uncorrected',
             scan_pitch_mm=.02,angle_deg=15.,**values)
