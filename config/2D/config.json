@@ -9,10 +9,10 @@
     "parameters": {
       "crop": {
         "circle_search_roi": [
-          3500,
+          3100,
           650,
-          4800,
-          2000
+          5100,
+          2250
         ],
         "detection_roi_offsets": [
           -4.0773,
