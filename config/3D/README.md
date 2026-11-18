@@ -309,6 +309,12 @@ C# DTO新增元数据属性，现有测高点/掩码字段保持；源码已构�
 
 `calibration.enabled`默认false；启用时把配准台“保存矩阵”的完整JSON放进`calibration.profile`。校验原始2D尺寸、深度宽度、坐标来源及Pitch几何设置后，仅复用线性4项，当前片粗配准参考点位置不变，不复用历史平移和分片行偏移。候选必须位于原粗配准搜索边界内，完整分辨率损失严格更低才作为起点；不匹配、非法或不改善均保留粗配准，并在`affine_initialization.reason`说明原因。片高和分片模式可不同，因为未复用历史平移。仅支持独立2D相机坐标。
 
+还支持 `format="affine_initializer_profile"`、`version=1`、`mode="coarse_relative"` 的统计初始化文件，其 `matrix` 为粗配准到最终仿射的相对修正 `R`：`M_start = R @ M_coarse_current`。训练使用各片 `M_final @ inverse(M_coarse)` 的均值，线性项和平移都随当前片粗配准合成；不会直接套用某片的历史平移。它同样受上述上下文、原始搜索边界和完整评分保护约束，通过时 `affine_initialization.source` 为 `calibration_coarse_relative`。旧的配准台矩阵格式仍保持只复用线性四项的行为。
+
+生成工具：`python -B visualization/build_affine_initializer.py --results results.json --matrices-csv matrices.csv --output-dir visualization/output/affine-initializer`。输入是完整的 `board_piece_registration_v1` 报告，CSV用于交叉核验；不同Pitch/坐标上下文不能混合训练。输出完整模型、默认关闭的calibration块，以及按整板留出的folds模型和矩阵预测报告。`initializer-profile.json` 是初始化修正，不能作为最终配准矩阵载入复用。
+
+矩阵级留板验证只比较对已保存拟合矩阵的预测差异，不会重新评估图像损失，也不能证明提速或测高精度。原图验证可用 `visualization/benchmark_affine.py --board-id 1 --variants current calibration --profile <folds/holdout-1.json>`；该选项从同一 `board_piece` 命名图像目录中只选择指定板，仍检查对应深度图板号。先逐板使用未参与训练的folds模型做对照，再决定是否把完整模型嵌入正式配置并启用。
+
 新增`affine_initial_parameters`、`affine_coarse_parameters`及`affine_initial_score`；`affine_score_before`仍代表原粗配准初值的完整评分。候选检查计入score_calls但不计入SciPy nfev。此功能可能改变收敛结果，需用同一板/不同板对照最终各区损失、映射位置与测高结果后再正式启用。
 
 每个仿射评分器预分配完整目标warp缓冲及各评分区的布尔差异缓冲，后续评分复用，不再逐次申请同尺寸数组。仍使用原生`warpAffine`、最近邻和常量零边界；各区差异比例、等权平均、剪切惩罚及Powell停止条件保持不变。缓冲仅属于当前片及当前评分分辨率，不跨并发配准共享；无需新增配置。

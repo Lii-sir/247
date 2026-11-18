@@ -87,7 +87,7 @@ def parameters(original, variant, profile=None):
                   multiscale=dict(enabled=False), maxfev=None, total_maxfev=None)
     if variant == "calibration":
         if profile is None:
-            raise ValueError("calibration requires --profile from a manually verified registration")
+            raise ValueError("calibration requires --profile from a verified registration or fitted initializer")
         values["calibration"] = dict(enabled=True, profile=copy.deepcopy(profile))
     elif variant == "multiscale":
         values["multiscale"] = dict(enabled=True, search_scale=0.5, search_maxiter=15,
@@ -98,7 +98,7 @@ def parameters(original, variant, profile=None):
     return values
 
 
-def select_inputs(directory, depth, pieces, expected):
+def select_inputs(directory, depth, pieces, expected, board_id=None):
     """One board per directory; accept 001.png or board_piece.png, never guess board IDs."""
     images, boards = {}, set()
     for path in sorted(directory.glob("*")):
@@ -108,6 +108,8 @@ def select_inputs(directory, depth, pieces, expected):
         if not match:
             continue
         board, number = match.groups()
+        if board_id is not None and (board is None or int(board) != board_id):
+            continue
         pid = int(number)
         if pid in images:
             raise ValueError(f"Duplicate piece {pid}: {images[pid]} / {path}")
@@ -338,10 +340,11 @@ def main(argv=None):
     parser.add_argument("--depth", type=Path)
     parser.add_argument("--config", type=Path, default=ROOT / "config/config.json")
     parser.add_argument("--pieces", type=int, nargs="+")
+    parser.add_argument("--board-id", type=int, help="Select one board from a shared board_piece image directory")
     parser.add_argument("--workers", type=int, nargs="+", default=[1, 2, 4, 8, 15])
     parser.add_argument("--opencv-threads", type=int, nargs="+", default=[1])
     parser.add_argument("--variants", choices=VARIANTS, nargs="+", default=["current"])
-    parser.add_argument("--profile", type=Path)
+    parser.add_argument("--profile", type=Path, help="Registration matrix or fitted coarse-relative initializer JSON")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--seed", type=int, default=20261107)
@@ -350,6 +353,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.repeats < 1 or args.warmup < 0 or min(args.workers) < 1 or min(args.opencv_threads) < 0:
         parser.error("repeats/workers must be positive; warmup/opencv-threads must be nonnegative")
+    if args.board_id is not None and args.board_id < 0:
+        parser.error("board-id must be nonnegative")
     if len(set(args.workers)) != len(args.workers) or len(set(args.opencv_threads)) != len(args.opencv_threads) or len(set(args.variants)) != len(args.variants):
         parser.error("Duplicate experiment groups are not allowed")
     config_path = args.config.resolve()
@@ -362,7 +367,7 @@ def main(argv=None):
             parser.error("Specify --depth; the default 3D directory must contain exactly one PNG")
         args.depth = candidates[0]
     inputs = select_inputs(args.images_dir, args.depth, args.pieces,
-                           config["segmentation_3d"]["parameters"].get("expected_piece_count", 10))
+                           config["segmentation_3d"]["parameters"].get("expected_piece_count", 10), args.board_id)
     cv2.setNumThreads(1)
     prepared, input_info = prepare(config, inputs, args.depth)
     folder = args.output_dir / ("run-"+datetime.now().strftime("%Y%m%d-%H%M%S-%f"))

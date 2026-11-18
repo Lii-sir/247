@@ -101,6 +101,64 @@ class AffineOptimizationTests(unittest.TestCase):
                 self.assertEqual(result['affine_initialization']['source'],'coarse')
                 self.assertFalse(result['affine_initialization']['profile_valid'])
 
+    def test_initializer_profile_composes_with_current_coarse_registration(self):
+        args=self.fixture();image,_,coarse,values=args
+        profile,context=self.calibration(args,[[1.005,.001],[.0005,.999]])
+        expected=np.array([[1.005,.001,2.],[.0005,.999,-1.]])
+        profile.update(format='affine_initializer_profile',mode='coarse_relative',
+                       matrix=np.vstack([expected,[0.,0.,1.]]).tolist())
+        depth=cv2.warpAffine((image>50).astype(np.uint16)*33000,expected,(100,70),flags=cv2.INTER_NEAREST)
+        seen=[]
+        def optimize(fn,start,**kwargs):
+            seen.append(start.copy());fn(start)
+            return SimpleNamespace(x=start,nit=1,nfev=1,success=True,status=0,message='done')
+        before=copy.deepcopy(profile)
+        with patch.object(reg,'minimize',side_effect=optimize):
+            result=reg.refine_affine_registration(image,depth,coarse,
+                {**values,'penalty_weight':0.,'calibration':{'enabled':True,'profile':profile}},context=context)
+        np.testing.assert_allclose(reg._full_affine(seen[0],1.),expected,atol=1e-12)
+        self.assertEqual(result['affine_initialization']['source'],'calibration_coarse_relative')
+        self.assertLess(result['affine_initial_score'],result['affine_score_before'])
+        self.assertEqual(profile,before)
+
+    def test_initializer_composition_is_preview_independent_and_follows_current_translation(self):
+        args=self.fixture();profile,context=self.calibration(args)
+        correction=np.array([[.9785,-.0044,6.8],[.00086,.99996,-.7],[0.,0.,1.]])
+        profile.update(format='affine_initializer_profile',mode='coarse_relative',matrix=correction.tolist())
+        for scale in (.5,.4,1.):
+            for tx,ty in ((-163.,-83.),(-12.,-86.)):
+                coarse_matrix=np.array([[.306,0.,tx],[0.,.306,ty],[0.,0.,1.]])
+                coarse=reg._affine_parameters_from_matrix(coarse_matrix[:2],scale)
+                candidate=reg._calibration_seed(profile,context,coarse,scale,
+                    np.full(6,-np.inf),np.full(6,np.inf))
+                np.testing.assert_allclose(reg._full_affine(candidate,scale),
+                                           (correction@coarse_matrix)[:2],atol=1e-12)
+
+    def test_initializer_invalid_matrix_mode_bounds_or_pitch_retain_coarse_seed(self):
+        args=self.fixture();profile,context=self.calibration(args)
+        profile.update(format='affine_initializer_profile',mode='coarse_relative',
+                       matrix=[[1.,0.,1.],[0.,1.,0.],[0.,0.,1.]])
+        invalid_profiles=[]
+        for matrix in (None,[],[[1]],[[1.,0.,1000.],[0.,1.,0.],[0.,0.,1.]],
+                       [[1.,0.,float('nan')],[0.,1.,0.],[0.,0.,1.]]):
+            invalid=copy.deepcopy(profile);invalid['matrix']=matrix;invalid_profiles.append(invalid)
+        invalid=copy.deepcopy(profile);invalid.pop('mode');invalid_profiles.append(invalid)
+        invalid=copy.deepcopy(profile);invalid['format']=[];invalid_profiles.append(invalid)
+        for invalid in invalid_profiles:
+            with self.subTest(profile=invalid):
+                result=reg.refine_affine_registration(*args[:3],
+                    {**args[3],'calibration':{'enabled':True,'profile':invalid}},context=context)
+                self.assertEqual(result['affine_initialization']['source'],'coarse')
+                self.assertFalse(result['affine_initialization']['profile_valid'])
+        valid=reg.refine_affine_registration(*args[:3],
+            {**args[3],'calibration':{'enabled':True,'profile':profile}},context=context)
+        self.assertTrue(valid['affine_initialization']['profile_valid'])
+        self.assertEqual(valid['affine_initialization']['reason'],'candidate_did_not_improve_full_score')
+        profile['context']['preprocessing']={'state':'applied','z_step_mm':.00105}
+        result=reg.refine_affine_registration(*args[:3],
+            {**args[3],'calibration':{'enabled':True,'profile':profile}},context=context)
+        self.assertEqual(result['affine_initialization']['reason'],'calibration_coordinate_or_pitch_mismatch')
+
     def test_calibration_allows_piece_height_changes_but_needs_context_and_lower_loss(self):
         args=self.fixture();profile,context=self.calibration(args,[[1,0],[0,1]])
         profile['context']['depth_size'][1]+=11

@@ -283,7 +283,9 @@ def refine_affine_registration(
             initialization.update(profile_valid=True, candidate_score=float(candidate_score) if np.isfinite(candidate_score) else None)
             if np.isfinite(candidate_score) and candidate_score < before:
                 start, initial_score = candidate, candidate_score
-                initialization.update(source="calibration_linear", reason="candidate_improved_full_score")
+                source = ("calibration_coarse_relative" if calibration["profile"]["format"] == "affine_initializer_profile"
+                          else "calibration_linear")
+                initialization.update(source=source, reason="candidate_improved_full_score")
             else:
                 initialization["reason"] = "candidate_did_not_improve_full_score"
     result.update(affine_initialization=initialization, affine_initial_parameters=start.tolist(),
@@ -407,10 +409,13 @@ def affine_coordinate_context(image_shape, depth_shape, correction=None, image_r
 
 
 def _calibration_seed(profile, context, coarse, preview_scale, lower, upper):
-    """Reuse only linear4. Current coarse anchor position is never replaced."""
-    if (not isinstance(profile, dict) or profile.get("format") != "registration_lab_matrix"
+    """Apply a relative prior, or reuse legacy linear4 at the current coarse anchor."""
+    if (not isinstance(profile, dict) or profile.get("format") not in ("registration_lab_matrix", "affine_initializer_profile")
             or type(profile.get("version")) is not int or profile["version"] != 1):
-        raise ValueError("calibration_requires_registration_lab_matrix_profile")
+        raise ValueError("calibration_requires_registration_matrix_or_initializer_profile")
+    relative = profile["format"] == "affine_initializer_profile"
+    if relative and profile.get("mode") != "coarse_relative":
+        raise ValueError("calibration_initializer_requires_coarse_relative_mode")
     saved = profile.get("context")
     if not isinstance(saved, dict) or not isinstance(context, dict):
         raise ValueError("calibration_coordinate_context_missing")
@@ -436,8 +441,12 @@ def _calibration_seed(profile, context, coarse, preview_scale, lower, upper):
     matrix = matrix / matrix[2,2]
     if not np.allclose(matrix[2,:2],0,rtol=0,atol=1e-12) or np.linalg.det(matrix[:2,:2]) <= 0:
         raise ValueError("calibration_requires_orientation_preserving_affine")
-    candidate = _affine_parameters_from_matrix(matrix[:2], preview_scale)
-    candidate[4:] = coarse[4:]
+    if relative:
+        current = np.vstack([_full_affine(coarse, preview_scale), [0., 0., 1.]])
+        candidate = _affine_parameters_from_matrix((matrix @ current)[:2], preview_scale)
+    else:
+        candidate = _affine_parameters_from_matrix(matrix[:2], preview_scale)
+        candidate[4:] = coarse[4:]
     if np.any(candidate < lower) or np.any(candidate > upper):
         raise ValueError("calibration_candidate_outside_original_bounds")
     return candidate
