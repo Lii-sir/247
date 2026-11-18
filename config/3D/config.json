@@ -119,7 +119,7 @@
       "min_component_area_px": 300,
       "depth_percentile": 95.0,
       "gray_offset": 32768.0,
-      "vertical_resolution_mm": 0.00105,
+      "vertical_resolution_mm": 0.0021,
       "max_wire_substrate_height_mm": 0.8
     }
   },
@@ -150,8 +150,8 @@
       "score_mode": "full",
       "cache_enabled": true,
       "calibration": {
-        "enabled": false,
-        "profile": null
+        "enabled": true,
+        "profile_path": "calibration/affine_initializer.json"
       },
       "multiscale": {
         "enabled": false,
@@ -201,7 +201,7 @@
         65535
       ],
       "gray_offset": 32768.0,
-      "vertical_resolution_mm": 0.00105,
+      "vertical_resolution_mm": 0.0021,
       "height_percentile": 95.0,
       "wire_measurement_erode_px": 2,
       "thin_measurement_erode_px": 1,
@@ -228,8 +228,8 @@
       "scan_axis": "rows",
       "trigger_mode": "external",
       "scan_pitch_mm": 0.02,
-      "angle_deg": 6.0,
-      "z_step_mm": 0.00105,
+      "angle_deg": 6.8,
+      "z_step_mm": 0.0021,
       "gray_offset": 32768.0,
       "z_origin_mm": 0.0
     }

@@ -57,7 +57,7 @@
       },
       "yolo": {
         "imgsz": 640,
-        "conf": 0.5,
+        "conf": 0.3,
         "iou": 0.3,
         "max_det": 50,
         "device": "0",

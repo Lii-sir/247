@@ -64,6 +64,7 @@ def load_runtime_config(config_text: str, config_path: str | None = None) -> Dic
     path_2d = parsed.get("config_2d")
     path_3d = parsed.get("config_3d")
     if not isinstance(path_2d, str) or not isinstance(path_3d, str):
+        _load_affine_initializer_profile(parsed, config_path)
         return parsed
     base = (
         Path(config_path).expanduser().resolve().parent
@@ -76,7 +77,58 @@ def load_runtime_config(config_text: str, config_path: str | None = None) -> Dic
         raise ValueError("stage config files must contain objects")
     merged = dict(first)
     merged.update({key: value for key, value in second.items() if key != "model_path"})
+    _load_affine_initializer_profile(merged, str((base / path_3d).resolve()))
     return merged
+
+
+def _load_affine_initializer_profile(config: Dict[str, Any], config_path: str | None) -> None:
+    """Resolve the optional coarse-relative affine profile from profile_path.
+
+    The production request carries a merged 2D+3D config, so ``config_path``
+    can point at the 2D stage file. In that case the sibling config/3D folder
+    is also searched. An inline ``profile`` remains supported for callers that
+    already materialize the JSON object themselves.
+    """
+    dynamic = config.get("dynamic_affine_3d")
+    if not isinstance(dynamic, dict):
+        return
+    parameters = dynamic.get("parameters")
+    if not isinstance(parameters, dict):
+        return
+    calibration = parameters.get("calibration")
+    if not isinstance(calibration, dict):
+        return
+    profile_path = calibration.get("profile_path")
+    if profile_path is None:
+        return
+    if not isinstance(profile_path, str) or not profile_path.strip():
+        raise ValueError("dynamic_affine_3d.calibration.profile_path must be a non-empty string")
+
+    raw = Path(profile_path).expanduser()
+    candidates = []
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        if config_path:
+            stage = Path(config_path).expanduser().resolve()
+            candidates.append(stage.parent / raw)
+            if stage.parent.name.casefold() == "2d":
+                candidates.append(stage.parent.parent / "3D" / raw)
+        candidates.append(Path(__file__).resolve().parents[2] / "config" / "3D" / raw)
+
+    selected = next((path.resolve() for path in candidates if path.is_file()), None)
+    if selected is None:
+        searched = ", ".join(str(path.resolve()) for path in candidates)
+        raise FileNotFoundError(
+            f"dynamic_affine_3d.calibration.profile_path does not exist: {profile_path}; searched {searched}"
+        )
+    try:
+        profile = json.loads(selected.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid affine initializer profile JSON: {selected}") from exc
+    if not isinstance(profile, dict):
+        raise ValueError("affine initializer profile must be a JSON object")
+    calibration["profile"] = profile
 
 
 def load_model_config(

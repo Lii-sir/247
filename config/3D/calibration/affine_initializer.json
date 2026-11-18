@@ -1,0 +1,61 @@
+{
+  "format": "affine_initializer_profile",
+  "version": 1,
+  "mode": "coarse_relative",
+  "matrix": [
+    [
+      0.9785367348116767,
+      -0.004785613297802985,
+      7.047702928746435
+    ],
+    [
+      0.0045191490338255935,
+      1.0007167900215035,
+      -2.2497995610871735
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "context": {
+    "source_space": "independent_2d_image",
+    "target_space": "depth_piece_local",
+    "image_size": [
+      5320,
+      3032
+    ],
+    "depth_size": [
+      1511,
+      778
+    ],
+    "preprocessing": {
+      "model": "smartray_pitch",
+      "image_role": "independent_camera",
+      "state": "applied",
+      "angle_deg": 6.8,
+      "scan_axis": "rows",
+      "scan_pitch_mm": 0.02,
+      "transform_direction": "recover_ideal",
+      "z_step_mm": 0.0021,
+      "gray_offset": 32768.0,
+      "z_origin_mm": 0.0
+    }
+  },
+  "source": {
+    "board_ids": [
+      "1",
+      "2",
+      "3",
+      "4"
+    ],
+    "piece_count": 40,
+    "method": "mean(final_matrix @ inverse(current_coarse_matrix))",
+    "usage": "Initialization only; never a final alignment matrix",
+    "validation": "Matrix prediction, not image fitting or height accuracy",
+    "results_sha256": "aed0b51f192613a9c03db506a232e98fab1e82baa31daae68d9ea88b0745aa24",
+    "config_sha256": "552779b59c3bf26bcd5a02a13328dee6c5c177b281d38cb71e7be763ba2a53bc",
+    "image_validation": "4 held-out-board image tests; 120 paired measurements; 120/120 accepted and valid"
+  }
+}

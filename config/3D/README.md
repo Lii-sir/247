@@ -307,7 +307,7 @@ C# DTO新增元数据属性，现有测高点/掩码字段保持；源码已构�
 
 实图测试由使用者执行：同一套10片输入、同配置和并发，分别cache_enabled=false/true，比较每片最终矩阵、最终损失、各区损失、真实变换次数及`affine_registration_ms`。命中率不设30%硬门槛，以墙钟和输出一致性判断。重新初始化后参数生效。
 
-`calibration.enabled`默认false；启用时把配准台“保存矩阵”的完整JSON放进`calibration.profile`。校验原始2D尺寸、深度宽度、坐标来源及Pitch几何设置后，仅复用线性4项，当前片粗配准参考点位置不变，不复用历史平移和分片行偏移。候选必须位于原粗配准搜索边界内，完整分辨率损失严格更低才作为起点；不匹配、非法或不改善均保留粗配准，并在`affine_initialization.reason`说明原因。片高和分片模式可不同，因为未复用历史平移。仅支持独立2D相机坐标。
+`calibration.enabled`默认false；可以把完整profile内嵌到`calibration.profile`，也可以只保留`calibration.profile_path`，路径相对于`config/3D/config.json`所在目录，例如`calibration/affine_initializer.json`。启用时校验原始2D尺寸、深度宽度、坐标来源及Pitch几何设置后，仅复用线性4项，当前片粗配准参考点位置不变，不复用历史平移和分片行偏移。候选必须位于原粗配准搜索边界内，完整分辨率损失严格更低才作为起点；不匹配、非法或不改善均保留粗配准，并在`affine_initialization.reason`说明原因。片高和分片模式可不同，因为未复用历史平移。仅支持独立2D相机坐标。
 
 还支持 `format="affine_initializer_profile"`、`version=1`、`mode="coarse_relative"` 的统计初始化文件，其 `matrix` 为粗配准到最终仿射的相对修正 `R`：`M_start = R @ M_coarse_current`。训练使用各片 `M_final @ inverse(M_coarse)` 的均值，线性项和平移都随当前片粗配准合成；不会直接套用某片的历史平移。它同样受上述上下文、原始搜索边界和完整评分保护约束，通过时 `affine_initialization.source` 为 `calibration_coarse_relative`。旧的配准台矩阵格式仍保持只复用线性四项的行为。
 
