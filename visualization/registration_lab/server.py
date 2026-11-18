@@ -25,14 +25,21 @@ sys.path.insert(0, str(ROOT / "python"))
 from algorithm.registration import (RegistrationConfig, platform_mask_2d,
     platform_mask_3d, register_platform_masks, refine_affine_registration, _affine_regions, affine_coordinate_context)
 from algorithm.tilt_correction import correct_smartray_pitch
+from algorithm.config import load_runtime_config
+from algorithm.depth_preprocessing import preprocessing_parameters
 segment = import_module("algorithm.3D.segment")
 SECTIONS = ("registration_3d", "dynamic_affine_3d", "segmentation_3d")
-PREVIEW_VERSION = 5
+PREVIEW_VERSION = 6
 
 
 def defaults():
-    config = json.loads((ROOT / "config/3D/config.json").read_text(encoding="utf-8-sig"))
+    manifest = ROOT / "config/config.json"
+    config = load_runtime_config(manifest.read_text(encoding="utf-8-sig"), str(manifest))
+    tilt = preprocessing_parameters(config)
+    tilt.update(enabled_2d=False, image_role="independent_camera",
+                input_state="uncorrected" if tilt.get("enabled_3d") else "unknown")
     return dict(preview_version=PREVIEW_VERSION, parameters={key: config[key]["parameters"] for key in SECTIONS},
+                tilt=tilt,
                 images_2d=[str(p) for p in sorted((ROOT / "demodatasets/2D").glob("*.png"))],
                 images_3d=[str(p) for p in sorted((ROOT / "demodatasets/3D").glob("*.png"))])
 

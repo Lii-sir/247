@@ -3,7 +3,7 @@
  'use strict';
  const restart='请关闭旧的测试台命令窗口，重新双击“启动配准测试台.cmd”，再刷新页面。';
  function validateServer(data){
-  if(data.preview_version!==5)throw Error('检测到旧版配准服务，与矩阵复用界面版本不匹配。'+restart);
+  if(data.preview_version!==6)throw Error('检测到旧版配准服务，与项目配置同步界面版本不匹配。'+restart);
  }
  function loadImage(src,label,ImageType){
   if(typeof src!=='string'||!src.startsWith('data:image/png;base64,'))

@@ -65,7 +65,7 @@ function updateTiltUI(){
 }
 function tiltSettings(){
  const mode=$('compensationMode').value,enabled=mode!=='off';
- const t={model:'smartray_pitch',enabled_2d:enabled&&$('imageRole').value==='smartray_intensity',enabled_3d:enabled,
+ const t={...initial.tilt,model:'smartray_pitch',enabled_2d:enabled&&$('imageRole').value==='smartray_intensity',enabled_3d:enabled,
  input_state:mode==='raw'?'uncorrected':mode==='sdk'?'sdk_corrected':'unknown',
  image_role:$('imageRole').value,scan_axis:$('scanAxis').value,
  transform_direction:$('direction').value,trigger_mode:$('trigger').value,
@@ -79,12 +79,12 @@ function tiltSettings(){
  }
  return t;
 }
-function setTilt(t={}){
+function setTilt(t=initial.tilt){
  const enabled=t.enabled_2d||t.enabled_3d;
  const invalid=enabled&&(t.model!=='smartray_pitch'||!t.enabled_3d||!['uncorrected','sdk_corrected'].includes(t.input_state));
- if(invalid)t={};
+ t=invalid?{...initial.tilt,enabled_2d:false,enabled_3d:false,input_state:'unknown'}:{...initial.tilt,...t};
  $('compensationMode').value=t.enabled_3d?(t.input_state==='sdk_corrected'?'sdk':'raw'):'off';
- for(const [id,key,value] of [['imageRole','image_role','independent_camera'],['scanAxis','scan_axis','rows'],['direction','transform_direction','recover_ideal'],['trigger','trigger_mode','external'],['angle','angle_deg',0],['pitch','scan_pitch_mm',''],['speed','transport_rate_mm_s',''],['frequency','scan_rate_hz',''],['zstep','z_step_mm',.00105],['grayOffset','gray_offset',32768],['zorigin','z_origin_mm',0]])$(id).value=t[key]??value;
+ for(const [id,key,value] of [['imageRole','image_role','independent_camera'],['scanAxis','scan_axis','rows'],['direction','transform_direction','recover_ideal'],['trigger','trigger_mode','external'],['angle','angle_deg',0],['pitch','scan_pitch_mm',''],['speed','transport_rate_mm_s',''],['frequency','scan_rate_hz',''],['zstep','z_step_mm'],['grayOffset','gray_offset'],['zorigin','z_origin_mm',0]])$(id).value=t[key]??value;
  updateTiltUI();markDirty();
  if(invalid)throw Error('旧版或状态未确认的补偿参数已关闭，请重新选择补偿方式并核对标定值');
 }
@@ -128,7 +128,12 @@ for(const n of [2,3]){
 $('piece').oninput=()=>{updatePairHint();markDirty();};
 $('depthMode').onchange=()=>{$('piece').disabled=$('depthMode').value==='piece';updatePairHint();markDirty();};
 $('controls').addEventListener('input',markDirty);$('controls').addEventListener('change',markDirty);
-$('reset').onclick=()=>{setParams(initial.parameters);setTilt();$('affine').checked=true;$('alignmentMode').value='estimate';updateMatrixUI();markDirty();status('已恢复项目参数和完整配准阶段，Pitch补偿已关闭');};
+$('reset').onclick=async()=>{
+ $('reset').disabled=true;
+ try{const d=await api('/api/defaults');LabPreview.validateServer(d);initial=d;setParams(d.parameters);setTilt(d.tilt);$('affine').checked=true;$('alignmentMode').value='estimate';updateMatrixUI();markDirty();status('已重新读取项目配置，Pitch补偿及标定参数已同步');}
+ catch(err){status('读取项目配置失败：'+err.message,true);}
+ finally{$('reset').disabled=false;}
+};
 $('exportParams').onclick=()=>{try{download({parameters:params(),tilt:tiltSettings()},'registration-parameters.json');}catch(e){status(e.message,true);}};
 $('import').onclick=()=>$('paramsFile').click();
 $('paramsFile').onchange=async e=>{try{const d=JSON.parse(await e.target.files[0].text());setParams(d.parameters||d);setTilt(d.tilt);status('参数已导入');}catch(err){status('导入失败：'+err.message,true);}finally{e.target.value='';}};
@@ -238,4 +243,4 @@ $('run').onclick=async()=>{
  }catch(e){status(e.message,true);}finally{running=false;busy();}
 };
 updateMatrixUI();busy();
-api('/api/defaults').then(d=>{LabPreview.validateServer(d);initial=d;ready=true;busy();setParams(d.parameters);for(const n of [2,3]){const list=d['images_'+(n===2?'2d':'3d')],select=$('samples'+n);const blank=document.createElement('option');blank.value='';blank.textContent='选择样本 / 自定义文件';select.append(blank);for(const path of list){const o=document.createElement('option');o.value=path;o.textContent=path.split(/[\\/]/).at(-1);select.append(o);fileEntries[n].set(path,{name:o.textContent,project:true,option:o});}if(list.length){select.value=list[0];select.onchange();}}status('就绪 · 选好图像后直接运行');}).catch(e=>status(e.message,true));
+api('/api/defaults').then(d=>{LabPreview.validateServer(d);initial=d;setParams(d.parameters);setTilt(d.tilt);ready=true;busy();for(const n of [2,3]){const list=d['images_'+(n===2?'2d':'3d')],select=$('samples'+n);const blank=document.createElement('option');blank.value='';blank.textContent='选择样本 / 自定义文件';select.append(blank);for(const path of list){const o=document.createElement('option');o.value=path;o.textContent=path.split(/[\\/]/).at(-1);select.append(o);fileEntries[n].set(path,{name:o.textContent,project:true,option:o});}if(list.length){select.value=list[0];select.onchange();}}status('就绪 · 已载入项目配准和Pitch配置');}).catch(e=>status(e.message,true));
