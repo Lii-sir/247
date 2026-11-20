@@ -11,8 +11,8 @@
         "circle_search_roi": [
           3100,
           650,
-          5100,
-          2250
+          5150,
+          2300
         ],
         "detection_roi_offsets": [
           -4.0773,
@@ -21,7 +21,7 @@
           2.1634
         ],
         "circle_radius": 560,
-        "radius_tolerance_pixels": 10
+        "radius_tolerance_pixels": 20
       },
       "crop_2d": {
         "roi": [
