@@ -100,9 +100,9 @@ def main():
     mode = str(boundary_config.get("mode", "polygon")).casefold()
 
     sys.path.insert(0, str(ROOT / "python"))
-    from algorithm.detect_board import DetectBoard, _mask_geometry
+    from algorithm.application.board.detect_board import DetectBoard, _mask_geometry
     from ultralytics import YOLO
-    silver = import_module("algorithm.2D.silver_inspection")
+    silver = import_module("algorithm.vision2d.silver_inspection")
 
     image = cv2.imdecode(np.fromfile(str(args.image.resolve()), dtype=np.uint8), cv2.IMREAD_COLOR)
     if image is None:

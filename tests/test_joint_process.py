@@ -17,9 +17,9 @@ sys.path.insert(0, str(ROOT/'python'))
 sys.path.insert(0, str(ROOT/'tests'))
 import cv2
 import numpy as np
-from algorithm.height_measurement import HeightConfig
-from algorithm.joint_process import JointMeasurementProcesses
-from algorithm.registration_process import SharedBoardInputs
+from algorithm.vision3d.measurement.height_measurement import HeightConfig
+from algorithm.execution.processes.joint_process import JointMeasurementProcesses
+from algorithm.execution.processes.registration_process import SharedBoardInputs
 from transport.bridge_server import AlgorithmServer
 from pipeline_fakes import FakeDetector
 
@@ -81,7 +81,7 @@ class JointProcessTests(unittest.TestCase):
         return self.service.submit_piece(**params)
 
     def test_complete_result_matches_direct_and_preserves_input_masks(self):
-        from algorithm.detect_board import DetectBoard
+        from algorithm.application.board.detect_board import DetectBoard
         detector = DetectBoard(lambda _: None)
         self.addCleanup(detector.release)
         detector.height_config, detector.min_component_area = self.config, 4
@@ -131,7 +131,7 @@ class JointProcessTests(unittest.TestCase):
         self.assertIn('wire_measurements', self.submit().result(20))
 
     def test_late_2d_ng_is_merged_in_parent_without_changing_height(self):
-        from algorithm.detect_board import DetectBoard
+        from algorithm.application.board.detect_board import DetectBoard
         relaxed = replace(self.config,max_wire_platform_height_mm=10.,max_solder_platform_height_mm=10.,max_solder_chip_height_mm=10.)
         raw = self.submit(height_config=relaxed).result(20)
         self.assertTrue(raw['is_ok'])
@@ -142,8 +142,8 @@ class JointProcessTests(unittest.TestCase):
         self.assertEqual(before, merged['wire_measurements'])
 
     def test_formal_pipeline_never_calls_parent_mapping_or_height(self):
-        from algorithm.detect_board import DetectBoard
-        from algorithm.board_pipeline import BoardPipeline
+        from algorithm.application.board.detect_board import DetectBoard
+        from algorithm.application.board.board_pipeline import BoardPipeline
         service, source, depth, height, matrix = self.service, self.entry, self.depth, self.config, self.registration
         class Detector(FakeDetector):
             submit_joint_measurement = DetectBoard.submit_joint_measurement
@@ -155,7 +155,7 @@ class JointProcessTests(unittest.TestCase):
                 self.log = lambda _:None
                 self.height_config = replace(height,max_wire_platform_height_mm=10.,max_solder_platform_height_mm=10.,max_solder_chip_height_mm=10.)
                 self.min_component_area, self.crop_roi, self.wire_rois = 4, (0,0,240,180), []
-                self.segmentation_config = import_module('algorithm.3D.segment').SegmentationConfig(
+                self.segmentation_config = import_module('algorithm.vision3d.depth.segment').SegmentationConfig(
                     expected_piece_count=1,mode='fixed',fixed_rois=((0,11,240,191),))
                 self._align_instances = Mock(side_effect=AssertionError('parent mapping executed'))
                 self._measure_piece = Mock(side_effect=AssertionError('parent height executed'))
@@ -191,14 +191,14 @@ class JointProcessTests(unittest.TestCase):
 
 class JointProcessStructureTests(unittest.TestCase):
     def test_model_free_import_does_not_load_torch(self):
-        code = "import sys;sys.path.insert(0,'python');from algorithm.joint_geometry import JointGeometry;assert 'torch' not in sys.modules"
+        code = "import sys;sys.path.insert(0,'python');from algorithm.vision3d.measurement.joint_geometry import JointGeometry;assert 'torch' not in sys.modules"
         result = subprocess.run([sys.executable,'-B','-c',code],cwd=ROOT,capture_output=True,text=True,timeout=10,
                                 creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),
                                 env={**os.environ,'PYTHONDONTWRITEBYTECODE':'1'})
         self.assertEqual(0,result.returncode,result.stderr)
 
     def test_24_core_partition_reserves_four_fast_main_cores_and_restores_in_reverse(self):
-        from algorithm.cpu_partition import choose_partition
+        from algorithm.execution.cpu_partition import choose_partition
         server = AlgorithmServer()
         self.addCleanup(server.close)
         server.board = FakeDetector()
@@ -219,14 +219,14 @@ class JointProcessStructureTests(unittest.TestCase):
                 service.close.side_effect = close
                 return service
             return create
-        from algorithm.config import load_runtime_config
+        from algorithm.runtime.config import load_runtime_config
         path = ROOT/'config/config.json'
         settings = server._thread_settings(load_runtime_config(path.read_text(encoding='utf-8'), str(path)))
-        with patch('algorithm.registration_process.RegistrationProcesses',side_effect=factory('registration')), \
-                patch('algorithm.cpu_2d_process.Cpu2DProcesses',side_effect=factory('cpu_2d')), \
-                patch('algorithm.joint_process.JointMeasurementProcesses',side_effect=factory('joint_measurement')), \
-                patch('algorithm.cpu_partition.physical_cores',return_value=cores), \
-                patch('algorithm.cpu_partition.current_cpus',side_effect=lambda:list(available)):
+        with patch('algorithm.execution.processes.registration_process.RegistrationProcesses',side_effect=factory('registration')), \
+                patch('algorithm.execution.processes.cpu_2d_process.Cpu2DProcesses',side_effect=factory('cpu_2d')), \
+                patch('algorithm.execution.processes.joint_process.JointMeasurementProcesses',side_effect=factory('joint_measurement')), \
+                patch('algorithm.execution.cpu_partition.physical_cores',return_value=cores), \
+                patch('algorithm.execution.cpu_partition.current_cpus',side_effect=lambda:list(available)):
             server._configure_cpu_processes(settings)
         groups = [set(server.threading_info[role+'_execution']['workers'][0]['cpu_ids'])
                   for role in ('registration','cpu_2d','joint_measurement')]
@@ -250,7 +250,7 @@ class JointProcessStructureTests(unittest.TestCase):
                     'worker_budget':50,'cpu_workers':2,'joint_workers':2,**fields}))))
 
     def test_formal_joint_submit_has_no_parent_execution_fallback(self):
-        from algorithm.detect_board import DetectBoard
+        from algorithm.application.board.detect_board import DetectBoard
         detector = DetectBoard(lambda _:None)
         self.addCleanup(detector.release)
         with self.assertRaisesRegex(RuntimeError,'measurement processes must be initialized'):
@@ -266,9 +266,9 @@ class JointProcessStructureTests(unittest.TestCase):
             instance.info = dict(backend='process')
             instance.close.side_effect = lambda:order.append(role)
             return instance
-        with patch('algorithm.registration_process.RegistrationProcesses',return_value=created('registration')), \
-                patch('algorithm.cpu_2d_process.Cpu2DProcesses',return_value=created('cpu_2d')), \
-                patch('algorithm.joint_process.JointMeasurementProcesses',side_effect=RuntimeError('joint startup failed')):
+        with patch('algorithm.execution.processes.registration_process.RegistrationProcesses',return_value=created('registration')), \
+                patch('algorithm.execution.processes.cpu_2d_process.Cpu2DProcesses',return_value=created('cpu_2d')), \
+                patch('algorithm.execution.processes.joint_process.JointMeasurementProcesses',side_effect=RuntimeError('joint startup failed')):
             with self.assertRaisesRegex(RuntimeError,'joint startup failed'):
                 server._configure_cpu_processes(server._thread_settings({}))
         self.assertEqual(['cpu_2d','registration'],order)

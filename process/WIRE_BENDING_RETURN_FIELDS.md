@@ -205,4 +205,4 @@ if (result != null)
 - 新旧 `MaskRatio` 的计算含义不同，旧报告数据不会因更换 DLL 或查看器而自动重新计算。跨版本比较时应区分生成结果所用算法版本。
 - 本次构建的 Release DLL 位于 `src/Bridge/bin/x64/Release/net48/Bridge.dll`；根目录原有 `Bridge.dll` 未在本次修改中覆盖。
 
-实现依据：[C# DTO](../src/Bridge/BridgeDtos.cs)、[弯曲测量实现](../python/algorithm/2D/defect_geometry.py)、[ROI 汇总实现](../python/algorithm/2D/wire_roi_presence.py)。完整返回结构见 [接口返回参数说明](OUTPUT_PARAMETERS.md)。
+实现依据：[C# DTO](../src/Bridge/BridgeDtos.cs)、[弯曲测量实现](../python/algorithm/vision2d/defect_geometry.py)、[ROI 汇总实现](../python/algorithm/vision2d/wire_roi_presence.py)。完整返回结构见 [接口返回参数说明](OUTPUT_PARAMETERS.md)。

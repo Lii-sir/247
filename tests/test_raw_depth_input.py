@@ -16,9 +16,9 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT/'python'), str(ROOT/'tests'), str(ROOT/'visualization')]
 from transport.depth_input import validate_depth_input, depth_from_uint16
-from algorithm.detect_board import DetectBoard
-from algorithm.board_pipeline import BoardPipeline
-from algorithm.timing import timing_context
+from algorithm.application.board.detect_board import DetectBoard
+from algorithm.application.board.board_pipeline import BoardPipeline
+from algorithm.runtime.timing import timing_context
 from pipeline_fakes import FakeDetector
 from detect_and_view import mapped_file
 
@@ -55,7 +55,7 @@ class RawDepthInputTests(unittest.TestCase):
         cases += [dict(image_width=value) for value in (0, -1, True, 3.0, '3', None)]
         cases += [dict(image_height=0), dict(data_size=11), dict(data_size=14),
                   dict(shm_name=''), dict(image_stride=8)]
-        with patch('algorithm.detect_board.read_shared_memory', side_effect=AssertionError('read before validation')):
+        with patch('algorithm.application.board.detect_board.read_shared_memory', side_effect=AssertionError('read before validation')):
             for change in cases:
                 with self.subTest(change=change), self.assertRaises(ValueError):
                     DetectBoard._read_3d({**base, **change})
@@ -70,8 +70,8 @@ class RawDepthInputTests(unittest.TestCase):
                 depth_from_uint16(bytes(size), 2, 2)
 
     def test_standalone_3d_uses_raw_depth_and_reports_view_timing(self):
-        module = import_module('algorithm.detect_3D')
-        segment = import_module('algorithm.3D.segment')
+        module = import_module('algorithm.application.standalone.detect_3D')
+        segment = import_module('algorithm.vision3d.depth.segment')
         depth = np.zeros((20, 3), np.uint16)
         depth[:5] = depth[10:15] = 33000
         detector = module.Detect3D()
@@ -123,7 +123,7 @@ class RawDepthInputTests(unittest.TestCase):
                     mapped_file(stack, path, '3d')
 
     def test_offline_pitch_prepares_pixels_before_algorithm_reads_shared_input(self):
-        from algorithm.depth_preprocessing import prepare_depth_for_detection
+        from algorithm.vision3d.depth.depth_preprocessing import prepare_depth_for_detection
         original=np.zeros((50,3),np.uint16);original[20:35]=32958
         settings=dict(model='smartray_pitch',enabled_3d=True,angle_deg=30,scan_pitch_mm=.01)
         expected,info=prepare_depth_for_detection(original,settings)

@@ -8,7 +8,7 @@ from typing import Any, Iterable, Mapping, Sequence
 import cv2
 import numpy as np
 
-silver = importlib.import_module("algorithm.2D.silver_inspection")
+silver = importlib.import_module("algorithm.vision2d.silver_inspection")
 ContinuitySettings = silver.ContinuitySettings
 ContinuityMeasurement = silver.ContinuityMeasurement
 _union_masks = silver._union_masks

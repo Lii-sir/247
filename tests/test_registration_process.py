@@ -16,9 +16,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
 sys.path.insert(0, str(ROOT / "tests"))
 import numpy as np
-from algorithm.cpu_partition import choose_partition, parse_cores
-from algorithm.registration import RegistrationConfig
-from algorithm.registration_process import RegistrationProcesses, SharedBoardInputs
+from algorithm.execution.cpu_partition import choose_partition, parse_cores
+from algorithm.vision3d.alignment.registration import RegistrationConfig
+from algorithm.execution.processes.registration_process import RegistrationProcesses, SharedBoardInputs
 from registration_process_tasks import hold
 
 
@@ -129,7 +129,7 @@ class ProcessRegistrationTests(unittest.TestCase):
         self.assertEqual(1, first["registration_worker"]["opencv_threads"])
 
     def test_process_queue_and_board_relative_timeline_are_separate_from_preparation(self):
-        from algorithm.timing import PipelineTimings
+        from algorithm.runtime.timing import PipelineTimings
         timeline={}
         timings=PipelineTimings({},origin=time.perf_counter(),timeline=timeline)
         self.submit(timings=timings).result(20)
@@ -236,12 +236,12 @@ class ProcessFailureTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "Windows initializer rejection")
     def test_initializer_failure_restores_launcher_and_reports_error(self):
         from multiprocessing.spawn import get_executable
-        from algorithm.cpu_partition import current_cpus
+        from algorithm.execution.cpu_partition import current_cpus
         original, executable, launcher = current_cpus(), get_executable(), os.environ.get("__PYVENV_LAUNCHER__")
         invalid = dict(original_cpus=original, main_cpus=original,
                        registration_cores=[dict(logical_cpus=[999], efficiency_class=0)],
                        registration_cpus=[999])
-        with patch("algorithm.cpu_partition.choose_partition", return_value=invalid):
+        with patch("algorithm.execution.cpu_partition.choose_partition", return_value=invalid):
             with self.assertRaisesRegex(RuntimeError, "startup failed"):
                 RegistrationProcesses(1, dict(enabled=True, physical_cores=1), startup_timeout=10)
         self.assertEqual(original, current_cpus())
@@ -266,11 +266,11 @@ class ProcessPipelineIntegrationTests(unittest.TestCase):
         detector.release.assert_called_once()
 
     def test_bridge_initialization_and_two_complete_boards_use_same_processes(self):
-        from algorithm.detect_board import DetectBoard
+        from algorithm.application.board.detect_board import DetectBoard
         from importlib import import_module
         from pipeline_fakes import FakeDetector
         from transport.bridge_server import AlgorithmServer
-        from algorithm.registration_worker import register_arrays
+        from algorithm.vision3d.alignment.registration import register_arrays
         entry, local, registration_config, affine = fixture()
         expected = register_arrays(entry["gray_image"], entry["registration_mask"], local,
                                    registration_config, affine, {})
@@ -282,7 +282,7 @@ class ProcessPipelineIntegrationTests(unittest.TestCase):
                 self.log = lambda text: None
                 self.registration_config = registration_config
                 self.dynamic_affine_config = affine
-                self.segmentation_config = import_module("algorithm.3D.segment").SegmentationConfig(
+                self.segmentation_config = import_module("algorithm.vision3d.depth.segment").SegmentationConfig(
                     expected_piece_count=2, mode="fixed", fixed_rois=((0, 0, 128, 96), (0, 96, 128, 192)))
 
             def handle_init(self, req):
@@ -329,7 +329,7 @@ class ProcessPipelineIntegrationTests(unittest.TestCase):
             self.assertEqual({}, resources._blocks)
 
     def test_formal_submit_requires_initialized_process_service(self):
-        from algorithm.detect_board import DetectBoard
+        from algorithm.application.board.detect_board import DetectBoard
         detector = DetectBoard(lambda _: None)
         self.addCleanup(detector.release)
         with self.assertRaisesRegex(RuntimeError, "processes must be initialized"):

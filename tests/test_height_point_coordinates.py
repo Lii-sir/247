@@ -9,7 +9,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
-from algorithm.height_measurement import height_points_to_board
+from algorithm.vision3d.measurement.height_measurement import height_points_to_board
 
 
 class HeightPointTests(unittest.TestCase):
@@ -69,7 +69,7 @@ class HeightPointTests(unittest.TestCase):
         self.assertEqual(height_points_to_board(original)["wire_measurements"][0]["height_3d"]["point"]["y"], 31)
 
     def detector(self):
-        from algorithm import detect_board as module
+        from algorithm.application.board import detect_board as module
         detector = module.DetectBoard(lambda text: None)
         detector._align_instance = Mock(side_effect=lambda item, *args: item)
         measurement = self.piece()

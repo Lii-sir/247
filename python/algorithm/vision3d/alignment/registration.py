@@ -9,6 +9,8 @@ import cv2
 import numpy as np
 from scipy.optimize import minimize, OptimizeResult
 
+from algorithm.runtime.timing import timed_call
+
 
 @dataclass(frozen=True)
 class RegistrationConfig:
@@ -406,6 +408,20 @@ def affine_coordinate_context(image_shape, depth_shape, correction=None, image_r
     return dict(source_space="independent_2d_image" if image_role == "independent_camera" else "smartray_intensity_depth_piece",
                 target_space="depth_piece_local", image_size=[int(image_shape[1]), int(image_shape[0])],
                 depth_size=[int(depth_shape[1]), int(depth_shape[0])], preprocessing=prep)
+
+
+def register_arrays(gray, mask_2d, depth_piece, registration_config, affine_config, correction, *, operations=None):
+    """Run coarse registration and affine refinement on one depth piece."""
+    make_mask, coarse_registration, refine = (
+        (platform_mask_3d, register_platform_masks, refine_affine_registration)
+        if operations is None else operations
+    )
+    if isinstance(registration_config, dict):
+        registration_config = RegistrationConfig.from_dict(registration_config)
+    mask = timed_call("platform_mask_3d_ms", make_mask, depth_piece, registration_config)
+    coarse = timed_call("coarse_registration_ms", coarse_registration, mask_2d, mask, registration_config)
+    context = affine_coordinate_context(gray.shape, depth_piece.shape, correction)
+    return timed_call("affine_registration_ms", refine, gray, depth_piece, coarse, affine_config, context=context)
 
 
 def _calibration_seed(profile, context, coarse, preview_scale, lower, upper):

@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
-from algorithm import height_measurement as height
+from algorithm.vision3d.measurement import height_measurement as height
 
 
 def reference_local_plane(depth, target_mask, exclude_mask, config):
@@ -101,7 +101,7 @@ class LocalHeightTests(unittest.TestCase):
                                                   "platform", limit))
 
     def test_chip_matching_reuses_regions_and_preserves_smallest_enclosing_chip(self):
-        from algorithm import detect_board
+        from algorithm.application.board import detect_board
         large = np.zeros((100, 140), np.uint8)
         large[10:90, 10:130] = 255
         large[30:70, 40:100] = 0  # The external-region contract fills holes.

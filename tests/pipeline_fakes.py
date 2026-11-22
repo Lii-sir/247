@@ -8,7 +8,7 @@ from importlib import import_module
 class FakeDetector:
     def __init__(self, count=10, delay=0.005):
         self.expected_piece_count = count
-        self.segmentation_config = import_module("algorithm.3D.segment").SegmentationConfig(
+        self.segmentation_config = import_module("algorithm.vision3d.depth.segment").SegmentationConfig(
             expected_piece_count=count, max_internal_gap_height=0)
         self.delay = delay
         self.lock = threading.Lock()
@@ -84,7 +84,7 @@ class FakeDetector:
 
     def submit_2d_postprocess(self, pool, inputs, prepared, timings, metadata, is_current):
         # Only a scheduling stub. Production dispatches to CPU-only processes.
-        from algorithm.timing import timing_context, measure
+        from algorithm.runtime.timing import timing_context, measure
         queued = time.perf_counter()
         def invoke():
             if not is_current():
@@ -118,7 +118,7 @@ class FakeDetector:
     def submit_registration(self, pool, inputs, piece_id, entry, depth, piece,
                             correction, timings, metadata, is_current):
         # Scheduling fake only: production DetectBoard always dispatches a process.
-        from algorithm.timing import timing_context, measure
+        from algorithm.runtime.timing import timing_context, measure
         queued = time.perf_counter()
         def invoke():
             if not is_current():
@@ -135,7 +135,7 @@ class FakeDetector:
     def submit_joint_measurement(self, pool, inputs, piece_id, entry, depth, piece, registration,
                                  correction, timings, metadata, is_current):
         # Scheduling stub. Formal DetectBoard always uses its process service.
-        from algorithm.timing import timing_context, measure
+        from algorithm.runtime.timing import timing_context, measure
         queued = time.perf_counter()
         def invoke():
             if not is_current():

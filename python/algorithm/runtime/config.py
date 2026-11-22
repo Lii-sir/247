@@ -3,6 +3,8 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 
+_PROJECT_CONFIG_DIR = Path(__file__).resolve().parents[3] / "config"
+
 DEFAULT_ALGORITHM_PARAMETERS: Dict[str, Any] = {
     # YOLO 默认参数；模型配置里的 algorithm.parameters 会覆盖这些值。
     "imgsz": 640,
@@ -69,7 +71,7 @@ def load_runtime_config(config_text: str, config_path: str | None = None) -> Dic
     base = (
         Path(config_path).expanduser().resolve().parent
         if config_path
-        else Path(__file__).resolve().parents[2] / "config"
+        else _PROJECT_CONFIG_DIR
     )
     first = json.loads((base / path_2d).resolve().read_text(encoding="utf-8-sig"))
     second = json.loads((base / path_3d).resolve().read_text(encoding="utf-8-sig"))
@@ -114,7 +116,7 @@ def _load_affine_initializer_profile(config: Dict[str, Any], config_path: str | 
             candidates.append(stage.parent / raw)
             if stage.parent.name.casefold() == "2d":
                 candidates.append(stage.parent.parent / "3D" / raw)
-        candidates.append(Path(__file__).resolve().parents[2] / "config" / "3D" / raw)
+        candidates.append(_PROJECT_CONFIG_DIR / "3D" / raw)
 
     selected = next((path.resolve() for path in candidates if path.is_file()), None)
     if selected is None:

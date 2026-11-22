@@ -6,8 +6,8 @@ from unittest.mock import Mock, patch
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT/'python'),str(ROOT/'tests')]
-from algorithm.cpu_partition import choose_partition
-from algorithm.config import load_runtime_config
+from algorithm.execution.cpu_partition import choose_partition
+from algorithm.runtime.config import load_runtime_config
 from transport.bridge_server import AlgorithmServer
 from pipeline_fakes import FakeDetector
 
@@ -53,11 +53,11 @@ class MainCoreReservationTests(unittest.TestCase):
         path=ROOT/'config/config.json'
         config=load_runtime_config(path.read_text(encoding='utf-8'),str(path))
         settings=server._thread_settings(config)
-        with patch('algorithm.registration_process.RegistrationProcesses',side_effect=factory('registration')), \
-                patch('algorithm.cpu_2d_process.Cpu2DProcesses',side_effect=factory('cpu_2d')), \
-                patch('algorithm.joint_process.JointMeasurementProcesses',side_effect=factory('joint_measurement')), \
-                patch('algorithm.cpu_partition.physical_cores',return_value=cores), \
-                patch('algorithm.cpu_partition.current_cpus',side_effect=lambda:list(available)):
+        with patch('algorithm.execution.processes.registration_process.RegistrationProcesses',side_effect=factory('registration')), \
+                patch('algorithm.execution.processes.cpu_2d_process.Cpu2DProcesses',side_effect=factory('cpu_2d')), \
+                patch('algorithm.execution.processes.joint_process.JointMeasurementProcesses',side_effect=factory('joint_measurement')), \
+                patch('algorithm.execution.cpu_partition.physical_cores',return_value=cores), \
+                patch('algorithm.execution.cpu_partition.current_cpus',side_effect=lambda:list(available)):
             server._configure_cpu_processes(settings)
         info=server.threading_info
         groups={role:set(info[role+'_execution']['workers'][0]['cpu_ids'])
@@ -94,10 +94,10 @@ class MainCoreReservationTests(unittest.TestCase):
             return service
         path=ROOT/'config/config.json'
         settings=server._thread_settings(load_runtime_config(path.read_text(encoding='utf-8'),str(path)))
-        with patch('algorithm.cpu_partition.physical_cores',return_value=cores), \
-                patch('algorithm.cpu_partition.current_cpus',side_effect=lambda:list(available)), \
-                patch('algorithm.cpu_2d_process.Cpu2DProcesses',side_effect=create), \
-                patch('algorithm.registration_process.RegistrationProcesses',side_effect=RuntimeError('3D startup failed')):
+        with patch('algorithm.execution.cpu_partition.physical_cores',return_value=cores), \
+                patch('algorithm.execution.cpu_partition.current_cpus',side_effect=lambda:list(available)), \
+                patch('algorithm.execution.processes.cpu_2d_process.Cpu2DProcesses',side_effect=create), \
+                patch('algorithm.execution.processes.registration_process.RegistrationProcesses',side_effect=RuntimeError('3D startup failed')):
             with self.assertRaisesRegex(RuntimeError,'3D startup failed'):server._configure_cpu_processes(settings)
         service.close.assert_called_once()
         self.assertEqual(list(range(32)),available)

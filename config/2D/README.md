@@ -12,6 +12,19 @@
 - `chip_rotation_2d.parameters`：芯片外接矩形角度阈值。
 - `chip_anomaly_2d.parameters`：芯片外观异常和 EfficientAD 模型区间映射。
 
+## 缺陷检测优先级
+
+在 `common_2d.parameters` 中设置 `defect_priority`，修改后重新初始化算法。例如：
+
+```json
+"defect_priority": ["chip_rotation_2d", "wire_bending_2d"]
+```
+
+列表按从左到右的顺序执行。已启用但未列出的检测随后执行，默认顺序依次为引线弯曲、芯片旋转、
+芯片外观、银浆溢出、银浆断连。空列表沿用默认检测流程。优先级按片生效，YOLO 分割仍是各项检测的共同输入。
+首项 NG 写入 `first_ng_check`，后续已启用项目返回 `status=skipped` 和 `is_ok=null`。
+联合检测会跳过该片的 3D 配准和测高，其余片独立处理。
+
 引线弯曲使用清理后的单个 `wire/thin` 实例，在重叠像素最多的 ROI 中寻找两端与边界的接触区间，
 各取两个端点连接成评估四边形。ROI 为 `[x1,x2) × [y1,y2)`，右/下边界像素为 `x2-1/y2-1`。
 覆盖率为 `该实例在 ROI 和四边形交集内的像素数 / 该实例在 ROI 内的像素数`；

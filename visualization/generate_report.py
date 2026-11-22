@@ -116,7 +116,7 @@ def build_payload(document: Any, *, base_dir: Path, images_2d: Path | None = Non
             if correction.get("applied") and not envelope.get("image_3d_preprocessed", False):
                 import sys
                 sys.path.insert(0, str(HERE.parent / "python"))
-                from algorithm.tilt_correction import correct_smartray_pitch
+                from algorithm.vision3d.depth.tilt_correction import correct_smartray_pitch
                 settings = {**correction, "enabled_3d": True, "enabled_2d": False,
                             "image_role": "independent_camera", "input_state": "uncorrected",
                             "trigger_mode": "external"}

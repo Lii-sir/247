@@ -4,28 +4,28 @@ This is documentation data: importing it does not import detection algorithms,
 load models, start pools, or run inference.
 """
 
-B = 'python/algorithm/detect_board.py'
-P = 'python/algorithm/board_pipeline.py'
+B = 'python/algorithm/application/board/detect_board.py'
+P = 'python/algorithm/application/board/board_pipeline.py'
 T = 'python/transport/bridge_server.py'
-R = 'python/algorithm/registration.py'
-H = 'python/algorithm/height_measurement.py'
-S = 'python/algorithm/2D/silver_inspection.py'
-A = 'python/algorithm/2D/chip_anomaly.py'
-G = 'python/algorithm/2D/defect_geometry.py'
-C = 'python/algorithm/2D/circle_roi.py'
-Z = 'python/algorithm/tilt_correction.py'
-DP = 'python/algorithm/depth_preprocessing.py'
-SEG = 'python/algorithm/3D/segment.py'
-I = 'python/algorithm/instance_tasks.py'
+R = 'python/algorithm/vision3d/alignment/registration.py'
+H = 'python/algorithm/vision3d/measurement/height_measurement.py'
+S = 'python/algorithm/vision2d/silver_inspection.py'
+A = 'python/algorithm/vision2d/chip_anomaly.py'
+G = 'python/algorithm/vision2d/defect_geometry.py'
+C = 'python/algorithm/vision2d/circle_roi.py'
+Z = 'python/algorithm/vision3d/depth/tilt_correction.py'
+DP = 'python/algorithm/vision3d/depth/depth_preprocessing.py'
+SEG = 'python/algorithm/vision3d/depth/segment.py'
+I = 'python/algorithm/execution/instance_tasks.py'
 V = 'visualization/validation_lab/server.py'
-RP = 'python/algorithm/registration_process.py'
-RW = 'python/algorithm/registration_worker.py'
-D2 = 'python/algorithm/cpu_2d_worker.py'
-P2 = 'python/algorithm/cpu_2d_process.py'
-IG = 'python/algorithm/2D/instance_geometry.py'
-J = 'python/algorithm/joint_geometry.py'
-JW = 'python/algorithm/joint_worker.py'
-JP = 'python/algorithm/joint_process.py'
+RP = 'python/algorithm/execution/processes/registration_process.py'
+RW = 'python/algorithm/execution/workers/registration_worker.py'
+D2 = 'python/algorithm/execution/workers/cpu_2d_worker.py'
+P2 = 'python/algorithm/execution/processes/cpu_2d_process.py'
+IG = 'python/algorithm/vision2d/instance_geometry.py'
+J = 'python/algorithm/vision3d/measurement/joint_geometry.py'
+JW = 'python/algorithm/execution/workers/joint_worker.py'
+JP = 'python/algorithm/execution/processes/joint_process.py'
 
 
 def build_flows():
@@ -81,7 +81,7 @@ def build_flows():
     n('o-shared', '共享输入与异步派发', '每板一份深度；每片gray/mask', 2, 6,
       '父准备线程复制并发布共享区|整板补偿后深度所有片复用|只向常驻子进程发送描述和数值配置|租约保护取消/释放期间的真实任务输入', pool='registration', times=('registration_shared_memory_ms',), src=(RP, 'prepare'))
     n('o-registration', '常驻进程独立配准', '粗配准 → 仿射；专用物理核组', 2, 7,
-      '按registration_workers限制进程数|不加载Torch和模型，原生线程均为1|主进程与配准使用不同物理核组|只读共享区，每片拟合一个全局矩阵|矩阵和诊断返回后立即投递测高', pool='registration_process', times=('registration_phase_ms',), src=(RW, 'register_arrays'))
+      '按registration_workers限制进程数|不加载Torch和模型，原生线程均为1|主进程与配准使用不同物理核组|只读共享区，每片拟合一个全局矩阵|矩阵和诊断返回后立即投递测高', pool='registration_process', times=('registration_phase_ms',), src=(R, 'register_arrays'))
     n('o-jointprep', '测高共享输入与派发', '复用整板深度＋原2D实例mask', 2, 8,
       '深度复用配准发布的同一共享块|追加当前片只读原2D实例mask|仅发送高度配置、几何元数据和当前矩阵|父joint线程不等待测高进程', pool='joint', src=(JP,'submit_piece'),times=('joint_measurement_shared_memory_ms',))
     n('o-joint', '独立进程映射与全实例测高', '第三核组；本进程实例执行器', 2, 9,
@@ -151,7 +151,7 @@ def build_flows():
     n('d-bending','2D引线弯曲','wire / thin原始实例',0,9,
       '局部清理实例并保留偏移|按最大交集选择一个2D诊断ROI|找ROI周界的两个连续接触段|四个端点凸包形成评估四边形|覆盖率=四边形覆盖前景/本实例ROI内前景|与rectangle_ratio_threshold比较，ROI外标记outside_rois',pool='cpu',src=(G,'measure_wire_bending'),params=('wire_bending_2d.parameters',),times=('wire_bending_ms',))
     n('d-presence','2D缺线与ROI存在性','每个配置框独立给诊断',0,10,
-      '使用已清理的弯曲结果选择ROI归属|缺少候选引线时给wire_missing|掩码被清理拒绝时给bending_unavailable|返回ROI框、关联实例和OK/NG|此ROI不限制后续3D测高目标',pool='cpu',src=('python/algorithm/2D/wire_roi_presence.py','check_wire_roi_presence'),times=('wire_roi_presence_ms',))
+      '使用已清理的弯曲结果选择ROI归属|缺少候选引线时给wire_missing|掩码被清理拒绝时给bending_unavailable|返回ROI框、关联实例和OK/NG|此ROI不限制后续3D测高目标',pool='cpu',src=('python/algorithm/vision2d/wire_roi_presence.py','check_wire_roi_presence'),times=('wire_roi_presence_ms',))
     n('d-rotation','芯片旋转 + 灰度缓存','geometry支路顺序收尾',0,11,
       '各chip轮廓求最小面积矩形|长边角度折算到最近坐标轴偏差[-45,45)|abs偏差与max_angle_deg比较|原图灰度通过gray_lock只转换一次|构建joint_entry并对实例字典做浅拷贝',pool='cpu',src=(B,'prepare_joint_piece'),params=('chip_rotation_2d.parameters',),times=('chip_rotation_ms','cache_gray_image_ms'))
     n('d-ready','提前发布联合输入','不等待银胶检查',0,12,
@@ -264,7 +264,7 @@ def build_flows():
             if node['id'] != 'r-worker':
                 node['row'] += 1
     n('r-handoff','返回矩阵并提交第三组进程','复用深度；不占父线程等待',1,10,
-      '父进程接收矩阵和评分诊断|复用整板深度与本片实例mask共享块，2D后处理与3D测高只发布一份mask|只向测高worker发送描述和高度参数|真实Future结束才释放深度及mask租约|已释放或失败的板不再开始测高',kind='data',src=(P,'_registered'),times=('registration_result_transfer_ms','joint_measurement_queue_ms'))
+      '父进程接收矩阵和评分诊断|复用深度与本片实例mask共享块，2D后处理与3D测高只发布一份mask|只向测高worker发送描述和高度参数|真实Future结束才释放深度及mask租约|已释放或失败的板不再开始测高',kind='data',src=(P,'_submit_joint'),times=('registration_result_transfer_ms','joint_measurement_queue_ms'))
     n('r-map','逐实例并行映射','共享只读H；独立目标缓冲',1,11,
       '原crop局部掩码先加crop左上角变成原图坐标|实际矩阵为H_full×T_crop_to_full|已规范化的uint8 0/255输入直接复用；未标记兼容输入仍二值化|nearest映射到完整片局部深度画幅|各实例提取2D/3D几何，字典和输出由任务独立持有|父线程按原实例顺序汇总|一片左右及全部类别都使用同一个矩阵',pool='instance',kind='parallel',src=(R,'align_crop_mask_to_depth'),times=('mask_alignment_ms','instance_alignment_work_ms'))
     n('r-height','进入参考面与全实例测高','已对齐实例 + 深度片',1,12,

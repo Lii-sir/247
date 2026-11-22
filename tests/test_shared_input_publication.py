@@ -10,7 +10,7 @@ import numpy as np
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'python'))
-from algorithm.registration_process import SharedBoardInputs
+from algorithm.execution.processes.registration_process import SharedBoardInputs
 
 
 class SharedPublicationTests(unittest.TestCase):
@@ -76,7 +76,7 @@ class SharedPublicationTests(unittest.TestCase):
         def create(*args,**kwargs):
             handle=SharedMemory(*args,**kwargs);names.append(handle.name);return handle
         with ThreadPoolExecutor(2) as pool,patch('numpy.copyto',new=copy), \
-                patch('algorithm.registration_process.SharedMemory',side_effect=create):
+                patch('algorithm.execution.processes.registration_process.SharedMemory',side_effect=create):
             pending=pool.submit(owner.prepare_named,dict(depth=source))
             try:
                 self.assertTrue(entered.wait(2))

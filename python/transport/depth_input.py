@@ -3,8 +3,9 @@ import numpy as np
 import math
 
 
-def depth_coordinate_space(correction):
-    return 'pitch_corrected_board_3d' if correction.get('applied') else 'board_3d'
+def depth_coordinate_space(correction, *, piece_local=False):
+    space = "piece_3d" if piece_local else "board_3d"
+    return "pitch_corrected_" + space if correction.get("applied") else space
 
 
 def input_depth_correction(descriptor):

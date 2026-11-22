@@ -9,7 +9,7 @@ import numpy as np
 
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT/'python'))
-from algorithm import detect_board as board
+from algorithm.application.board import detect_board as board
 
 
 class AllHeightTargetsTests(unittest.TestCase):

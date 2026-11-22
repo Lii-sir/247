@@ -1,6 +1,6 @@
 """Prepare per-piece shared masks for isolated 2D CPU postprocessing."""
-from algorithm.registration_process import RegistrationProcesses, SharedBoardInputs
-from algorithm import cpu_2d_worker
+from algorithm.execution.processes.registration_process import RegistrationProcesses, SharedBoardInputs
+from algorithm.execution.workers import cpu_2d_worker
 
 
 class Cpu2DProcesses(RegistrationProcesses):
@@ -12,11 +12,11 @@ class Cpu2DProcesses(RegistrationProcesses):
                      *, shared_inputs=None):
         inputs = shared_inputs if shared_inputs is not None else SharedBoardInputs()
         def payload():
-            from importlib import import_module
+            from algorithm.vision2d.instance_geometry import share_instances
             boundary = prepared.get("silver_boundary")
             if boundary is None:
                 raise RuntimeError("2D boundary preparation must finish before CPU process dispatch")
-            arrays, records = import_module("algorithm.2D.instance_geometry").share_instances(
+            arrays, records = share_instances(
                 prepared["joint_entry"]["instances"], inputs,
                 cache_prefix=("instance_mask", metadata["piece_id"]))
             return dict(arrays=arrays, instances=records,

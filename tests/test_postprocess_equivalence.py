@@ -10,9 +10,9 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
-silver = importlib.import_module("algorithm.2D.silver_inspection")
-geometry = importlib.import_module("algorithm.2D.defect_geometry")
-from algorithm.detect_board import DetectBoard, _mask_geometry
+silver = importlib.import_module("algorithm.vision2d.silver_inspection")
+geometry = importlib.import_module("algorithm.vision2d.defect_geometry")
+from algorithm.application.board.detect_board import DetectBoard, _mask_geometry
 
 
 def reference_geometry(mask, offset, epsilon):

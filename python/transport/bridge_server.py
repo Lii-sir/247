@@ -13,8 +13,8 @@ if str(PYTHON_ROOT) not in sys.path:
     # 允许直接以脚本方式运行 python/transport/bridge_server.py 时仍能导入 python 根包
     sys.path.insert(0, str(PYTHON_ROOT))
 
-from algorithm.timing import timing_context, timed_call, record_duration
-from algorithm.config import load_runtime_config
+from algorithm.runtime.timing import timing_context, timed_call, record_duration
+from algorithm.runtime.config import load_runtime_config
 
 
 def configure_native_threads():
@@ -351,9 +351,9 @@ class AlgorithmServer:
 
     def _configure_cpu_processes(self, settings):
         """Initialize once per detector load, never lazily during a measured request."""
-        from algorithm.registration_process import RegistrationProcesses
-        from algorithm.cpu_2d_process import Cpu2DProcesses
-        from algorithm.joint_process import JointMeasurementProcesses
+        from algorithm.execution.processes.registration_process import RegistrationProcesses
+        from algorithm.execution.processes.cpu_2d_process import Cpu2DProcesses
+        from algorithm.execution.processes.joint_process import JointMeasurementProcesses
         self._stop_cpu_processes()
         self.board.registration_process = None
         self.threading_info["registration_execution"] = {"ready": False, "backend": "process"}
@@ -373,7 +373,7 @@ class AlgorithmServer:
             self.threading_info["main_reserved_cores"] = []
             self.threading_info["main_reserved_cpu_ids"] = []
             if reserved_count:
-                from algorithm.cpu_partition import current_cpus, physical_cores, choose_partition
+                from algorithm.execution.cpu_partition import current_cpus, physical_cores, choose_partition
                 reservation = choose_partition(physical_cores(), current_cpus(), reserved_count)
                 reserved_main = reservation["registration_cpus"]
                 self.threading_info["main_reserved_cores"] = reservation["registration_cores"]
@@ -391,7 +391,7 @@ class AlgorithmServer:
                 setattr(self.board, role+"_process", service)
                 self.threading_info[role+"_execution"] = dict(ready=True, **service.info)
             if os.name == "nt":
-                from algorithm.cpu_partition import current_cpus
+                from algorithm.execution.cpu_partition import current_cpus
                 self.threading_info["main_cpu_ids"] = current_cpus()
                 if not set(reserved_main).issubset(self.threading_info["main_cpu_ids"]):
                     raise RuntimeError("CPU pools consumed reserved main-process cores")
@@ -489,7 +489,7 @@ class AlgorithmServer:
 
     def get_two_d(self):
         if self.two_d is None:
-            from algorithm.detect_2D import Detect2D
+            from algorithm.application.standalone.detect_2D import Detect2D
 
             self.two_d = Detect2D(self.log)
 
@@ -497,7 +497,7 @@ class AlgorithmServer:
 
     def get_board(self):
         if self.board is None:
-            from algorithm.detect_board import DetectBoard
+            from algorithm.application.board.detect_board import DetectBoard
 
             self.board = DetectBoard(self.log)
 
@@ -505,7 +505,7 @@ class AlgorithmServer:
 
     def get_three_d(self):
         if self.three_d is None:
-            from algorithm.detect_3D import Detect3D
+            from algorithm.application.standalone.detect_3D import Detect3D
 
             self.three_d = Detect3D()
 
@@ -530,7 +530,7 @@ class AlgorithmServer:
 
     def get_pipeline(self):
         if self.pipeline is None:
-            from algorithm.board_pipeline import BoardPipeline
+            from algorithm.application.board.board_pipeline import BoardPipeline
             self.pipeline = BoardPipeline(
                 self.get_board(), self.cpu_pool, self.gpu_pool,
                 postprocess_pool=self.postprocess_pool,
@@ -547,6 +547,8 @@ class AlgorithmServer:
         board_id = req.get("board_id")
         if cmd == "detect_2d_piece" or (cmd == "detect" and stage == "2d" and board_id):
             return self.get_pipeline().submit_2d(req)
+        if cmd == "detect_3d_piece":
+            return self.get_pipeline().submit_3d_piece(req)
         if cmd == "detect_3d_board" or (cmd == "detect" and stage == "3d" and board_id):
             return self.get_pipeline().submit_3d(req)
         if cmd == "release_board":

@@ -8,8 +8,8 @@ import numpy as np
 
 ROOT=Path(__file__).resolve().parents[2]
 sys.path[:0]=[str(ROOT/'python'),str(Path(__file__).resolve().parent)]
-from algorithm.tilt_correction import correct_smartray_pitch, _depth_lookup
-from algorithm.depth_preprocessing import DepthPreprocessor
+from algorithm.vision3d.depth.tilt_correction import correct_smartray_pitch, _depth_lookup
+from algorithm.vision3d.depth.depth_preprocessing import DepthPreprocessor
 from fixtures.pitch_reference import correct_smartray_pitch as reference
 
 

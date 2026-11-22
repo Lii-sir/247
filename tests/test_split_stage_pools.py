@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
 sys.path.insert(0, str(ROOT / "tests"))
-from algorithm.board_pipeline import BoardPipeline
+from algorithm.application.board.board_pipeline import BoardPipeline
 from transport.bridge_server import AlgorithmServer
 from pipeline_fakes import FakeDetector
 import test_early_joint_pipeline as early
@@ -104,7 +104,7 @@ class SplitPoolSettingsTests(unittest.TestCase):
         self.assertEqual(settings["joint_workers"], 4)
 
     def test_checked_in_config_enables_split_pools(self):
-        from algorithm.config import load_runtime_config
+        from algorithm.runtime.config import load_runtime_config
         manifest = ROOT / 'config' / 'config.json'
         current = load_runtime_config(manifest.read_text(encoding="utf-8-sig"), str(manifest))
         settings = self.server._thread_settings(current)

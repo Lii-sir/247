@@ -5,7 +5,6 @@ import gc
 import io
 import time
 from contextlib import redirect_stdout
-from importlib import import_module
 from pathlib import Path
 from typing import Any, Dict
 
@@ -13,21 +12,16 @@ import cv2
 import numpy as np
 import torch
 
-from algorithm.config import (
+from algorithm.runtime.config import (
     DEFAULT_ALGORITHM_PARAMETERS,
     feature_parameters,
     load_runtime_config,
     parse_config_text,
 )
+from algorithm.application.defect_checks import detection_order, evaluate_in_order, silver_check, wire_bending_result
+from algorithm.vision2d import chip_alignment, chip_anomaly, circle_roi, silver_inspection, wire_roi_presence
+from algorithm.vision2d import defect_geometry as geometry
 from transport.shared_memory import read_shared_memory
-
-circle_roi = import_module("algorithm.2D.circle_roi")
-geometry = import_module("algorithm.2D.defect_geometry")
-silver_inspection = import_module("algorithm.2D.silver_inspection")
-chip_alignment = import_module("algorithm.2D.chip_alignment")
-chip_anomaly = import_module("algorithm.2D.chip_anomaly")
-wire_roi_presence = import_module("algorithm.2D.wire_roi_presence")
-
 
 class Detect2D:
     def __init__(self, log):
@@ -44,6 +38,7 @@ class Detect2D:
         self.chip_alignment_config: Dict[str, Any] = {}
         self.chip_anomaly_config: Dict[str, Any] = {"configured": False}
         self.chip_anomaly_inspector = None
+        self.defect_order = ()
         # Per-request diagnostic artifacts are kept outside the JSON protocol.
         # The visualization tool can consume them without forcing numpy/torch
         # objects through the bridge response.
@@ -97,6 +92,7 @@ class Detect2D:
             raise ValueError("2D config must be an object")
         self.config = config
         common = feature_parameters(config, "common_2d")
+        self.defect_order = detection_order(common.get("defect_priority", []))
         crop = common.get("crop") or {}
         if not isinstance(crop, dict):
             raise ValueError("crop must be an object")
@@ -249,86 +245,94 @@ class Detect2D:
             inference_ms = self.elapsed_ms(stage_start)
             stage_start = time.perf_counter()
             results = self._convert_predictions(predictions, roi, roi_box, roi_boxes)
-            wire_measurements = self._measure_2d_wire_regions(results, roi_boxes, roi_box) if self.wire_enabled else []
-            wire_roi_checks = (wire_roi_presence.check_wire_roi_presence(
-                results, roi_boxes, roi_box[:2]
-            ) if self.wire_enabled else [])
-            chip_diagnostics = chip_alignment.measure_chip_alignment(
-                results, self.chip_alignment_config, roi_box[:2]
-            )
-            if self.chip_anomaly_inspector is None:
-                raise RuntimeError("chip anomaly inspector is not initialized")
-            chip_anomaly_diagnostics = self.chip_anomaly_inspector.inspect(
-                image, results, roi_box, include_visualization=True,
-                threshold=req.get("threshold")
-            )
-            diagnostics = silver_inspection.inspect_masks(
-                results,
-                roi.shape[:2],
-                self.silver_config,
-                crop_box=roi_box,
-                circle=circle,
-                image=image,
-                base_dir=Path(self.config_path).parent if self.config_path else None,
-            )
-            diagnostics = silver_inspection.offset_geometry(diagnostics, roi_box[:2])
-            continuity_diagnostics = diagnostics["disconnection"]
-            overflow_diagnostics = diagnostics["silver_overflow"]
-            wire_bending_diagnostics = {
-                "enabled": self.wire_enabled,
-                "is_ok": (bool(wire_roi_checks) and all(item["is_ok"] for item in wire_roi_checks))
-                         if self.wire_enabled else None,
-                "roi_checks": wire_roi_checks,
-                "measurements": wire_measurements,
-            }
-            continuity_diagnostics = {"enabled": self.silver_continuity_enabled,
-                                      **continuity_diagnostics}
-            overflow_diagnostics = {"enabled": self.silver_overflow_enabled,
-                                    **overflow_diagnostics}
+            diagnostics, first_ng = self._diagnose(
+                results, roi.shape[:2], roi_box, circle, roi_boxes, image, req.get("threshold"))
             postprocess_ms = self.elapsed_ms(stage_start)
             rectangles = [{"points": item["rectangle"],
                            "mask_ratio": item["rectangle_ratio"],
                            "is_ok": item["is_ok"]}
                           for item in results if item["rectangle"] is not None]
             public_instances = [self._public_instance(item, roi_box[:2]) for item in results]
-            checks = [bool(item["is_ok"]) for item in results]
-            checks.extend(bool(item["is_ok"]) for item in wire_roi_checks)
-            if chip_diagnostics.get("enabled") and chip_diagnostics.get("is_ok") is not True:
-                checks.append(False)
-            if (chip_anomaly_diagnostics.get("enabled")
-                    and chip_anomaly_diagnostics.get("is_ok") is not True):
-                checks.append(False)
-            for result in (diagnostics.get("silver_overflow"), diagnostics.get("disconnection")):
-                if (diagnostics.get("enabled") and result
-                        and result.get("status") != "disabled"
-                        and result.get("is_ok") is not True):
-                    checks.append(False)
             total_ms = self.elapsed_ms(start)
             self._last_visualization = {
                 "image": image,
                 "roi": roi.copy(),
                 "roi_box": tuple(int(v) for v in roi_box),
                 "predictions": predictions,
-                "chip_anomaly": chip_anomaly_diagnostics.pop("_visualizations", []),
+                "chip_anomaly": diagnostics["chip_anomaly_2d"].pop("_visualizations", []),
             }
+            if self.defect_order and first_ng is not None:
+                diagnostics["first_ng_check"] = first_ng
             return {"ok": True, "cmd": "detect", "stage": "2d", "elapsed_ms": self.elapsed_ms(start),
-                    "results_2d": {"is_ok": bool(checks) and all(checks),
+                    "results_2d": {"is_ok": bool(results) and first_ng is None
+                                            and all(item["is_ok"] for item in results),
                                    "circle": {"x": circle[0], "y": circle[1], "radius": circle[2]},
                                    "crop_box": list(roi_box),
                                    "wire_rois_2d": [list(item) for item in roi_boxes],
                                    "rectangles": rectangles,
                                    "instances": public_instances,
-                                   "wire_bending_2d": wire_bending_diagnostics,
-                                   "silver_continuity_2d": continuity_diagnostics,
-                                   "silver_overflow_2d": overflow_diagnostics,
-                                   "chip_rotation_2d": chip_diagnostics,
-                                   "chip_anomaly_2d": chip_anomaly_diagnostics},
+                                   **diagnostics},
                     "timings": {"decode_ms": decode_ms, "circle_crop_ms": circle_crop_ms,
                                 "inference_ms": inference_ms, "mask_postprocess_ms": postprocess_ms,
                                 "total_detect_ms": total_ms},
                     "message": "2D segmentation complete"}
         except Exception as exc:
             return {"ok": False, "cmd": "detect", "stage": "2d", "error": f"2D inference failed: {exc}"}
+
+    def _diagnose(self, instances, shape, crop_box, circle, rois, image, threshold):
+        base_dir = Path(self.config_path).parent if self.config_path else None
+
+        def wires():
+            measurements = self._measure_2d_wire_regions(instances, rois, crop_box)
+            roi_checks = wire_roi_presence.check_wire_roi_presence(instances, rois, crop_box[:2])
+            return measurements, roi_checks
+
+        def rotation():
+            return chip_alignment.measure_chip_alignment(instances, self.chip_alignment_config, crop_box[:2])
+
+        def anomaly():
+            if self.chip_anomaly_inspector is None:
+                raise RuntimeError("chip anomaly inspector is not initialized")
+            return self.chip_anomaly_inspector.inspect(image, instances, crop_box,
+                include_visualization=True, threshold=threshold)
+
+        def silver(name, config):
+            return silver_check(name, config, instances, shape, crop_box=crop_box,
+                                circle=circle, image=image, base_dir=base_dir)
+
+        if self.defect_order:
+            checks = {
+                "wire_bending_2d": (lambda: wire_bending_result(*wires())) if self.wire_enabled else None,
+                "chip_rotation_2d": rotation if self.chip_alignment_config is not None else None,
+                "chip_anomaly_2d": anomaly if self.chip_anomaly_config.get("configured") else None,
+                "silver_overflow_2d": (lambda: silver("silver_overflow_2d", self.silver_config["overflow"]))
+                                      if self.silver_overflow_enabled else None,
+                "silver_continuity_2d": (lambda: silver("silver_continuity_2d", self.silver_config["continuity"]))
+                                        if self.silver_continuity_enabled else None,
+            }
+            return evaluate_in_order(self.defect_order, checks)
+
+        if self.wire_enabled:
+            measurements, roi_checks = wires()
+            wire = {"enabled": True, "is_ok": bool(roi_checks) and all(item["is_ok"] for item in roi_checks),
+                    "measurements": measurements, "roi_checks": roi_checks}
+        else:
+            wire = {"enabled": False, "is_ok": None, "measurements": [], "roi_checks": []}
+        chip, appearance = rotation(), anomaly()
+        silver_results = silver_inspection.inspect_masks(instances, shape, self.silver_config,
+            crop_box=crop_box, circle=circle, image=image, base_dir=base_dir)
+        silver_results = silver_inspection.offset_geometry(silver_results, crop_box[:2])
+        results = {
+            "wire_bending_2d": wire,
+            "chip_rotation_2d": chip,
+            "chip_anomaly_2d": appearance,
+            "silver_overflow_2d": {"enabled": self.silver_overflow_enabled, **silver_results["silver_overflow"]},
+            "silver_continuity_2d": {"enabled": self.silver_continuity_enabled, **silver_results["disconnection"]},
+        }
+        first_ng = next(
+            (name for name, result in results.items() if result.get("enabled")
+             and result.get("status") != "disabled" and result.get("is_ok") is not True), None)
+        return results, first_ng
 
     def _convert_predictions(self, predictions: Any, roi: np.ndarray, box, roi_boxes):
         output = []

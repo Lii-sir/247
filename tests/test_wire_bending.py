@@ -12,10 +12,10 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
-geometry = importlib.import_module("algorithm.2D.defect_geometry")
-presence = importlib.import_module("algorithm.2D.wire_roi_presence")
-from algorithm.detect_board import DetectBoard
-from algorithm.detect_2D import Detect2D
+geometry = importlib.import_module("algorithm.vision2d.defect_geometry")
+presence = importlib.import_module("algorithm.vision2d.wire_roi_presence")
+from algorithm.application.board.detect_board import DetectBoard
+from algorithm.application.standalone.detect_2D import Detect2D
 
 
 class WireBendingTests(unittest.TestCase):
@@ -198,7 +198,7 @@ class WireBendingTests(unittest.TestCase):
         self.assertEqual(instances[1]["bending_2d"]["status"], "empty_mask")
 
     def test_joint_height_reuses_bending_without_computing_2d_diagnostics(self):
-        from algorithm import detect_board as module
+        from algorithm.application.board import detect_board as module
         detector = DetectBoard(lambda _: None)
         detector.min_component_area = 5
         mask = self.straight()

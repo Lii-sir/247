@@ -9,17 +9,17 @@ import unittest
 import numpy as np
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT/'python'));sys.path.insert(0,str(Path(__file__).resolve().parent))
-from algorithm.tilt_correction import correct_smartray_pitch, correct_smartray_depth
-from algorithm.instance_tasks import InstanceTasks
-from algorithm.detect_board import DetectBoard
-from algorithm.detect_3D import Detect3D
-from algorithm.config import load_runtime_config
+from algorithm.vision3d.depth.tilt_correction import correct_smartray_pitch, correct_smartray_depth
+from algorithm.execution.instance_tasks import InstanceTasks
+from algorithm.application.board.detect_board import DetectBoard
+from algorithm.application.standalone.detect_3D import Detect3D
+from algorithm.runtime.config import load_runtime_config
 from fixtures.pitch_reference import correct_smartray_pitch as reference
 
 
 class PitchParallelTests(unittest.TestCase):
     def test_projection_subtimings_are_merged_and_keep_pixels_unchanged(self):
-        from algorithm.timing import timing_context, timed_call
+        from algorithm.runtime.timing import timing_context, timed_call
         depth=np.random.default_rng(51).integers(32000,34000,(33,17),dtype=np.uint16)
         for workers in (1,3):
             settings=self.settings(projection_workers=workers)
@@ -45,7 +45,7 @@ class PitchParallelTests(unittest.TestCase):
             self.assertIn('pitch_output_merge_ms',timings)
 
     def test_timing_does_not_break_empty_depth_and_disabled_has_no_projection(self):
-        from algorithm.timing import timing_context
+        from algorithm.runtime.timing import timing_context
         for shape in ((0,3),(3,0)):
             depth=np.zeros(shape,np.uint16)
             with timing_context({},phase='depth'):
@@ -139,7 +139,7 @@ class PitchParallelTests(unittest.TestCase):
         standalone.release()
         self.assertTrue(standalone.handle_init(dict(config_text=json.dumps(config)))['ok'])
         depth=np.full((25,30),33000,np.uint16)
-        from algorithm.depth_preprocessing import preprocessing_parameters, prepare_depth_for_detection
+        from algorithm.vision3d.depth.depth_preprocessing import preprocessing_parameters, prepare_depth_for_detection
         settings=preprocessing_parameters(config)
         actual=prepare_depth_for_detection(depth,settings)[0]
         expected=reference(None,depth,{**settings,'input_state':'uncorrected'})[1]

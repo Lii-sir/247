@@ -15,11 +15,11 @@ import cv2
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python"))
-from algorithm.detect_board import DetectBoard
-from algorithm.instance_tasks import InstanceTasks
-from algorithm.timing import record_duration, timing_context, timed_call
-from algorithm.config import load_runtime_config
-from algorithm import detect_board as board
+from algorithm.application.board.detect_board import DetectBoard
+from algorithm.execution.instance_tasks import InstanceTasks
+from algorithm.runtime.timing import record_duration, timing_context, timed_call
+from algorithm.runtime.config import load_runtime_config
+from algorithm.application.board import detect_board as board
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fixtures.wire_reference import LegacyWireReference
 
@@ -129,7 +129,7 @@ class InstanceParallelTests(unittest.TestCase):
         name = threading.current_thread().name
         self.assertEqual(self.detector._instance_tasks.map(lambda _: threading.current_thread().name,[1,2]),[name,name])
         self.detector._instance_tasks.configure(2)
-        with patch('algorithm.detect_board.torch.cuda.is_available', return_value=False):
+        with patch('algorithm.application.board.detect_board.torch.cuda.is_available', return_value=False):
             self.detector.release()
         self.assertIsNone(self.detector._instance_tasks._pool)
         self.detector._load_config(json.dumps(config))

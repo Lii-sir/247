@@ -78,7 +78,7 @@ class ReportTests(unittest.TestCase):
 
     def test_pitch_preview_uses_corrected_grid(self):
         sys.path.insert(0, str(ROOT.parent / "python"))
-        from algorithm.tilt_correction import correct_smartray_pitch
+        from algorithm.vision3d.depth.tilt_correction import correct_smartray_pitch
         depth = np.zeros((80,100),np.uint16);depth[20:60,10:90]=32958
         Image.fromarray(depth).save(self.depth)
         settings = dict(model='smartray_pitch',enabled_3d=True,input_state='uncorrected',

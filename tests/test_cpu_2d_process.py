@@ -15,13 +15,13 @@ sys.path.insert(0, str(ROOT / "python"))
 sys.path.insert(0, str(ROOT / "tests"))
 import cv2
 import numpy as np
-from algorithm.cpu_2d_process import Cpu2DProcesses
-from algorithm.cpu_2d_worker import compute
-from algorithm.timing import timing_context
-from algorithm.board_pipeline import BoardPipeline
+from algorithm.execution.processes.cpu_2d_process import Cpu2DProcesses
+from algorithm.execution.workers.cpu_2d_worker import compute
+from algorithm.runtime.timing import timing_context
+from algorithm.application.board.board_pipeline import BoardPipeline
 from pipeline_fakes import FakeDetector
 from transport.bridge_server import AlgorithmServer
-silver = import_module("algorithm.2D.silver_inspection")
+silver = import_module("algorithm.vision2d.silver_inspection")
 
 
 def fixture():
@@ -67,7 +67,7 @@ class Cpu2DProcessTests(unittest.TestCase):
         self.addCleanup(self.pool.shutdown, wait=True)
 
     def test_silver_and_geometry_match_direct_functions_and_preserve_masks(self):
-        from algorithm.detect_board import DetectBoard
+        from algorithm.application.board.detect_board import DetectBoard
         prepared, settings = fixture()
         instances = prepared["joint_entry"]["instances"]
         before = [item["mask"].copy() for item in instances]
@@ -134,7 +134,7 @@ class Cpu2DProcessTests(unittest.TestCase):
         self.assertEqual(expected["public_instances"], actual["public_instances"])
 
     def test_parent_finalize_reuses_worker_output_and_matches_full_direct_response(self):
-        from algorithm.detect_board import DetectBoard
+        from algorithm.application.board.detect_board import DetectBoard
         detector = DetectBoard(lambda _: None)
         self.addCleanup(detector.release)
         prepared, settings = fixture()
@@ -157,7 +157,7 @@ class Cpu2DProcessTests(unittest.TestCase):
         self.assertEqual(result["diagnostics"]["silver_overflow"], entry["silver_overflow_2d"])
 
     def test_real_pipeline_handoff_returns_2d_worker_and_late_diagnostics(self):
-        from algorithm.detect_board import DetectBoard
+        from algorithm.application.board.detect_board import DetectBoard
         original, settings = fixture()
         service = self.service
         class Detector(FakeDetector):
@@ -235,10 +235,10 @@ class CpuPoolPartitionTests(unittest.TestCase):
                     common_2d=dict(parameters=dict(threading=dict(cpu_process_workers=2,
                     cpu_process_affinity=dict(enabled=cpu_enabled, physical_cores=2))))))
                 try:
-                    with patch("algorithm.registration_process.RegistrationProcesses", side_effect=factory("registration")), \
-                            patch("algorithm.cpu_2d_process.Cpu2DProcesses", side_effect=factory("cpu_2d")), \
-                            patch("algorithm.joint_process.JointMeasurementProcesses", side_effect=factory("joint_measurement")), \
-                            patch("algorithm.cpu_partition.current_cpus", side_effect=lambda: list(available)):
+                    with patch("algorithm.execution.processes.registration_process.RegistrationProcesses", side_effect=factory("registration")), \
+                            patch("algorithm.execution.processes.cpu_2d_process.Cpu2DProcesses", side_effect=factory("cpu_2d")), \
+                            patch("algorithm.execution.processes.joint_process.JointMeasurementProcesses", side_effect=factory("joint_measurement")), \
+                            patch("algorithm.execution.cpu_partition.current_cpus", side_effect=lambda: list(available)):
                         server._configure_cpu_processes(settings)
                     reg = server.threading_info["registration_execution"]["workers"][0]["cpu_ids"]
                     cpu = server.threading_info["cpu_2d_execution"]["workers"][0]["cpu_ids"]
@@ -264,8 +264,8 @@ class CpuPoolPartitionTests(unittest.TestCase):
         server.board = FakeDetector()
         service = Mock()
         service.info = dict(backend="process")
-        with patch("algorithm.registration_process.RegistrationProcesses", return_value=service), \
-                patch("algorithm.cpu_2d_process.Cpu2DProcesses", side_effect=RuntimeError("2D startup failed")):
+        with patch("algorithm.execution.processes.registration_process.RegistrationProcesses", return_value=service), \
+                patch("algorithm.execution.processes.cpu_2d_process.Cpu2DProcesses", side_effect=RuntimeError("2D startup failed")):
             with self.assertRaisesRegex(RuntimeError, "2D startup failed"):
                 server._configure_cpu_processes(server._thread_settings({}))
         service.close.assert_called_once()

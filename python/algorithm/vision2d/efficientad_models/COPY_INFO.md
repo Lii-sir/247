@@ -14,5 +14,5 @@ Copied source files:
 `torch_model.py` replaces anomalib's result container with a small local
 `NamedTuple`.  No anomalib or Lightning installation is required to run the
 Bridge inference path.  The checkpoint scoring, calibration and image
-preprocessing logic lives in `algorithm/2D/chip_anomaly.py`.
+preprocessing logic lives in `algorithm/vision2d/chip_anomaly.py`.
 

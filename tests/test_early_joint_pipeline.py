@@ -4,11 +4,13 @@ from pathlib import Path
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
 sys.path.insert(0, str(ROOT / "tests"))
-from algorithm.board_pipeline import BoardPipeline
+from algorithm.application.board.board_pipeline import BoardPipeline
 from pipeline_fakes import FakeDetector
 
 
@@ -182,7 +184,7 @@ class EarlyJointTests(unittest.TestCase):
 
 class DiagnosticJoinTests(unittest.TestCase):
     def test_real_join_applies_late_ng_and_preserves_height_coordinates(self):
-        from algorithm.detect_board import DetectBoard
+        from algorithm.application.board.detect_board import DetectBoard
         piece = {"is_ok": True, "wire_measurements": [{"height_3d": {
             "point": {"x": 5, "y": 1010}, "point_coordinate_space": "board_3d"}}]}
         silver = {"status": "overflow", "is_ok": False}
@@ -195,10 +197,138 @@ class DiagnosticJoinTests(unittest.TestCase):
             {"is_ok": False}, {"silver_overflow_2d": {"status": "ok", "is_ok": True}})["is_ok"])
 
     def test_disabled_diagnostics_do_not_fail_joint_result(self):
-        from algorithm.detect_board import DetectBoard
+        from algorithm.application.board.detect_board import DetectBoard
         result = DetectBoard.finalize_joint_piece({"is_ok": True}, {
             "silver_overflow_2d": {"status": "disabled", "is_ok": None}})
         self.assertTrue(result["is_ok"])
+
+
+class DetectionPolicyTests(unittest.TestCase):
+    def setUp(self):
+        import numpy as np
+        import torch
+        from algorithm.application.board import detect_board
+        from algorithm.application.defect_checks import detection_order
+
+        self.module = detect_board
+        self.detector = detector = detect_board.DetectBoard(lambda _: None)
+        self.order = detection_order(["chip_rotation_2d", "silver_overflow_2d"])
+        image = np.zeros((16, 16, 3), np.uint8)
+        detector.expected_piece_count = 1
+        detector.segmentation_config = detect_board.SegmentationConfig(
+            expected_piece_count=1, mode="fixed", fixed_rois=((0, 0, 16, 16),))
+        detector.model = object()
+        detector.chip_anomaly_inspector = Mock()
+        detector._read_2d = Mock(return_value=image)
+        detector._read_3d = Mock(return_value=np.full((16, 16), 33000, np.uint16))
+        detector._stream_crop = Mock(return_value=(image, (0, 0, 16, 16), None, []))
+        self.prediction = SimpleNamespace(
+            masks=SimpleNamespace(data=torch.ones(1, 16, 16)),
+            boxes=SimpleNamespace(cls=torch.tensor([0]), conf=torch.tensor([0.9])),
+            names={0: "chip"},
+        )
+        detector._predict_batch = Mock(return_value=[self.prediction])
+        detector.submit_registration = Mock(side_effect=AssertionError("3D registration must be skipped"))
+        detector.submit_joint_measurement = Mock(side_effect=AssertionError("3D heights must be skipped"))
+
+    def run_stream(self):
+        with ThreadPoolExecutor(2) as cpu, ThreadPoolExecutor(1) as gpu:
+            pipeline = BoardPipeline(self.detector, cpu, gpu)
+            self.addCleanup(pipeline.close)
+            board = pipeline.submit_3d({"board_id": "A"})
+            piece = pipeline.submit_2d({"board_id": "A", "piece_id": 1}).result(3)
+            self.assertTrue(piece["ok"], piece)
+            response = board.result(3)
+            self.assertTrue(response["ok"], response)
+            self.assertFalse(pipeline.has_pending)
+            return piece["results_2d"], response["results_board"]
+
+    def assert_3d_skipped(self, result, reason):
+        self.assertFalse(result["is_ok"])
+        piece, = result["pieces"]
+        self.assertEqual(piece["skip_3d_reason"], reason)
+        self.assertEqual(piece["registration"], {"is_valid": False, "status": "skipped"})
+        self.assertEqual(piece["wire_measurements"], [])
+        self.detector.submit_registration.assert_not_called()
+        self.detector.submit_joint_measurement.assert_not_called()
+        return piece
+
+    def test_stream_order_skips_unreached_checks_and_3d(self):
+        detector = self.detector
+        detector.defect_order = self.order
+        detector.chip_alignment_config = {}
+        detector.chip_anomaly_config = {"configured": True}
+        detector.silver_config = {"overflow": {}, "continuity": {}}
+        with patch.object(self.module._chip_alignment, "measure_chip_alignment",
+                          return_value={"enabled": True, "status": "ng", "is_ok": False}) as rotation, \
+             patch.object(detector, "_check_wires") as wires, \
+             patch.object(detector, "prepare_silver_boundary") as boundary, \
+             patch.object(self.module, "silver_check") as silver:
+            two_d, board = self.run_stream()
+        self.assertFalse(two_d["is_ok"])
+        self.assertEqual(two_d["first_ng_check"], "chip_rotation_2d")
+        for name in set(self.order) - {"chip_rotation_2d"}:
+            self.assertEqual(two_d[name]["status"], "skipped")
+            self.assertIsNone(two_d[name]["is_ok"])
+        rotation.assert_called_once()
+        wires.assert_not_called()
+        boundary.assert_not_called()
+        silver.assert_not_called()
+        detector.chip_anomaly_inspector.inspect.assert_not_called()
+        piece = self.assert_3d_skipped(board, "2d_ng")
+        self.assertEqual(piece["first_ng_check"], "chip_rotation_2d")
+
+    def test_no_yolo_masks_skips_3d_with_default_flow(self):
+        self.prediction.masks = None
+        self.detector.chip_anomaly_inspector.inspect.return_value = {"enabled": False}
+        self.detector.submit_2d_postprocess = Mock(side_effect=lambda pool, *args: pool.submit(lambda: None))
+        two_d, board = self.run_stream()
+        self.assertFalse(two_d["is_ok"])
+        self.assertEqual(two_d["instances"], [])
+        self.assert_3d_skipped(board, "no_2d_result")
+
+    def test_single_piece_with_empty_2d_never_opens_the_depth_buffer(self):
+        self.prediction.masks = None
+        self.detector.chip_anomaly_inspector.inspect.return_value = {"enabled": False}
+        self.detector.submit_2d_postprocess = Mock(side_effect=lambda pool, *args: pool.submit(lambda: None))
+        with ThreadPoolExecutor(2) as cpu, ThreadPoolExecutor(1) as gpu:
+            pipeline = BoardPipeline(self.detector, cpu, gpu)
+            self.addCleanup(pipeline.close)
+            response = pipeline.submit_2d(dict(board_id="A", piece_id=1)).result(3)
+            self.assertTrue(response["ok"])
+            self.assertEqual(response["results_2d"]["instances"], [])
+            result = pipeline.submit_3d_piece(dict(
+                board_id="A", piece_id=1, shm_name="unopened_depth",
+                data_size=512, image_width=16, image_height=16)).result(3)
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["results_piece"]["is_ok"])
+        self.assertEqual(result["results_piece"]["skip_3d_reason"], "no_2d_result")
+        self.detector._read_3d.assert_not_called()
+        self.detector.submit_registration.assert_not_called()
+
+    def test_priority_continues_after_pass_and_skips_later_checks(self):
+        from algorithm.application.defect_checks import detection_order, evaluate_in_order
+        rotation, silver, *later = self.order
+        checks = {name: Mock(return_value={"is_ok": True}) for name in self.order}
+        checks[silver].return_value = {"status": "uncertain", "is_ok": None}
+        results, first_ng = evaluate_in_order(self.order, checks)
+        self.assertEqual(first_ng, silver)
+        checks[rotation].assert_called_once()
+        checks[silver].assert_called_once()
+        for name in later:
+            checks[name].assert_not_called()
+            self.assertEqual(results[name]["status"], "skipped")
+        for invalid in ([rotation, rotation], ["unknown"], "wire_bending_2d"):
+            with self.assertRaises(ValueError):
+                detection_order(invalid)
+
+    def test_batch_empty_masks_skips_synchronous_registration(self):
+        self.prediction.masks = None
+        with patch.object(self.module, "register_platform_masks") as register:
+            response = self.detector.handle_detect({"images_2d": [{"piece_id": 1}], "image_3d": {}})
+        self.assertTrue(response["ok"], response)
+        self.assert_3d_skipped(response["results_board"], "no_2d_result")
+        register.assert_not_called()
 
 
 if __name__ == "__main__":

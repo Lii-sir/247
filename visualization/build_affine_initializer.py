@@ -13,7 +13,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
-from algorithm.registration import (_affine_parameters_from_matrix, _affine_regions,
+from algorithm.vision3d.alignment.registration import (_affine_parameters_from_matrix, _affine_regions,
     _calibration_seed, _full_affine)
 
 

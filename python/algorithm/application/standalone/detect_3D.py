@@ -1,21 +1,13 @@
 import gc
 import time
-from importlib import import_module
 from typing import Any, Dict
 
-from algorithm.config import feature_parameters, load_runtime_config
+from algorithm.runtime.config import feature_parameters, load_runtime_config
+from algorithm.vision3d.depth.segment import PieceCountMismatchError, SegmentationConfig, segment_depth_image
+from algorithm.vision3d.measurement.wire_height import configure as configure_measurement
+from algorithm.vision3d.measurement.wire_height import measure as measure_depth
 from transport.shared_memory import read_shared_memory
 from transport.depth_input import validate_depth_input, depth_from_uint16, input_depth_correction, depth_coordinate_space
-
-
-# 具体算法存放在 3D 目录；数字目录名不能用于常规 from ... import 语法。
-_segment = import_module("algorithm.3D.segment")
-_wire_height = import_module("algorithm.3D.wire_height")
-PieceCountMismatchError = _segment.PieceCountMismatchError
-SegmentationConfig = _segment.SegmentationConfig
-segment_depth_image = _segment.segment_depth_image
-measure_depth = _wire_height.measure
-configure_measurement = _wire_height.configure
 
 
 class Detect3D:

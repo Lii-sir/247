@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 
-from algorithm import registration_worker
+from algorithm.execution.workers import registration_worker
 
 _spawn_lock = threading.Lock()
 
@@ -157,7 +157,7 @@ class RegistrationProcesses:
         started = time.perf_counter()
         partition = None
         if affinity.get("enabled", False):
-            from algorithm.cpu_partition import current_cpus, physical_cores, choose_partition
+            from algorithm.execution.cpu_partition import current_cpus, physical_cores, choose_partition
             partition = choose_partition(physical_cores(), current_cpus(), affinity["physical_cores"],
                                          reserved_cpus=affinity.get("reserved_main_cpus", ()))
             if workers > len(partition["registration_cores"]):
@@ -215,7 +215,7 @@ class RegistrationProcesses:
                     else:
                         os.environ["__PYVENV_LAUNCHER__"] = original_launcher
             if partition:
-                from algorithm.cpu_partition import set_cpus
+                from algorithm.execution.cpu_partition import set_cpus
                 self._restore_cpus = partition["original_cpus"]
                 set_cpus(partition["main_cpus"])
             self.info = dict(backend="process", role=role, process_workers=workers, workers=metadata,
@@ -363,7 +363,7 @@ class RegistrationProcesses:
         finally:
             try:
                 if self._restore_cpus is not None:
-                    from algorithm.cpu_partition import set_cpus
+                    from algorithm.execution.cpu_partition import set_cpus
                     set_cpus(self._restore_cpus)
                     self._restore_cpus = None
             finally:

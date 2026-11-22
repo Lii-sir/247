@@ -11,14 +11,14 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'python'))
 sys.path.insert(0, str(ROOT / 'tests'))
-from algorithm.registration_process import SharedBoardInputs, JointSharedInputs
-from algorithm.cpu_2d_process import Cpu2DProcesses
-from algorithm.joint_process import JointMeasurementProcesses
-from algorithm.board_pipeline import BoardPipeline
+from algorithm.execution.processes.registration_process import SharedBoardInputs, JointSharedInputs
+from algorithm.execution.processes.cpu_2d_process import Cpu2DProcesses
+from algorithm.execution.processes.joint_process import JointMeasurementProcesses
+from algorithm.application.board.board_pipeline import BoardPipeline
 from pipeline_fakes import FakeDetector
 from test_joint_process import fixture
 
-share_instances = import_module('algorithm.2D.instance_geometry').share_instances
+share_instances = import_module('algorithm.vision2d.instance_geometry').share_instances
 
 
 class SharedInstanceInputsTests(unittest.TestCase):

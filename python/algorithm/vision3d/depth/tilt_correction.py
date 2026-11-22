@@ -6,8 +6,8 @@ import math
 import time
 from functools import lru_cache
 import numpy as np
-from algorithm.instance_tasks import InstanceTasks
-from algorithm.timing import record_duration, timed_call, note, current_timings
+from algorithm.execution.instance_tasks import InstanceTasks
+from algorithm.runtime.timing import record_duration, timed_call, note, current_timings
 from transport.depth_input import depth_coordinate_space
 
 MODEL = 'smartray_pitch'
@@ -56,7 +56,7 @@ def _unchanged_depth(depth, out, image):
 
 def production_pitch_parameters(config, gray_offset=32768., z_step_mm=.00105):
     """Optional production block; formal 2D inputs are independent photographs."""
-    from algorithm.config import feature_parameters
+    from algorithm.runtime.config import feature_parameters
     values = feature_parameters(config, 'smartray_pitch_3d', required=False) or {}
     if values.get('enabled_2d') or values.get('image_role', 'independent_camera') != 'independent_camera':
         raise ValueError('正式检测接收独立2D照片；smartray_pitch_3d仅支持3D补偿')

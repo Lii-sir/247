@@ -13,10 +13,10 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
 sys.path.insert(0, str(ROOT / "tests"))
-from algorithm.detect_board import DetectBoard, _mask_geometry
+from algorithm.application.board.detect_board import DetectBoard, _mask_geometry
 from reference_silver_continuity import measure_continuity as reference_continuity
-silver = importlib.import_module("algorithm.2D.silver_inspection")
-anomaly = importlib.import_module("algorithm.2D.chip_anomaly")
+silver = importlib.import_module("algorithm.vision2d.silver_inspection")
+anomaly = importlib.import_module("algorithm.vision2d.chip_anomaly")
 
 
 class Local2DTests(unittest.TestCase):
@@ -66,7 +66,7 @@ class Local2DTests(unittest.TestCase):
         image = np.random.default_rng(3).integers(0, 256, (300, 500, 3), np.uint8)
         prepared = dict(image=image, gray_lock=threading.Lock())
         converter = cv2.cvtColor
-        with patch("algorithm.detect_board.cv2.cvtColor", wraps=converter) as convert:
+        with patch("algorithm.application.board.detect_board.cv2.cvtColor", wraps=converter) as convert:
             with ThreadPoolExecutor(max_workers=8) as pool:
                 grays = list(pool.map(lambda _: DetectBoard._prepared_gray_image(prepared), range(20)))
         self.assertEqual(convert.call_count, 1)

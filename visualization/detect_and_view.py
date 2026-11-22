@@ -232,7 +232,7 @@ def mapped_file(stack: ExitStack, path: Path, kind: str, piece_id: int | None = 
         if pitch_preprocessor is not None:
             raw, correction = pitch_preprocessor.encode(depth)
         elif pitch_settings is not None:
-            from algorithm.depth_preprocessing import prepare_depth_for_detection
+            from algorithm.vision3d.depth.depth_preprocessing import prepare_depth_for_detection
             depth, correction = prepare_depth_for_detection(depth, pitch_settings)
             raw = depth.astype("<u2", copy=False).tobytes(order="C")
         else:
@@ -449,7 +449,7 @@ def main() -> int:
         init_req = algorithm_request(args.score_mode, args.score_pool_kernel,
                                      args.silver_calibration)
         sys.path.insert(0, str(ROOT / 'python'))
-        from algorithm.depth_preprocessing import preprocessing_parameters, DepthPreprocessor
+        from algorithm.vision3d.depth.depth_preprocessing import preprocessing_parameters, DepthPreprocessor
         client_config = json.loads(init_req['config_text'])
         pitch_settings = preprocessing_parameters(client_config)
         client_config.pop('smartray_pitch_3d', None)

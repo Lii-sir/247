@@ -17,9 +17,9 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
 sys.path.insert(0, str(ROOT / "visualization"))
-silver = importlib.import_module("algorithm.2D.silver_inspection")
+silver = importlib.import_module("algorithm.vision2d.silver_inspection")
 calibrator = importlib.import_module("calibrate_silver_boundary")
-from algorithm.timing import timing_context
+from algorithm.runtime.timing import timing_context
 
 
 class SilverBoundaryTests(unittest.TestCase):

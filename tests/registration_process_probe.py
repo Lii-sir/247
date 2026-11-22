@@ -16,10 +16,9 @@ def main():
     from concurrent.futures import ThreadPoolExecutor
     import cv2
     import numpy as np
-    from algorithm.registration import RegistrationConfig
-    from algorithm.registration_process import RegistrationProcesses, SharedBoardInputs
-    from algorithm.registration_worker import register_arrays
-    from algorithm.cpu_partition import current_cpus
+    from algorithm.vision3d.alignment.registration import RegistrationConfig, register_arrays
+    from algorithm.execution.processes.registration_process import RegistrationProcesses, SharedBoardInputs
+    from algorithm.execution.cpu_partition import current_cpus
     from multiprocessing.shared_memory import SharedMemory
     cv2.setNumThreads(1)
     before = current_cpus() if os.name == "nt" else None

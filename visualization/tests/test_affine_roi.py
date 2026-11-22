@@ -9,7 +9,7 @@ import numpy as np
 
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT/'python'))
-from algorithm import registration as reg
+from algorithm.vision3d.alignment import registration as reg
 
 
 class AffineRoiTests(unittest.TestCase):

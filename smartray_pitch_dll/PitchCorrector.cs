@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Threading.Tasks;
 using System.Reflection;
 
@@ -33,6 +34,25 @@ namespace SmartRay.PitchCorrection
         }
     }
 
+    public sealed class CorrectedDepthPiece
+    {
+        public ushort[] Depth { get; private set; }
+        public int Width { get; private set; }
+        public int Height { get; private set; }
+        public int StartRow { get; private set; }
+        public Dictionary<string, object> PitchCorrection { get; private set; }
+
+        internal CorrectedDepthPiece(ushort[] depth, int width, int height, int startRow,
+            Dictionary<string, object> pitchCorrection)
+        {
+            Depth = depth;
+            Width = width;
+            Height = height;
+            StartRow = startRow;
+            PitchCorrection = pitchCorrection;
+        }
+    }
+
     /// <summary>
     /// Packed row-major uint16 depth correction. Constructor snapshots options;
     /// reuse this instance across frames. No source pixels are modified.
@@ -47,12 +67,17 @@ namespace SmartRay.PitchCorrection
         private readonly double[] shifts;
         private readonly ushort[] values;
         private readonly ParallelOptions parallelOptions;
+        private readonly Dictionary<string, object> correctionMetadata;
 
         public PitchCorrector(PitchOptions options)
         {
             if (options == null) throw new ArgumentNullException("options");
             enabled = options.Enabled;
-            if (!enabled) return;
+            if (!enabled)
+            {
+                correctionMetadata = new Dictionary<string, object> { { "applied", false }, { "reason", "disabled" } };
+                return;
+            }
             double angle = Finite(options.AngleDegrees, "AngleDegrees");
             double pitch = Finite(options.ScanPitchMm, "ScanPitchMm");
             double step = Finite(options.ZStepMm, "ZStepMm");
@@ -69,6 +94,18 @@ namespace SmartRay.PitchCorrection
             if (direction != TransformDirection.RecoverIdeal && direction != TransformDirection.DocumentForward)
                 throw new ArgumentOutOfRangeException("Direction");
             parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = workers };
+            correctionMetadata = new Dictionary<string, object>
+            {
+                { "applied", true },
+                { "model", "smartray_pitch" },
+                { "angle_deg", angle },
+                { "scan_pitch_mm", pitch },
+                { "z_step_mm", step },
+                { "gray_offset", offset },
+                { "z_origin_mm", origin },
+                { "scan_axis", axis == ScanAxis.Rows ? "rows" : "columns" },
+                { "transform_direction", direction == TransformDirection.RecoverIdeal ? "recover_ideal" : "document_forward" }
+            };
 
             double radians = angle * (Math.PI / 180.0);
             double cosine = Math.Cos(radians), sine = Math.Sin(radians), tangent = Math.Tan(radians);
@@ -109,6 +146,20 @@ namespace SmartRay.PitchCorrection
             return output;
         }
 
+        /// <summary>Correct the full-width raw rows [startRow, endRow) in piece-local coordinates.</summary>
+        public CorrectedDepthPiece CorrectPiece(ushort[] input, int width, int height, int startRow, int endRow)
+        {
+            CheckInput(input, width, height);
+            if (startRow < 0 || startRow >= height) throw new ArgumentOutOfRangeException("startRow");
+            if (endRow <= startRow || endRow > height) throw new ArgumentOutOfRangeException("endRow");
+
+            int pieceHeight = endRow - startRow;
+            var corrected = new ushort[width * pieceHeight];
+            Project(input, corrected, width, pieceHeight, false, startRow * width);
+            return new CorrectedDepthPiece(corrected, width, pieceHeight, startRow,
+                new Dictionary<string, object>(correctionMetadata));
+        }
+
         /// <summary>Output must be a distinct packed array of width*height values.</summary>
         public void CorrectInto(ushort[] input, ushort[] output, int width, int height)
         {
@@ -119,12 +170,13 @@ namespace SmartRay.PitchCorrection
             Project(input, output, width, height, true);
         }
 
-        private void Project(ushort[] input, ushort[] output, int width, int height, bool clearOutput)
+        private void Project(ushort[] input, ushort[] output, int width, int height, bool clearOutput,
+            int sourceOffset = 0)
         {
-            int length = input.Length;
+            int length = output.Length;
             if (!enabled)
             {
-                Array.Copy(input, output, length);
+                Array.Copy(input, sourceOffset, output, 0, length);
                 return;
             }
             // Each strip owns the entire scan axis: even large shifts and
@@ -150,7 +202,7 @@ namespace SmartRay.PitchCorrection
                         for (int rowBase = 0; rowBase < length; rowBase += width)
                             Array.Clear(output, rowBase + begin, end - begin);
                     }
-                    int sourceRow = 0;
+                    int sourceRow = sourceOffset;
                     for (int row = 0; row < height; ++row)
                     {
                         int sourceIndex = sourceRow + begin;
@@ -169,11 +221,11 @@ namespace SmartRay.PitchCorrection
                 }
                 else
                 {
-                    int sourceRow = begin * width;
-                    if (clearOutput) Array.Clear(output, sourceRow, (end - begin) * width);
+                    int targetRow = begin * width;
+                    if (clearOutput) Array.Clear(output, targetRow, (end - begin) * width);
                     for (int row = begin; row < end; ++row)
                     {
-                        int sourceIndex = sourceRow;
+                        int sourceIndex = sourceOffset + targetRow;
                         for (int col = 0; col < width; ++col)
                         {
                             ushort source = input[sourceIndex++];
@@ -181,10 +233,10 @@ namespace SmartRay.PitchCorrection
                             if (value == 0) continue;
                             double mapped = Math.Round(col + shifts[source], MidpointRounding.ToEven);
                             if (!(mapped >= 0 && mapped < width)) continue;
-                            int target = sourceRow + (int)mapped;
+                            int target = targetRow + (int)mapped;
                             if (value > output[target]) output[target] = value;
                         }
-                        sourceRow += width;
+                        targetRow += width;
                     }
                 }
             };

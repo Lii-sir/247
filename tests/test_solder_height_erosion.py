@@ -9,8 +9,8 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'python'))
-from algorithm import height_measurement as height
-from algorithm import detect_board as board
+from algorithm.vision3d.measurement import height_measurement as height
+from algorithm.application.board import detect_board as board
 
 
 class SolderHeightErosionTests(unittest.TestCase):

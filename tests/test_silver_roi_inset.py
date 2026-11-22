@@ -10,8 +10,8 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'python'))
-silver = importlib.import_module('algorithm.2D.silver_inspection')
-from algorithm.detect_board import DetectBoard
+silver = importlib.import_module('algorithm.vision2d.silver_inspection')
+from algorithm.application.board.detect_board import DetectBoard
 
 
 def config(**overrides):

@@ -1,6 +1,7 @@
 using System;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using SmartRay.PitchCorrection;
 
 internal static class PitchRunner
@@ -34,6 +35,7 @@ internal static class PitchRunner
             Reject(delegate { corrector.CorrectInto(array, array, 1, 1); });
             Reject(delegate { corrector.CorrectInto(array, null, 1, 1); });
             Reject(delegate { corrector.CorrectInto(array, new ushort[2], 1, 1); });
+            CheckPieceCorrection();
             Console.WriteLine("16 API rejection checks passed.");
             return 0;
         }
@@ -61,6 +63,14 @@ internal static class PitchRunner
             Require(input[i] == original[i]);
             Require(actual[i] == reused[i]);
         }
+        // Exercise a non-zero source offset on both scan axes while keeping local projection coordinates.
+        int firstRow = height > 2 ? 1 : 0;
+        int lastRow = height > 2 ? height - 1 : height;
+        var piece = correctorInstance.CorrectPiece(input, width, height, firstRow, lastRow);
+        var rawPiece = new ushort[width * (lastRow - firstRow)];
+        Array.Copy(input, firstRow * width, rawPiece, 0, rawPiece.Length);
+        Require(piece.Depth.SequenceEqual(correctorInstance.Correct(rawPiece, width, lastRow - firstRow)));
+        Require(piece.Width == width && piece.Height == lastRow - firstRow && piece.StartRow == firstRow);
         // Concurrent frame calls share only immutable tables, not output pixels.
         System.Threading.Tasks.Parallel.For(0, 3, delegate(int job)
         {
@@ -81,5 +91,34 @@ internal static class PitchRunner
         using (BinaryWriter writer = new BinaryWriter(File.Create(args[1])))
             foreach (ushort value in actual) writer.Write(value);
         return 0;
+    }
+
+    private static void CheckPieceCorrection()
+    {
+        var options = new PitchOptions { AngleDegrees = 6, ScanPitchMm = .02, Axis = ScanAxis.Columns };
+        var corrector = new PitchCorrector(options);
+        options.AngleDegrees = -20;
+        ushort[] raw = { 32768, 33010, 34000, 65535, 32810, 32825 };
+        var first = corrector.CorrectPiece(raw, 2, 3, 1, 3);
+        Require(first.Depth.SequenceEqual(corrector.Correct(new ushort[] { 34000, 65535, 32810, 32825 }, 2, 2)));
+        Require((bool)first.PitchCorrection["applied"] && (string)first.PitchCorrection["model"] == "smartray_pitch");
+        Require((double)first.PitchCorrection["angle_deg"] == 6 && (double)first.PitchCorrection["scan_pitch_mm"] == .02);
+        Require((string)first.PitchCorrection["scan_axis"] == "columns");
+        Require((string)first.PitchCorrection["transform_direction"] == "recover_ideal");
+        first.PitchCorrection["angle_deg"] = 59.0;
+        first.Depth[0] = 0;
+        var second = corrector.CorrectPiece(raw, 2, 3, 0, 1);
+        Require(second.Depth.SequenceEqual(corrector.Correct(new ushort[] { 32768, 33010 }, 2, 1)));
+        Require((double)second.PitchCorrection["angle_deg"] == 6 && raw[2] == 34000);
+
+        var disabled = new PitchCorrector(new PitchOptions { Enabled = false });
+        var bypassed = disabled.CorrectPiece(raw, 2, 3, 1, 2);
+        Require(bypassed.Depth.SequenceEqual(new ushort[] { 34000, 65535 }));
+        Require(!(bool)bypassed.PitchCorrection["applied"]);
+        Reject(delegate { corrector.CorrectPiece(raw, 2, 3, -1, 2); });
+        Reject(delegate { corrector.CorrectPiece(raw, 2, 3, 1, 1); });
+        Reject(delegate { corrector.CorrectPiece(raw, 2, 3, 1, 4); });
+        Reject(delegate { corrector.CorrectPiece(raw, 2, 4, 1, 2); });
+        Console.WriteLine("Per-piece slicing, metadata isolation, bypass and invalid ranges passed.");
     }
 }

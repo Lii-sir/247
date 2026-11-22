@@ -3,7 +3,7 @@ import math
 import sys
 import time
 import traceback
-from algorithm import registration_worker as bootstrap
+from algorithm.execution.workers import registration_worker as bootstrap
 
 _runtime = None
 warmup = bootstrap.warmup
@@ -13,16 +13,16 @@ def initialize(assignments, assignment_index, ready, warmup_gate, role="joint_me
     global _runtime
     workers = (options or {}).get("instance_workers", 1)
     bootstrap.initialize(assignments, assignment_index, ready, warmup_gate, role,
-                         extra_imports=("algorithm.joint_geometry",), extra_info=dict(instance_workers=workers))
-    from algorithm.joint_geometry import JointGeometry
+                         extra_imports=("algorithm.vision3d.measurement.joint_geometry",), extra_info=dict(instance_workers=workers))
+    from algorithm.vision3d.measurement.joint_geometry import JointGeometry
     _runtime = JointGeometry(workers)
 
 
 def run(payload):
     from multiprocessing.shared_memory import SharedMemory
     import numpy as np
-    from algorithm.height_measurement import HeightConfig
-    from algorithm.timing import timing_context, measure
+    from algorithm.vision3d.measurement.height_measurement import HeightConfig
+    from algorithm.runtime.timing import timing_context, measure
     arrays, handles, instances, timings, logs = {}, [], [], {}, []
     started = time.perf_counter()
     try:

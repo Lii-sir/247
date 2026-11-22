@@ -10,21 +10,6 @@ _startup = None
 _warmup_gate = None
 
 
-def register_arrays(gray, mask_2d, depth_piece, registration_config, affine_config, correction, *, operations=None):
-    """Shared implementation for direct lab/synchronous calls and process workers."""
-    from algorithm.registration import (RegistrationConfig, affine_coordinate_context,
-        platform_mask_3d, register_platform_masks, refine_affine_registration)
-    from algorithm.timing import timed_call
-    if operations is not None:
-        platform_mask_3d, register_platform_masks, refine_affine_registration = operations
-    if isinstance(registration_config, dict):
-        registration_config = RegistrationConfig.from_dict(registration_config)
-    mask = timed_call("platform_mask_3d_ms", platform_mask_3d, depth_piece, registration_config)
-    coarse = timed_call("coarse_registration_ms", register_platform_masks, mask_2d, mask, registration_config)
-    return timed_call("affine_registration_ms", refine_affine_registration, gray, depth_piece,
-                      coarse, affine_config, context=affine_coordinate_context(gray.shape, depth_piece.shape, correction))
-
-
 def initialize(assignments, assignment_index, ready, warmup_gate, role="registration", extra_imports=(), extra_info=None):
     global _startup, _warmup_gate
     try:
@@ -36,12 +21,12 @@ def initialize(assignments, assignment_index, ready, warmup_gate, role="registra
             assigned = assignments[assignment_index.value]
             assignment_index.value += 1
         if assigned is not None:
-            from algorithm.cpu_partition import set_cpus
+            from algorithm.execution.cpu_partition import set_cpus
             set_cpus(assigned)
         import cv2
         import numpy
         import scipy
-        from algorithm import registration
+        from algorithm.vision3d.alignment import registration
         from importlib import import_module
         for name in extra_imports:
             import_module(name)
@@ -50,7 +35,7 @@ def initialize(assignments, assignment_index, ready, warmup_gate, role="registra
             raise RuntimeError("registration worker imported Torch; use the model-free Bridge entry point")
         actual = None
         if os.name == "nt":
-            from algorithm.cpu_partition import current_cpus
+            from algorithm.execution.cpu_partition import current_cpus
             actual = current_cpus()
         _startup = dict(pid=os.getpid(), role=role, cpu_ids=actual, assigned_cpu_ids=assigned,
                         executable=sys.executable, prefix=sys.prefix,
@@ -75,7 +60,8 @@ def warmup():
 def run(payload):
     from multiprocessing.shared_memory import SharedMemory
     import numpy as np
-    from algorithm.timing import timing_context, measure
+    from algorithm.runtime.timing import timing_context, measure
+    from algorithm.vision3d.alignment.registration import register_arrays
     handles, arrays, timings, logs = [], {}, {}, []
     started = time.perf_counter()
     local = None

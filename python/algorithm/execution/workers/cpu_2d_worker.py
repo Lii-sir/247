@@ -1,21 +1,19 @@
 """Model-free 2D silver and public-geometry worker; no GPU objects cross IPC."""
 import time
 import traceback
-from algorithm import registration_worker as bootstrap
+from algorithm.execution.workers import registration_worker as bootstrap
 
 warmup = bootstrap.warmup
 
 
 def initialize(assignments, assignment_index, ready, warmup_gate, role="cpu_2d"):
     bootstrap.initialize(assignments, assignment_index, ready, warmup_gate, role,
-                         ("algorithm.2D.silver_inspection", "algorithm.2D.instance_geometry"))
+                         ("algorithm.vision2d.silver_inspection", "algorithm.vision2d.instance_geometry"))
 
 
 def compute(instances, shape, settings, crop_box, circle, boundary, base_dir, silver_prepare_ms=0.):
-    from importlib import import_module
-    from algorithm.timing import current_timings, timed_call, record_duration, measure
-    silver = import_module("algorithm.2D.silver_inspection")
-    geometry = import_module("algorithm.2D.instance_geometry")
+    from algorithm.runtime.timing import current_timings, timed_call, record_duration, measure
+    from algorithm.vision2d import instance_geometry as geometry, silver_inspection as silver
     started = time.perf_counter()
     diagnostics = timed_call("silver_mask_checks_ms", silver.inspect_masks, instances, shape, settings,
         crop_box=crop_box, circle=circle, image=None, base_dir=base_dir, prepared_boundary=boundary)
@@ -37,7 +35,7 @@ def run(payload):
     import math
     from multiprocessing.shared_memory import SharedMemory
     import numpy as np
-    from algorithm.timing import timing_context, measure
+    from algorithm.runtime.timing import timing_context, measure
     arrays, handles, instances, timings, logs = {}, [], [], {}, []
     started = time.perf_counter()
     try:

@@ -1,6 +1,6 @@
 # 上位机接口返回参数说明
 
-更新日期：2026-10-14。依据当前 `PythonBridge.cs`、`BridgeDtos.cs`（代码版本 `9d9ab70`）。
+更新日期：2026-11-21。依据当前 `PythonBridge.cs` 和 `BridgeDtos.cs`。
 
 **本文只说明上位机调用 Bridge 后取得的返回对象和参数。** 不包含测试脚本输出目录、
 CSV、日志、时间线或可视化专用字段。JSON 名称与 C# 属性名称对照列出；
@@ -18,6 +18,8 @@ CSV、日志、时间线或可视化专用字段。JSON 名称与 C# 属性名�
 | 上述单片接口的`...Async(...)` 版本                                                                             | `Task<DetectResponse>` | `await` 后得到同样的返回对象                       |
 | `bridge.ThreeD.DetectBoardFile(...)` / `DetectBoardSharedMemory(...)`                                        | `DetectResponse`       | 整板 3D 与同板 2D 联合结果，主要读取`ResultsBoard` |
 | 上述整板 3D 接口的`...Async(...)` 版本                                                                         | `Task<DetectResponse>` | `await` 后得到同样的返回对象                       |
+| `bridge.ThreeD.DetectPiece(...)` / `DetectPieceFile(...)` / `DetectPieceSharedMemory(...)` | `DetectResponse` | 按板号、片号提交已分好的 3D 深度图，返回 `ResultsPiece` |
+| 上述单片 3D 接口的 `...Async(...)` 版本 | `Task<DetectResponse>` | 异步返回同一片的联合判定 |
 | `bridge.Board.DetectStreamingFilesAsync(...)`                                                                  | `Task<DetectResponse>` | 提交十片 2D 与一张整板 3D，返回最终联合整板结果      |
 | `bridge.Board.DetectFiles(...)` / `DetectSharedMemory(...)`                                                  | `DetectResponse`       | 批量板级结果；不保证执行全部流式 2D 检查             |
 | `bridge.TwoD.Detect2DFile(...)` / `Detect2DSharedMemory(...)`                                                | `DetectResponse`       | 独立 2D 结果，主要读取`Results2D`                  |
@@ -62,9 +64,10 @@ CSV、日志、时间线或可视化专用字段。JSON 名称与 C# 属性名�
 | `elapsed_ms`                    | `ElapsedMs`                 | `double`          | 服务端汇总耗时，毫秒；接口不同，计时边界不同，不等于 C# 完整调用时间 |
 | `board_id`                      | `BoardId`                   | `string?`         | 流式检测板号，2D 与 3D 通过它关联                                    |
 | `batch_id`                      | `BatchId`                   | `string?`         | 批量板号；部分联合响应也返回该兼容字段                               |
-| `piece_id`                      | `PieceId`                   | `int?`            | 单片 2D 的片号；整板响应通常不提供                                   |
+| `piece_id`                      | `PieceId`                   | `int?`            | 单片 2D 或单片 3D 的片号                                   |
 | `results_2d`                    | `Results2D`                 | `Results2D?`      | 单片/独立 2D 结果                                                    |
 | `results_board`                 | `ResultsBoard`              | `ResultsBoard?`   | 联合或批量整板结果                                                   |
+| `results_piece`                 | `ResultsPiece`              | `BoardPieceResult?` | 单片 2D+3D 联合判定                                                   |
 | `results_3d`                    | `Results3D`                 | `Results3D?`      | 独立 3D 检测结果；与`ResultsBoard` 不同                            |
 | `cache_state`                   | `CacheState`                | `CacheState?`     | 流式 2D 的板数据缓存状态                                             |
 | `released`                      | `Released`                  | `ReleaseSummary?` | 本次板缓存释放情况                                                   |
@@ -72,11 +75,38 @@ CSV、日志、时间线或可视化专用字段。JSON 名称与 C# 属性名�
 | `csharp_image_read_ms`          | `CsharpImageReadMs`         | `double`          | 文件接口记录的读图/输入准备时间，毫秒；外部共享内存接口通常为 0      |
 | `csharp_shared_memory_write_ms` | `CsharpSharedMemoryWriteMs` | `double`          | Bridge 创建/写入共享内存的时间，毫秒；外部已写好共享内存时为 0       |
 
+整板深度图已收到时，流式接口等候对应的 2D 片，等待期结束后把缺失片判为 NG，片号写入
+`MissingPieceIds`。2D 分割没有有效掩码时，对应片直接判 NG。两种情况都会跳过该片 3D 配准和测高，
+并在 `ResultsBoard.Pieces` 保留该片。整板响应为 `Ok=true`、`ResultsBoard.IsOk=false`。
+已有 3D 结果的其他片照常返回。
+
+跳过的片通过 `Skip3DReason` 区分 `no_2d_result`（无有效掩码）、`missing_2d_result`（未收到对应的 2D 结果）
+和 `2d_ng`（按优先级检查时命中 NG）。其 `Registration.Status` 为 `skipped`，测量列表为空。
+启用优先级时，`Results2D.FirstNgCheck` 和因该检查跳过 3D 的 `BoardPieceResult.FirstNgCheck`
+提供首项 NG 的检测名称。
+
+单片模式使用 `init_algorithm(stage=board)`。调用方先提交该片 2D，再提交同一板号和片号的
+已分片深度图。若对应 2D 正在处理，只等这一片。若当前没有对应的 2D 请求或缓存结果，
+立即返回 `Ok=true`、`ResultsPiece.IsOk=false` 和 `Skip3DReason=missing_2d_result`。
+无掩码或优先级命中 NG 时同样跳过配准和测高，Python 无需读取深度缓冲区。
+同一板缓存期间只使用一种 3D 提交方式。
+
+```csharp
+await bridge.TwoD.DetectPieceFileAsync(boardId, pieceId, image2DPath);
+var response = await bridge.ThreeD.DetectPieceAsync(boardId, pieceId, depth, width, height);
+bool? pieceOk = response.Ok ? response.ResultsPiece?.IsOk : null;
+```
+
+`depth` 为行优先的单片 `ushort[]`，宽高对应本次提交的深度图。测高点坐标相对于该片图的左上角，
+`DepthCoordinateSpace` 为 `piece_3d`，输入已做 Pitch 补偿时为 `pitch_corrected_piece_3d`。
+上位机按实际裁剪原点映射回整板坐标。
+
 ### 3.1 根据调用方式选择结果对象
 
 | 调用场景                | 应读取                           |
 | ----------------------- | -------------------------------- |
 | 逐片 2D                 | `response.Results2D`           |
+| 一片的 2D+3D 联合检测 | `response.ResultsPiece` |
 | 一块板的 2D+3D 联合检测 | `response.ResultsBoard.Pieces` |
 | 独立 3D                 | `response.Results3D.Pieces`    |
 

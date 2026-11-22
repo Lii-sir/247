@@ -13,7 +13,7 @@ HERE = Path(__file__).resolve().parent
 PROJECT = HERE.parent
 ROOT = PROJECT.parent
 sys.path.insert(0, str(ROOT / 'python'))
-from algorithm.tilt_correction import correct_smartray_depth
+from algorithm.vision3d.depth.tilt_correction import correct_smartray_depth
 reference_spec = importlib.util.spec_from_file_location('frozen_pitch_reference',
     ROOT / 'visualization/tests/fixtures/pitch_reference.py')
 reference = importlib.util.module_from_spec(reference_spec)

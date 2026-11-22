@@ -1,6 +1,6 @@
 """Rectify YOLO chip masks and inspect the resulting crops with EfficientAD."""
 from __future__ import annotations
-from algorithm.timing import timed_call, note, cuda_sync_enabled
+from algorithm.runtime.timing import timed_call, note, cuda_sync_enabled
 
 import math
 import threading
@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as torch_functional
 from PIL import Image
 
-from algorithm.efficientad_models import EfficientAdModel
+from algorithm.vision2d.efficientad_models import EfficientAdModel
 
 
 MULTISCALE_SCORE_METHOD = "masked_multiscale_normalized_topk_max"

@@ -247,6 +247,10 @@ var metadata = new Dictionary<string, object> {
 var result = await bridge.ThreeD.DetectBoardAsync(boardId, corrected, width, height, metadata);
 ```
 
+单片处理用 `corrector.CorrectPiece(rawDepth, width, height, startRow, endRow)`。返回后由上位机决定是否提交
+`ThreeD.DetectPieceAsync`，已补偿的检测点标为 `pitch_corrected_piece_3d`。
+行范围使用原始深度图坐标，矫正的投影边界以该片为准。 [单片调用示例](../../smartray_pitch_dll/README.md#逐片切分和矫正)
+
 C#数组/共享内存/文件辅助接口末尾可传可选`Dictionary<string, object> correction`；批量共享内存输入填`BoardImage3DInput.PitchCorrection`。C#文件辅助方法只读取像素，默认认为文件已由调用方准备，不再自动执行矫正。Python验证台/CLI文件适配器会按预处理配置先矫正，再发送像素和元数据。
 
 C# DTO新增元数据属性，现有测高点/掩码字段保持；源码已构建验证。上位机若继续引用旧DLL，新增属性不会出现在旧类型中，需要更新引用的构建产物。不要重复对SDK已矫正数据启用原始数据补偿。
@@ -334,7 +338,7 @@ Python按标定参数缓存65536项连续位移及深度编码表（最多8组�
 `correct_smartray_depth(..., out=buffer)`支持复用同尺寸、可写、C连续的uint16输出，输出不可与深度或强度图共享内存。关闭矫正时默认仍原样返回输入；显式提供输出时复制到输出。持续输入建议复用调用侧对象：
 
 ```python
-from algorithm.depth_preprocessing import DepthPreprocessor
+from algorithm.vision3d.depth.depth_preprocessing import DepthPreprocessor
 with DepthPreprocessor(settings) as preprocessor:
     for depth in frames:
         raw_bytes, correction = preprocessor.encode(depth)

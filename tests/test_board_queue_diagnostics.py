@@ -9,7 +9,7 @@ import unittest
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT/'python'),str(ROOT/'tests')]
-from algorithm.board_pipeline import BoardPipeline
+from algorithm.application.board.board_pipeline import BoardPipeline
 from pipeline_fakes import FakeDetector
 from test_early_joint_pipeline import GatedDetector
 

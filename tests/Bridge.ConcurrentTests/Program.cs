@@ -81,6 +81,28 @@ static class Program
                     scan.Result.ResultsBoard.PitchCorrection.TryGetValue("applied", out var applied) && !applied.GetBoolean(),
                     "Pitch correction metadata was lost during DTO mapping.");
 
+                Check(bridge.TwoD.DetectPieceSharedMemory("piece-board", 4,
+                    inputs[3].Name, 3, 1, 1, 3, "bgr8").Ok, "Single piece 2D failed.");
+                var pieceDepth = depthValues.Take(30).ToArray();
+                var pieceScan = bridge.ThreeD.DetectPieceAsync("piece-board", 4, pieceDepth, 3, 10);
+                Array.Clear(pieceDepth, 0, pieceDepth.Length);
+                Check(pieceScan.Wait(5000) && pieceScan.Result.Ok && pieceScan.Result.PieceId == 4 &&
+                    pieceScan.Result.ResultsPiece is { PieceId: 4, DepthCoordinateSpace: "piece_3d", DepthEndRow: 10 },
+                    "Piece-based 3D deserialization or array snapshot failed.");
+                using (var pieceMapping = Mapping(depthBytes.Take(60).ToArray()))
+                {
+                    Check(bridge.TwoD.DetectPieceSharedMemory("piece-board", 5,
+                        inputs[4].Name, 3, 1, 1, 3, "bgr8").Ok, "Shared-memory piece 2D failed.");
+                    var mappingScan = bridge.ThreeD.DetectPieceSharedMemory(
+                        "piece-board", 5, pieceMapping.Name, 60, 3, 10);
+                    Check(mappingScan.Ok && mappingScan.ResultsPiece?.PieceId == 5,
+                        "Piece-based shared-memory request failed.");
+                    var skipped = bridge.ThreeD.DetectPieceSharedMemory(
+                        "piece-board", 6, pieceMapping.Name, 60, 3, 10);
+                    Check(skipped.Ok && skipped.ResultsPiece is { IsOk: false, Skip3DReason: "missing_2d_result" },
+                        "Missing 2D should return a skipped NG piece.");
+                }
+
                 var orphan = bridge.ThreeD.DetectBoardSharedMemoryAsync("orphan-board", depth.Name, 600, 3, 100);
                 Thread.Sleep(50);
                 Check(bridge.ReleaseBoard("orphan-board").Ok, "Explicit release failed.");
@@ -114,6 +136,17 @@ static class Program
                         files, depthFile, "high-level-board").GetAwaiter().GetResult();
                     Check(joined.Ok && joined.ResultsBoard?.Pieces.Count == 10,
                         "High-level 2D/3D orchestration failed.");
+                    string piecePath = Path.Combine(temp, "piece.png");
+                    var pieceImage = BitmapSource.Create(3, 10, 96, 96, PixelFormats.Gray16, null,
+                        depthValues.Take(30).ToArray(), 6);
+                    var pieceEncoder = new PngBitmapEncoder();
+                    pieceEncoder.Frames.Add(BitmapFrame.Create(pieceImage));
+                    using (var file = File.Create(piecePath)) pieceEncoder.Save(file);
+                    Check(bridge.TwoD.DetectPieceFileAsync("piece-file", 1, files[0]).GetAwaiter().GetResult().Ok,
+                        "Piece file 2D failed.");
+                    var fromFile = bridge.ThreeD.DetectPieceFileAsync("piece-file", 1, piecePath)
+                        .GetAwaiter().GetResult();
+                    Check(fromFile.Ok && fromFile.ResultsPiece?.PieceId == 1, "Piece-based depth file failed.");
                 }
                 finally { Directory.Delete(temp, recursive: true); }
 

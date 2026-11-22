@@ -1,8 +1,7 @@
 """Isolated 3D mapping/height submission using the board's leased shared depth."""
 from dataclasses import asdict
-from importlib import import_module
-from algorithm.registration_process import RegistrationProcesses
-from algorithm import joint_worker
+from algorithm.execution.processes.registration_process import RegistrationProcesses
+from algorithm.execution.workers import joint_worker
 
 
 class JointMeasurementProcesses(RegistrationProcesses):
@@ -16,7 +15,8 @@ class JointMeasurementProcesses(RegistrationProcesses):
                      correction, height_config, min_component_area, crop_roi, wire_rois,
                      timings, metadata, is_current, log=None):
         def payload():
-            arrays, instances = import_module("algorithm.2D.instance_geometry").share_instances(
+            from algorithm.vision2d.instance_geometry import share_instances
+            arrays, instances = share_instances(
                 entry["instances"], inputs, arrays=dict(depth=depth), cache_keys=dict(depth="depth"),
                 cache_prefix=("instance_mask", piece_id))
             return dict(arrays=arrays, instances=instances, piece_id=piece_id, piece=dict(piece),

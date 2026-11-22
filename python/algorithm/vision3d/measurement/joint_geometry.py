@@ -1,19 +1,18 @@
 """Model-free 3D mapping and height pipeline shared with the board detector."""
 from __future__ import annotations
 import sys
-from importlib import import_module
 from typing import Any, Dict, Sequence
 import cv2
 import numpy as np
-from algorithm.height_measurement import (HeightConfig, dilate_mask, erode_wire_mask_in_place,
+from algorithm.vision3d.measurement.height_measurement import (HeightConfig, dilate_mask, erode_wire_mask_in_place,
     erode_measurement_mask_crop, fit_chip_plane, fit_local_platform_plane, fit_platform_plane,
     height_points_to_board, map_platform_rois, measure_mask_height, split_thin_mask)
-from algorithm.registration import align_crop_mask_to_depth
+from algorithm.vision3d.alignment.registration import align_crop_mask_to_depth
 from transport.depth_input import depth_coordinate_space
-from algorithm.instance_tasks import InstanceTasks
-from algorithm.timing import timed_call
-_geometry = import_module("algorithm.2D.defect_geometry")
-_mask_geometry = import_module("algorithm.2D.instance_geometry").mask_geometry
+from algorithm.execution.instance_tasks import InstanceTasks
+from algorithm.runtime.timing import timed_call
+from algorithm.vision2d import defect_geometry as _geometry
+from algorithm.vision2d.instance_geometry import mask_geometry as _mask_geometry
 
 
 class JointGeometry:
@@ -56,7 +55,8 @@ class JointGeometry:
             "depth_start_row": y1,
             "depth_end_row": y2,
             "pitch_correction": pitch_correction or {},
-            "depth_coordinate_space": self._joint_ops.depth_coordinate_space(pitch_correction or {}),
+            "depth_coordinate_space": (piece.get("depth_coordinate_space")
+                                       or self._joint_ops.depth_coordinate_space(pitch_correction or {})),
             "registration": registration,
             "is_ok": bool(
                 measurement["is_ok"]

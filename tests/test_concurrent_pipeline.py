@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
 sys.path.insert(0, str(ROOT / "tests"))
-from algorithm.board_pipeline import BoardPipeline
+from algorithm.application.board.board_pipeline import BoardPipeline
 from transport.bridge_server import AlgorithmServer, configure_native_threads
 from transport.shared_memory import SharedImage
 from pipeline_fakes import FakeDetector
@@ -39,6 +39,77 @@ class PipelineTests(unittest.TestCase):
         return [self.pipeline.submit_2d(dict(board_id=board, piece_id=pid,
                                             marker=f"{board}:{pid}", **kwargs))
                 for pid in range(1, 11)]
+
+    def piece_depth(self, board, piece_id):
+        return dict(board_id=board, piece_id=piece_id, shm_name="piece_depth",
+                    data_size=400, image_width=20, image_height=10)
+
+    def test_piece_3d_without_2d_skips_without_reading_depth(self):
+        self.detector._read_3d = Mock(side_effect=AssertionError("must not read depth"))
+        result = self.pipeline.submit_3d_piece(self.piece_depth("A", 3)).result(1)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["cmd"], "detect_3d_piece")
+        self.assertEqual(result["piece_id"], 3)
+        piece = result["results_piece"]
+        self.assertFalse(piece["is_ok"])
+        self.assertEqual(piece["skip_3d_reason"], "missing_2d_result")
+        self.assertEqual(piece["depth_coordinate_space"], "piece_3d")
+        self.detector._read_3d.assert_not_called()
+        self.assertFalse(self.pipeline.has_pending)
+
+    def test_piece_3d_pairs_by_board_and_piece_and_only_waits_for_matching_2d(self):
+        for board, piece_id in (("A", 2), ("B", 1)):
+            self.assertTrue(self.pipeline.submit_2d(dict(
+                board_id=board, piece_id=piece_id, marker=f"{board}:{piece_id}")).result(2)["ok"])
+        self.detector.gpu_started.clear()
+        self.detector.gpu_gate.clear()
+        two_d = self.pipeline.submit_2d(dict(board_id="A", piece_id=1, marker="A:1"))
+        try:
+            self.assertTrue(self.detector.gpu_started.wait(1))
+            pending = self.pipeline.submit_3d_piece(self.piece_depth("A", 1))
+            self.assertFalse(pending.done())
+            duplicate = self.pipeline.submit_3d_piece(self.piece_depth("A", 1)).result(1)
+            self.assertEqual(duplicate["error"], "invalid_piece")
+            whole_board = self.pipeline.submit_3d(dict(board_id="A")).result(1)
+            self.assertEqual(whole_board["error"], "invalid_board")
+            for board, piece_id in (("A", 2), ("B", 1)):
+                result = self.pipeline.submit_3d_piece(self.piece_depth(board, piece_id)).result(2)
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["results_piece"]["marker"], f"{board}:{piece_id}")
+        finally:
+            self.detector.gpu_gate.set()
+        self.assertTrue(two_d.result(2)["ok"])
+        result = pending.result(2)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["results_piece"]["marker"], "A:1")
+        self.assertFalse(self.pipeline.has_pending)
+
+    def test_piece_3d_retries_after_invalid_depth_without_losing_2d(self):
+        self.assertTrue(self.pipeline.submit_2d(dict(board_id="A", piece_id=1, marker="retained")).result(2)["ok"])
+        result = self.pipeline.submit_3d_piece({**self.piece_depth("A", 1), "fail_3d": True}).result(2)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "3d_piece_failed")
+        retry = self.pipeline.submit_3d_piece(self.piece_depth("A", 1)).result(2)
+        self.assertTrue(retry["ok"])
+        self.assertEqual(retry["results_piece"]["marker"], "retained")
+
+    def test_release_finishes_piece_3d_waiting_on_2d(self):
+        self.detector.gpu_gate.clear()
+        image = self.pipeline.submit_2d(dict(board_id="A", piece_id=1))
+        try:
+            self.assertTrue(self.detector.gpu_started.wait(1))
+            pending = self.pipeline.submit_3d_piece(self.piece_depth("A", 1))
+            self.assertFalse(pending.done())
+            self.assertTrue(self.pipeline.release_board("A")["ok"])
+            response = pending.result(1)
+            self.assertEqual(response["cmd"], "detect_3d_piece")
+            self.assertEqual(response["piece_id"], 1)
+            self.assertEqual(response["error"], "board_released")
+            self.assertFalse(self.detector.depth_started.is_set())
+        finally:
+            self.detector.gpu_gate.set()
+        self.assertFalse(image.result(2)["ok"])
+        self.assertFalse(self.pipeline.has_pending)
 
     def test_3d_first_waits_without_worker_and_pairs_before_ten(self):
         board = self.pipeline.submit_3d(dict(board_id="A"))
@@ -165,8 +236,14 @@ class PipelineTests(unittest.TestCase):
             self.pipeline._boards["A"].touched -= 2
         self.pipeline.expire_pending()
         result = board.result(1)
-        self.assertEqual(result["error"], "board_timeout")
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["results_board"]["is_ok"])
         self.assertEqual(result["missing_piece_ids"], list(range(1, 11)))
+        pieces = result["results_board"]["pieces"]
+        self.assertEqual([p["piece_id"] for p in pieces], list(range(1, 11)))
+        self.assertTrue(all(p["skip_3d_reason"] == "missing_2d_result" for p in pieces))
+        self.assertEqual(result["results_board"]["pipeline_diagnostics"]["completion_gate"], "missing_2d")
+        self.assertEqual(self.detector.measured_ids, [])
         self.assertFalse(self.pipeline._boards)
 
     def test_release_completes_pending_3d(self):
@@ -391,7 +468,7 @@ class ThreadBudgetTests(unittest.TestCase):
                 server.close()
 
     def test_checked_in_stage_configs_define_effective_pool_sizes(self):
-        from algorithm.config import load_runtime_config
+        from algorithm.runtime.config import load_runtime_config
 
         root = Path(__file__).resolve().parents[1]
         manifest_path = root / "config" / "config.json"
@@ -418,9 +495,9 @@ class ThreadBudgetTests(unittest.TestCase):
         from types import SimpleNamespace
         import torch
         import numpy as np
-        from algorithm.detect_board import DetectBoard
+        from algorithm.application.board.detect_board import DetectBoard
         from concurrent.futures import ThreadPoolExecutor as ModelPool
-        from algorithm import detect_board as detector_module
+        from algorithm.application.board import detect_board as detector_module
 
         detector = DetectBoard(lambda _: None)
         detector.model = object()
@@ -518,7 +595,7 @@ class ThreadBudgetTests(unittest.TestCase):
     def test_gpu_stream_uses_configured_yolo_device_when_models_are_not_moved_yet(self):
         from types import SimpleNamespace
         import torch
-        from algorithm.detect_board import DetectBoard
+        from algorithm.application.board.detect_board import DetectBoard
 
         detector = DetectBoard(lambda _: None)
         detector.configure_gpu_worker_count(2)
@@ -542,7 +619,7 @@ class ThreadBudgetTests(unittest.TestCase):
     def test_gpu_stream_auto_device_falls_back_to_active_cuda_device(self):
         from types import SimpleNamespace
         import torch
-        from algorithm.detect_board import DetectBoard
+        from algorithm.application.board.detect_board import DetectBoard
 
         detector = DetectBoard(lambda _: None)
         detector.configure_gpu_worker_count(2)

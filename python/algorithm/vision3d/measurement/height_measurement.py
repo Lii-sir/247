@@ -370,15 +370,15 @@ def measure_mask_height(
 
 
 def height_points_to_board(piece: Dict[str, Any]) -> Dict[str, Any]:
-    """Serialize measurement points in the original full-board depth coordinates.
+    """Serialize measurement points in the submitted depth image coordinates.
 
     Joint detection slices rows only (depth[start:end, :]), so X is already
     full-image X. Copy nested heights: measurements and instance masks can
     share the same height object and must not receive the offset twice.
     Reference planes and mask_3d_local remain in piece-local coordinates.
     """
-    board_spaces = {"board_3d", "pitch_corrected_board_3d"}
-    if piece.get("height_point_coordinate_space") in board_spaces:
+    input_spaces = {"board_3d", "pitch_corrected_board_3d", "piece_3d", "pitch_corrected_piece_3d"}
+    if piece.get("height_point_coordinate_space") in input_spaces:
         return piece
     space = piece.get("depth_coordinate_space", "board_3d")
     row_offset = int(piece["depth_start_row"])
@@ -389,7 +389,7 @@ def height_points_to_board(piece: Dict[str, Any]) -> Dict[str, Any]:
             return item
         converted = dict(height)
         point = height.get("point")
-        if isinstance(point, dict) and height.get("point_coordinate_space") not in board_spaces:
+        if isinstance(point, dict) and height.get("point_coordinate_space") not in input_spaces:
             converted["point"] = {**point, "x": int(point["x"]), "y": int(point["y"]) + row_offset}
         converted["point_coordinate_space"] = space
         return {**item, "height_3d": converted}

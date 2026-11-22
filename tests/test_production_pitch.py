@@ -9,10 +9,11 @@ import numpy as np
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT/'python'),str(ROOT/'tests')]
-from algorithm import detect_board as board_module, detect_3D as standalone_module
-from algorithm.board_pipeline import BoardPipeline
-from algorithm.depth_preprocessing import prepare_depth_for_detection, preprocessing_parameters
-from algorithm.tilt_correction import correct_smartray_depth
+from algorithm.application.board import detect_board as board_module
+from algorithm.application.standalone import detect_3D as standalone_module
+from algorithm.application.board.board_pipeline import BoardPipeline
+from algorithm.vision3d.depth.depth_preprocessing import prepare_depth_for_detection, preprocessing_parameters
+from algorithm.vision3d.depth.tilt_correction import correct_smartray_depth
 from transport.depth_input import input_depth_correction
 from pipeline_fakes import FakeDetector
 
@@ -45,10 +46,10 @@ class ProductionPitchTests(unittest.TestCase):
             with self.assertRaises(ValueError):preprocessing_parameters(config)
 
     def test_formal_load_has_no_pitch_runtime_or_validation(self):
-        from algorithm.config import load_runtime_config
+        from algorithm.runtime.config import load_runtime_config
         config=load_runtime_config((ROOT/'config/config.json').read_text(encoding='utf-8-sig'),str(ROOT/'config/config.json'))
         config['smartray_pitch_3d']['parameters']={'enabled_3d':True,'scan_pitch_mm':0}
-        with patch('algorithm.tilt_correction.correct_smartray_depth',side_effect=AssertionError('detector corrected')):
+        with patch('algorithm.vision3d.depth.tilt_correction.correct_smartray_depth',side_effect=AssertionError('detector corrected')):
             self.detector._load_config(json.dumps(config))
         self.assertFalse(hasattr(self.detector,'_pitch_tasks'))
         self.assertFalse(hasattr(self.detector,'prepare_3d_depth'))
@@ -114,7 +115,9 @@ class ProductionPitchTests(unittest.TestCase):
         detector._validate_descriptors=Mock(return_value=[{'piece_id':1}])
         detector._read_2d=Mock(return_value=np.zeros((8,8,3),np.uint8));detector._read_3d=Mock(return_value=self.corrected)
         detector._stream_crop=Mock(return_value=(np.zeros((8,8,3),np.uint8),(0,0,8,8),None,[]))
-        detector._predict_batch=Mock(return_value=[object()]);detector._extract_instances=Mock(return_value=[])
+        detector._predict_batch=Mock(return_value=[object()])
+        detector._extract_instances=Mock(return_value=[{"class_name": "chip", "mask": np.ones((8, 8), np.uint8)}])
+        detector._align_instances=Mock(return_value=[])
         with patch.object(board_module,'register_platform_masks',return_value=registration),patch.object(board_module,'refine_affine_registration',return_value=registration):
             response=detector.handle_detect({'images_2d':[],'image_3d':{'pitch_correction':self.info}})
         self.assertTrue(response['ok'],response)

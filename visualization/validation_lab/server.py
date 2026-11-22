@@ -29,7 +29,7 @@ sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(ROOT / "python"))
 from detect_and_view import ProtocolClient, algorithm_request, mapped_file, save_timing_csv, summarize_2d_latency
 from generate_report import render_report
-from algorithm.depth_preprocessing import preprocessing_parameters, DepthPreprocessor
+from algorithm.vision3d.depth.depth_preprocessing import preprocessing_parameters, DepthPreprocessor
 
 
 def board_number(value):

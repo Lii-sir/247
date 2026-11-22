@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
 sys.path.insert(0, str(ROOT / "tests"))
-from algorithm.board_pipeline import BoardPipeline
+from algorithm.application.board.board_pipeline import BoardPipeline
 from pipeline_fakes import FakeDetector
 from transport.bridge_server import AlgorithmServer
 from test_split_stage_pools import config
@@ -95,7 +95,7 @@ class RegistrationSettingsTests(unittest.TestCase):
         final.shutdown.assert_called_once_with(wait=True)
 
     def test_project_process_settings_match_configured_core_groups(self):
-        from algorithm.config import load_runtime_config
+        from algorithm.runtime.config import load_runtime_config
         path = ROOT / "config/config.json"
         settings = self.server._thread_settings(load_runtime_config(path.read_text(encoding="utf-8"), str(path)))
         self.assertEqual(4, settings["registration_workers"])
@@ -352,7 +352,7 @@ class RegistrationSchedulingTests(unittest.TestCase):
 class DetectorStageEquivalenceTests(unittest.TestCase):
     def test_wrapper_and_split_have_identical_results_and_full_width_depth(self):
         import numpy as np
-        from algorithm import detect_board as module
+        from algorithm.application.board import detect_board as module
         detector = module.DetectBoard(lambda _: None)
         self.addCleanup(detector.release)
         gray = np.zeros((80, 100), np.uint8)

@@ -1,13 +1,13 @@
 """Caller-side depth preparation. Complete this before submitting detection."""
-from algorithm.tilt_correction import correct_smartray_depth, production_pitch_parameters
+from algorithm.vision3d.depth.tilt_correction import correct_smartray_depth, production_pitch_parameters
 from transport.depth_input import input_depth_correction
-from algorithm.instance_tasks import InstanceTasks
+from algorithm.execution.instance_tasks import InstanceTasks
 import threading
 import numpy as np
 
 
 def preprocessing_parameters(config):
-    from algorithm.config import feature_parameters
+    from algorithm.runtime.config import feature_parameters
     height = feature_parameters(config, 'height_measurement_3d', required=False) or {}
     return production_pitch_parameters(config, float(height.get('gray_offset', 32768.)),
                                        float(height.get('vertical_resolution_mm', .00105)))

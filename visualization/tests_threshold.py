@@ -17,7 +17,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
-chip = import_module("algorithm.2D.chip_anomaly")
+chip = import_module("algorithm.vision2d.chip_anomaly")
 import detect_and_view as client
 
 
@@ -137,7 +137,7 @@ class ThresholdTests(unittest.TestCase):
         self.assertEqual(client.threshold_request(None), {})
 
     def test_stream_gpu_phase_receives_this_piece_threshold(self):
-        module = import_module("algorithm.detect_board")
+        module = import_module("algorithm.application.board.detect_board")
         detector = module.DetectBoard(lambda text: None)
         detector.model = object()
         detector._synchronize_model = Mock()
@@ -151,7 +151,7 @@ class ThresholdTests(unittest.TestCase):
         self.assertEqual(detector.chip_anomaly_inspector.inspect.call_args.kwargs["threshold"], override)
 
     def test_prepare_preserves_threshold_without_changing_detector_config(self):
-        module = import_module("algorithm.detect_board")
+        module = import_module("algorithm.application.board.detect_board")
         detector = module.DetectBoard(lambda text: None)
         image = np.zeros((48, 64, 3), np.uint8)
         detector._read_2d = Mock(return_value=image)

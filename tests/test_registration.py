@@ -10,7 +10,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
-from algorithm import registration
+from algorithm.vision3d.alignment import registration
 
 
 class MaskMappingInputTests(unittest.TestCase):
@@ -46,8 +46,8 @@ class MaskMappingInputTests(unittest.TestCase):
 
     def test_formal_producer_marks_masks_and_shared_payload_preserves_internal_flag(self):
         from importlib import import_module
-        from algorithm.detect_board import DetectBoard
-        from algorithm.registration_process import SharedBoardInputs
+        from algorithm.application.board.detect_board import DetectBoard
+        from algorithm.execution.processes.registration_process import SharedBoardInputs
         import torch
         detector = DetectBoard.__new__(DetectBoard)
         detector.min_component_area = 1
@@ -56,7 +56,7 @@ class MaskMappingInputTests(unittest.TestCase):
         instance = detector._extract_instances(result, (2, 2))[0]
         self.assertIs(instance['_mask_binary_255'], True)
         np.testing.assert_array_equal(instance['mask'], np.array([[0, 255], [255, 0]], np.uint8))
-        geometry = import_module('algorithm.2D.instance_geometry')
+        geometry = import_module('algorithm.vision2d.instance_geometry')
         owner = SharedBoardInputs()
         try:
             _, records = geometry.share_instances([instance], owner)

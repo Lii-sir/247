@@ -23,7 +23,7 @@ def validate_calibration(document: dict, image: Path) -> dict:
     from importlib import import_module
     from PIL import Image
     sys.path.insert(0, str(ROOT / "python"))
-    silver = import_module("algorithm.2D.silver_inspection")
+    silver = import_module("algorithm.vision2d.silver_inspection")
     if not isinstance(document, dict) or document.get("mode") != "polygon":
         raise ValueError("标定 JSON 必须为 mode=polygon 的对象")
     points = document.get("template_points")

@@ -2,7 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import nullcontext
 
-from algorithm.timing import measure, record_duration, timing_context, timing_metadata
+from algorithm.runtime.timing import measure, record_duration, timing_context, timing_metadata
 
 
 class InstanceTasks:

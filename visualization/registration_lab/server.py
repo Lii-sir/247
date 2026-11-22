@@ -22,12 +22,12 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[2]
 ASSETS = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "python"))
-from algorithm.registration import (RegistrationConfig, platform_mask_2d,
+from algorithm.vision3d.alignment.registration import (RegistrationConfig, platform_mask_2d,
     platform_mask_3d, register_platform_masks, refine_affine_registration, _affine_regions, affine_coordinate_context)
-from algorithm.tilt_correction import correct_smartray_pitch
-from algorithm.config import load_runtime_config
-from algorithm.depth_preprocessing import preprocessing_parameters
-segment = import_module("algorithm.3D.segment")
+from algorithm.vision3d.depth.tilt_correction import correct_smartray_pitch
+from algorithm.runtime.config import load_runtime_config
+from algorithm.vision3d.depth.depth_preprocessing import preprocessing_parameters
+segment = import_module("algorithm.vision3d.depth.segment")
 SECTIONS = ("registration_3d", "dynamic_affine_3d", "segmentation_3d")
 PREVIEW_VERSION = 6
 

@@ -9,9 +9,9 @@ import cv2
 import numpy as np
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT/'python'));sys.path.insert(0,str(ROOT/'tests'))
-from algorithm.detect_board import DetectBoard
+from algorithm.application.board.detect_board import DetectBoard
 from reference_silver_continuity import measure_continuity as reference
-silver=importlib.import_module('algorithm.2D.silver_inspection')
+silver=importlib.import_module('algorithm.vision2d.silver_inspection')
 
 
 class SilverReuseTests(unittest.TestCase):

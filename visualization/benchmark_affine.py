@@ -31,14 +31,14 @@ import cv2
 import numpy as np
 import scipy
 import PIL
-from algorithm.config import load_runtime_config
-from algorithm.registration import (
+from algorithm.runtime.config import load_runtime_config
+from algorithm.vision3d.alignment.registration import (
     RegistrationConfig, affine_coordinate_context, platform_mask_2d,
     platform_mask_3d, refine_affine_registration, register_platform_masks,
 )
-from algorithm.tilt_correction import correct_smartray_depth, production_pitch_parameters
+from algorithm.vision3d.depth.tilt_correction import correct_smartray_depth, production_pitch_parameters
 
-segment = importlib.import_module("algorithm.3D.segment")
+segment = importlib.import_module("algorithm.vision3d.depth.segment")
 VARIANTS = ("current", "baseline", "cache", "calibration", "multiscale", "budget")
 
 
@@ -377,8 +377,8 @@ def main(argv=None):
                   config=config, config_sha256=hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest(),
                   depth=dict(path=str(args.depth.resolve()), sha256=sha256(args.depth)),
                   code_sha256={str(path.relative_to(ROOT)): sha256(path) for path in
-                               (Path(__file__).resolve(), ROOT / "python/algorithm/registration.py",
-                                ROOT / "python/algorithm/tilt_correction.py", ROOT / "python/algorithm/3D/segment.py")},
+                               (Path(__file__).resolve(), ROOT / "python/algorithm/vision3d/alignment/registration.py",
+                                ROOT / "python/algorithm/vision3d/depth/tilt_correction.py", ROOT / "python/algorithm/vision3d/depth/segment.py")},
                   inputs=input_info, variants=variants, groups=[], summary=[], complete=False)
     if args.dry_run:
         report.update(complete=True, dry_run=True)

@@ -7,8 +7,7 @@ import queue
 import sys
 import threading
 import time
-from contextlib import nullcontext, redirect_stdout
-from importlib import import_module
+from contextlib import contextmanager, nullcontext, redirect_stdout
 from pathlib import Path
 from typing import Any, Dict, Sequence
 
@@ -17,13 +16,13 @@ import numpy as np
 import torch
 import torch.nn.functional as torch_functional
 
-from algorithm.config import (
+from algorithm.runtime.config import (
     DEFAULT_ALGORITHM_PARAMETERS,
     feature_parameters,
     load_runtime_config,
     parse_config_text,
 )
-from algorithm.height_measurement import (
+from algorithm.vision3d.measurement.height_measurement import (
     HeightConfig,
     dilate_mask,
     erode_wire_mask_in_place,
@@ -36,33 +35,34 @@ from algorithm.height_measurement import (
     measure_mask_height,
     split_thin_mask,
 )
-from algorithm.registration import (
+from algorithm.vision3d.alignment.registration import (
     RegistrationConfig,
     affine_coordinate_context,
     align_crop_mask_to_depth,
     platform_mask_2d,
     platform_mask_3d,
     refine_affine_registration,
+    register_arrays,
     register_platform_masks,
 )
-from transport.depth_input import depth_coordinate_space, input_depth_correction
+from algorithm.vision3d.depth.segment import PieceCountMismatchError, SegmentationConfig, segment_depth_image
+from algorithm.vision2d import (
+    chip_alignment as _chip_alignment,
+    chip_anomaly as _chip_anomaly,
+    circle_roi as _circle_roi,
+    defect_geometry as _geometry,
+    instance_geometry as _instance_geometry,
+    silver_inspection as _silver_inspection,
+    wire_roi_presence as _wire_roi_presence,
+)
+from transport.depth_input import depth_coordinate_space
 from transport.shared_memory import read_shared_memory, SharedImage
-from algorithm.timing import timed_call, measure, note, record_duration, current_timings
-from algorithm.instance_tasks import InstanceTasks
-from algorithm.joint_geometry import JointGeometry
-
-
-_segment = import_module("algorithm.3D.segment")
-_geometry = import_module("algorithm.2D.defect_geometry")
-_instance_geometry = import_module("algorithm.2D.instance_geometry")
-_circle_roi = import_module("algorithm.2D.circle_roi")
-_silver_inspection = import_module("algorithm.2D.silver_inspection")
-_chip_alignment = import_module("algorithm.2D.chip_alignment")
-_chip_anomaly = import_module("algorithm.2D.chip_anomaly")
-_wire_roi_presence = import_module("algorithm.2D.wire_roi_presence")
-PieceCountMismatchError = _segment.PieceCountMismatchError
-SegmentationConfig = _segment.SegmentationConfig
-segment_depth_image = _segment.segment_depth_image
+from algorithm.runtime.timing import timed_call, measure, note, record_duration, current_timings
+from algorithm.execution.instance_tasks import InstanceTasks
+from algorithm.vision3d.measurement.joint_geometry import JointGeometry
+from algorithm.application.board.board_depth import read_board_depth
+from algorithm.application.board.board_results import board_results, join_piece_diagnostics, skipped_3d_piece
+from algorithm.application.defect_checks import detection_order, evaluate_in_order, silver_check, wire_bending_result
 
 
 class DetectBoard(JointGeometry):
@@ -95,6 +95,7 @@ class DetectBoard(JointGeometry):
         self.chip_alignment_config: Dict[str, Any] = {}
         self.chip_anomaly_config: Dict[str, Any] = {"configured": False}
         self.chip_anomaly_inspector = None
+        self.defect_order = ()
         # Streaming mode stores only decoded/preprocessed 2D data and YOLO
         # masks.  The source shared-memory block is read synchronously and is
         # never retained by Python.
@@ -254,6 +255,7 @@ class DetectBoard(JointGeometry):
         self.config = config
 
         common_2d = feature_parameters(config, "common_2d")
+        self.defect_order = detection_order(common_2d.get("defect_priority", []))
         common_3d = feature_parameters(config, "common_3d")
         input_config = _dict(common_3d.get("input"), "common_3d.parameters.input")
         self.expected_piece_count = int(input_config.get("piece_count", 10))
@@ -407,12 +409,8 @@ class DetectBoard(JointGeometry):
         if owner is not None:
             owner.close()
 
-    def infer_2d_piece(self, prepared: Dict[str, Any]) -> None:
-        """Run one piece on an independently owned GPU model replica."""
-        crop = prepared["crop"]
-        image, crop_box = prepared["image"], prepared["crop_box"]
-        note("input_shape", image_shape=list(image.shape), roi_shape=list(crop.shape),
-             imgsz=self.yolo_parameters.get("imgsz"))
+    @contextmanager
+    def _gpu_piece_resource(self):
         return_resource = bool(self._gpu_worker_resources)
         slot_started = time.perf_counter()
         if return_resource:
@@ -439,40 +437,7 @@ class DetectBoard(JointGeometry):
                 record_duration("model_lock_wait_ms", self.elapsed_ms(lock_start))
                 if model is None or inspector is None:
                     raise RuntimeError("GPU model resources are not initialized")
-                inference_start = time.perf_counter()
-                timed_call("cuda_before_yolo_ms", self._synchronize_model, model, stream)
-                predictions = timed_call(
-                    "yolo_predict_wall_ms", self._predict_batch,
-                    [crop], model, model_lock,
-                )
-                timed_call("cuda_after_yolo_ms", self._synchronize_model, model, stream)
-                inference_ms = self.elapsed_ms(inference_start)
-                if len(predictions) != 1:
-                    raise RuntimeError(
-                        f"YOLO returned {len(predictions)} results for one 2D image"
-                    )
-                speed = getattr(predictions[0], "speed", None)
-                if isinstance(speed, dict):
-                    for stage in ("preprocess", "inference", "postprocess"):
-                        value = speed.get(stage)
-                        if isinstance(value, (int, float)) and np.isfinite(value):
-                            record_duration(f"yolo_reported_{stage}_ms", float(value))
-
-                instances = timed_call(
-                    "mask_extract_to_cpu_ms", self._extract_instances,
-                    predictions[0], crop.shape[:2],
-                )
-                chip_anomaly_diagnostics = timed_call(
-                    "efficientad_total_ms", inspector.inspect,
-                    image, instances, crop_box, threshold=prepared.get("threshold"),
-                )
-                device = getattr(model, "device", None)
-                if isinstance(device, torch.device) and device.type == "cuda":
-                    note("gpu_memory", allocated_mb=round(torch.cuda.memory_allocated(device) / 1048576, 2),
-                         reserved_mb=round(torch.cuda.memory_reserved(device) / 1048576, 2),
-                         instances=len(instances), gpu_worker_count=self.gpu_worker_count)
-            prepared.update(instances=instances, inference_ms=inference_ms,
-                            chip_anomaly_diagnostics=chip_anomaly_diagnostics)
+                yield model, inspector, model_lock, stream
         finally:
             try:
                 if stream is not None:
@@ -482,6 +447,48 @@ class DetectBoard(JointGeometry):
             finally:
                 if return_resource:
                     self._gpu_worker_slots.put(resource)
+
+    def infer_2d_piece(self, prepared: Dict[str, Any]) -> None:
+        """Run one piece on an independently owned GPU model replica."""
+        crop = prepared["crop"]
+        image, crop_box = prepared["image"], prepared["crop_box"]
+        note("input_shape", image_shape=list(image.shape), roi_shape=list(crop.shape),
+             imgsz=self.yolo_parameters.get("imgsz"))
+        with self._gpu_piece_resource() as (model, inspector, model_lock, stream):
+            inference_start = time.perf_counter()
+            timed_call("cuda_before_yolo_ms", self._synchronize_model, model, stream)
+            predictions = timed_call(
+                "yolo_predict_wall_ms", self._predict_batch,
+                [crop], model, model_lock,
+            )
+            timed_call("cuda_after_yolo_ms", self._synchronize_model, model, stream)
+            inference_ms = self.elapsed_ms(inference_start)
+            if len(predictions) != 1:
+                raise RuntimeError(
+                    f"YOLO returned {len(predictions)} results for one 2D image"
+                )
+            speed = getattr(predictions[0], "speed", None)
+            if isinstance(speed, dict):
+                for stage in ("preprocess", "inference", "postprocess"):
+                    value = speed.get(stage)
+                    if isinstance(value, (int, float)) and np.isfinite(value):
+                        record_duration(f"yolo_reported_{stage}_ms", float(value))
+
+            instances = timed_call(
+                "mask_extract_to_cpu_ms", self._extract_instances,
+                predictions[0], crop.shape[:2],
+            )
+            if not self.defect_order:
+                prepared["chip_anomaly_diagnostics"] = timed_call(
+                    "efficientad_total_ms", inspector.inspect,
+                    image, instances, crop_box, threshold=prepared.get("threshold"),
+                )
+            device = getattr(model, "device", None)
+            if isinstance(device, torch.device) and device.type == "cuda":
+                note("gpu_memory", allocated_mb=round(torch.cuda.memory_allocated(device) / 1048576, 2),
+                     reserved_mb=round(torch.cuda.memory_reserved(device) / 1048576, 2),
+                     instances=len(instances), gpu_worker_count=self.gpu_worker_count)
+            prepared.update(instances=instances, inference_ms=inference_ms)
 
     def prepare_silver_boundary(self, prepared: Dict[str, Any]):
         """Build the silver boundary from the existing ROI or template."""
@@ -514,29 +521,34 @@ class DetectBoard(JointGeometry):
 
     def prepare_joint_piece(self, prepared: Dict[str, Any]) -> Dict[str, Any]:
         """Build immutable joint inputs after inference, before heavy diagnostics."""
-        piece_id = prepared["piece_id"]
-        image, crop, crop_box, circle, roi_boxes = (
-            prepared[key] for key in ("image", "crop", "crop_box", "circle", "roi_boxes"))
-        registration_mask = prepared["registration_mask"]
-        instances = prepared["instances"]
-        chip_anomaly_diagnostics = prepared["chip_anomaly_diagnostics"]
+        crop_box, instances = prepared["crop_box"], prepared["instances"]
+        wire_measurements, wire_roi_checks = self._check_wires(prepared)
+        chip_diagnostics = timed_call("chip_rotation_ms", _chip_alignment.measure_chip_alignment,
+            instances, self.chip_alignment_config, crop_box[:2])
+        entry = self._build_2d_entry(prepared, wire_measurements, wire_roi_checks,
+                                     chip_diagnostics, prepared["chip_anomaly_diagnostics"])
+        prepared["joint_entry"] = entry
+        return {**entry, "instances": [dict(item) for item in instances]}
+
+    def _check_wires(self, prepared):
+        instances, roi_boxes, crop_box = (prepared[key] for key in ("instances", "roi_boxes", "crop_box"))
         wire_measurements = timed_call("wire_bending_ms", self._measure_2d_wire_instances,
             instances, roi_boxes, crop_box
         )
         wire_roi_checks = timed_call("wire_roi_presence_ms", _wire_roi_presence.check_wire_roi_presence,
             instances, roi_boxes, crop_box[:2]
         )
-        chip_diagnostics = timed_call("chip_rotation_ms", _chip_alignment.measure_chip_alignment,
-            instances, self.chip_alignment_config, crop_box[:2]
-        )
+        return wire_measurements, wire_roi_checks
+
+    def _build_2d_entry(self, prepared, wire_measurements, wire_roi_checks,
+                        chip_diagnostics, chip_anomaly_diagnostics, *, first_ng=None):
+        image, crop_box, instances = (prepared[key] for key in ("image", "crop_box", "instances"))
         entry = {
-            "piece_id": piece_id,
-            "gray_image": self._prepared_gray_image(prepared),
+            "piece_id": prepared["piece_id"],
             "image_shape": [int(image.shape[1]), int(image.shape[0])],
             "crop_box": tuple(int(value) for value in crop_box),
-            "circle": circle,
-            "roi_boxes": [tuple(int(value) for value in item) for item in roi_boxes],
-            "registration_mask": registration_mask,
+            "circle": prepared["circle"],
+            "roi_boxes": [tuple(int(value) for value in item) for item in prepared["roi_boxes"]],
             "instances": instances,
             "wire_measurements": wire_measurements,
             "wire_roi_checks": wire_roi_checks,
@@ -544,8 +556,51 @@ class DetectBoard(JointGeometry):
             "chip_anomaly_2d": chip_anomaly_diagnostics,
             "received_at": time.time(),
         }
-        prepared["joint_entry"] = entry
-        return {**entry, "instances": [dict(item) for item in instances]}
+        if first_ng is not None:
+            entry["first_ng_check"] = first_ng
+        if not instances:
+            entry["skip_3d_reason"] = "no_2d_result"
+        elif first_ng is not None:
+            entry["skip_3d_reason"] = "2d_ng"
+        else:
+            entry["gray_image"] = self._prepared_gray_image(prepared)
+            entry["registration_mask"] = prepared["registration_mask"]
+        return entry
+
+    def _run_ordered_checks(self, prepared):
+        image, instances, crop_box = (prepared[key] for key in ("image", "instances", "crop_box"))
+
+        def anomaly():
+            with self._gpu_piece_resource() as (_, inspector, _, _):
+                return timed_call("efficientad_total_ms", inspector.inspect, image, instances,
+                                  crop_box, threshold=prepared.get("threshold"))
+
+        def silver(name, settings):
+            return silver_check(name, settings, instances, prepared["crop"].shape[:2],
+                                crop_box=crop_box, circle=prepared["circle"], image=image,
+                                base_dir=self._silver_config_base_dir())
+
+        overflow, continuity = self.silver_config.get("overflow"), self.silver_config.get("continuity")
+        checks = {
+            "wire_bending_2d": lambda: wire_bending_result(*self._check_wires(prepared)),
+            "chip_rotation_2d": (lambda: timed_call("chip_rotation_ms", _chip_alignment.measure_chip_alignment,
+                instances, self.chip_alignment_config, crop_box[:2])) if self.chip_alignment_config is not None else None,
+            "chip_anomaly_2d": anomaly if self.chip_anomaly_config.get("configured") else None,
+            "silver_overflow_2d": (lambda: silver("silver_overflow_2d", overflow)) if overflow is not None else None,
+            "silver_continuity_2d": (lambda: silver("silver_continuity_2d", continuity)) if continuity is not None else None,
+        }
+        return evaluate_in_order(self.defect_order, checks)
+
+    def _ordered_2d_entry(self, prepared):
+        diagnostics, first_ng = self._run_ordered_checks(prepared)
+        wire = diagnostics["wire_bending_2d"]
+        entry = self._build_2d_entry(
+            prepared, wire.get("measurements", []), wire.get("roi_checks", []),
+            diagnostics["chip_rotation_2d"], diagnostics["chip_anomaly_2d"], first_ng=first_ng,
+        )
+        entry.update(silver_overflow_2d=diagnostics["silver_overflow_2d"],
+                     silver_continuity_2d=diagnostics["silver_continuity_2d"])
+        return entry, diagnostics
 
     def finish_2d_piece(self, prepared: Dict[str, Any], *, publish_cache: bool = True,
                         on_joint_ready=None):
@@ -556,16 +611,23 @@ class DetectBoard(JointGeometry):
         read_decode_ms, circle_crop_ms, inference_ms = (
             prepared[key] for key in ("read_decode_ms", "circle_crop_ms", "inference_ms"))
         postprocess_start = time.perf_counter()
+        ordered = None
+        if getattr(self, "defect_order", ()):
+            prepared["joint_entry"], ordered = self._ordered_2d_entry(prepared)
         if "joint_entry" not in prepared:
             self.prepare_joint_piece(prepared)
         entry = prepared["joint_entry"]
         instances = entry["instances"]
         wire_measurements, wire_roi_checks = entry["wire_measurements"], entry["wire_roi_checks"]
         chip_diagnostics, chip_anomaly_diagnostics = entry["chip_rotation_2d"], entry["chip_anomaly_2d"]
-        if on_joint_ready is not None:
+        if on_joint_ready is not None and not entry.get("skip_3d_reason"):
             on_joint_ready({**entry, "instances": [dict(item) for item in instances]})
         computed = prepared.get("cpu_2d_result")
-        if computed is None:
+        if ordered is not None:
+            diagnostics = dict(enabled=True, silver_overflow=ordered["silver_overflow_2d"],
+                               disconnection=ordered["silver_continuity_2d"])
+            postprocess_ms = self.elapsed_ms(postprocess_start)
+        elif computed is None:
             # Direct synchronous entry; formal streaming receives this work
             # from the dedicated model-free CPU process pool below.
             diagnostics = timed_call("silver_mask_checks_ms", _silver_inspection.inspect_masks,
@@ -605,7 +667,7 @@ class DetectBoard(JointGeometry):
             if (
                 diagnostics.get("enabled")
                 and check
-                and check.get("status") not in {None, "disabled"}
+                and check.get("status") not in {None, "disabled", "skipped"}
                 and check.get("is_ok") is not True
             ):
                 checks.append(False)
@@ -616,7 +678,7 @@ class DetectBoard(JointGeometry):
             "board_id": board_id,
             "piece_id": piece_id,
             "results_2d": {
-                "is_ok": bool(checks) and all(checks),
+                "is_ok": bool(instances) and ("first_ng_check" not in entry if ordered is not None else all(checks)),
                 "circle": ({"x": circle[0], "y": circle[1], "radius": circle[2]}
                            if circle is not None else None),
                 "crop_box": list(crop_box),
@@ -630,7 +692,7 @@ class DetectBoard(JointGeometry):
                 "instances": public_instances,
                 "wire_measurements": wire_measurements,
                 "wire_roi_checks": wire_roi_checks,
-                "wire_bending_2d": {
+                "wire_bending_2d": ordered["wire_bending_2d"] if ordered is not None else {
                     "enabled": True,
                     "is_ok": bool(wire_roi_checks) and all(
                         item["is_ok"] for item in wire_roi_checks
@@ -657,52 +719,37 @@ class DetectBoard(JointGeometry):
                 + (" (replaced previous piece)" if replaced else "")
             ),
         }
+        if "first_ng_check" in entry:
+            response["results_2d"]["first_ng_check"] = entry["first_ng_check"]
         return response if publish_cache else (response, entry)
 
     def handle_detect_3d_board(self, req: Dict[str, Any]) -> Dict[str, Any]:
-        """Consume one 3D board and the ten cached 2D piece results."""
+        """Consume one 3D board against the currently cached 2D results."""
         start = time.perf_counter()
         try:
             board_id = self._stream_board_id(req)
         except ValueError as exc:
             return self._stream_failure("invalid_board_id", str(exc), board_id="")
-        entries: Dict[int, Dict[str, Any]] = {}
-        cache_count = 0
         try:
             with self._piece_cache_lock:
-                board_cache = self._piece_cache.get(board_id, {})
-                expected_ids = set(range(1, self.expected_piece_count + 1))
-                missing = sorted(expected_ids - set(board_cache))
-                if missing:
-                    return self._stream_failure(
-                        "missing_2d_pieces",
-                        f"board {board_id!r} is missing 2D piece IDs: {missing}",
-                        board_id=board_id,
-                        missing_piece_ids=missing,
-                    )
-                # Hold references only for the duration of this request.  The
-                # cache is removed in finally after the board is consumed.
-                entries = {piece_id: board_cache[piece_id] for piece_id in expected_ids}
-                cache_count = len(entries)
+                entries = self._piece_cache.pop(board_id, {})
 
-            read_start = time.perf_counter()
-            depth = self._read_3d(req)
-            read_decode_ms = self.elapsed_ms(read_start)
-            pitch_correction = input_depth_correction(req)
-
-            segment_start = time.perf_counter()
-            depth_pieces = segment_depth_image(depth, self.segmentation_config)
-            segmentation_ms = self.elapsed_ms(segment_start)
-            if len(depth_pieces) != self.expected_piece_count:
-                raise PieceCountMismatchError(
-                    self.expected_piece_count, len(depth_pieces)
-                )
+            scan = read_board_depth(req, self._read_3d, self.segmentation_config,
+                                    self.expected_piece_count, segment=segment_depth_image)
 
             align_start = time.perf_counter()
             results = []
-            for index, piece in enumerate(depth_pieces):
-                piece_id = index + 1
-                results.append(self.measure_prepared_piece(piece_id, entries[piece_id], depth, piece, pitch_correction))
+            for piece in scan.pieces:
+                piece_id = int(piece["piece_id"])
+                entry = entries.get(piece_id)
+                reason = "missing_2d_result" if entry is None else entry.get("skip_3d_reason")
+                if reason:
+                    result = skipped_3d_piece(piece, scan.correction, reason, entry)
+                    if entry is not None:
+                        result = self.finalize_joint_piece(result, entry)
+                else:
+                    result = self.measure_prepared_piece(piece_id, entry, scan.image, piece, scan.correction)
+                results.append(result)
             alignment_ms = self.elapsed_ms(align_start)
             total_ms = self.elapsed_ms(start)
             return {
@@ -711,27 +758,18 @@ class DetectBoard(JointGeometry):
                 "stage": "3d",
                 "board_id": board_id,
                 "batch_id": board_id,
-                "results_board": {
-                    "pitch_correction": pitch_correction,
-                    "depth_coordinate_space": depth_coordinate_space(pitch_correction),
-                    "registration_ok": all(
-                        piece["registration"]["is_valid"] for piece in results
-                    ),
-                    "is_ok": all(
-                        piece["registration"]["is_valid"] and piece["is_ok"]
-                        for piece in results
-                    ),
-                    "pieces": results,
-                },
+                "results_board": board_results(results, scan.correction),
+                "missing_piece_ids": [piece["piece_id"] for piece in results
+                                      if piece.get("skip_3d_reason") == "missing_2d_result"],
                 "released": {
                     "board_id": board_id,
-                    "released_2d_count": cache_count,
+                    "released_2d_count": len(entries),
                     "released_3d": True,
                 },
                 "elapsed_ms": total_ms,
                 "timings": {
-                    "shared_memory_read_ms": read_decode_ms,
-                    "segmentation_3d_ms": segmentation_ms,
+                    "shared_memory_read_ms": scan.read_ms,
+                    "segmentation_3d_ms": scan.segmentation_ms,
                     "registration_and_mask_alignment_ms": alignment_ms,
                     "total_detect_ms": total_ms,
                 },
@@ -745,13 +783,6 @@ class DetectBoard(JointGeometry):
             return self._stream_failure(
                 "3d_board_failed", str(exc), board_id=board_id
             )
-        finally:
-            # Once all ten 2D entries were present, this board is terminal:
-            # release them even when 3D decoding/alignment fails.  A missing
-            # piece returns before entries are captured and remains retryable.
-            if cache_count == self.expected_piece_count:
-                with self._piece_cache_lock:
-                    self._piece_cache.pop(board_id, None)
 
     def measure_prepared_piece(self, piece_id: int, entry: Dict[str, Any],
                                depth: np.ndarray, piece: Dict[str, Any],
@@ -764,7 +795,6 @@ class DetectBoard(JointGeometry):
                                depth: np.ndarray, piece: Dict[str, Any],
                                pitch_correction: Dict[str, Any] | None = None) -> Dict[str, Any]:
         """Fit one piece's matrix without waiting for mapping or height work."""
-        from algorithm.registration_worker import register_arrays
         return register_arrays(entry["gray_image"], entry["registration_mask"],
             depth[int(piece["y1"]):int(piece["y2"])], self.registration_config,
             self.dynamic_affine_config, pitch_correction,
@@ -799,34 +829,7 @@ class DetectBoard(JointGeometry):
 
     @staticmethod
     def finalize_joint_piece(piece: Dict[str, Any], entry: Dict[str, Any]) -> Dict[str, Any]:
-        """Join completed diagnostics without mutating an in-flight 3D result."""
-        diagnostics_ok = all(
-            check.get("is_ok") is True
-            for check in (
-                entry.get("silver_overflow_2d", {}),
-                entry.get("silver_continuity_2d", {}),
-                entry.get("chip_anomaly_2d", {}),
-                entry.get("chip_rotation_2d", {}),
-            )
-            if isinstance(check, dict) and check.get("status") not in {None, "disabled"}
-        )
-        diagnostics_present = any(
-            check.get("status") not in {None, "disabled"}
-            for check in (
-                entry.get("silver_overflow_2d", {}),
-                entry.get("silver_continuity_2d", {}),
-                entry.get("chip_anomaly_2d", {}),
-                entry.get("chip_rotation_2d", {}),
-            )
-            if isinstance(check, dict)
-        )
-        return {
-            **piece,
-            "is_ok": bool(piece["is_ok"] and (not diagnostics_present or diagnostics_ok)),
-            "chip_anomaly_2d": entry.get("chip_anomaly_2d", {"status": "disabled", "is_ok": None}),
-            "silver_overflow_2d": entry.get("silver_overflow_2d", {"status": "disabled", "is_ok": None}),
-            "silver_continuity_2d": entry.get("silver_continuity_2d", {"status": "disabled", "is_ok": None}),
-        }
+        return join_piece_diagnostics(piece, entry)
 
     def handle_release_board(self, req: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -934,21 +937,21 @@ class DetectBoard(JointGeometry):
             image_shapes = []
             crop_metadata = []
             gray_images = []
+            ordered_sources = []
             for descriptor in descriptors:
                 image = self._read_2d(descriptor)
+                if self.defect_order:
+                    ordered_sources.append(image)
                 image_shapes.append([int(image.shape[1]), int(image.shape[0])])
                 registration_masks.append(platform_mask_2d(image, self.registration_config))
                 crop, crop_box, circle, roi_boxes = self._stream_crop(image)
                 crops.append(crop.copy())
                 crop_metadata.append((crop_box, circle, roi_boxes))
                 gray_images.append(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
-            depth = self._read_3d(depth_descriptor)
-            shared_memory_read_decode_ms = self.elapsed_ms(read_start)
-            pitch_correction = input_depth_correction(depth_descriptor)
-
-            segment_start = time.perf_counter()
-            depth_pieces = segment_depth_image(depth, self.segmentation_config)
-            segmentation_ms = self.elapsed_ms(segment_start)
+            read_2d_ms = self.elapsed_ms(read_start)
+            scan = read_board_depth(depth_descriptor, self._read_3d, self.segmentation_config,
+                                    self.expected_piece_count, segment=segment_depth_image)
+            depth, pitch_correction = scan.image, scan.correction
 
             if self.model is None:
                 raise RuntimeError("YOLO model is not initialized")
@@ -966,8 +969,32 @@ class DetectBoard(JointGeometry):
             align_start = time.perf_counter()
             results = []
             for index, (descriptor, crop, prediction, piece) in enumerate(
-                zip(descriptors, crops, predictions, depth_pieces)
+                zip(descriptors, crops, predictions, scan.pieces)
             ):
+                crop_box, circle, roi_boxes = crop_metadata[index]
+                instances = self._extract_instances(prediction, crop.shape[:2])
+                if self.defect_order:
+                    entry, _ = self._ordered_2d_entry(dict(
+                        piece_id=int(descriptor["piece_id"]), image=ordered_sources[index], crop=crop,
+                        instances=instances, crop_box=crop_box, circle=circle, roi_boxes=roi_boxes,
+                        gray_image=gray_images[index], registration_mask=registration_masks[index],
+                        threshold=descriptor.get("threshold"),
+                    ))
+                    ordered_sources[index] = None
+                    reason = entry.get("skip_3d_reason")
+                    if reason:
+                        result = skipped_3d_piece(piece, pitch_correction, reason, entry)
+                        results.append(self.finalize_joint_piece(result, entry))
+                    else:
+                        results.append(self.measure_prepared_piece(
+                            entry["piece_id"], entry, depth, piece, pitch_correction))
+                    continue
+                if not instances:
+                    results.append(skipped_3d_piece(piece, pitch_correction, "no_2d_result", {
+                        "image_shape": image_shapes[index], "crop_box": crop_box,
+                        "roi_boxes": roi_boxes,
+                    }))
+                    continue
                 y1, y2 = int(piece["y1"]), int(piece["y2"])
                 local_depth = depth[y1:y2]
                 registration = register_platform_masks(
@@ -979,8 +1006,6 @@ class DetectBoard(JointGeometry):
                     gray_images[index], local_depth, registration, self.dynamic_affine_config,
                     context=affine_coordinate_context(gray_images[index].shape, local_depth.shape, pitch_correction),
                 )
-                crop_box, circle, roi_boxes = crop_metadata[index]
-                instances = self._extract_instances(prediction, crop.shape[:2])
                 aligned_masks = self._align_instances(instances, local_depth.shape, registration, crop_box)
                 measurement = self._measure_piece(
                     local_depth, aligned_masks, registration,
@@ -1011,22 +1036,11 @@ class DetectBoard(JointGeometry):
                 "cmd": "detect_board",
                 "stage": "board",
                 "batch_id": str(req.get("batch_id") or ""),
-                "results_board": {
-                    "pitch_correction": pitch_correction,
-                    "depth_coordinate_space": depth_coordinate_space(pitch_correction),
-                    "registration_ok": all(
-                        piece["registration"]["is_valid"] for piece in results
-                    ),
-                    "is_ok": all(
-                        piece["registration"]["is_valid"] and piece["is_ok"]
-                        for piece in results
-                    ),
-                    "pieces": results,
-                },
+                "results_board": board_results(results, pitch_correction),
                 "elapsed_ms": elapsed_ms,
                 "timings": {
-                    "shared_memory_read_decode_ms": shared_memory_read_decode_ms,
-                    "segmentation_3d_ms": segmentation_ms,
+                    "shared_memory_read_decode_ms": read_2d_ms + scan.read_ms,
+                    "segmentation_3d_ms": scan.segmentation_ms,
                     "yolo_batch_inference_ms": inference_ms,
                     "registration_and_mask_alignment_ms": alignment_ms,
                     "total_detect_ms": elapsed_ms,
@@ -1324,7 +1338,7 @@ def _mask_geometry(
 
 
 def _filled_external_region(mask: np.ndarray) -> np.ndarray:
-    from algorithm.joint_geometry import _filled_external_region as fill
+    from algorithm.vision3d.measurement.joint_geometry import _filled_external_region as fill
     return fill(mask)
 
 

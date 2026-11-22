@@ -85,6 +85,10 @@ public class Detect3DRequest
     [JsonPropertyName("board_id")]
     public string BoardId { get; set; } = string.Empty;
 
+    [JsonPropertyName("piece_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? PieceId { get; set; }
+
     [JsonPropertyName("shm_name")]
     public string ShmName { get; set; } = string.Empty;
 
@@ -255,6 +259,9 @@ public class DetectResponse : BridgeBaseResponse
     [JsonPropertyName("results_board")]
     public ResultsBoard? ResultsBoard { get; set; }
 
+    [JsonPropertyName("results_piece")]
+    public BoardPieceResult? ResultsPiece { get; set; }
+
     [JsonPropertyName("csharp_image_read_ms")]
     public double CsharpImageReadMs { get; set; }
 
@@ -298,6 +305,12 @@ public class ResultsBoard
 
 public class BoardPieceResult
 {
+    [JsonPropertyName("skip_3d_reason")]
+    public string? Skip3DReason { get; set; }
+
+    [JsonPropertyName("first_ng_check")]
+    public string? FirstNgCheck { get; set; }
+
     [JsonPropertyName("timeline")]
     public Dictionary<string, double> Timeline { get; set; } = new();
 
@@ -364,6 +377,9 @@ public class BoardPieceResult
 
 public class RegistrationResult
 {
+    [JsonPropertyName("status")]
+    public string? Status { get; set; }
+
     [JsonPropertyName("scale")]
     public double Scale { get; set; }
 
@@ -591,6 +607,9 @@ public class MaskGeometry
 
 public class Results2D
 {
+    [JsonPropertyName("first_ng_check")]
+    public string? FirstNgCheck { get; set; }
+
     [JsonPropertyName("is_ok")]
     public bool IsOk { get; set; }
 
@@ -717,6 +736,9 @@ public class WireRoiCheck2D
 
 public class WireBending2DResult
 {
+    [JsonPropertyName("status")]
+    public string? Status { get; set; }
+
     [JsonPropertyName("enabled")]
     public bool Enabled { get; set; }
 

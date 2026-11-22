@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
-from algorithm.timing import current_timings, measure, note, timing_context, timed_call
+from algorithm.runtime.timing import current_timings, measure, note, timing_context, timed_call
 
 
 class TimingTests(unittest.TestCase):
@@ -77,7 +77,7 @@ class TimingTests(unittest.TestCase):
         import numpy as np
         import torch
         from types import SimpleNamespace
-        from algorithm.detect_board import DetectBoard
+        from algorithm.application.board.detect_board import DetectBoard
         detector = DetectBoard(lambda message: None)
         detector.model = SimpleNamespace(device=torch.device("cpu"))
         detector.chip_anomaly_inspector = SimpleNamespace(inspect=lambda *args, **kw: {"status": "disabled"})

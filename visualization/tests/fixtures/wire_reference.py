@@ -1,6 +1,6 @@
 """Frozen full-frame wire path from 2491f41 for differential regressions."""
 import numpy as np
-from algorithm.detect_board import (DetectBoard, Any, Dict, Sequence, _geometry,
+from algorithm.application.board.detect_board import (DetectBoard, Any, Dict, Sequence, _geometry,
     _mask_geometry, split_thin_mask, align_crop_mask_to_depth,
     erode_wire_mask_in_place, measure_mask_height, timed_call, fit_platform_plane,
     map_platform_rois, fit_chip_plane, dilate_mask, _filled_external_region)

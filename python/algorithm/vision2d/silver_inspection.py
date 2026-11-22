@@ -20,7 +20,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import cv2
 import numpy as np
-from algorithm.timing import timed_call, note
+from algorithm.runtime.timing import timed_call, note
 
 
 EPSILON = 1e-6

@@ -27,7 +27,7 @@
 
 ## 2. 当前检测流程
 
-正式入口是 [bridge_server.py](D:/projects/247-likai/python/transport/bridge_server.py)。带板号和片号的 2D 请求、带板号的整板 3D 请求交给 [board_pipeline.py](D:/projects/247-likai/python/algorithm/board_pipeline.py)；具体算法集中在 [detect_board.py](D:/projects/247-likai/python/algorithm/detect_board.py)。
+正式入口是 [bridge_server.py](../python/transport/bridge_server.py)。带板号和片号的 2D 请求、带板号的整板 3D 请求交给 [board_pipeline.py](../python/algorithm/application/board/board_pipeline.py)；具体算法集中在 [detect_board.py](../python/algorithm/application/board/detect_board.py)。
 
 ```mermaid
 flowchart TD
@@ -110,7 +110,7 @@ GPU 阶段区间重叠只证明调用与任务生命周期重叠；不能证明 
 
 ### 5.1 动态仿射配准：首要热点
 
-位置：[registration.py:138](D:/projects/247-likai/python/algorithm/registration.py:138)。当前 Powell 优化六个参数，每次评分都执行一次完整目标画布的最近邻仿射变换，然后只在若干区域统计二值失配。
+位置：[registration.py:138](../python/algorithm/vision3d/alignment/registration.py:138)。当前 Powell 优化六个参数，每次评分都执行一次完整目标画布的最近邻仿射变换，然后只在若干区域统计二值失配。
 
 目标函数为：
 
@@ -132,7 +132,7 @@ L(p)=\frac{1}{K}\sum_{k=1}^{K}\frac{\#\{W_p(S)_k\ne T_k\}}{|R_k|}
 
 ### 5.2 Pitch：预计算深度值查找表
 
-位置：[tilt_correction.py:111](D:/projects/247-likai/python/algorithm/tilt_correction.py:111)。当前开启 15°、按行补偿，整板补偿先于分片，平均约 728 ms/板。
+位置：[tilt_correction.py:111](../python/algorithm/vision3d/depth/tilt_correction.py:111)。当前开启 15°、按行补偿，整板补偿先于分片，平均约 728 ms/板。
 
 恢复方向的当前公式为：
 
@@ -149,7 +149,7 @@ z=(d-o)s+z_0,\qquad r'=\operatorname{rint}(r-z\tan\beta/p),
 
 ### 5.3 仿射矩阵走仿射映射，并复用公共映射
 
-位置：[registration.py:391](D:/projects/247-likai/python/algorithm/registration.py:391)。主路径生成的齐次矩阵末行为 `[0,0,1]`，但实例映射统一使用 `warpPerspective`。
+位置：[registration.py:391](../python/algorithm/vision3d/alignment/registration.py:391)。主路径生成的齐次矩阵末行为 `[0,0,1]`，但实例映射统一使用 `warpPerspective`。
 
 数学上该分母恒为 1，可在确认矩阵为仿射时用 `warpAffine`；实际透视矩阵继续走原路径。进一步可每片预计算公共逆映射，供多个实例复用，减少重复坐标求逆与计算。
 
@@ -157,7 +157,7 @@ z=(d-o)s+z_0,\qquad r'=\operatorname{rint}(r-z\tan\beta/p),
 
 ### 5.4 细线主轴：N×2 SVD 改为 2×2 特征分解
 
-位置：[height_measurement.py:238](D:/projects/247-likai/python/algorithm/height_measurement.py:238)。现实现对所有前景坐标中心化后进行 SVD，主要用到第一条主轴。
+位置：[height_measurement.py:238](../python/algorithm/vision3d/measurement/height_measurement.py:238)。现实现对所有前景坐标中心化后进行 SVD，主要用到第一条主轴。
 
 可累计中心化二阶矩：
 
@@ -174,7 +174,7 @@ C=\begin{bmatrix}\sum \Delta x^2&\sum \Delta x\Delta y\\
 
 ### 5.5 鲁棒平面拟合：稳定后提前结束
 
-位置：[height_measurement.py:404](D:/projects/247-likai/python/algorithm/height_measurement.py:404)。目前最多连续做 5 次最小二乘及 MAD 筛点，即使内点集合已经不变也继续计算。
+位置：[height_measurement.py:404](../python/algorithm/vision3d/measurement/height_measurement.py:404)。目前最多连续做 5 次最小二乘及 MAD 筛点，即使内点集合已经不变也继续计算。
 
 若一轮重新得到的 `keep_new` 与本轮求解使用的 `keep` 完全相同，后续输入矩阵和深度值不变，可以提前结束。保持相同的点顺序、筛选阈值和返回字段，是较低风险的优化方向。
 

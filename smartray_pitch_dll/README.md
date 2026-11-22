@@ -36,6 +36,28 @@ ushort[] corrected = corrector.Correct(input, width, height);
 // metadata只描述上述矫正参数和applied=true，详见../config/3D/README.md。
 ```
 
+## 逐片切分和矫正
+
+`CorrectPiece` 接收原始深度数组与本片的行范围。下例在上位机代码中执行。
+
+```csharp
+var piece = corrector.CorrectPiece(rawDepth, width, height, startRow, endRow);
+if (shouldInspect)
+{
+    var response = await bridge.ThreeD.DetectPieceAsync(
+        boardId, pieceId, piece.Depth, piece.Width, piece.Height, piece.PitchCorrection);
+    bool? pieceOk = response.Ok ? response.ResultsPiece?.IsOk : null;
+}
+```
+
+`startRow` 和 `endRow` 使用原始深度图的零基行号，范围左闭右开，保留全宽。
+如果输入已经是一片，传入 `0, height`。每次调用在该片范围内完成矫正，返回独立的深度数组、宽高、
+原图起始行 `StartRow` 和 Pitch 元数据。投影落在片外的像素会丢弃。
+`Enabled=false` 时返回原始切片，并标记 `applied=false`。输入深度在调用返回前须保持有效。
+
+矫正结果可由上位机保存、显示或送检。上位机安排同板号、同片号的 2D 请求，随后自行调用单片 3D 接口。
+测高点使用单片坐标。 [上位机接口说明](../process/OUTPUT_PARAMETERS.md)
+
 复用上位机自己的输出缓冲：
 
 ```csharp
@@ -116,4 +138,4 @@ $env:PYTHONDONTWRITEBYTECODE='1'
 
 校验程序将优化后的Python和DLL分别对照冻结的旧公式，覆盖全部uint16编码、双轴/双方向、正负角、半像素及其相邻浮点数、奇数宽度、单工作位/并行、输出缓冲复用与并发调用。它不采集相机数据，也不作性能基准。
 
-该验证编译一个C#控制台程序调用实际DLL，并与当前`python/algorithm/tilt_correction.py`输出逐像素对照。覆盖行/列、正负角度、两种方向、所有65536种深度编码、无效点、越界/碰撞、半像素取整、非默认原点、单行/列、多线程及禁用旁路；检查输入不变、复用缓冲清零、同实例跨帧并发和16种非法输入。未连接相机、未调用模型、未做真实图像性能测试。
+该验证编译一个C#控制台程序调用实际DLL，并与当前`python/algorithm/vision3d/depth/tilt_correction.py`输出逐像素对照。覆盖行/列、正负角度、两种方向、所有65536种深度编码、无效点、越界/碰撞、半像素取整、非默认原点、单行/列、多线程及禁用旁路；检查输入不变、复用缓冲清零、同实例跨帧并发和16种非法输入。未连接相机、未调用模型、未做真实图像性能测试。
