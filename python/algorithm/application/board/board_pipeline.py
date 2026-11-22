@@ -116,6 +116,13 @@ class BoardPipeline:
                     received_piece_count=len(ids), piece_ids=ids,
                     ready_for_3d=len(ids) == self.detector.expected_piece_count)
 
+    @staticmethod
+    def _take_piece_cache(state, piece_id):
+        state.entries.pop(piece_id, None)
+        state.joint_entries.pop(piece_id, None)
+        state.diagnostics_ready_at.pop(piece_id, None)
+        return state.mask_inputs.pop(piece_id, None)
+
     def _submit_timed(self, pool, phase, timings, board_id, piece_id, request_id, function, *args, state=None):
         queued = time.perf_counter()
         def invoke():
@@ -173,11 +180,19 @@ class BoardPipeline:
             with self._lock:
                 if self._current(state):
                     state.inflight.discard(piece_id)
-                    state.joint_entries.pop(piece_id, None)
                     if piece_id in state.claimed:
                         self._terminate(state, self._failure(
                             board_id, "2d_piece_failed", f"piece {piece_id}: {exc}"))
-                    self._start_piece_if_ready(state, piece_id)
+                    else:
+                        masks = self._take_piece_cache(state, piece_id)
+                        if masks is not None:
+                            try:
+                                masks.close()
+                            except Exception as cleanup_error:
+                                exc = RuntimeError(f"{exc}. Shared mask cleanup failed: {cleanup_error}")
+                        self._start_piece_if_ready(state, piece_id)
+                        if state.completion is None and not (state.entries or state.inflight or state.piece_requests):
+                            self._terminate(state, self._failure(board_id, "2d_piece_failed", str(exc)))
             response = self._failure(board_id, "2d_piece_failed", str(exc), piece_id)
             response["timings"] = dict(detail_timings)
             output.set_result(response)
@@ -448,10 +463,7 @@ class BoardPipeline:
         job = state.piece_requests.pop(piece_id)
         inputs = [job.registration_inputs]
         if consume:
-            state.entries.pop(piece_id, None)
-            state.joint_entries.pop(piece_id, None)
-            state.diagnostics_ready_at.pop(piece_id, None)
-            masks = state.mask_inputs.pop(piece_id, None)
+            masks = self._take_piece_cache(state, piece_id)
             if masks is not None:
                 inputs.append(masks)
         for shared_input in inputs:

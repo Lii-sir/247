@@ -8,7 +8,10 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from multiprocessing.shared_memory import SharedMemory
 from unittest.mock import Mock, patch
+
+import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
@@ -206,6 +209,38 @@ class PipelineTests(unittest.TestCase):
         response = self.pipeline.submit_2d(dict(board_id="A", piece_id=1)).result(2)
         self.assertTrue(response["ok"])
         self.assertEqual(self.detector.closed_inputs, 2)
+
+    def test_2d_failure_after_mask_publication_releases_only_that_piece(self):
+        self.assertTrue(self.pipeline.submit_2d(dict(board_id="A", piece_id=2)).result(2)["ok"])
+        names = []
+
+        def fail_after_publication(pool, inputs, *args):
+            def publish_then_fail():
+                descriptor = inputs.prepare_named({"mask": np.ones((2, 2), dtype=np.uint8)})
+                names.append(descriptor["mask"]["name"])
+                raise RuntimeError("synthetic worker failure after mask publication")
+            return pool.submit(publish_then_fail)
+
+        with patch.object(self.detector, "submit_2d_postprocess", fail_after_publication):
+            failed = self.pipeline.submit_2d(dict(board_id="A", piece_id=1)).result(2)
+        self.assertFalse(failed["ok"])
+        self.assertEqual(len(names), 1)
+        try:
+            stale = SharedMemory(name=names[0])
+        except FileNotFoundError:
+            pass
+        else:
+            stale.close()
+            self.fail("failed 2D piece left shared memory mapped")
+        with self.pipeline._lock:
+            self.assertEqual(set(self.pipeline._boards["A"].entries), {2})
+            self.assertEqual(set(self.pipeline._boards["A"].mask_inputs), {2})
+        self.assertTrue(self.pipeline.submit_2d(dict(board_id="A", piece_id=1)).result(2)["ok"])
+
+    def test_failed_only_2d_request_does_not_hold_an_empty_board(self):
+        response = self.pipeline.submit_2d(dict(board_id="A", piece_id=1, fail_2d=True)).result(2)
+        self.assertFalse(response["ok"])
+        self.assertFalse(self.pipeline.has_pending)
 
     def test_cross_board_results_never_mix(self):
         boards = [self.pipeline.submit_3d(dict(board_id=name)) for name in ("A", "B")]
