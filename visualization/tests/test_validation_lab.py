@@ -40,6 +40,11 @@ class FakeClient:
                 self.condition.wait_for(lambda:len(self.pieces.get(board,set()))==2 or board in self.released,2)
                 if board in self.released:return dict(response,ok=False,error='board released')
                 response['results_board']={'is_ok':False,'pieces':[]}
+            if cmd=='detect_3d_piece':
+                pid=q['piece_id'];matched=pid in self.pieces.get(board,set())
+                self.pieces.get(board,set()).discard(pid)
+                response['results_piece']=dict(piece_id=pid,is_ok=matched,
+                    skip_3d_reason=None if matched else 'missing_2d_result')
             if cmd=='release_board':
                 self.released.add(board);self.pieces.pop(board,None);self.condition.notify_all()
             return response
@@ -148,6 +153,56 @@ class ValidationTests(unittest.TestCase):
         self.assertFalse(result['ok']);self.assertIn('16位',result['error']);self.assertEqual(clients,[])
         self.assertTrue((folder/'result.json').exists())
 
+    def test_manual_clicks_keep_pairing_and_send_one_protocol_request(self):
+        runner,clients=self.make_runner();self.addCleanup(runner.close)
+        cfg=json.loads(init_request()['config_text'])
+        cfg['segmentation_3d']={'description':'synthetic windows','parameters':{
+            'mode':'fixed','expected_piece_count':2,'fixed_rois':[[0,0,4,2],[0,2,4,4]]}}
+        runner.init_builder=lambda *args:dict(cmd='init_algorithm',config_text=json.dumps(cfg))
+        pixels=np.arange(16,dtype=np.uint16).reshape(4,4)+33000
+        Image.fromarray(pixels).save(self.rows[2]['path'])
+
+        def click(n,mode,piece=None):
+            folder=self.root/str(n);folder.mkdir()
+            return runner.run_manual(self.rows,'2',mode,piece,2,folder,lambda _:None)
+
+        with self.assertRaisesRegex(ValueError,'请先提交本板2D'):
+            click(0,'manual_board_3d')
+        self.assertFalse(any(q['cmd'].startswith('detect_') for q in clients[0].requests))
+        two_d=click(1,'manual_2d',2)
+        self.assertEqual(two_d['ready_piece_ids'],[2])
+        single=click(2,'manual_piece_3d',2)
+        self.assertTrue(single['product_is_ok'])
+        self.assertEqual(single['ready_piece_ids'],[])
+        with Image.open(self.root/'2/piece-depth.png') as image:
+            np.testing.assert_array_equal(np.asarray(image),pixels[2:])
+        missing=click(3,'manual_piece_3d',1)
+        self.assertEqual(missing['skip_3d_reason'],'missing_2d_result')
+        click(4,'manual_2d',1)
+        click(5,'manual_2d',2)
+        self.assertTrue(click(6,'manual_board_3d')['ok'])
+        self.assertEqual(len(clients),1)
+        detect=[(q['cmd'],q.get('piece_id')) for q in clients[0].requests if q['cmd'].startswith('detect_')]
+        self.assertEqual(detect,[('detect_2d_piece',2),('detect_3d_piece',2),('detect_3d_piece',1),
+            ('detect_2d_piece',1),('detect_2d_piece',2),('detect_3d_board',None)])
+
+    def test_manual_affinity_uses_local_process_pools_when_core_budget_is_too_large(self):
+        cfg={'common_2d':{'parameters':{'threading':{'cpu_process_affinity':{
+            'enabled':True,'physical_cores':2}}}},'common_3d':{'parameters':{'threading':{
+            'main_reserved_physical_cores':2,'registration_affinity':{'enabled':True,'physical_cores':2},
+            'joint_affinity':{'enabled':True,'physical_cores':4}}}}}
+        cores=[{'logical_cpus':[i],'efficiency_class':0} for i in range(10)]
+        with patch.object(lab.os,'name','nt'), patch('algorithm.execution.cpu_partition.physical_cores',return_value=cores):
+            with patch('algorithm.execution.cpu_partition.current_cpus',return_value=list(range(10))):
+                self.assertIsNone(lab.fit_manual_affinity(cfg))
+            with patch('algorithm.execution.cpu_partition.current_cpus',return_value=list(range(6))):
+                self.assertIn('需要 10 个',lab.fit_manual_affinity(cfg))
+        self.assertFalse(cfg['common_2d']['parameters']['threading']['cpu_process_affinity']['enabled'])
+        three_d=cfg['common_3d']['parameters']['threading']
+        self.assertFalse(three_d['registration_affinity']['enabled'])
+        self.assertFalse(three_d['joint_affinity']['enabled'])
+        self.assertEqual(three_d['main_reserved_physical_cores'],0)
+
     def test_two_d_mode_does_not_mutate_or_require_depth_calibration(self):
         runner,clients=self.make_runner();self.addCleanup(runner.close)
         cfg=json.loads(init_request()['config_text'])
@@ -183,5 +238,59 @@ class ValidationTests(unittest.TestCase):
         key='a'*32;folder=server.folder/key;folder.mkdir();(folder/'result.json').write_text('{"ok":true}')
         with urlopen(base+'/runs/'+key+'/result.json') as r:self.assertEqual(json.load(r),{'ok':True})
 
+    def test_http_manual_action_preserves_exact_piece_and_dispatches_without_batch(self):
+        server=lab.Server(0,self.root/'manual-api')
+        thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+        self.addCleanup(server.server_close);self.addCleanup(server.shutdown)
+        base=f'http://127.0.0.1:{server.server_port}'
+        body=dict(files=self.rows,board_id='02',mode='manual_2d',piece_id=2)
+        def post(data):
+            return urlopen(Request(base+'/api/run',data=json.dumps(data).encode(),
+                headers={'Content-Type':'application/json'}))
+        done=threading.Event()
+        def manual(*args):
+            done.set()
+            return {'ok':True,'piece_id':2}
+        with patch.object(server.runner,'run_manual',side_effect=manual) as exact, patch.object(server.runner,'run') as batch:
+            with self.assertRaises(HTTPError) as invalid:
+                post({**body,'piece_id':True})
+            self.assertEqual(invalid.exception.code,400)
+            with post(body) as response:
+                self.assertEqual(response.status,202)
+                job_id=json.load(response)['id']
+            self.assertTrue(done.wait(2))
+            args=exact.call_args.args
+            self.assertEqual((args[1],args[2],args[3]),('2','manual_2d',2))
+            self.assertEqual([row['name'] for row in args[0]],['2_2.png'])
+            batch.assert_not_called()
+        with urlopen(base+'/api/jobs/'+job_id) as response:
+            self.assertEqual(json.load(response)['piece_id'],2)
+
+    def test_http_workflow_publishes_one_history_entry_and_combined_report(self):
+        server=lab.Server(0,self.root/'workflow-api')
+        threading.Thread(target=server.serve_forever,daemon=True).start()
+        self.addCleanup(server.server_close);self.addCleanup(server.shutdown)
+        base=f'http://127.0.0.1:{server.server_port}'
+        ids=['1'*32,'2'*32]
+        for key, mode, result in zip(ids,('manual_2d','manual_piece_3d'),(
+            {'results_2d':{'is_ok':True}}, {'results_piece':{'piece_id':1,'is_ok':True}})):
+            folder=server.folder/key;folder.mkdir()
+            envelope=dict(board_id='2',response=dict(ok=True,board_id='2',piece_id=1,**result))
+            (folder/'result.json').write_text(json.dumps(envelope),encoding='utf-8')
+            server.jobs[key]={'status':'done','board_id':'2','piece_id':1,'mode':mode}
+        body=json.dumps({'run_ids':ids,'outcome':'done'}).encode()
+        request=Request(base+'/api/workflows',data=body, headers={'Content-Type':'application/json'})
+        with urlopen(request) as response:
+            self.assertEqual(response.status,201)
+            group=json.load(response)
+        self.assertEqual(group['runs'],2)
+        with urlopen(base+'/api/history') as response:
+            self.assertEqual(json.load(response),[group])
+        with urlopen(base+'/runs/'+group['id']+'/report.html') as response:
+            html=response.read().decode()
+        self.assertIn('workflow_stages',html)
+        self.assertIn('流程 1',html)
+        with urlopen(base+'/runs/'+group['id']+'/result.json') as response:
+            self.assertEqual([r['id'] for r in json.load(response)['runs']],ids)
 
 if __name__=='__main__':unittest.main()

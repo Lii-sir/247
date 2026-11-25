@@ -76,7 +76,9 @@ def build_payload(document: Any, *, base_dir: Path, images_2d: Path | None = Non
     response, replies = unpack(document)
     envelope = document if isinstance(document, dict) else {}
     board = response.get("results_board") or {}
-    source_pieces = board.get("pieces") or (response.get("results_3d") or {}).get("pieces") or []
+    single = response.get("results_piece")
+    source_pieces = [single] if isinstance(single, dict) else (
+        board.get("pieces") or (response.get("results_3d") or {}).get("pieces") or [])
     pieces = {int(p.get("piece_id", i + 1)): dict(p) for i, p in enumerate(source_pieces) if isinstance(p, dict)}
     if isinstance(response.get("results_2d"), dict):
         replies = [*replies, response]
@@ -112,7 +114,8 @@ def build_payload(document: Any, *, base_dir: Path, images_2d: Path | None = Non
                 depth = np.asarray(image).copy()
             if depth.ndim != 2 or depth.dtype.kind not in "ui":
                 raise ValueError("Depth must be a single-channel integer image")
-            correction = board.get("pitch_correction") or (response.get("results_3d") or {}).get("pitch_correction") or {}
+            correction = (board.get("pitch_correction") or (single or {}).get("pitch_correction")
+                          or (response.get("results_3d") or {}).get("pitch_correction") or {})
             if correction.get("applied") and not envelope.get("image_3d_preprocessed", False):
                 import sys
                 sys.path.insert(0, str(HERE.parent / "python"))
@@ -170,10 +173,68 @@ def safe_script_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, allow_nan=False).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
 
 
+def build_workflow_payload(document: dict, *, base_dir: Path) -> dict:
+    """Group one run by board, then join the most recent result of each stage on each piece."""
+    boards = {}
+    for run in document["runs"]:
+        source = run["document"]
+        response = source["response"]
+        board_id = str(response.get("board_id") or run.get("board_id") or source["board_id"])
+        board = boards.setdefault(board_id, {"pieces": {}, "warnings": [], "errors": [], "ok": True})
+        stage = "2d" if run.get("mode") == "manual_2d" or response.get("cmd") == "detect_2d_piece" else "3d"
+        if not response.get("ok"):
+            board["ok"] = False
+            reason = response.get("message") or response.get("error") or "请求失败"
+            piece_id = response.get("piece_id") or run.get("piece_id")
+            if piece_id is None:
+                board["errors"].append(f"整板 {stage.upper()}：{reason}")
+                continue
+            board["pieces"].setdefault(int(piece_id), {})[stage] = (
+                {}, {"status": "failed", "message": reason})
+            continue
+        payload = build_payload(source, base_dir=base_dir)
+        board["warnings"].extend(payload["warnings"])
+        for piece in payload["pieces"]:
+            skipped = piece.get("skip_3d_reason") if stage == "3d" else None
+            stage_result = {"status": "skipped" if skipped else "done", "is_ok": piece.get("is_ok")}
+            elapsed = (piece.get("timings_2d", {}).get("total_detect_ms") if stage == "2d"
+                       else piece.get("timings", {}).get("joint_pipeline_ms"))
+            if elapsed is None and response.get("piece_id") == piece["piece_id"]:
+                elapsed = response.get("elapsed_ms")
+            if elapsed is not None:
+                stage_result["elapsed_ms"] = elapsed
+            if skipped:
+                stage_result["reason"] = skipped
+            board["pieces"].setdefault(piece["piece_id"], {})[stage] = (piece, stage_result)
+
+    board_payloads = []
+    for board_id, board in boards.items():
+        pieces = []
+        for piece_id, stages in sorted(board["pieces"].items()):
+            two_d = stages.get("2d", ({}, {}))[0]
+            three_d = stages.get("3d", ({}, {}))[0]
+            outcomes = {stage: info for stage, (_, info) in stages.items()}
+            joined = {**two_d, **three_d, "piece_id": piece_id, "workflow_stages": outcomes}
+            for key in ("results_2d", "timings_2d", "preview_2d", "overlay_2d_valid"):
+                if key in two_d:
+                    joined[key] = two_d[key]
+            verdicts = [info.get("is_ok") for info in outcomes.values()]
+            joined["is_ok"] = False if False in verdicts else True if all(v is True for v in verdicts) else None
+            pieces.append(joined)
+        board_payloads.append(dict(board_id=board_id, pieces=pieces,
+            response=dict(ok=board["ok"], error="\n".join(board["errors"])),
+            warnings=list(dict.fromkeys(board["warnings"]))))
+    return dict(viewer_version=1, mode="workflow", title=document["title"],
+                boards=board_payloads, response=document)
+
+
 def render_report(document: Any, output: Path, *, base_dir: Path, images_2d: Path | None = None, depth_path: Path | None = None, force: bool = False) -> Path:
     if output.exists() and not force:
         raise FileExistsError(f"Refusing to overwrite: {output}. Use --force if intended.")
-    payload = build_payload(document, base_dir=base_dir, images_2d=images_2d, depth_path=depth_path)
+    if isinstance(document, dict) and document.get("mode") == "workflow":
+        payload = build_workflow_payload(document, base_dir=base_dir)
+    else:
+        payload = build_payload(document, base_dir=base_dir, images_2d=images_2d, depth_path=depth_path)
     template = (HERE / "viewer.html").read_text(encoding="utf-8")
     template = template.replace("/*__VIEWER_CSS__*/", (HERE / "viewer.css").read_text(encoding="utf-8"))
     template = template.replace("/*__VIEWER_JS__*/", (HERE / "viewer.js").read_text(encoding="utf-8"))

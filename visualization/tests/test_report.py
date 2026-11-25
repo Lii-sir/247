@@ -45,6 +45,47 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(piece["depth_origin_row"], 10)
         self.assertTrue(piece["preview_2d"]["url"].startswith("data:image/jpeg;base64,"))
 
+    def test_manual_piece_report_renders_only_selected_corrected_depth(self):
+        response={"ok":True,"board_id":"A","results_piece":{"piece_id":4,
+            "depth_start_row":0,"depth_end_row":80,"depth_coordinate_space":"pitch_corrected_piece_3d",
+            "pitch_correction":{"applied":True},"is_ok":True}}
+        payload=report.build_payload({"response":response,"image_3d":str(self.depth),
+            "image_3d_preprocessed":True,"images_2d":[{"piece_id":4,"path":str(self.images/"1.png")}]},
+            base_dir=self.root)
+        piece,=payload["pieces"]
+        self.assertEqual(piece["piece_id"],4)
+        self.assertEqual((piece["preview_3d"]["width"],piece["preview_3d"]["height"]),(100,80))
+        self.assertEqual(piece["depth_origin_row"],0)
+        self.assertIn("preview_2d",piece)
+
+    def test_workflow_joins_stages_by_board_and_piece_and_preserves_skips_and_failures(self):
+        def two(board, piece, ok=True):
+            return dict(board_id=board, mode="manual_2d", piece_id=piece,
+                document=dict(response=dict(ok=ok, board_id=board, piece_id=piece,
+                    **({"results_2d": {"is_ok": False}} if ok else {"error": "2D failure"}))))
+        def three(board, piece, **fields):
+            return dict(board_id=board, mode="manual_piece_3d", piece_id=piece,
+                document=dict(response=dict(ok=True, board_id=board, piece_id=piece,
+                    results_piece=dict(piece_id=piece, is_ok=True, **fields))))
+        board_depth = dict(board_id="A", mode="manual_board_3d", document=dict(response=dict(
+            ok=True, board_id="A", results_board={"pieces": [
+                {"piece_id":1,"is_ok":True}, {"piece_id":3,"is_ok":True}]})))
+        document=dict(mode="workflow", title="流程 7", runs=[
+            two("A",1),two("A",2),board_depth,three("B",1),two("B",2,ok=False),
+            three("A",2,skip_3d_reason="2d_ng")])
+        payload=report.build_workflow_payload(document,base_dir=self.root)
+        board_a,board_b=payload["boards"]
+        p1,p2,p3=board_a["pieces"]
+        self.assertEqual(set(p1["workflow_stages"]),{"2d","3d"})
+        self.assertFalse(p1["workflow_stages"]["2d"]["is_ok"])
+        self.assertTrue(p1["workflow_stages"]["3d"]["is_ok"])
+        self.assertEqual(p2["workflow_stages"]["3d"]["status"],"skipped")
+        self.assertEqual(p2["workflow_stages"]["3d"]["reason"],"2d_ng")
+        self.assertEqual(set(p3["workflow_stages"]),{"3d"})
+        self.assertEqual(set(board_b["pieces"][0]["workflow_stages"]),{"3d"})
+        self.assertEqual(board_b["pieces"][1]["workflow_stages"]["2d"]["message"],"2D failure")
+        self.assertEqual(payload["response"]["title"],"流程 7")
+
     def test_join_stream_diagnostics(self):
         reply = {"ok": True, "board_id": "board-1", "piece_id": 1, "results_2d": {
             "is_ok": False, "silver_overflow_2d": {"is_ok": False, "status": "overflow"}

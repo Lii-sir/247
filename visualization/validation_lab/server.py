@@ -25,6 +25,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 SERVICE_NAME = "detection-validation-lab"
 MAX_REQUEST_INTERVAL_MS = 3600000
+MANUAL_MODES = {"manual_2d", "manual_piece_3d", "manual_board_3d"}
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(ROOT / "python"))
 from detect_and_view import ProtocolClient, algorithm_request, mapped_file, save_timing_csv, summarize_2d_latency
@@ -57,9 +58,11 @@ def submission_options(submission_mode="concurrent", request_interval_ms=0):
                 request_interval_ms=float(request_interval_ms) if submission_mode == "paced" else 0.)
 
 
-def board_inputs(rows, board_id, mode, count):
-    if mode not in {"joint", "2d"}:
-        raise ValueError("验证方式须为joint或2d")
+def board_inputs(rows, board_id, mode, count, *, piece_id=None):
+    if not isinstance(mode, str) or mode not in {"joint", "2d", *MANUAL_MODES}:
+        raise ValueError("未知验证方式")
+    if mode in {"manual_2d", "manual_piece_3d"} and (type(piece_id) is not int or not 1 <= piece_id <= count):
+        raise ValueError(f"片号须为1～{count}的整数")
     board_id = board_number(board_id)
     if not isinstance(rows, list) or len(rows) > 1000:
         raise ValueError("文件清单无效或超过1000行")
@@ -78,7 +81,9 @@ def board_inputs(rows, board_id, mode, count):
         kind = row.get("kind")
         if kind not in {"2d", "3d"}:
             raise ValueError("未知图像类型")
-        if mode == "2d" and kind == "3d":
+        if mode in {"2d", "manual_2d"} and kind == "3d":
+            continue
+        if mode in {"manual_2d", "manual_piece_3d"} and kind == "2d" and row.get("piece_id") != piece_id:
             continue
         path = Path(str(row.get("path", ""))).expanduser().resolve()
         if not path.is_file() or path.stat().st_size == 0:
@@ -94,15 +99,41 @@ def board_inputs(rows, board_id, mode, count):
             if piece in images:
                 raise ValueError(f"板{board_id}的第{piece}片重复，请移除或修改编号")
             images[piece] = {**row, "path": str(path), "piece_id": piece}
-    if not images:
+    if not images and mode != "manual_piece_3d":
         raise ValueError(f"板{board_id}没有2D片图")
-    if mode == "joint":
+    if mode in {"joint", "manual_board_3d"}:
         missing = sorted(set(range(1, count+1)) - images.keys())
         if missing:
             raise ValueError("联合验证缺少2D片号：" + ", ".join(map(str, missing)))
-        if len(depths) != 1:
-            raise ValueError(f"联合验证每板需要恰好一张3D整板图，目前{len(depths)}张")
-    return board_id, [images[p] for p in sorted(images)], depths[0] if depths and mode == "joint" else None
+    needs_depth = mode in {"joint", "manual_board_3d", "manual_piece_3d"}
+    if needs_depth and len(depths) != 1:
+        raise ValueError(f"每板需要恰好一张3D整板图，目前{len(depths)}张")
+    return board_id, [images[p] for p in sorted(images)], depths[0] if needs_depth else None
+
+
+def fit_manual_affinity(config):
+    """Keep model settings while allowing manual tests on a smaller Windows host."""
+    if os.name != "nt":
+        return None
+    two_d = config.get("common_2d", {}).get("parameters", {}).get("threading", {})
+    three_d = config["common_3d"]["parameters"].get("threading", {})
+    affinity = [settings[key] for settings, key in (
+        (two_d, "cpu_process_affinity"), (three_d, "registration_affinity"), (three_d, "joint_affinity"))
+        if isinstance(settings.get(key), dict) and settings[key].get("enabled") is True]
+    if not affinity:
+        return None
+    from algorithm.execution.cpu_partition import current_cpus, physical_cores
+
+    allowed = set(current_cpus())
+    available = sum(bool(allowed.intersection(core["logical_cpus"])) for core in physical_cores())
+    required = max(1, three_d.get("main_reserved_physical_cores", 0))
+    required += sum(group.get("physical_cores", 0) for group in affinity)
+    if required <= available:
+        return None
+    for group in affinity:
+        group["enabled"] = False
+    three_d["main_reserved_physical_cores"] = 0
+    return f"本机可用物理核 {available} 个，正式配置需要 {required} 个。本次手动验证使用不绑核的进程池。"
 
 
 class Runner:
@@ -118,6 +149,7 @@ class Runner:
         self._depth_settings_key = None
         self._state_lock = threading.RLock()
         self._stopping = threading.Event()
+        self._manual_boards = {}
 
     def close(self, *, force=False):
         with self._state_lock:
@@ -131,6 +163,7 @@ class Runner:
                 self.client = None
                 self.fingerprint = None
                 self._startup_threading = None
+                self._manual_boards.clear()
                 if self._depth_preprocessor is not None:
                     self._depth_preprocessor.close()
                     self._depth_preprocessor = None
@@ -182,6 +215,124 @@ class Runner:
             self.fingerprint = fingerprint
         return dict(model_reused=False, process_pid=client.process.pid,
                     threading=self._startup_threading)
+
+    def _manual_piece_depth(self, path, piece_id, config, settings, folder):
+        import numpy as np
+        from algorithm.runtime.config import feature_parameters
+        from algorithm.vision3d.depth.segment import SegmentationConfig, segment_depth_image
+
+        with Image.open(path) as image:
+            if image.format != "PNG" or image.mode not in {"I", "I;16", "I;16B", "I;16L"}:
+                raise ValueError("3D须为原始16位单通道深度PNG")
+            pixels = np.asarray(image, dtype=np.uint16).copy()
+        corrected, metadata = self._depth_runtime(settings).prepare(pixels)
+        pieces = segment_depth_image(corrected, SegmentationConfig.from_dict(
+            feature_parameters(config, "segmentation_3d")))
+        piece = next((part for part in pieces if part["piece_id"] == piece_id), None)
+        if piece is None:
+            raise ValueError(f"整板深度图中未找到第{piece_id}片")
+        asset = folder / "piece-depth.png"
+        Image.fromarray(corrected[piece["y1"]:piece["y2"], :]).save(asset)
+        return asset, metadata
+
+    def run_manual(self, rows, board_id, mode, piece_id, count, folder, progress):
+        board_id, images, depth = board_inputs(rows, board_id, mode, count, piece_id=piece_id)
+        if mode == "manual_2d":
+            with Image.open(images[0]["path"]) as image:
+                image.verify()
+        init = self.init_builder(None, None)
+        config = json.loads(init["config_text"])
+        if int(config["common_3d"]["parameters"]["input"]["piece_count"]) != count:
+            raise ValueError("配置片数已变，请刷新页面")
+        settings = preprocessing_parameters(config) if depth else None
+        affinity_note = fit_manual_affinity(config)
+        config.pop("smartray_pitch_3d", None)
+        init["config_text"] = json.dumps(config, ensure_ascii=True)
+        # A click must use the same service configuration for 2D and 3D.
+        startup = self._ensure(init, progress)
+        client = self.client
+        idle_timeout = float(os.environ.get("BRIDGE_BOARD_TIMEOUT_SECONDS", "90"))
+        now = time.monotonic()
+        for key, cached in list(self._manual_boards.items()):
+            if now - cached["touched"] >= idle_timeout:
+                self._manual_boards.pop(key, None)
+        state = self._manual_boards.setdefault(board_id, dict(images={}, piece_mode=False, touched=now))
+        known = state["images"]
+        chosen = {r["piece_id"]: r["path"] for r in images}
+        if mode == "manual_board_3d":
+            if state["piece_mode"]:
+                raise ValueError("本板已使用单片3D。请完成剩余单片，或释放板缓存后重新提交2D")
+            missing = [pid for pid, path in chosen.items() if known.get(pid) != path]
+            if missing:
+                raise ValueError("请先提交本板2D（缓存也可能已过期）： " + "、".join(map(str, missing)))
+        elif mode == "manual_piece_3d" and piece_id in known and known[piece_id] != chosen.get(piece_id):
+            raise ValueError("该片2D文件已变更，请重新提交对应2D")
+
+        command = {"manual_2d": "detect_2d_piece", "manual_piece_3d": "detect_3d_piece",
+                   "manual_board_3d": "detect_3d_board"}[mode]
+        label = {"manual_2d": "2D", "manual_piece_3d": "单片3D", "manual_board_3d": "整板3D"}[mode]
+        title = f"板 {board_id} · " + (f"第{piece_id}片 · " if piece_id is not None else "") + label
+        envelope = dict(viewer_version=1, mode="stream", board_id=board_id, title=title,
+                        images_2d=images, responses_2d=[], warnings=[affinity_note] if affinity_note else [])
+        progress(f"准备{label}输入")
+        with ExitStack() as stack:
+            if mode == "manual_2d":
+                descriptor = self.mapper(stack, Path(images[0]["path"]), "2d", piece_id)
+            elif mode == "manual_piece_3d":
+                asset, metadata = self._manual_piece_depth(Path(depth["path"]), piece_id, config, settings, folder)
+                descriptor = self.mapper(stack, asset, "3d", piece_id)
+                descriptor.update(piece_id=piece_id, pitch_correction=metadata)
+                envelope.update(image_3d=str(asset), image_3d_preprocessed=True)
+            else:
+                descriptor = self.mapper(stack, Path(depth["path"]), "3d", pitch_settings=settings,
+                                         pitch_preprocessor=self._depth_runtime(settings))
+                envelope["image_3d"] = depth["path"]
+            if self._stopping.is_set():
+                raise RuntimeError("验证台正在停止")
+            if mode == "manual_board_3d" and time.monotonic() - state["touched"] >= idle_timeout:
+                self._manual_boards.pop(board_id, None)
+                raise ValueError("整板深度准备期间2D缓存已过期，请重新提交2D")
+            start_index, started = len(client.timeline), time.perf_counter()
+            progress(f"等待{label}响应")
+            reply = client.request(dict(cmd=command, board_id=board_id, **descriptor), 900)
+        elapsed = (time.perf_counter() - started) * 1000
+        state["touched"] = time.monotonic()
+        if mode == "manual_2d":
+            known.pop(piece_id, None)
+            if reply.get("ok"):
+                known[piece_id] = chosen[piece_id]
+        elif mode == "manual_piece_3d" and reply.get("ok"):
+            known.pop(piece_id, None)
+            state["piece_mode"] = bool(known)
+        elif mode == "manual_board_3d":
+            known.clear()
+        if not known:
+            self._manual_boards.pop(board_id, None)
+
+        timeline = client.timeline[start_index:]
+        envelope.update(response=reply, timeline=timeline,
+                        submission=dict(submission_mode="manual", requests=timeline))
+        (folder / "result.json").write_text(json.dumps(envelope, ensure_ascii=False, indent=2), encoding="utf-8")
+        save_timing_csv(envelope, folder / "timings.csv")
+        self.reporter(envelope, folder / "report.html", base_dir=folder, force=True)
+        if (self.folder / "python.log").exists():
+            shutil.copyfile(self.folder / "python.log", folder / "python.log")
+        detail = next((reply[k] for k in ("results_2d", "results_piece", "results_board") if k in reply), {})
+        latency = summarize_2d_latency(timeline, expected_count=1) if mode == "manual_2d" else None
+        return dict(ok=bool(reply.get("ok")), product_is_ok=detail.get("is_ok"),
+                    board_id=board_id, piece_id=piece_id, submission_mode="manual", action=label,
+                    ready_piece_ids=sorted(known), piece_mode=state["piece_mode"],
+                    pieces=len(detail.get("pieces", [])) if piece_id is None else 1,
+                    total_wall_ms=elapsed, error=(reply.get("message") or reply.get("error")) if not reply.get("ok") else None,
+                    two_d_latency=latency, skip_3d_reason=detail.get("skip_3d_reason"), note=affinity_note,
+                    output_dir=str(folder), model_reused=startup.get("model_reused", False))
+
+    def release_manual(self, board_id):
+        self._manual_boards.pop(board_id, None)
+        if self.client is not None and self.client.process.poll() is None:
+            reply = self.client.request(dict(cmd="release_board", board_id=board_id), 15)
+            if not reply.get("ok"):
+                raise RuntimeError(reply.get("message") or "释放板缓存失败")
 
     def run(self, rows, board_id, mode, count, folder, progress, *,
             submission_mode="concurrent", request_interval_ms=0):
@@ -247,7 +398,9 @@ class Runner:
             with self._state_lock:
                 if self._stopping.is_set():
                     raise RuntimeError("验证台正在停止")
-                client = self.client
+            client = self.client
+            if board_id in self._manual_boards:
+                self.release_manual(board_id)
             timeline_start = len(client.timeline)
             progress("提交前准备深度及Pitch矫正（不计入算法耗时）" if depth else "准备共享内存")
             with ExitStack() as stack, ThreadPoolExecutor(max_workers=min(len(images)+1, 16)) as pool:
@@ -408,7 +561,65 @@ class Server(ThreadingHTTPServer):
         (self.folder / "uploads").mkdir(parents=True)
         self.assets = {f: (HERE / f).read_bytes() for f in ("index.html", "app.js", "pairing.js", "style.css")}
         self.runner, self.jobs = Runner(self.folder), {}
+        self.workflows, self.grouped_runs = {}, set()
+        self.workflow_number = 0
         self.pool, self.lock = ThreadPoolExecutor(1), threading.Lock()
+
+    def finish_workflow(self, request):
+        ids, outcome = request.get("run_ids"), request.get("outcome")
+        if not isinstance(ids, list) or any(
+            not isinstance(key, str) or not re.fullmatch(r"[a-f0-9]{32}", key) for key in ids
+        ) or len(set(ids)) != len(ids):
+            raise ValueError("流程的检测记录无效或重复")
+        if outcome not in ("done", "stopped", "failed"):
+            raise ValueError("未知流程结束状态")
+        with self.lock:
+            if self.grouped_runs.intersection(ids):
+                raise ValueError("检测记录已归入流程")
+            jobs = [dict(self.jobs.get(key, {})) for key in ids]
+            if any(job.get("status") == "running" for job in jobs):
+                raise ValueError("流程仍有请求正在处理")
+            self.workflow_number += 1
+            title = f"流程 {self.workflow_number}"
+            self.grouped_runs.update(ids)
+        try:
+            return self._write_workflow(ids, jobs, title, outcome, str(request.get("error") or ""))
+        except Exception:
+            with self.lock:
+                self.grouped_runs.difference_update(ids)
+            raise
+
+    def _write_workflow(self, ids, jobs, title, outcome, error):
+        runs, timing_rows = [], []
+        for key, job in zip(ids, jobs):
+            child = self.folder / key
+            result_file = child / "result.json"
+            if result_file.is_file():
+                result = json.loads(result_file.read_text(encoding="utf-8"))
+                if result.get("mode") == "workflow":
+                    raise ValueError("流程报告不能作为单次检测归入")
+            elif job.get("status") == "failed":
+                result = dict(board_id=job["board_id"], response=dict(ok=False, error=job.get("error")))
+            else:
+                raise ValueError("找不到流程中的检测记录")
+            runs.append(dict(id=key, board_id=job.get("board_id"), piece_id=job.get("piece_id"),
+                             mode=job.get("mode"), document=result))
+            timings = child / "timings.csv"
+            if timings.is_file():
+                timing_rows.extend(timings.read_text(encoding="utf-8-sig").splitlines()[1:])
+        key = uuid.uuid4().hex
+        folder = self.folder / key
+        folder.mkdir()
+        document = dict(mode="workflow", title=title, outcome=outcome, error=error, runs=runs)
+        render_report(document, folder / "report.html", base_dir=folder)
+        (folder / "result.json").write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8")
+        (folder / "timings.csv").write_text("\n".join(
+            ["board_id,phase,piece_id,stage,elapsed_ms", *timing_rows]) + "\n", encoding="utf-8-sig")
+        entry = dict(kind="workflow", title=title, status=outcome, created=time.time(), runs=len(runs),
+                     boards=len({run["document"]["board_id"] for run in runs}), error=error)
+        with self.lock:
+            self.workflows[key] = entry
+        return dict(id=key, **entry)
 
     def server_close(self):
         super().server_close()
@@ -458,11 +669,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, dict(service=SERVICE_NAME))
             if path == "/api/history":
                 with self.server.lock:
-                    rows = [dict(id=key, **job) for key, job in reversed(list(self.server.jobs.items()))]
-                return self.send(200, rows)
+                    rows = [dict(id=key, **job) for key, job in self.server.jobs.items()
+                            if key not in self.server.grouped_runs]
+                    rows.extend(dict(id=key, **group) for key, group in self.server.workflows.items())
+                return self.send(200, sorted(rows, key=lambda row: row.get("created", 0), reverse=True)[:32])
             if path.startswith("/api/jobs/"):
                 with self.server.lock:
-                    job = dict(self.server.jobs.get(path.rsplit("/", 1)[-1], {}))
+                    key = path.rsplit("/", 1)[-1]
+                    job = dict(self.server.jobs.get(key) or self.server.workflows.get(key) or {})
                 return self.send(200 if job else 404, job or {"error": "记录不存在"})
             if path.startswith("/runs/"):
                 parts = path.split("/")
@@ -499,14 +713,26 @@ class Handler(BaseHTTPRequestHandler):
                 # shutdown() must run outside the serve_forever thread.
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
-            if parsed.path != "/api/run":
+            if parsed.path not in {"/api/run", "/api/release-board", "/api/workflows"}:
                 return self.send(404, {"error": "接口不存在"})
             request = json.loads(self.rfile.read(size))
             if not isinstance(request, dict):
                 raise ValueError("验证请求须为JSON对象")
-            options = submission_options(request.get("submission_mode", "concurrent"), request.get("request_interval_ms", 0))
+            if parsed.path == "/api/workflows":
+                return self.send(201, self.server.finish_workflow(request))
+            if parsed.path == "/api/release-board":
+                board = board_number(request.get("board_id"))
+                with self.server.lock:
+                    if any(j["status"] == "running" for j in self.server.jobs.values()):
+                        return self.send(409, {"error": "已有验证运行中，请等待完成"})
+                    self.server.runner.release_manual(board)
+                return self.send(200, {"board_id": board})
+            mode = request.get("mode")
+            manual = isinstance(mode, str) and mode in MANUAL_MODES
+            piece_id = request.get("piece_id") if manual and mode != "manual_board_3d" else None
+            options = {} if manual else submission_options(request.get("submission_mode", "concurrent"), request.get("request_interval_ms", 0))
             count = defaults()["piece_count"]
-            board, images, depth = board_inputs(request.get("files"), request.get("board_id"), request.get("mode"), count)
+            board, images, depth = board_inputs(request.get("files"), request.get("board_id"), mode, count, piece_id=piece_id)
             rows = images + ([depth] if depth else [])
             with self.server.lock:
                 if any(j["status"] == "running" for j in self.server.jobs.values()):
@@ -514,21 +740,26 @@ class Handler(BaseHTTPRequestHandler):
                 if len(self.server.jobs) >= 32:
                     self.server.jobs.pop(next(iter(self.server.jobs)))
                 key = uuid.uuid4().hex
-                self.server.jobs[key] = dict(status="running", phase="准备验证", board_id=board)
+                self.server.jobs[key] = dict(status="running", phase="准备验证", board_id=board, created=time.time())
+                if manual:
+                    self.server.jobs[key].update(mode=mode, piece_id=piece_id)
             folder = self.server.folder / key;folder.mkdir()
             def update(**values):
                 with self.server.lock:
                     self.server.jobs[key].update(values)
             def execute():
                 try:
-                    result = self.server.runner.run(rows, board, request["mode"], count, folder,
-                        lambda phase:update(phase=phase), **options)
+                    progress = lambda phase: update(phase=phase)
+                    if manual:
+                        result = self.server.runner.run_manual(rows, board, mode, piece_id, count, folder, progress)
+                    else:
+                        result = self.server.runner.run(rows, board, mode, count, folder, progress, **options)
                     update(status="done" if result["ok"] else "failed", result=result, error=result.get("error"))
                 except Exception as exc:
                     update(status="failed", error=str(exc))
             self.server.pool.submit(execute)
             self.send(202, {"id":key})
-        except (OSError, ValueError, TypeError, KeyError) as exc:
+        except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
             self.send(400, {"error":str(exc)})
 
 

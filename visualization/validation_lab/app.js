@@ -1,7 +1,15 @@
 'use strict';
 const $=id=>document.getElementById(id);
 let files=[],config=null,busy=false,uploading=false,revision=0;
+const workflow=[];
+const detectionTypes={manual_2d:'单片 2D',manual_piece_3d:'单片 3D',manual_board_3d:'整板 3D'};
+const actions={...detectionTypes,delay:'延时触发'};
+const palette=[['addDetection','manual_2d'],['addDelay','delay']];
+const savedWorkflowKey='validation-lab.workflow-templates.v1';
+const workflowFileFormat='validation-lab-workflow';
+let nodeID=0, activeRun=null, cancelCountdown=null, refreshCards=[];
 async function api(url,options){const r=await fetch(url,options),d=await r.json();if(!r.ok)throw Error(d.error||'HTTP '+r.status);return d;}
+const post=(url,body)=>api(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
 function status(text,error=false){$('progress').textContent=text;$('progress').className=error?'error':'';}
 function assess(){
  const d=Pairing.check(files,$('board').value,$('mode').value,config?.piece_count||0);
@@ -12,6 +20,8 @@ function assess(){
  $('submissionHint').textContent=paced?'按片号升序发送2D'+($('mode').value==='joint'?'，最后发送3D':'')+'；不等待上一张检测完成。间隔按相邻请求开始发送计，0ms仍保持顺序；实际发送时刻保存到结果JSON。':'并发发送所选板的请求，间隔设置不生效。';
  $('demo').disabled=busy||uploading;$('clear').disabled=busy||uploading;
  for(const id of ['upload2','upload3','board','mode','submissionMode'])$(id).disabled=busy||uploading;
+ $('releaseBoard').disabled=busy||uploading||!$('board').value;
+ updateWorkflow();
  return {...d,ok:d.ok&&valid};
 }
 function boardList(){const old=$('board').value;$('board').replaceChildren();for(const id of Pairing.boards(files)){const o=document.createElement('option');o.value=id;o.textContent='板 '+id;$('board').append(o);}if(Pairing.boards(files).includes(old))$('board').value=old;else $('board').value=Pairing.boards(files)[0]||'';$('counts').textContent='共 '+files.length+'个文件 · '+Pairing.boards(files).length+'个已编号板号'+(files.some(r=>!Pairing.board(r.board_id))?' · 有文件尚未指定板号':'');assess();}
@@ -37,23 +47,452 @@ $('clear').onclick=()=>{files=[];revision++;renderFiles();status('清单已清�
 $('board').onchange=$('mode').onchange=assess;
 $('requestInterval').value=$('requestInterval').value||'100';
 $('submissionMode').onchange=$('requestInterval').oninput=()=>{revision++;assess();};
-function links(id){for(const [key,file] of [['reportLink','report.html'],['jsonLink','result.json'],['csvLink','timings.csv'],['logLink','python.log']])$(key).href='/runs/'+id+'/'+file;$('links').hidden=false;}
+function links(id,workflow=false){
+ for(const [key,file] of [['reportLink','report.html'],['jsonLink','result.json'],['csvLink','timings.csv'],['logLink','python.log']])$(key).href='/runs/'+id+'/'+file;
+ $('links').hidden=false;$('logLink').hidden=workflow;
+}
+const workflowStatus={done:'完成',stopped:'已停止',failed:'失败'};
+function showWorkflow(id,group){
+ links(id,true);
+ $('resultEmpty').hidden=true;$('report').hidden=false;$('report').src='/runs/'+id+'/report.html';
+ $('summary').textContent=`${group.title} · ${workflowStatus[group.status]} · ${group.boards} 板 · ${group.runs} 个检测请求`+
+  (group.error?'\n'+group.error:'');
+}
 function showResult(id,job){
  links(id);$('resultEmpty').hidden=true;$('report').hidden=false;$('report').src='/runs/'+id+'/report.html';
  const r=job.result;
  $('summary').textContent=r?'板 '+r.board_id+' · '+(r.ok?(r.product_is_ok?'检测完成 · OK':'检测完成 · NG（算法判定）'):'检测请求失败')+' · '+r.pieces+'片 · '+(r.total_wall_ms/1000).toFixed(2)+'秒 · '+(r.model_reused?'复用已加载模型':'本次初始化模型')+(r.submission_mode==='paced'?' · 按间隔提交 '+r.request_interval_ms+'ms':r.submission_mode==='concurrent'?' · 并发提交':'')+(r.error?'\n'+r.error:'')+'\n输出：'+r.output_dir:'验证失败：'+(job.error||'未知错误');
+ if(r?.submission_mode==='manual'){
+  const skipped={missing_2d_result:'缺少或已过期的2D结果',no_2d_result:'2D无有效掩码','2d_ng':'2D已判为NG'};
+  const target=r.piece_id==null?'':' · 第'+r.piece_id+'片';
+  $('summary').textContent='板 '+r.board_id+target+' · '+r.action+' · '+(r.ok?(r.product_is_ok?'OK':'NG'):'请求失败')+
+   (r.skip_3d_reason?' · '+(skipped[r.skip_3d_reason]||r.skip_3d_reason):'')+
+   (r.error?'\n'+r.error:'')+'\n用时 '+(r.total_wall_ms/1000).toFixed(2)+'秒';
+  if(r.note)$('summary').textContent+='\n'+r.note;
+ }
  const latency=r?.two_d_latency;
  if(latency&&Number.isFinite(latency.max_ms))$('summary').textContent+='\n2D请求≤'+latency.target_ms+'ms：'+(latency.meets_target?'达标':'未达标')+' · 最大 '+latency.max_ms.toFixed(1)+'ms'+(latency.over_target_piece_ids?.length?' · 超标片号 '+latency.over_target_piece_ids.join(', '):'');
 }
-async function history(){const list=await api('/api/history');const old=$('history').value;$('history').replaceChildren();const blank=document.createElement('option');blank.value='';blank.textContent='历史验证记录';$('history').append(blank);for(const j of list){const o=document.createElement('option');o.value=j.id;o.textContent='板 '+j.board_id+' · '+(j.status==='done'?'完成':j.status==='failed'?'失败':'运行中');$('history').append(o);}if(list.some(j=>j.id===old))$('history').value=old;}
-$('history').onchange=async()=>{if(!$('history').value)return;try{const id=$('history').value,j=await api('/api/jobs/'+id);if(j.status==='running'){status('该记录仍在运行');return;}showResult(id,j);status('正在查看历史结果；当前文件清单不会改变该报告。');}catch(e){status(e.message,true);}};
+async function history(){
+ const list=await api('/api/history'),old=$('history').value;
+ $('history').replaceChildren();
+ appendOption($('history'),'','选择流程或单次检测');
+ for(const job of list){
+  const label=job.kind==='workflow'
+   ?`${job.title} · ${workflowStatus[job.status]} · ${job.boards} 板`
+   :'板 '+job.board_id+(job.piece_id==null?'':' · 第'+job.piece_id+'片')+
+     (actions[job.mode]?' · '+actions[job.mode]:'')+' · '+(workflowStatus[job.status]||'运行中');
+  appendOption($('history'),job.id,label);
+ }
+ if(list.some(job=>job.id===old))$('history').value=old;
+}
+$('history').onchange=async()=>{
+ if(!$('history').value)return;
+ try{
+  const id=$('history').value,job=await api('/api/jobs/'+id);
+  if(job.kind==='workflow'){showWorkflow(id,job);return;}
+  if(job.status==='running'){status('该记录仍在运行');return;}
+  if(!job.result){showJobError(job);status(job.error||'该记录没有报告',true);return;}
+  showResult(id,job);status('正在查看历史结果；报告对应当时选用的文件。');
+ }catch(e){status(e.message,true);}
+};
+async function runValidation(request){
+ const snapshot=revision;
+ const group=activeRun?.kind==='workflow'?activeRun:null;
+ status('正在提交验证…');
+ try{
+  const {id}=await post('/api/run',request);
+  if(group)group.runIds.push(id);
+  while(true){
+   await new Promise(r=>setTimeout(r,800));
+   const job=await api('/api/jobs/'+id);
+   if(job.status==='running'){status(job.phase);continue;}
+   if(!group){
+    if(job.result)showResult(id,job);else showJobError(job);
+    try{await history();$('history').value=id;}catch(error){console.warn('历史验证记录刷新失败',error);}
+   }
+   const latencyMiss=job.result?.two_d_latency?.meets_target===false;
+   status(job.status==='done'?(latencyMiss?'验证完成；2D请求未满足1秒目标，请查看超标片号。':'验证完成，可在下方复核。'):job.error||'验证失败，请检查报告与服务日志。',job.status!=='done'||latencyMiss);
+   if(snapshot!==revision)status('验证已完成；报告对应提交时的文件。');
+   return job;
+  }
+ }catch(e){status(e.message,true);return {status:'failed',error:e.message};}
+}
+async function runExclusive(work,kind=null){
+ if(busy||uploading||!config)return;
+ busy=true;
+ activeRun=kind?{kind,stopped:false,runIds:[]}:null;
+ renderFiles();
+ try{return await work(activeRun);}
+ finally{activeRun=null;busy=false;renderFiles();}
+}
+function showJobError(job){
+ $('summary').textContent=job.error||'验证失败';
+ $('links').hidden=true;$('report').hidden=true;$('resultEmpty').hidden=false;
+}
 $('run').onclick=async()=>{
  if(!assess().ok||busy||uploading||!config)return;
- const snapshot=revision,request={files:structuredClone(files),board_id:$('board').value,mode:$('mode').value,submission_mode:$('submissionMode').value,request_interval_ms:$('submissionMode').value==='paced'?Number($('requestInterval').value):0};
- busy=true;renderFiles();assess();status('正在提交验证…');
- try{
-  const {id}=await api('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(request)});
-  while(true){await new Promise(r=>setTimeout(r,800));const job=await api('/api/jobs/'+id);if(job.status==='running'){status(job.phase);continue;}links(id);if(job.result)showResult(id,job);else $('summary').textContent=job.error||'验证失败';await history();$('history').value=id;const latencyMiss=job.result?.two_d_latency?.meets_target===false;status(job.status==='done'?(latencyMiss?'验证完成；2D请求未满足1秒目标，请查看超标片号。':'验证完成，可在右侧交互查看。'):job.error||'验证失败，请检查报告与服务日志。',job.status!=='done'||latencyMiss);if(snapshot!==revision)status('验证已完成；清单有变化，报告仍对应提交时的文件。');break;}
- }catch(e){status(e.message,true);}finally{busy=false;renderFiles();assess();}
+ return runExclusive(()=>runValidation({files:structuredClone(files),board_id:$('board').value,mode:$('mode').value,
+  submission_mode:$('submissionMode').value,request_interval_ms:$('submissionMode').value==='paced'?Number($('requestInterval').value):0}));
 };
-api('/api/defaults').then(d=>{config=d;$('pieceCount').textContent=d.piece_count;const p=d.pitch;$('config').textContent='每板 '+d.piece_count+'片 · 粗配准 + 仿射 · Pitch '+(p.enabled_3d?'启用，'+p.angle_deg+'°，步距'+p.scan_pitch_mm+' mm/profile':'关闭');renderFiles();status('就绪，请添加文件或载入项目样本。');return history();}).catch(e=>status('配置加载失败：'+e.message,true));
+
+function target(mode){
+ if(mode==='delay')return {mode,delay_ms:'1000'};
+ return {mode,board_id:$('board').value,piece_spec:'1'};
+}
+function nodeCheck(node){
+ if(node.mode==='delay'){
+  const max=config?.max_request_interval_ms??3600000;
+  const text=String(node.delay_ms??'').trim(), ms=Number(text);
+  return text!==''&&Number.isFinite(ms)&&ms>=0&&ms<=max
+   ?{ok:true,message:''}:{ok:false,message:'等待时间须为0～'+max+'毫秒的有限数值'};
+ }
+ const count=config?.piece_count||0;
+ const pieces=node.mode==='manual_board_3d'?[null]:Pairing.pieceNumbers(node.piece_spec,count);
+ if(!pieces.length)return {ok:false,message:'请填写 1～'+count+' 的片号，支持用逗号和范围'};
+ for(const piece of pieces){
+  const check=Pairing.checkManual(files,node.board_id,node.mode,piece,count);
+  if(!check.ok)return {ok:false,message:(piece===null?'':'第'+piece+'片：')+check.message};
+ }
+ return {ok:true,message:'',pieces};
+}
+function delayCheck(node,index){
+ const duration=nodeCheck(node);
+ if(!duration.ok)return duration;
+ const next=workflow[index+1];
+ if(!next||next.mode==='delay')return {ok:false,message:'请将延时节点放在要触发的检测节点前'};
+ return nodeCheck(next);
+}
+function addNode(node,index=workflow.length){
+ if(busy||uploading||!config)return;
+ workflow.splice(index,0,{...node,id:++nodeID,status:'待执行'});
+ updateWorkflow();
+}
+function moveNode(id,index){
+ const current=workflow.findIndex(node=>node.id===id);
+ if(current<0||index===current||busy||uploading)return;
+ const [node]=workflow.splice(current,1);
+ workflow.splice(index,0,node);
+ updateWorkflow();
+}
+async function runDetection(node,run){
+ const {ok,message,pieces}=nodeCheck(node);
+ if(!ok){status(message,true);return false;}
+ const {mode,board_id}=node;
+ let finished=0,ng=0;
+ for(const piece_id of pieces){
+  if(run.stopped)break;
+  node.status=piece_id===null?'执行中':`第 ${piece_id} 片 · ${finished+1}/${pieces.length}`;
+  node.outcome='running';updateWorkflow();
+  const snapshot=files.filter(row=>Pairing.board(row.board_id)===board_id&&
+   (row.kind==='3d'?mode!=='manual_2d':piece_id===null||row.piece_id===piece_id));
+  const job=await runValidation({mode,board_id,piece_id,files:structuredClone(snapshot)});
+  if(job.status!=='done'){
+   node.outcome='failed';node.status='请求失败';node.message=job.error||'';
+   updateWorkflow();return false;
+  }
+  finished++;
+  if(!job.result?.product_is_ok)ng++;
+ }
+ node.outcome=finished===pieces.length?'done':'';
+ node.status=finished<pieces.length?`已停止 · ${finished}/${pieces.length}`:
+  pieces.length===1?(ng?'完成 · NG':'完成 · OK'):`完成 ${finished} 片 · ${ng} 片 NG`;
+ node.message='';
+ updateWorkflow();
+ return !run.stopped;
+}
+function waitDelay(node,next){
+ const duration=Math.ceil(Number(node.delay_ms)),deadline=Date.now()+duration;
+ const tick=()=>{
+  const remaining=Math.max(0,deadline-Date.now());
+  status('等待 '+(remaining<1000?remaining+' ms':(remaining/1000).toFixed(1)+' 秒')+
+   ' · 板 '+next.board_id+' · '+actions[next.mode]);
+ };
+ node.status='计时中';node.outcome='running';
+ return new Promise(resolve=>{
+  const finish=elapsed=>{
+   clearTimeout(timeout);clearInterval(update);cancelCountdown=null;
+   node.status=elapsed?'延时完成':'已取消';node.outcome=elapsed?'done':'';
+   updateWorkflow();resolve(elapsed);
+  };
+  const update=setInterval(tick,250),timeout=setTimeout(()=>finish(true),duration);
+  cancelCountdown=()=>finish(false);
+  updateWorkflow();tick();
+ });
+}
+function runSingleNode(node,index){
+ if(node.mode!=='delay')return runExclusive(run=>runDetection(node,run),'detection');
+ const check=delayCheck(node,index);
+ if(!check.ok){status(check.message,true);return;}
+ const next=workflow[index+1];
+ return runExclusive(async run=>{
+  const elapsed=await waitDelay(node,next);
+  if(elapsed)await runDetection(next,run);
+  if(run.stopped)status(elapsed?'后续请求已停止。':'计时已取消。');
+ },'delay');
+}
+function workflowIssue(){
+ for(const [index,node] of workflow.entries()){
+  const check=node.mode==='delay'?delayCheck(node,index):nodeCheck(node);
+  if(!check.ok)return `节点 ${index+1}：${check.message}`;
+ }
+ return '';
+}
+$('startWorkflow').onclick=()=>{
+ const issue=workflowIssue();
+ if(issue){status(issue,true);return;}
+ if(!workflow.length)return;
+ return runExclusive(async run=>{
+  for(const node of workflow){node.outcome='';node.status='待执行';node.message='';}
+  let error='';
+  for(const [index,node] of workflow.entries()){
+   if(run.stopped)break;
+   const finished=node.mode==='delay'?await waitDelay(node,workflow[index+1]):await runDetection(node,run);
+   if(!finished){
+    if(!run.stopped)error=`流程停在节点 ${index+1}：${node.message||'检测请求失败'}`;
+    break;
+   }
+  }
+  const outcome=run.stopped?'stopped':error?'failed':'done';
+  status('正在汇总流程结果…');
+  try{
+   const group=await post('/api/workflows',{run_ids:run.runIds,outcome,error});
+   showWorkflow(group.id,group);
+   await history();$('history').value=group.id;
+   status(error||(run.stopped?'流程已停止。':'流程执行完成。'),!!error);
+  }catch(err){
+   await history().catch(()=>{});
+   status([error,'流程结果汇总失败：'+err.message].filter(Boolean).join('\n'),true);
+  }
+ },'workflow');
+};
+function refreshWorkflowControls(){
+ const locked=busy||uploading||!config;
+ for(const [id] of palette)$(id).disabled=locked;
+ const issue=config&&workflow.length?workflowIssue():'';
+ $('flowEmpty').hidden=workflow.length>0;
+ $('clearFlow').disabled=locked||!workflow.length;
+ $('startWorkflow').disabled=locked||!workflow.length||!!issue;
+ $('workflowName').disabled=locked;
+ $('savedWorkflow').disabled=locked;
+ $('saveWorkflow').disabled=locked||!workflow.length||!$('workflowName').value.trim();
+ $('loadWorkflow').disabled=locked||!$('savedWorkflow').value;
+ $('saveWorkflowFile').disabled=locked||!workflow.length;
+ $('openWorkflowFile').disabled=locked;
+ $('workflowIssue').textContent=issue;$('workflowIssue').hidden=!issue||busy;
+ $('stopWorkflow').hidden=!activeRun;
+ $('stopWorkflow').disabled=activeRun?.stopped===true;
+ $('stopWorkflow').textContent=activeRun?.kind==='workflow'?'停止流程':cancelCountdown?'取消计时':'停止后续请求';
+ for(const refresh of refreshCards)refresh();
+}
+function addField(group,text,control){
+ const label=document.createElement('label');
+ label.textContent=text;label.append(control);group.append(label);
+ return label;
+}
+function appendOption(select,value,text){
+ const option=document.createElement('option');option.value=value;option.textContent=text;select.append(option);
+}
+function nodeSetup({mode,board_id,piece_spec,delay_ms}){
+ return mode==='delay'?{mode,delay_ms}:{mode,board_id,piece_spec};
+}
+function workflowSetup(){
+ return workflow.map(nodeSetup);
+}
+function validWorkflow(entry){
+ const validNode=node=>node&&(node.mode==='delay'?typeof node.delay_ms==='string':
+  Object.hasOwn(detectionTypes,node.mode)&&typeof node.board_id==='string'&&typeof node.piece_spec==='string');
+ return entry&&typeof entry.name==='string'&&entry.name.trim()&&
+  Array.isArray(entry.nodes)&&entry.nodes.length&&entry.nodes.every(validNode);
+}
+function readSavedWorkflows(){
+ const entries=JSON.parse(window.localStorage.getItem(savedWorkflowKey)||'[]');
+ if(!Array.isArray(entries)||!entries.every(validWorkflow))throw Error('已保存的流程格式有误');
+ return entries;
+}
+function showSavedWorkflows(entries,selected=$('savedWorkflow').value){
+ const list=$('savedWorkflow');
+ list.replaceChildren();appendOption(list,'','选择已保存的流程');
+ for(const entry of entries)appendOption(list,entry.name,entry.name);
+ list.value=entries.some(entry=>entry.name===selected)?selected:'';
+ refreshWorkflowControls();
+}
+$('workflowName').oninput=refreshWorkflowControls;
+$('savedWorkflow').onchange=refreshWorkflowControls;
+$('saveWorkflow').onclick=()=>{
+ if($('saveWorkflow').disabled)return;
+ try{
+  const name=$('workflowName').value.trim(),nodes=workflowSetup();
+  const entries=readSavedWorkflows(),index=entries.findIndex(entry=>entry.name===name);
+  if(index<0)entries.push({name,nodes});
+  else{
+   if(!window.confirm('更新已保存的流程「'+name+'」？'))return;
+   entries[index]={name,nodes};
+  }
+  window.localStorage.setItem(savedWorkflowKey,JSON.stringify(entries));
+  $('workflowName').value=name;
+  showSavedWorkflows(entries,name);status('已保存流程「'+name+'」。');
+ }catch(error){status('保存流程失败：'+error.message,true);}
+};
+function applySavedWorkflow(entry,stored=[]){
+ const current=JSON.stringify(workflowSetup()),nodes=entry.nodes.map(nodeSetup);
+ if(workflow.length&&current!==JSON.stringify(nodes)&&
+  !stored.some(item=>JSON.stringify(item.nodes)===current)&&
+  !window.confirm('载入「'+entry.name+'」将替换当前画布，是否继续？'))return;
+ workflow.splice(0,workflow.length,...nodes.map(node=>({...node,id:++nodeID,status:'待执行'})));
+ $('workflowName').value=entry.name;
+ updateWorkflow();
+ status('已载入流程「'+entry.name+'」。');
+}
+$('loadWorkflow').onclick=()=>{
+ if($('loadWorkflow').disabled)return;
+ try{
+  const entries=readSavedWorkflows();
+  const entry=entries.find(item=>item.name===$('savedWorkflow').value);
+  if(!entry){showSavedWorkflows(entries);status('找不到这份流程。',true);return;}
+  applySavedWorkflow(entry,entries);
+ }catch(error){status('载入流程失败：'+error.message,true);}
+};
+$('saveWorkflowFile').onclick=()=>{
+ if($('saveWorkflowFile').disabled)return;
+ return runExclusive(async()=>{
+  const name=$('workflowName').value.trim()||'检测流程';
+  const body=JSON.stringify({format:workflowFileFormat,version:1,name,nodes:workflowSetup()},null,2)+'\n';
+  const filename='流程-'+name.replace(/[<>:"/\\|?*\u0000-\u001f]/g,'_').slice(0,100)+'.json';
+  try{
+   if(typeof window.showSaveFilePicker==='function'){
+    const file=await window.showSaveFilePicker({suggestedName:filename,
+     types:[{description:'检测流程',accept:{'application/json':['.json']}}]});
+    const stream=await file.createWritable();
+    try{await stream.write(body);await stream.close();}
+    catch(error){await stream.abort().catch(()=>{});throw error;}
+    status('已保存流程文件 '+file.name+'。');
+   }else{
+    const url=URL.createObjectURL(new Blob([body],{type:'application/json'}));
+    const link=document.createElement('a');link.href=url;link.download=filename;link.click();
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+    status('已交给浏览器下载 '+filename+'。');
+   }
+  }catch(error){if(error.name!=='AbortError')status('保存流程文件失败：'+error.message,true);}
+ });
+};
+$('openWorkflowFile').onclick=()=>{if(!$('openWorkflowFile').disabled)$('workflowFileInput').click();};
+$('workflowFileInput').onchange=event=>{
+ const input=event.target,file=input.files?.[0];
+ input.value='';
+ if(!file)return;
+ return runExclusive(async()=>{
+  try{
+   const document=JSON.parse(await file.text());
+   if(document?.format!==workflowFileFormat||document.version!==1||!validWorkflow(document))
+    throw Error('请选择验证台导出的流程 JSON');
+   applySavedWorkflow(document);
+  }catch(error){status('载入流程文件失败：'+error.message,true);}
+ });
+};
+function editNode(node,changes){
+ Object.assign(node,changes,{status:'待执行',outcome:'',message:''});
+ refreshWorkflowControls();
+}
+function detectionFields(node,boards,locked){
+ const fields=document.createElement('div');fields.className='node-fields';
+ const type=document.createElement('select');type.disabled=locked;
+ for(const [value,title] of Object.entries(detectionTypes))appendOption(type,value,title);
+ type.value=node.mode;
+ addField(fields,'检测类型',type);
+ const board=document.createElement('select');board.disabled=locked;
+ appendOption(board,'','选择板号');
+ for(const id of boards)appendOption(board,id,'板 '+id);
+ if(node.board_id&&!boards.includes(node.board_id))appendOption(board,node.board_id,'板 '+node.board_id+'（未载入）');
+ board.value=node.board_id;
+ addField(fields,'板号',board);
+ const pieces=document.createElement('input');pieces.type='text';pieces.value=node.piece_spec;
+ pieces.placeholder='如 1 或 1,3-5';pieces.disabled=locked;
+ const pieceField=addField(fields,'片号',pieces);
+ pieceField.hidden=node.mode==='manual_board_3d';
+ type.onchange=()=>{pieceField.hidden=type.value==='manual_board_3d';editNode(node,{mode:type.value});};
+ board.onchange=()=>editNode(node,{board_id:board.value});
+ pieces.oninput=()=>editNode(node,{piece_spec:pieces.value});
+ return fields;
+}
+function updateWorkflow(){
+ const locked=busy||uploading||!config;
+ const boards=Pairing.boards(files);
+ refreshCards=[];
+ $('flowNodes').replaceChildren();
+ for(const [index,node] of workflow.entries()){
+  const isDelay=node.mode==='delay';
+  const card=document.createElement('li');card.className=isDelay?'flow-node delay-node':'flow-node';card.dataset.flowId=String(node.id);
+  const grip=document.createElement('div');grip.className='flow-grip';grip.draggable=!locked;grip.tabIndex=0;
+  grip.title='拖动排序，也可用方向键移动';
+  grip.ondragstart=event=>event.dataTransfer.setData('text/plain',JSON.stringify({id:node.id}));
+  grip.onkeydown=event=>{
+   const offset={ArrowLeft:-1,ArrowUp:-1,ArrowRight:1,ArrowDown:1}[event.key];
+   if(!offset)return;
+   event.preventDefault();moveNode(node.id,Math.max(0,Math.min(workflow.length-1,index+offset)));
+  };
+  const footer=document.createElement('div');footer.className='flow-footer';
+  const state=document.createElement('span');
+  const execute=document.createElement('button');
+  const refresh=()=>{
+   grip.textContent=(index+1)+' · '+actions[node.mode];
+   state.className='flow-status '+(node.outcome||'');state.textContent=node.status;state.title=node.message||'';
+   execute.textContent=isDelay?'开始计时':node.outcome==='done'?'重跑':'执行';
+   const check=isDelay?delayCheck(node,index):nodeCheck(node);
+   execute.disabled=locked||!check.ok;execute.title=check.message;
+  };
+  let description;
+  if(isDelay){
+   description=document.createElement('label');
+   description.className='delay-setting';description.textContent='等待时间（ms）';
+   const input=document.createElement('input');input.type='number';input.min=0;
+   input.max=config?.max_request_interval_ms??3600000;input.step='any';input.value=node.delay_ms;
+   input.disabled=locked;
+   input.setAttribute('aria-label','节点 '+(index+1)+' 等待时间（毫秒）');
+   input.oninput=()=>editNode(node,{delay_ms:input.value});
+   description.append(input);
+  }else description=detectionFields(node,boards,locked);
+  refreshCards.push(refresh);
+  execute.onclick=()=>runSingleNode(node,index);
+  const remove=document.createElement('button');remove.textContent='×';remove.title='移除节点';remove.disabled=locked;
+  remove.setAttribute('aria-label','移除节点 '+(index+1));
+  remove.onclick=()=>{workflow.splice(index,1);updateWorkflow();};
+  footer.append(state,execute,remove);card.append(grip,description,footer);$('flowNodes').append(card);
+ }
+ refreshWorkflowControls();
+}
+for(const [id,mode] of palette){
+ $(id).onclick=()=>addNode(target(mode));
+ $(id).ondragstart=event=>{if(!$(id).disabled)event.dataTransfer.setData('text/plain',JSON.stringify({node:target(mode)}));};
+}
+$('flowCanvas').ondragover=event=>{if(!busy&&!uploading)event.preventDefault();};
+$('flowCanvas').ondrop=event=>{
+ event.preventDefault();
+ if(busy||uploading)return;
+ let data;
+ try{data=JSON.parse(event.dataTransfer.getData('text/plain'));}catch{return;}
+ const targetID=Number(event.target.closest?.('[data-flow-id]')?.dataset.flowId);
+ const index=workflow.findIndex(node=>node.id===targetID);
+ if(data?.node&&Object.hasOwn(actions,data.node.mode))addNode(data.node,index<0?workflow.length:index);
+ else if(Number.isInteger(data?.id))moveNode(data.id,index<0?workflow.length-1:index);
+};
+$('clearFlow').onclick=()=>{if(!busy&&!uploading){workflow.length=0;updateWorkflow();}};
+$('stopWorkflow').onclick=()=>{
+ if(!activeRun||activeRun.stopped)return;
+ activeRun.stopped=true;
+ if(cancelCountdown)cancelCountdown();
+ else{refreshWorkflowControls();status('当前请求完成后停止。');}
+};
+$('releaseBoard').onclick=async()=>{
+ if(busy||uploading||!$('board').value)return;
+ const board_id=$('board').value;busy=true;assess();
+ try{await post('/api/release-board',{board_id});status('板 '+board_id+' 的检测缓存已释放。');}
+ catch(error){status(error.message,true);}finally{busy=false;assess();}
+};
+api('/api/defaults').then(d=>{
+ config=d;$('pieceCount').textContent=d.piece_count;
+ const p=d.pitch;$('config').textContent='每板 '+d.piece_count+'片 · 粗配准 + 仿射 · Pitch '+(p.enabled_3d?'启用，'+p.angle_deg+'°，步距'+p.scan_pitch_mm+' mm/profile':'关闭');
+ renderFiles();status('就绪，请添加文件或载入项目样本。');
+ try{showSavedWorkflows(readSavedWorkflows());}catch(error){status('读取已保存流程失败：'+error.message,true);}
+ return history();
+}).catch(e=>status('配置加载失败：'+e.message,true));

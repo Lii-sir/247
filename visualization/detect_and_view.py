@@ -283,8 +283,10 @@ def save_timing_csv(envelope: dict, path: Path) -> None:
     for reply in envelope.get("responses_2d", []):
         collect("2d", reply.get("piece_id"), reply.get("timings"))
     response = envelope.get("response", {})
-    collect("board", "", response.get("timings"))
-    for piece in response.get("results_board", {}).get("pieces", []):
+    piece = response.get("results_piece")
+    collect("2d" if response.get("results_2d") else "3d_piece" if piece else "board",
+            response.get("piece_id", ""), response.get("timings"))
+    for piece in ([piece] if piece else response.get("results_board", {}).get("pieces", [])):
         collect("joint_3d", piece.get("piece_id"), piece.get("timings"))
     with path.open("w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.DictWriter(stream, fieldnames=["board_id", "phase", "piece_id", "stage", "elapsed_ms"])

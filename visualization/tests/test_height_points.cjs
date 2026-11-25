@@ -5,7 +5,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '..', 'viewer.js'), 'utf8');
 
-function plotted(piece) {
+function loadViewer(data) {
   const nodes = new Map();
   const arcs = [];
   const makeNode = (id = '') => ({
@@ -13,7 +13,7 @@ function plotted(piece) {
     append(...items) { this.children.push(...items); },
     appendChild(item) { this.children.push(item); },
     replaceChildren(...items) { this.children = items; },
-    addEventListener() {}, setAttribute() {},
+    handlers: {}, addEventListener(name,handler) { this.handlers[name]=handler; }, setAttribute() {},
     getBoundingClientRect() { return {width: 600, height: 400}; },
     getContext() {
       return new Proxy({
@@ -23,18 +23,18 @@ function plotted(piece) {
     },
   });
   const document = {
+    body: {dataset:{}},
     getElementById(id) {
       if (!nodes.has(id)) nodes.set(id, makeNode(id));
       return nodes.get(id);
     },
     createElement() { return makeNode(); },
   };
-  document.getElementById('report-data').textContent = JSON.stringify({
-    response: {ok: true}, pieces: [piece], warnings: [],
-  });
+  document.getElementById('report-data').textContent = JSON.stringify(data);
   vm.runInNewContext(source, {document, window: {devicePixelRatio: 1, addEventListener() {}}});
-  return arcs;
+  return {arcs,nodes};
 }
+function plotted(piece) { return loadViewer({response:{ok:true},pieces:[piece],warnings:[]}).arcs; }
 
 function piece(space, row = 1000) {
   return {piece_id: 2, depth_start_row: row, depth_end_row: row + 200,
@@ -57,3 +57,25 @@ absent.wire_measurements[0].height_3d.point = null;
 assert.deepEqual(plotted(absent), [], 'Invalid height has no fabricated point');
 assert.deepEqual(plotted(piece('pitch_corrected_board_3d')), [[75,31]], 'Corrected full-board point is plotted relative to corrected preview');
 console.log('6 real-viewer coordinate checks passed');
+
+const done={status:'done',is_ok:true};
+const board=(board_id,pieces)=>({board_id,pieces,response:{ok:true},warnings:[]});
+const {nodes}=loadViewer({mode:'workflow',title:'Test flow',response:{mode:'workflow'},boards:[
+  board('A',[
+    {piece_id:1,workflow_stages:{'2d':done,'3d':done}},
+    {piece_id:2,workflow_stages:{'2d':done,'3d':{status:'skipped',reason:'2d_ng'}}},
+  ]),
+  board('B',[{piece_id:1,workflow_stages:{'3d':done}}])
+]});
+assert.equal(nodes.get('panel-2d').hidden,false);
+assert.equal(nodes.get('panel-3d').hidden,false);
+nodes.get('pieces').children[1].handlers.click();
+assert.equal(nodes.get('panel-2d').hidden,false);
+assert.equal(nodes.get('panel-3d').hidden,true);
+assert.match(nodes.get('piece-stage-warnings').textContent,/3D 跳过/);
+nodes.get('workflow-board').value='B';
+nodes.get('workflow-board').handlers.change();
+assert.equal(nodes.get('panel-2d').hidden,true);
+assert.equal(nodes.get('panel-3d').hidden,false);
+assert.equal(nodes.get('piece-stage-warnings').hidden,true);
+console.log('Workflow board/piece switches and stage visibility passed');

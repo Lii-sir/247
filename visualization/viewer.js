@@ -1,7 +1,9 @@
 (function () {
   "use strict";
 
-  const data = JSON.parse(document.getElementById("report-data").textContent);
+  const report = JSON.parse(document.getElementById("report-data").textContent);
+  const workflow = report.mode === "workflow";
+  let data = workflow ? report.boards[0] || {} : report;
   const state = {
     selected: Number(data.pieces?.[0]?.piece_id || 1),
     showMasks: true,
@@ -28,8 +30,10 @@
   const number = (value, digits = 2) => value == null || typeof value === "boolean" || value === "" || !Number.isFinite(Number(value)) ? "—" : Number(value).toFixed(digits);
   const statusText = (value) => value === true ? "OK" : value === false ? "NG" : "未提供";
   const statusClass = (value) => value === true ? "status-ok" : value === false ? "status-ng" : "status-unknown";
-  const boardResult = data.response?.results_board || {};
   const result2dOfPiece = (piece) => piece?.results_2d || {};
+  const hasStage = (piece, stage) => !workflow || piece?.workflow_stages?.[stage]?.status === "done";
+  const skippedReasons = {missing_2d_result:"缺少或已过期的 2D 结果",
+    no_2d_result:"2D 无有效掩码", "2d_ng":"2D 已判为 NG"};
   const classColor = (name) => {
     const key = String(name || "").toLowerCase();
     if (key === "chip") return "#87abff";
@@ -76,16 +80,18 @@
 
   function focusWire(piece, item) {
     state.highlight = { id: Number(item.instance_id), kind: "wire" };
-    const bounds = item.mask_2d?.bounding_box;
-    if (bounds?.length === 4 && piece?.overlay_2d_valid !== false) {
+    const kind = hasStage(piece, "2d") ? "2d" : "3d";
+    const canvas = $("canvas"+kind);
+    const bounds = (kind==="2d"?item.mask_2d:item.mask_3d_local)?.bounding_box;
+    if (bounds?.length === 4 && (kind==="3d" || piece?.overlay_2d_valid !== false)) {
       const [x1, y1, x2, y2] = bounds.map(Number);
-      const rect = $("canvas2d").getBoundingClientRect();
+      const rect = canvas.getBoundingClientRect();
       const scale = Math.max(.005, Math.min(rect.width / Math.max(x2-x1+160, 1), rect.height / Math.max(y2-y1+160, 1), 4));
-      Object.assign(state.views.canvas2d, { scale, x: rect.width/2-(x1+x2)*scale/2,
+      Object.assign(state.views[canvas.id], { scale, x: rect.width/2-(x1+x2)*scale/2,
         y: rect.height/2-(y1+y2)*scale/2, fitted: true });
     }
     renderAll();
-    $("canvas2d").scrollIntoView({ behavior: "smooth", block: "center" });
+    canvas.scrollIntoView({ behavior: "smooth", block: "center" });
   }
 
   function drawBending(ctx, piece) {
@@ -134,16 +140,20 @@
 
   function updateOverview() {
     const response = data.response || {};
-    setText("report-title", data.title || "检测结果复核");
+    const boardResult = response.results_board || {};
+    const piece = selectedPiece();
+    setText("report-title", report.title || "检测结果复核");
     setText("board-id", String(data.board_id || "未提供板号"));
     setText("service-status", statusText(response.ok), statusClass(response.ok));
-    const verdict = boardResult.is_ok ?? response.results_2d?.is_ok ?? response.results_3d?.is_ok;
-    $("verdict-label").textContent = response.results_board ? "算法整板结论" : "当前响应结论";
+    const verdict = workflow ? piece?.is_ok :
+      (boardResult.is_ok ?? response.results_2d?.is_ok ?? response.results_3d?.is_ok);
+    $("verdict-label").textContent = workflow ? "当前片结论" : response.results_board ? "算法整板结论" : "当前响应结论";
     setText("board-status", statusText(verdict), statusClass(verdict));
-    setText("registration-status", statusText(boardResult.registration_ok), statusClass(boardResult.registration_ok));
+    const registration = workflow ? piece?.registration?.is_valid : boardResult.registration_ok;
+    setText("registration-status", statusText(registration), statusClass(registration));
     setText("elapsed", response.elapsed_ms == null ? "—" : `${number(response.elapsed_ms, 1)} ms`);
     $("piece-count").textContent = `${pieces().length} 片 · 点击片号查看细节`;
-    const warningText = (data.warnings || []).join("\n");
+    const warningText = [workflow && report.response?.error, ...(data.warnings || [])].filter(Boolean).join("\n");
     const notice = $("notice");
     notice.hidden = !warningText;
     notice.textContent = warningText;
@@ -187,7 +197,13 @@
       button.setAttribute("aria-current", String(Number(piece.piece_id) === state.selected));
       const id = document.createElement("strong"); id.textContent = `#${piece.piece_id}`;
       const verdict = document.createElement("span"); verdict.className = statusClass(piece.is_ok); verdict.textContent = statusText(piece.is_ok);
-      const score = document.createElement("span"); score.textContent = `配准 ${number(piece.registration?.score, 3)}`;
+      const score = document.createElement("span");
+      if(workflow){
+        score.textContent = ["2d","3d"].filter(stage=>piece.workflow_stages?.[stage]).map(stage=>{
+          const result=piece.workflow_stages[stage];
+          return stage.toUpperCase()+(result.status==="done"?"":result.status==="skipped"?" 跳过":" 失败");
+        }).join(" · ");
+      }else score.textContent = `配准 ${number(piece.registration?.score, 3)}`;
       button.append(id, verdict, score);
       button.addEventListener("click", () => {
         state.selected = Number(piece.piece_id);
@@ -198,6 +214,24 @@
       });
       root.appendChild(button);
     }
+  }
+
+  function bindWorkflowBoards(){
+    if(!workflow)return;
+    const selector=$("workflow-board");
+    $("workflow-board-field").hidden=report.boards.length<2;
+    for(const board of report.boards){
+      const option=document.createElement("option");
+      option.value=String(board.board_id);option.textContent=String(board.board_id);
+      selector.append(option);
+    }
+    selector.addEventListener("change",()=>{
+      const board=report.boards.find(item=>String(item.board_id)===selector.value);
+      if(!board)return;
+      data=board;state.selected=Number(pieces()[0]?.piece_id||1);state.highlight=null;
+      for(const view of Object.values(state.views))view.fitted=false;
+      renderAll();
+    });
   }
 
   function polygon(ctx, contour, color, lineWidth = 1.6, fill = false) {
@@ -269,7 +303,7 @@
   }
 
   function renderAlignment(piece) {
-    if(!piece){$("alignment-section").hidden=true;return;}
+    if(!piece||!hasStage(piece,"2d")||!hasStage(piece,"3d")){$("alignment-section").hidden=true;return;}
     $("alignment-section").hidden=!piece.registration;
     if (!piece.registration) return;
     const h=alignmentMatrix(piece),source=piece.preview_2d,depth=piece.preview_3d;
@@ -309,7 +343,7 @@
       if(bounds&&(state.alignmentMapped||state.alignmentProjected))drawText(ctx,bounds[0],bounds[1],`${item.class_name||"instance"} #${item.instance_id}`,"#e7edf7");
     }
     ctx.setLineDash([]);ctx.restore();
-    const space=piece.depth_coordinate_space==="pitch_corrected_board_3d"?"Pitch补偿后的深度片":"输入深度片";
+    const space=["pitch_corrected_board_3d","pitch_corrected_piece_3d"].includes(piece.depth_coordinate_space)?"Pitch补偿后的深度片":"输入深度片";
     $("alignment-note").textContent=(piece.registration.is_valid===false?"配准标记无效，以下仅展示该矩阵的投影。 ":"")+`2D原图按本次实际矩阵投影到${space}；不重新优化，不重复添加裁剪偏移或整板起始行。`+(source._alignmentError||depth._alignmentError?" 预览图加载失败，请重新生成报告。":"");
   }
 
@@ -357,7 +391,7 @@
     }
     const masks = Array.isArray(piece?.masks) ? piece.masks : [];
     const instances = Array.isArray(result2dOfPiece(piece)?.instances) ? result2dOfPiece(piece).instances : [];
-    const allMasks = masks.length ? masks : instances;
+    const allMasks = workflow && kind === "2d" ? instances : masks.length ? masks : instances;
     const canOverlay = kind !== "2d" || piece?.overlay_2d_valid !== false;
     if (state.showMasks && canOverlay) {
       for (const item of allMasks) {
@@ -483,18 +517,19 @@
       ? "银浆边界生成" : "银浆边界配准";
     const checks = [
       ["片级结论", piece?.is_ok],
-      ["配准", piece?.registration?.is_valid],
-      ["2D 引线 ROI", Array.isArray(piece?.wire_roi_checks) ? (piece.wire_roi_checks.length ? piece.wire_roi_checks.every((x) => x.is_ok === true) : null) : two.wire_bending_2d?.is_ok],
-      ["芯片旋转", two.chip_rotation_2d?.is_ok],
-      ["芯片外观", piece?.chip_anomaly_2d?.is_ok ?? two.chip_anomaly_2d?.is_ok],
-      ["银浆连通", (two.silver_continuity_2d || piece?.silver_continuity_2d)?.is_ok],
-      ["银浆溢出", (two.silver_overflow_2d || piece?.silver_overflow_2d)?.is_ok],
-      [silverBoundaryLabel, (two.silver_overflow_2d || piece?.silver_overflow_2d)?.registration?.status === "not_configured" ? null : (two.silver_overflow_2d || piece?.silver_overflow_2d)?.registration?.is_valid],
-      ["引线高度", Array.isArray(piece?.wire_measurements) && piece.wire_measurements.length ? piece.wire_measurements.every((x) => x.height_3d?.is_ok === true) : null],
-      ["焊脚高度", Array.isArray(piece?.solder_measurements) && piece.solder_measurements.length ? piece.solder_measurements.every((x) => x.height_3d?.is_ok === true) : null],
-      ["配准分数", piece?.registration?.score == null ? "—" : number(piece.registration.score, 4)],
+      ["配准", piece?.registration?.is_valid, "3d"],
+      ["2D 引线 ROI", Array.isArray(piece?.wire_roi_checks) ? (piece.wire_roi_checks.length ? piece.wire_roi_checks.every((x) => x.is_ok === true) : null) : two.wire_bending_2d?.is_ok, "2d"],
+      ["芯片旋转", two.chip_rotation_2d?.is_ok, "2d"],
+      ["芯片外观", workflow ? two.chip_anomaly_2d?.is_ok : (piece?.chip_anomaly_2d?.is_ok ?? two.chip_anomaly_2d?.is_ok), "2d"],
+      ["银浆连通", (two.silver_continuity_2d || piece?.silver_continuity_2d)?.is_ok, "2d"],
+      ["银浆溢出", (two.silver_overflow_2d || piece?.silver_overflow_2d)?.is_ok, "2d"],
+      [silverBoundaryLabel, (two.silver_overflow_2d || piece?.silver_overflow_2d)?.registration?.status === "not_configured" ? null : (two.silver_overflow_2d || piece?.silver_overflow_2d)?.registration?.is_valid, "2d"],
+      ["引线高度", Array.isArray(piece?.wire_measurements) && piece.wire_measurements.length ? piece.wire_measurements.every((x) => x.height_3d?.is_ok === true) : null, "3d"],
+      ["焊脚高度", Array.isArray(piece?.solder_measurements) && piece.solder_measurements.length ? piece.solder_measurements.every((x) => x.height_3d?.is_ok === true) : null, "3d"],
+      ["配准分数", piece?.registration?.score == null ? "—" : number(piece.registration.score, 4), "3d"],
     ];
-    checks.forEach(([name, value]) => {
+    checks.forEach(([name, value, stage]) => {
+      if (workflow && stage && !hasStage(piece, stage)) return;
       const card = document.createElement("div"); card.className = "check";
       const valueClass = typeof value === "boolean" || value == null ? statusClass(value) : "";
       const label = document.createElement("div"); label.textContent = name;
@@ -578,10 +613,11 @@
       timings_joint_3d: piece?.timings, timings_board: data.response?.timings }, null, 2);
     const two = result2dOfPiece(piece);
     $("diagnostics-json").textContent = JSON.stringify({ chip_rotation_2d: two.chip_rotation_2d || null,
-      chip_anomaly_2d: piece?.chip_anomaly_2d || two.chip_anomaly_2d || null,
+      chip_anomaly_2d: (workflow ? two.chip_anomaly_2d : (piece?.chip_anomaly_2d || two.chip_anomaly_2d)) || null,
       silver_continuity_2d: two.silver_continuity_2d || piece?.silver_continuity_2d || null,
       silver_overflow_2d: two.silver_overflow_2d || piece?.silver_overflow_2d || null }, null, 2);
-    $("raw-json").textContent = JSON.stringify(data.response, null, 2);
+    if (!workflow || !$("raw-json").textContent)
+      $("raw-json").textContent = JSON.stringify(workflow?report.response:data.response, null, 2);
   }
 
   function refreshCalibration() {
@@ -630,14 +666,42 @@
   function renderAll() {
     updateOverview(); renderPieceButtons();
     const piece = selectedPiece();
-    if (!piece) { $("piece-title").textContent = "没有片数据"; return; }
+    if(workflow){
+      $("inspection").hidden=!piece;
+      const show2d=hasStage(piece,"2d"),show3d=hasStage(piece,"3d");
+      document.body.dataset.workflowStages=show2d&&show3d?"both":show2d?"2d":show3d?"3d":"none";
+      $("panel-2d").hidden=!show2d;$("panel-3d").hidden=!show3d;
+      $("view-grid").className=show2d&&show3d?"view-grid":"view-grid single-panel";
+      const warnings=[];
+      for(const stage of ["2d","3d"]){
+        const result=piece?.workflow_stages?.[stage],label=$("stage-"+stage);
+        label.hidden=result?.status!=="done";
+        label.textContent=result?.status==="done"?statusText(result.is_ok)+
+          (result.elapsed_ms==null?"":` · ${number(result.elapsed_ms,1)} ms`):"";
+        label.className="stage-summary "+statusClass(result?.is_ok);
+        if(result?.status==="failed")warnings.push(`${stage.toUpperCase()} 请求失败：${result.message}`);
+        if(result?.status==="skipped")warnings.push(`${stage.toUpperCase()} 跳过：${skippedReasons[result.reason]||result.reason}`);
+      }
+      const notice=$("piece-stage-warnings");
+      notice.hidden=!warnings.length;notice.textContent=warnings.join("\n");
+    }
+    if (!piece) {
+      $("piece-title").textContent = "没有片数据";
+      if(workflow){$("checks").replaceChildren();$("measurements").replaceChildren();renderDetails(null);}
+      return;
+    }
     $("piece-title").textContent = `片 ${piece.piece_id}`;
-    $("piece-subtitle").textContent = `2D 尺寸 ${piece.image_2d_size?.join(" × ") || "—"} · 深度行 ${piece.depth_start_row ?? "—"}–${piece.depth_end_row ?? "—"} · 配准平移 ${number(piece.registration?.tx, 1)}, ${number(piece.registration?.ty, 1)}`;
+    $("piece-subtitle").textContent = [
+      hasStage(piece,"2d") && `2D 尺寸 ${piece.image_2d_size?.join(" × ") || "—"}`,
+      hasStage(piece,"3d") && `深度行 ${piece.depth_start_row ?? "—"}–${piece.depth_end_row ?? "—"} · 配准平移 ${number(piece.registration?.tx, 1)}, ${number(piece.registration?.ty, 1)}`,
+    ].filter(Boolean).join(" · ");
     $("image2d-info").textContent = piece.preview_2d ? `${piece.preview_2d.width} × ${piece.preview_2d.height}` : "未加载原图";
     const range = piece.preview_3d?.gray_range;
     $("image3d-info").textContent = piece.preview_3d ? `${piece.preview_3d.width} × ${piece.preview_3d.height}${range ? ` · 灰度 ${number(range[0], 0)}–${number(range[1], 0)}` : ""}` : "未加载深度图";
     $("image2d-note").textContent = piece.overlay_2d_valid === false ? "原图尺寸与检测结果不一致，已停用叠加。" : "轮廓使用检测返回的原始像素坐标。";
-    renderCanvas($("canvas2d"), piece, "2d"); renderCanvas($("canvas3d"), piece, "3d"); renderAlignment(piece);
+    if(hasStage(piece,"2d"))renderCanvas($("canvas2d"), piece, "2d");
+    if(hasStage(piece,"3d"))renderCanvas($("canvas3d"), piece, "3d");
+    renderAlignment(piece);
     renderChecks(piece); renderMeasurements(piece); renderDetails(piece); refreshCalibration();
   }
 
@@ -704,9 +768,10 @@
     state.showSilverBoundary = event.target.checked;
     renderAll();
   });
-  $("export-json").addEventListener("click", () => { const blob = new Blob([JSON.stringify(data.response, null, 2)], { type: "application/json" }); const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = `${data.board_id || "detection"}-response.json`; link.click(); URL.revokeObjectURL(link.href); });
+  $("export-json").addEventListener("click", () => { const blob = new Blob([JSON.stringify(workflow?report.response:data.response, null, 2)], { type: "application/json" }); const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = workflow?"workflow-result.json":`${data.board_id || "detection"}-response.json`; link.click(); URL.revokeObjectURL(link.href); });
   bindCanvas($("canvas2d")); bindCanvas($("canvas3d")); bindCanvas($("canvasAlignment"));
   window.addEventListener("resize", () => { state.views.canvas2d.fitted = false; state.views.canvas3d.fitted = false; state.views.canvasAlignment.fitted = false; renderAll(); });
   renderTimeline();
+  bindWorkflowBoards();
   renderAll();
 })();

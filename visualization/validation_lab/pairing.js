@@ -17,5 +17,30 @@
   }
   return {ok:true,message:'板 '+id+' · '+images.length+'张2D'+(mode==='joint'?' + 1张整板3D · 配对齐全':' · 仅验证这些片的2D结果')};
  }
- const api={board,boards,check};if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.Pairing=api;
+ function checkManual(files,id,mode,piece,count){
+  if(mode==='manual_board_3d')return check(files,id,'joint',count);
+  if(mode!=='manual_2d'&&mode!=='manual_piece_3d')return {ok:false,message:'未知检测方式'};
+  id=board(id);
+  if(!id)return {ok:false,message:'请选择板号'};
+  if(!Number.isInteger(piece)||piece<1||piece>count)return {ok:false,message:'请选择有效片号'};
+  const rows=files.filter(r=>board(r.board_id)===id);
+  const images=rows.filter(r=>r.kind==='2d'&&r.piece_id===piece);
+  if(images.length>1)return {ok:false,message:'该片有重复的2D文件'};
+  if(mode==='manual_2d'&&images.length!==1)return {ok:false,message:'该片需要一张2D图片'};
+  if(mode==='manual_piece_3d'&&rows.filter(r=>r.kind==='3d').length!==1)
+   return {ok:false,message:'单片3D需要一张整板深度图'};
+  return {ok:true,message:''};
+ }
+ function pieceNumbers(value,count){
+  const ids=new Set();
+  for(const part of String(value??'').trim().split(/[,，]/)){
+   const range=/^(\d+)(?:\s*-\s*(\d+))?$/.exec(part.trim());
+   if(!range)return [];
+   const first=Number(range[1]),last=Number(range[2]??range[1]);
+   if(first<1||last<first||last>count)return [];
+   for(let n=first;n<=last;n++)ids.add(n);
+  }
+  return [...ids];
+ }
+ const api={board,boards,check,checkManual,pieceNumbers};if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.Pairing=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
