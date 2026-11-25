@@ -55,10 +55,8 @@ def feature_parameters(
 def load_runtime_config(config_text: str, config_path: str | None = None) -> Dict[str, Any]:
     """Load either a stage file or the small project manifest.
 
-    The manifest only points at ``config/2D/config.json`` and
-    ``config/3D/config.json``.  The board detector receives both files as one
-    in-memory object so the algorithm code never needs to know deployment
-    paths; direct 2D/3D callers can still pass their stage file unchanged.
+    The manifest points at the algorithm parameters and the inspection policy.
+    Callers that assemble the request themselves can include an inline inspection object.
     """
     parsed = parse_config_text(config_text) if config_text else {}
     if not isinstance(parsed, dict):
@@ -79,8 +77,21 @@ def load_runtime_config(config_text: str, config_path: str | None = None) -> Dic
         raise ValueError("stage config files must contain objects")
     merged = dict(first)
     merged.update({key: value for key, value in second.items() if key != "model_path"})
+    if "config_inspection" in parsed:
+        policy_path = parsed["config_inspection"]
+        if not isinstance(policy_path, str) or not policy_path.strip():
+            raise ValueError("config_inspection must be a non-empty path")
+        merged["inspection"] = json.loads((base / policy_path).resolve().read_text(encoding="utf-8-sig"))
     _load_affine_initializer_profile(merged, str((base / path_3d).resolve()))
     return merged
+
+
+def inspection_parameters(config, legacy_2d):
+    """Read the independent policy, with support for older inline stage settings."""
+    settings = config.get("inspection", legacy_2d)
+    if not isinstance(settings, dict):
+        raise ValueError("inspection configuration must be an object")
+    return settings
 
 
 def _load_affine_initializer_profile(config: Dict[str, Any], config_path: str | None) -> None:

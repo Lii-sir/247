@@ -25,10 +25,10 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 SERVICE_NAME = "detection-validation-lab"
 MAX_REQUEST_INTERVAL_MS = 3600000
-MANUAL_MODES = {"manual_2d", "manual_piece_3d", "manual_board_3d"}
+MANUAL_MODES = {"manual_2d", "manual_piece_3d"}
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(ROOT / "python"))
-from detect_and_view import ProtocolClient, algorithm_request, mapped_file, save_timing_csv, summarize_2d_latency
+from detect_and_view import ProtocolClient, algorithm_request, mapped_file, save_timing_csv, split_depth_sample, summarize_2d_latency
 from generate_report import render_report
 from algorithm.vision3d.depth.depth_preprocessing import preprocessing_parameters, DepthPreprocessor
 
@@ -59,7 +59,7 @@ def submission_options(submission_mode="concurrent", request_interval_ms=0):
 
 
 def board_inputs(rows, board_id, mode, count, *, piece_id=None):
-    if not isinstance(mode, str) or mode not in {"joint", "2d", *MANUAL_MODES}:
+    if not isinstance(mode, str) or mode not in {"2d", *MANUAL_MODES}:
         raise ValueError("未知验证方式")
     if mode in {"manual_2d", "manual_piece_3d"} and (type(piece_id) is not int or not 1 <= piece_id <= count):
         raise ValueError(f"片号须为1～{count}的整数")
@@ -101,11 +101,7 @@ def board_inputs(rows, board_id, mode, count, *, piece_id=None):
             images[piece] = {**row, "path": str(path), "piece_id": piece}
     if not images and mode != "manual_piece_3d":
         raise ValueError(f"板{board_id}没有2D片图")
-    if mode in {"joint", "manual_board_3d"}:
-        missing = sorted(set(range(1, count+1)) - images.keys())
-        if missing:
-            raise ValueError("联合验证缺少2D片号：" + ", ".join(map(str, missing)))
-    needs_depth = mode in {"joint", "manual_board_3d", "manual_piece_3d"}
+    needs_depth = mode == "manual_piece_3d"
     if needs_depth and len(depths) != 1:
         raise ValueError(f"每板需要恰好一张3D整板图，目前{len(depths)}张")
     return board_id, [images[p] for p in sorted(images)], depths[0] if needs_depth else None
@@ -217,18 +213,8 @@ class Runner:
                     threading=self._startup_threading)
 
     def _manual_piece_depth(self, path, piece_id, config, settings, folder):
-        import numpy as np
-        from algorithm.runtime.config import feature_parameters
-        from algorithm.vision3d.depth.segment import SegmentationConfig, segment_depth_image
-
-        with Image.open(path) as image:
-            if image.format != "PNG" or image.mode not in {"I", "I;16", "I;16B", "I;16L"}:
-                raise ValueError("3D须为原始16位单通道深度PNG")
-            pixels = np.asarray(image, dtype=np.uint16).copy()
-        corrected, metadata = self._depth_runtime(settings).prepare(pixels)
-        pieces = segment_depth_image(corrected, SegmentationConfig.from_dict(
-            feature_parameters(config, "segmentation_3d")))
-        piece = next((part for part in pieces if part["piece_id"] == piece_id), None)
+        corrected, pieces, metadata = split_depth_sample(path, config, self._depth_runtime(settings))
+        piece = pieces.get(piece_id)
         if piece is None:
             raise ValueError(f"整板深度图中未找到第{piece_id}片")
         asset = folder / "piece-depth.png"
@@ -256,42 +242,28 @@ class Runner:
         for key, cached in list(self._manual_boards.items()):
             if now - cached["touched"] >= idle_timeout:
                 self._manual_boards.pop(key, None)
-        state = self._manual_boards.setdefault(board_id, dict(images={}, piece_mode=False, touched=now))
+        state = self._manual_boards.setdefault(board_id, dict(images={}, touched=now))
         known = state["images"]
         chosen = {r["piece_id"]: r["path"] for r in images}
-        if mode == "manual_board_3d":
-            if state["piece_mode"]:
-                raise ValueError("本板已使用单片3D。请完成剩余单片，或释放板缓存后重新提交2D")
-            missing = [pid for pid, path in chosen.items() if known.get(pid) != path]
-            if missing:
-                raise ValueError("请先提交本板2D（缓存也可能已过期）： " + "、".join(map(str, missing)))
-        elif mode == "manual_piece_3d" and piece_id in known and known[piece_id] != chosen.get(piece_id):
+        if mode == "manual_piece_3d" and piece_id in known and known[piece_id] != chosen.get(piece_id):
             raise ValueError("该片2D文件已变更，请重新提交对应2D")
 
-        command = {"manual_2d": "detect_2d_piece", "manual_piece_3d": "detect_3d_piece",
-                   "manual_board_3d": "detect_3d_board"}[mode]
-        label = {"manual_2d": "2D", "manual_piece_3d": "单片3D", "manual_board_3d": "整板3D"}[mode]
-        title = f"板 {board_id} · " + (f"第{piece_id}片 · " if piece_id is not None else "") + label
+        command = {"manual_2d": "detect_2d_piece", "manual_piece_3d": "detect_3d_piece"}[mode]
+        label = {"manual_2d": "2D", "manual_piece_3d": "单片3D"}[mode]
+        title = f"板 {board_id} · 第{piece_id}片 · {label}"
         envelope = dict(viewer_version=1, mode="stream", board_id=board_id, title=title,
                         images_2d=images, responses_2d=[], warnings=[affinity_note] if affinity_note else [])
         progress(f"准备{label}输入")
         with ExitStack() as stack:
             if mode == "manual_2d":
                 descriptor = self.mapper(stack, Path(images[0]["path"]), "2d", piece_id)
-            elif mode == "manual_piece_3d":
+            else:
                 asset, metadata = self._manual_piece_depth(Path(depth["path"]), piece_id, config, settings, folder)
                 descriptor = self.mapper(stack, asset, "3d", piece_id)
                 descriptor.update(piece_id=piece_id, pitch_correction=metadata)
                 envelope.update(image_3d=str(asset), image_3d_preprocessed=True)
-            else:
-                descriptor = self.mapper(stack, Path(depth["path"]), "3d", pitch_settings=settings,
-                                         pitch_preprocessor=self._depth_runtime(settings))
-                envelope["image_3d"] = depth["path"]
             if self._stopping.is_set():
                 raise RuntimeError("验证台正在停止")
-            if mode == "manual_board_3d" and time.monotonic() - state["touched"] >= idle_timeout:
-                self._manual_boards.pop(board_id, None)
-                raise ValueError("整板深度准备期间2D缓存已过期，请重新提交2D")
             start_index, started = len(client.timeline), time.perf_counter()
             progress(f"等待{label}响应")
             reply = client.request(dict(cmd=command, board_id=board_id, **descriptor), 900)
@@ -301,11 +273,8 @@ class Runner:
             known.pop(piece_id, None)
             if reply.get("ok"):
                 known[piece_id] = chosen[piece_id]
-        elif mode == "manual_piece_3d" and reply.get("ok"):
+        elif reply.get("ok"):
             known.pop(piece_id, None)
-            state["piece_mode"] = bool(known)
-        elif mode == "manual_board_3d":
-            known.clear()
         if not known:
             self._manual_boards.pop(board_id, None)
 
@@ -317,12 +286,11 @@ class Runner:
         self.reporter(envelope, folder / "report.html", base_dir=folder, force=True)
         if (self.folder / "python.log").exists():
             shutil.copyfile(self.folder / "python.log", folder / "python.log")
-        detail = next((reply[k] for k in ("results_2d", "results_piece", "results_board") if k in reply), {})
+        detail = reply.get("results_2d") or reply.get("results_piece", {})
         latency = summarize_2d_latency(timeline, expected_count=1) if mode == "manual_2d" else None
         return dict(ok=bool(reply.get("ok")), product_is_ok=detail.get("is_ok"),
                     board_id=board_id, piece_id=piece_id, submission_mode="manual", action=label,
-                    ready_piece_ids=sorted(known), piece_mode=state["piece_mode"],
-                    pieces=len(detail.get("pieces", [])) if piece_id is None else 1,
+                     ready_piece_ids=sorted(known), pieces=1,
                     total_wall_ms=elapsed, error=(reply.get("message") or reply.get("error")) if not reply.get("ok") else None,
                     two_d_latency=latency, skip_3d_reason=detail.get("skip_3d_reason"), note=affinity_note,
                     output_dir=str(folder), model_reused=startup.get("model_reused", False))
@@ -337,16 +305,14 @@ class Runner:
     def run(self, rows, board_id, mode, count, folder, progress, *,
             submission_mode="concurrent", request_interval_ms=0):
         options = submission_options(submission_mode, request_interval_ms)
-        board_id, images, depth = board_inputs(rows, board_id, mode, count)
+        board_id, images, _ = board_inputs(rows, board_id, mode, count)
         folder = Path(folder)
         envelope = dict(viewer_version=1, mode="stream", board_id=board_id,
-                        title=f"板 {board_id} · {'联合检测' if mode == 'joint' else '2D验证'}",
+                         title=f"板 {board_id} · 2D验证",
                         images_2d=[dict(piece_id=r["piece_id"], path=r["path"], name=r.get("name")) for r in images],
                         responses_2d=[], response={}, warnings=[],
-                        submission={**options, "requests": [], "planned_count": len(images)+bool(depth),
+                         submission={**options, "requests": [], "planned_count": len(images),
                                     "interval_basis": "minimum_start_to_start_no_response_wait"})
-        if depth:
-            envelope["image_3d"] = depth["path"]
         envelope["title"] += (f" · 按间隔提交 {options['request_interval_ms']:g}ms"
                               if options["submission_mode"] == "paced" else " · 并发提交")
         started, startup, client, timeline_start, release_sent = None, {}, None, 0, False
@@ -354,11 +320,9 @@ class Runner:
         try:
             if self._stopping.is_set():
                 raise RuntimeError("验证台正在停止")
-            progress("检查图像格式与深度位数")
-            for row in images + ([depth] if depth else []):
+            progress("检查图像格式")
+            for row in images:
                 with Image.open(row["path"]) as image:
-                    if row["kind"] == "3d" and (image.format != "PNG" or image.mode not in {"I", "I;16", "I;16B", "I;16L"}):
-                        raise ValueError("3D须为原始16位单通道深度PNG，不能使用彩色图或8位截图")
                     image.verify()
             init = self.init_builder(None, None)
             config = json.loads(init["config_text"])
@@ -384,13 +348,12 @@ class Runner:
                 if isinstance(joint_affinity, dict):
                     joint_affinity["enabled"] = False
                 init["config_text"] = json.dumps(config, ensure_ascii=True)
-            pitch_settings = preprocessing_parameters(config)
             config.pop('smartray_pitch_3d', None)
             init['config_text'] = json.dumps(config, ensure_ascii=True)
             cache_timeout = float(os.environ.get("BRIDGE_BOARD_TIMEOUT_SECONDS", "90"))
             if not math.isfinite(cache_timeout) or cache_timeout <= 0:
                 raise ValueError("BRIDGE_BOARD_TIMEOUT_SECONDS须为正的有限数值")
-            schedule_span = (len(images)+bool(depth)-1)*options["request_interval_ms"]/1000
+            schedule_span = (len(images)-1)*options["request_interval_ms"]/1000
             needed_timeout = max(cache_timeout, schedule_span+30.) if schedule_span > 0 else cache_timeout
             startup = self._ensure(init, progress,
                 board_timeout_seconds=needed_timeout if needed_timeout > cache_timeout else None)
@@ -402,19 +365,11 @@ class Runner:
             if board_id in self._manual_boards:
                 self.release_manual(board_id)
             timeline_start = len(client.timeline)
-            progress("提交前准备深度及Pitch矫正（不计入算法耗时）" if depth else "准备共享内存")
-            with ExitStack() as stack, ThreadPoolExecutor(max_workers=min(len(images)+1, 16)) as pool:
+            progress("准备共享内存")
+            with ExitStack() as stack, ThreadPoolExecutor(max_workers=min(len(images), 16)) as pool:
                 inputs = [(r, self.mapper(stack, Path(r["path"]), "2d", r["piece_id"])) for r in images]
-                depth_request = (dict(cmd="detect_3d_board", stage="3d", board_id=board_id,
-                    **self.mapper(stack, Path(depth["path"]), "3d", pitch_settings=pitch_settings,
-                                  pitch_preprocessor=self._depth_runtime(pitch_settings))) if depth else None)
                 started = time.perf_counter()
                 requests = [dict(cmd="detect_2d_piece", stage="2d", board_id=board_id, **desc) for row, desc in inputs]
-                if options["submission_mode"] == "paced":
-                    if depth_request:
-                        requests.append(depth_request)
-                elif depth_request:
-                    requests.insert(0, depth_request)
                 futures, consumed = {}, set()
                 finished = 0
                 submission_started = time.perf_counter()
@@ -437,15 +392,12 @@ class Runner:
                     consumed.add(future)
                     reply = future.result()
                     piece = futures[future]
-                    if piece is None:
-                        envelope["response"] = reply
-                    else:
-                        envelope["responses_2d"].append(reply)
-                        finished += 1
-                    progress(f"已完成2D {finished}/{len(images)}" + (" · 等待/处理整板3D" if depth else ""))
+                    envelope["responses_2d"].append(reply)
+                    finished += 1
+                    progress(f"已完成2D {finished}/{len(images)}")
                     if not reply.get("ok") and first_error is None:
                         details = [str(reply[k]) for k in ("error", "message") if reply.get(k)]
-                        first_error = (f"第{piece}片：" if piece is not None else "整板3D：") + "；".join(dict.fromkeys(details) or ["请求失败"])
+                        first_error = f"第{piece}片：" + "；".join(dict.fromkeys(details) or ["请求失败"])
                         release()
 
                 def collect_ready():
@@ -501,16 +453,15 @@ class Runner:
                             if not wait_until(None, event, future):
                                 break
                             previous_sent = sent_at[0]
-                            progress(f"已发送 {'整板3D' if request['cmd']=='detect_3d_board' else '2D第'+str(request['piece_id'])+'片'} · 间隔{options['request_interval_ms']:g}ms")
+                            progress(f"已发送2D第{request['piece_id']}片 · 间隔{options['request_interval_ms']:g}ms")
                     for future in as_completed(futures):
                         consume(future)
                 except Exception:
                     release()
                     raise
                 envelope["responses_2d"].sort(key=lambda r: r.get("piece_id", 0))
-            if mode == "2d":
-                envelope["response"] = dict(ok=all(r.get("ok") for r in envelope["responses_2d"]),
-                                             stage="2d", board_id=board_id, cmd="validate_2d")
+            envelope["response"] = dict(ok=all(r.get("ok") for r in envelope["responses_2d"]),
+                                        stage="2d", board_id=board_id, cmd="validate_2d")
             if first_error:
                 envelope["response"]["ok"] = False
                 envelope["response"]["error"] = first_error
@@ -542,8 +493,7 @@ class Runner:
         if (self.folder / "python.log").exists():
             shutil.copyfile(self.folder / "python.log", folder / "python.log")
         ok = bool(envelope["response"].get("ok"))
-        board = envelope["response"].get("results_board", {})
-        product = board.get("is_ok") if mode == "joint" else all(r.get("results_2d", {}).get("is_ok") is True for r in envelope["responses_2d"])
+        product = all(r.get("results_2d", {}).get("is_ok") is True for r in envelope["responses_2d"])
         return dict(ok=ok, product_is_ok=product if ok else None, board_id=board_id,
                     **options,
                     pieces=len(envelope["responses_2d"]), model_reused=startup.get("model_reused", False),
@@ -729,7 +679,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, {"board_id": board})
             mode = request.get("mode")
             manual = isinstance(mode, str) and mode in MANUAL_MODES
-            piece_id = request.get("piece_id") if manual and mode != "manual_board_3d" else None
+            piece_id = request.get("piece_id") if manual else None
             options = {} if manual else submission_options(request.get("submission_mode", "concurrent"), request.get("request_interval_ms", 0))
             count = defaults()["piece_count"]
             board, images, depth = board_inputs(request.get("files"), request.get("board_id"), mode, count, piece_id=piece_id)

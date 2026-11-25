@@ -68,7 +68,6 @@ test('manual duplicate piece blocks submission and partial2D mode permits missin
  const input=nodes.get('files').children[1].children[2].children[0];input.value='1';input.oninput();
  assert.equal(nodes.get('run').disabled,true);await nodes.get('run').onclick();assert.equal(requests.length,0);
  nodes.get('demo').onclick();nodes.get('files').children[1].children[3].children[0].onclick();
- assert.equal(nodes.get('run').disabled,true);nodes.get('mode').value='2d';nodes.get('mode').onchange();
  assert.equal(nodes.get('run').disabled,false);await nodes.get('run').onclick();assert.equal(requests[0].mode,'2d');
 });
 test('batch file upload displays original names and permits manual board editing',async()=>{
@@ -78,7 +77,7 @@ test('batch file upload displays original names and permits manual board editing
  assert.equal(nodes.get('run').disabled,false);assert.equal(nodes.get('files').children[0].children[0].textContent,'2_1.png');
  const board=nodes.get('files').children[0].children[1].children[0];board.value='3';board.oninput();
  assert.match(nodes.get('counts').textContent,/2个已编号板号/);
- nodes.get('board').value='2';nodes.get('board').onchange();assert.equal(nodes.get('run').disabled,true);
+ nodes.get('board').value='2';nodes.get('board').onchange();assert.equal(nodes.get('run').disabled,false);
 });
 test('paced submission carries interval and keeps report snapshot',async()=>{
  const {nodes,requests}=await boot();nodes.get('demo').onclick();
@@ -117,7 +116,7 @@ test('loading, dragging and reordering never submit; each execution sends one se
  nodes.get('addDetection').onclick();
  setDetection(cards.children[1],{mode:'manual_piece_3d'});
  nodes.get('addDetection').onclick();
- setDetection(cards.children[2],{mode:'manual_board_3d'});
+ setDetection(cards.children[2],{mode:'manual_piece_3d',pieces:'2'});
  cards.children[1].children[0].ondragstart({dataTransfer});
  drop({closest:()=>cards.children[0]});
  assert.equal(requests.length,0);
@@ -135,8 +134,25 @@ test('loading, dragging and reordering never submit; each execution sends one se
  assert.deepEqual(requests[1].files.map(row=>row.name),['2_2.png']);
  await execute(cards.children[2]).onclick();
  assert.equal(requests.length,3);
- assert.equal(requests[2].mode,'manual_board_3d');
- assert.equal(requests[2].piece_id,null);
+ assert.equal(requests[2].mode,'manual_piece_3d');
+ assert.equal(requests[2].piece_id,2);
+});
+
+test('saved whole-board 3D nodes load as a range of single-piece requests',async()=>{
+ const localStorage=browserStorage();
+ localStorage.setItem('validation-lab.workflow-templates.v1',JSON.stringify([
+  {name:'旧流程',nodes:[{mode:'manual_board_3d',board_id:'2',piece_spec:'1'}]}
+ ]));
+ const {nodes,requests}=await boot(null,{},()=>false,{localStorage});
+ nodes.get('demo').onclick();
+ nodes.get('savedWorkflow').value='旧流程';nodes.get('savedWorkflow').onchange();
+ nodes.get('loadWorkflow').onclick();
+ const card=nodes.get('flowNodes').children[0];
+ assert.equal(card.children[1].children[2].children[0].value,'1-2');
+ await execute(card).onclick();
+ assert.deepEqual(requests.map(({mode,piece_id})=>[mode,piece_id]),[
+  ['manual_piece_3d',1],['manual_piece_3d',2]
+ ]);
 });
 
 function deferredTimers(){

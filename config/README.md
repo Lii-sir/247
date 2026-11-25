@@ -1,27 +1,39 @@
-# Bridge 配置目录
+# Bridge 配置
 
-运行时维护两份阶段配置：
+- `2D/config.json` 保存圆定位、ROI、YOLO 和各项 2D 算法的参数。
+- `3D/config.json` 保存单片 3D 配准和测高参数，以及验证台在调用端分片和矫正所需的参数。
+- `inspection.json` 保存检测项选择、报告优先级和跳过规则。
+- `config.json` 引用以上文件。模型路径相对 2D 配置文件解析。
 
-- `2D/config.json`：2D 圆定位、ROI、YOLO、引线弯曲、银浆、芯片旋转和
-  EfficientAD。模型路径统一指向 `config/models/`。
-- `3D/config.json`：3D 分片、初始配准、动态仿射、透视配准、焊脚/引线高度和
-  独立 3D 引线高度接口。
+## 检测策略
 
-`config/config.json` 是给 Bridge DLL 使用的轻量 manifest，只保存两份阶段配置的
-相对路径，不承载算法参数。
-
-每个功能块采用一致结构：
+修改 `inspection.json` 后重新初始化算法。例如只检查芯片旋转和引线高度，并在同片 2D 判 NG 后跳过 3D。
 
 ```json
 {
-  "description": "功能说明",
-  "parameters": { "...": "现场需要调整的参数" }
+  "defect_sequence": ["chip_rotation_2d", "wire_height_3d"],
+  "skip_3d_on_2d_ng": true
 }
 ```
 
-不使用 `enabled` 开关。功能块存在即执行；可选功能不需要时，从交付配置中移除
-对应功能块。`common_2d`、`common_3d` 只存放阶段公共参数。
+| 检测项 | 配置名 |
+| --- | --- |
+| 引线缺失和弯曲 | `wire_bending_2d` |
+| 芯片旋转 | `chip_rotation_2d` |
+| 芯片外观异常 | `chip_anomaly_2d` |
+| 银浆溢出 | `silver_overflow_2d` |
+| 银浆断连 | `silver_continuity_2d` |
+| 引线高度 | `wire_height_3d` |
+| 平台侧焊点和焊脚高度 | `solder_platform_height_3d` |
+| 芯片侧焊点和焊脚高度 | `solder_chip_height_3d` |
 
-板级接口初始化时由 C# 读取两份阶段配置并在内存中合并；Python 算法和传输服务
-统一从 `python/` 加载。配置中的模型路径相对于 2D 配置文件解析，不依赖开发机
-桌面绝对路径。
+- 清单只启用列出的项目。同一阶段有多个 NG 时，优先报告清单靠前的项，联合结果优先报告 2D 的 NG。
+- `defect_sequence: null` 使用默认检测项。空数组 `[]` 只验证 YOLO 分割是否有有效掩码。
+- `skip_3d_on_2d_ng: true` 在同一片 2D 判 NG 时返回 `2d_ng` 并跳过配准和测高。为 `false` 时，有有效掩码的片可继续测高，联合结论仍保留 2D NG。
+- 没有对应片的 2D 结果，或该片没有有效掩码时，跳过 3D 并按 NG 返回。只启用 3D 项也需要先提交该片 2D 供 YOLO 分割。
+
+现场使用过旧字段时，把设置迁入 `inspection.json`。独立文件生效后以它为准。自组初始化请求可把文件内容作为顶层 `inspection` 对象传入。
+
+## 上位机提交
+
+使用 `InitAlgorithm("board")` 初始化联合检测。上位机按相同板号、片号分别提交 `detect_2d_piece` 和 `detect_3d_piece`，深度图在调用端完成切片和矫正。C# 和测高结果字段参见[接口说明](../process/OUTPUT_PARAMETERS.md)。

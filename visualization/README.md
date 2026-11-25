@@ -129,7 +129,7 @@ SIFT 匹配的是模板与当前图像的特征点，得到 Homography 后映射
 & .\.venv\Scripts\python.exe .\visualization\detect_and_view.py --open
 ```
 
-默认读取 `demodatasets/2D` 的 10 张图片以及 `demodatasets/3D` 的唯一深度图，走逐片 2D → 整板 3D 的流式路径，结束后生成并打开报告。需要已安装算法依赖和可用 CUDA GPU；初始化或检测失败也会保存错误 JSON/日志和报告。
+默认读取 `demodatasets/2D` 的 10 张图片以及 `demodatasets/3D` 的唯一深度图，在客户端准备单片深度，按对应片号分别提交 2D 和 3D 请求，结束后生成并打开报告。需要已安装算法依赖和可用 CUDA GPU；初始化或检测失败也会保存错误 JSON/日志和报告。
 
 输出保存在 `visualization/output/<时间戳>/`：`result.json`、`report.html` 和 `python.log`。报告自包含；查看时不需要保持 Python 服务运行。
 
@@ -146,7 +146,7 @@ $env:BRIDGE_BOARD_TIMEOUT_SECONDS = "900"
 ```
 
 `--repeat 2` 只启动一个服务进程、只调用一次 `init_algorithm`。第一批完整结束后，
-第二批直接推理同一批 10 张 2D 和整板 3D 图片，不重新加载模型。每批使用独立板号
+第二批使用相同的 2D 图片和 3D 样本分片，不重新加载模型。每批使用独立板号
 （`-run-01`、`-run-02`），防止缓存串板；每批重新建立共享内存，模拟新的采集批次。
 所有批次完成后才释放模型并生成 HTML，避免报告生成干扰后续推理计时。
 
@@ -178,7 +178,6 @@ GPU 每个工作槽使用独立 YOLO 与 EfficientAD 模型副本；两个新增
 | `common_2d.parameters.threading.postprocess_workers`（2D 配置） | 5 | `bridge-postprocess`：完整 2D 诊断、银浆溢出/连续性判断、结果整理；不含提前计算的边界配准 |
 | `common_2d.parameters.threading.silver_workers`（2D 配置，新增） | 5 | `bridge-silver`：银浆边界 SIFT 特征提取、匹配、RANSAC、模板点映射/回退 |
 | 配置 `config/2D/config.json` 的 `common_2d.parameters.threading.gpu_workers` | 3 | GPU 推理工作线程数；统一板级检测中每个线程使用独立模型副本 |
-| `common_3d.parameters.threading.early_joint_workers` | 省略，等于 `joint_workers` | 每板 2D 诊断未全部完成时，允许提前提交且尚未完成的联合 3D 任务上限；正整数且不超过 `joint_workers`；不是第六个线程池 |
 | `BRIDGE_MAX_WORKERS` / `BRIDGE_CPU_WORKERS` / `BRIDGE_POSTPROCESS_WORKERS` / `BRIDGE_GPU_WORKERS` | 对应配置缺省时回退 | JSON 配置优先，环境变量不覆盖已有 JSON 值 |
 | `BRIDGE_SILVER_WORKERS` / `BRIDGE_JOINT_WORKERS`（新增） | 对应配置缺省时回退 | 显式设置会启用独立银浆/联合 3D 池，并计入线程预算 |
 | `BRIDGE_NATIVE_THREADS` | `1` | 服务启动、导入数值库之前，为 OpenBLAS/OpenMP/MKL 设置默认线程数 |
@@ -338,7 +337,7 @@ EfficientAD 评分可以在启动时显式传参：
 
 两个模型的阈值独立。`--threshold` 推荐按模型名分别传入，示例值 `0.4`、`2.0` 仅演示语法，不是产线推荐阈值。只传 `chip_short=0.4` 不会改变 `chip_long` 的配置或默认阈值。为兼容旧命令，单个数字仍作为显式覆盖两个模型的选项，但不建议用于需要独立阈值的场景。
 
-`--threshold` 会随每张 2D 推理请求传递，不是算法初始化参数。优先级是：本次请求中对应模型的阈值 → 初始化配置中对应模型的阈值 → 该模型 checkpoint 自己的校准阈值。`pool+top` 优先使用各自 checkpoint 的 `pool_top_threshold`；没有该字段时兼容回退到该模型原始 `threshold`。运行覆盖只影响判定和异常框，不改权重或 checkpoint，响应的每个芯片都返回实际 `threshold` 和 `threshold_source`。Python 协议也支持在单片 `detect_2d_piece` 请求的 `threshold` 字段中传数值或每模型字典；C# `DetectStreamingFilesAsync`/`DetectPieceFile` 同样接受单个 `double` 或 `Dictionary<string,double>`。只指定一个模型的阈值时，另一个模型沿用其配置/自身 checkpoint 阈值。
+`--threshold` 会随每张 2D 推理请求传递，不是算法初始化参数。优先级是：本次请求中对应模型的阈值 → 初始化配置中对应模型的阈值 → 该模型 checkpoint 自己的校准阈值。`pool+top` 优先使用各自 checkpoint 的 `pool_top_threshold`；没有该字段时兼容回退到该模型原始 `threshold`。运行覆盖只影响判定和异常框，不改权重或 checkpoint，响应的每个芯片都返回实际 `threshold` 和 `threshold_source`。Python 协议也支持在单片 `detect_2d_piece` 请求的 `threshold` 字段中传数值或每模型字典；C# `DetectPieceFile` 同样接受单个 `double` 或 `Dictionary<string,double>`。只指定一个模型的阈值时，另一个模型沿用其配置/自身 checkpoint 阈值。
 
 配置形式：在 `config/2D/config.json` 的 `chip_anomaly_2d.parameters` 中添加：
 
@@ -354,7 +353,6 @@ EfficientAD 评分可以在启动时显式传参：
 
 池化归一化仍按 checkpoint 对应 kernel 的校准值读取；更改 kernel 或评分模式后应验证并重新校准阈值。
 
-如需与当前 `Bridge.Demo` 的批量路径比较，添加 `--mode board`。批量路径没有执行全部流式 2D 诊断；报告会显示“未提供”，不会将缺失数据标为 OK。这个客户端不改变现有算法的串行调度或合格判定。
 
 ## 1. 保存检测结果
 
@@ -370,7 +368,7 @@ File.WriteAllText("D:/results/board-001.json", JsonSerializer.Serialize(response
 [
   {"cmd":"detect_2d_piece", "board_id":"board-001", "piece_id":1, "results_2d":{}},
   {"cmd":"detect_2d_piece", "board_id":"board-001", "piece_id":2, "results_2d":{}},
-  {"cmd":"detect_3d_board", "board_id":"board-001", "results_board":{}}
+  {"cmd":"detect_3d_piece", "board_id":"board-001", "piece_id":1, "results_piece":{}}
 ]
 ```
 

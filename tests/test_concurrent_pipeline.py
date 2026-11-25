@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 from algorithm.application.board.board_pipeline import BoardPipeline
 from transport.bridge_server import AlgorithmServer, configure_native_threads
 from transport.shared_memory import SharedImage
-from pipeline_fakes import FakeDetector
+from pipeline_fakes import FakeDetector, depth_piece_request
 
 
 class PipelineTests(unittest.TestCase):
@@ -73,8 +73,6 @@ class PipelineTests(unittest.TestCase):
             self.assertFalse(pending.done())
             duplicate = self.pipeline.submit_3d_piece(self.piece_depth("A", 1)).result(1)
             self.assertEqual(duplicate["error"], "invalid_piece")
-            whole_board = self.pipeline.submit_3d(dict(board_id="A")).result(1)
-            self.assertEqual(whole_board["error"], "invalid_board")
             for board, piece_id in (("A", 2), ("B", 1)):
                 result = self.pipeline.submit_3d_piece(self.piece_depth(board, piece_id)).result(2)
                 self.assertTrue(result["ok"])
@@ -114,43 +112,30 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(image.result(2)["ok"])
         self.assertFalse(self.pipeline.has_pending)
 
-    def test_3d_first_waits_without_worker_and_pairs_before_ten(self):
-        board = self.pipeline.submit_3d(dict(board_id="A"))
-        self.assertTrue(self.detector.depth_started.wait(1))
-        self.assertFalse(board.done())
-        first = self.pipeline.submit_2d(dict(board_id="A", piece_id=1, marker="A:1"))
-        self.assertTrue(first.result(2)["ok"])
-        self.assertTrue(self.detector.measured.wait(1))
-        self.assertFalse(board.done())
-        rest = [self.pipeline.submit_2d(dict(board_id="A", piece_id=pid, marker=f"A:{pid}"))
-                for pid in range(2, 11)]
-        self.assertTrue(all(f.result(3)["ok"] for f in rest))
-        result = board.result(3)
-        self.assertTrue(result["ok"])
-        self.assertEqual([p["marker"] for p in result["results_board"]["pieces"]],
-                         [f"A:{pid}" for pid in range(1, 11)])
-        self.assertEqual(len(self.pipeline._boards), 0)
-
     def test_2d_first_and_gpu_has_one_owner(self):
         requests = self.pieces()
         self.assertTrue(all(f.result(3)["ok"] for f in requests))
-        self.assertTrue(self.pipeline.submit_3d(dict(board_id="A")).result(3)["ok"])
+        results = [self.pipeline.submit_3d_piece(self.piece_depth("A", pid)) for pid in range(1, 11)]
+        self.assertTrue(all(f.result(3)["ok"] for f in results))
         self.assertEqual(self.detector.max_gpu_active, 1)
         self.assertGreater(self.detector.max_cpu_active, 1)
         self.assertEqual(self.detector.closed_inputs, 10)
 
-    def test_depth_preprocessing_runs_while_gpu_is_busy(self):
+    def test_depth_preprocessing_runs_while_gpu_is_busy_on_another_piece(self):
+        self.assertTrue(self.pipeline.submit_2d(dict(board_id="A", piece_id=1)).result(2)["ok"])
+        self.detector.gpu_started.clear()
         self.detector.gpu_gate.clear()
-        requests = self.pieces()
-        self.assertTrue(self.detector.gpu_started.wait(1))
-        board = self.pipeline.submit_3d(dict(board_id="A"))
-        self.assertTrue(self.detector.depth_started.wait(1))
-        self.assertFalse(board.done())
-        self.detector.gpu_gate.set()
-        self.assertTrue(all(f.result(3)["ok"] for f in requests))
-        self.assertTrue(board.result(3)["ok"])
+        piece = self.pipeline.submit_2d(dict(board_id="A", piece_id=2))
+        try:
+            self.assertTrue(self.detector.gpu_started.wait(1))
+            result = self.pipeline.submit_3d_piece(self.piece_depth("A", 1)).result(2)
+            self.assertTrue(result["ok"])
+            self.assertFalse(piece.done())
+        finally:
+            self.detector.gpu_gate.set()
+        self.assertTrue(piece.result(3)["ok"])
 
-    def test_heavy_postprocessing_is_bounded_without_blocking_gpu_or_depth(self):
+    def test_heavy_postprocessing_is_bounded_without_blocking_gpu(self):
         gate = threading.Event()
         occupied = threading.Event()
         all_inferred = threading.Event()
@@ -187,16 +172,11 @@ class PipelineTests(unittest.TestCase):
             try:
                 requests = self.pieces()
                 self.assertTrue(occupied.wait(1))
-                # GPU work and depth preparation continue while both heavy
-                # workers are busy; excess work stays in the executor queue.
+                # GPU work continues while both postprocessing workers are busy.
                 self.assertTrue(all_inferred.wait(1))
-                board = self.pipeline.submit_3d(dict(board_id="A"))
-                self.assertTrue(self.detector.depth_started.wait(1))
-                self.assertFalse(board.done())
             finally:
                 gate.set()
             self.assertTrue(all(f.result(3)["ok"] for f in requests))
-            self.assertTrue(board.result(3)["ok"])
         self.assertEqual(peak, 2)
         self.assertEqual(self.detector.max_gpu_active, 1)
         self.assertEqual(self.detector.closed_inputs, 10)
@@ -243,11 +223,11 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(self.pipeline.has_pending)
 
     def test_cross_board_results_never_mix(self):
-        boards = [self.pipeline.submit_3d(dict(board_id=name)) for name in ("A", "B")]
         requests = self.pieces("A") + self.pieces("B")
         self.assertTrue(all(f.result(3)["ok"] for f in requests))
-        for name, future in zip(("A", "B"), boards):
-            self.assertTrue(all(p["board_id"] == name for p in future.result(3)["results_board"]["pieces"]))
+        for name in ("A", "B"):
+            results = [self.pipeline.submit_3d_piece(self.piece_depth(name, pid)) for pid in range(1, 11)]
+            self.assertTrue(all(f.result(3)["results_piece"]["board_id"] == name for f in results))
 
     def test_duplicate_and_invalid_piece_are_rejected(self):
         self.detector.gpu_gate.clear()
@@ -257,34 +237,15 @@ class PipelineTests(unittest.TestCase):
         self.detector.gpu_gate.set()
         self.assertTrue(first.result(2)["ok"])
 
-    def test_timeout_reports_missing_and_releases(self):
-        board = self.pipeline.submit_3d(dict(board_id="A"))
-        # Expiry intentionally ignores active decoding; wait until it is idle.
-        deadline = time.monotonic() + 1
-        while time.monotonic() < deadline:
-            with self.pipeline._lock:
-                if not self.pipeline._boards["A"].depth_inflight:
-                    break
-            time.sleep(0.001)
-        self.assertFalse(self.pipeline._boards["A"].depth_inflight)
+    def test_timeout_releases_expired_2d_cache(self):
+        self.assertTrue(self.pipeline.submit_2d(dict(board_id="A", piece_id=1)).result(2)["ok"])
         with self.pipeline._lock:
             self.pipeline._boards["A"].touched -= 2
         self.pipeline.expire_pending()
-        result = board.result(1)
-        self.assertTrue(result["ok"])
-        self.assertFalse(result["results_board"]["is_ok"])
-        self.assertEqual(result["missing_piece_ids"], list(range(1, 11)))
-        pieces = result["results_board"]["pieces"]
-        self.assertEqual([p["piece_id"] for p in pieces], list(range(1, 11)))
-        self.assertTrue(all(p["skip_3d_reason"] == "missing_2d_result" for p in pieces))
-        self.assertEqual(result["results_board"]["pipeline_diagnostics"]["completion_gate"], "missing_2d")
-        self.assertEqual(self.detector.measured_ids, [])
-        self.assertFalse(self.pipeline._boards)
-
-    def test_release_completes_pending_3d(self):
-        board = self.pipeline.submit_3d(dict(board_id="A"))
-        self.assertTrue(self.pipeline.release_board("A")["ok"])
-        self.assertEqual(board.result(1)["error"], "board_released")
+        self.assertFalse(self.pipeline.has_pending)
+        result = self.pipeline.submit_3d_piece(self.piece_depth("A", 1)).result(2)
+        self.assertEqual(result["results_piece"]["skip_3d_reason"], "missing_2d_result")
+        self.assertFalse(self.detector.depth_started.is_set())
 
     def test_failed_2d_can_be_retried(self):
         failed = self.pipeline.submit_2d(dict(board_id="A", piece_id=1, fail_2d=True)).result(2)
@@ -312,13 +273,11 @@ class PipelineTests(unittest.TestCase):
                     "cpu_postprocess_queue_ms", "cpu_postprocess_phase_ms", "request_pipeline_ms"):
             self.assertGreaterEqual(response["timings"][key], 0)
 
-    def test_3d_failure_and_joint_failure_finish_board(self):
-        failed = self.pipeline.submit_3d(dict(board_id="A", fail_3d=True)).result(2)
-        self.assertEqual(failed["error"], "3d_board_failed")
-        board = self.pipeline.submit_3d(dict(board_id="B"))
-        self.pipeline.submit_2d(dict(board_id="B", piece_id=1, fail_joint=True)).result(2)
-        self.assertEqual(board.result(2)["error"], "joint_detection_failed")
-
+    def test_joint_failure_is_reported_for_its_piece(self):
+        self.assertTrue(self.pipeline.submit_2d(dict(board_id="A", piece_id=1, fail_joint=True)).result(2)["ok"])
+        result = self.pipeline.submit_3d_piece(self.piece_depth("A", 1)).result(2)
+        self.assertEqual(result["error"], "3d_piece_failed")
+        self.assertIn("synthetic registration failure", result["message"])
 
 class ThreadBudgetTests(unittest.TestCase):
     def test_native_defaults_respect_explicit_library_settings(self):
@@ -365,11 +324,11 @@ class ThreadBudgetTests(unittest.TestCase):
                 server.board = FakeDetector()
                 try:
                     pipeline = server.get_pipeline()
-                    board = pipeline.submit_3d(dict(board_id="small"))
                     requests = [pipeline.submit_2d(dict(board_id="small", piece_id=pid))
                                 for pid in range(1, 11)]
                     self.assertTrue(all(f.result(3)["ok"] for f in requests))
-                    self.assertTrue(board.result(3)["ok"])
+                    scans = [pipeline.submit_3d_piece(depth_piece_request("small", pid)) for pid in range(1, 11)]
+                    self.assertTrue(all(f.result(3)["ok"] for f in scans))
                     self.assertEqual(server.board.closed_inputs, 10)
                 finally:
                     server.close()
@@ -677,15 +636,25 @@ class ThreadBudgetTests(unittest.TestCase):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_removed_whole_board_3d_commands_are_rejected(self):
+        server = AlgorithmServer()
+        self.addCleanup(server.close)
+        for req in (dict(cmd="detect_3d_board", board_id="A"), dict(cmd="detect_board"),
+                    dict(cmd="detect", stage="board"), dict(cmd="detect", stage="3d"),
+                    dict(cmd="detect", stage="3d", board_id="A"), dict(cmd="init_algorithm", stage="3d")):
+            with self.subTest(req=req):
+                self.assertFalse(server.dispatch(req)["ok"])
+        self.assertIsNone(server.board)
+
     def test_out_of_order_replies_keep_request_ids(self):
         server = AlgorithmServer()
         server.board = FakeDetector()
         stream = io.StringIO()
         try:
-            server._accept(dict(cmd="detect_3d_board", board_id="A", request_id="depth"), stream)
             for pid in range(1, 11):
                 server._accept(dict(cmd="detect_2d_piece", board_id="A", piece_id=pid,
                                     request_id=f"image-{pid}", marker=f"marker-{pid}"), stream)
+            server._accept(dict(cmd="detect_3d_piece", request_id="depth", **depth_piece_request("A")), stream)
             deadline = time.monotonic() + 4
             while time.monotonic() < deadline:
                 with server._pending_lock:

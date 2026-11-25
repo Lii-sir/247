@@ -5,11 +5,63 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="f45a9d93-da79-4d4c-b621-f1da0bf4d833" name="更改" comment="">
+      <change beforePath="$PROJECT_DIR$/.idea/misc.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/yinxkj.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/yinxkj.iml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Bridge.dll" beforeDir="false" afterPath="$PROJECT_DIR$/Bridge.dll" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/config/2D/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/config/2D/README.md" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/config/2D/config.json" beforeDir="false" afterPath="$PROJECT_DIR$/config/2D/config.json" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/config/3D/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/config/3D/README.md" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/config/3D/config.json" beforeDir="false" afterPath="$PROJECT_DIR$/config/3D/config.json" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/python/algorithm/config.py" beforeDir="false" afterPath="$PROJECT_DIR$/python/algorithm/config.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/config/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/config/README.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/config/config.json" beforeDir="false" afterPath="$PROJECT_DIR$/config/config.json" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/process/DETECTION_FLOW_OPTIMIZATION_ANALYSIS_20261106.md" beforeDir="false" afterPath="$PROJECT_DIR$/process/DETECTION_FLOW_OPTIMIZATION_ANALYSIS_20261106.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/process/OUTPUT_PARAMETERS.md" beforeDir="false" afterPath="$PROJECT_DIR$/process/OUTPUT_PARAMETERS.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/python/algorithm/application/board/board_depth.py" beforeDir="false" afterPath="$PROJECT_DIR$/python/algorithm/application/board/board_depth.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/python/algorithm/application/board/board_pipeline.py" beforeDir="false" afterPath="$PROJECT_DIR$/python/algorithm/application/board/board_pipeline.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/python/algorithm/application/board/board_results.py" beforeDir="false" afterPath="$PROJECT_DIR$/python/algorithm/application/board/board_results.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/python/algorithm/application/board/detect_board.py" beforeDir="false" afterPath="$PROJECT_DIR$/python/algorithm/application/board/detect_board.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/python/algorithm/application/defect_checks.py" beforeDir="false" afterPath="$PROJECT_DIR$/python/algorithm/application/defect_checks.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/python/algorithm/application/standalone/detect_2D.py" beforeDir="false" afterPath="$PROJECT_DIR$/python/algorithm/application/standalone/detect_2D.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/python/algorithm/application/standalone/detect_3D.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/python/algorithm/execution/processes/joint_process.py" beforeDir="false" afterPath="$PROJECT_DIR$/python/algorithm/execution/processes/joint_process.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/python/algorithm/runtime/config.py" beforeDir="false" afterPath="$PROJECT_DIR$/python/algorithm/runtime/config.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/python/algorithm/vision3d/measurement/joint_geometry.py" beforeDir="false" afterPath="$PROJECT_DIR$/python/algorithm/vision3d/measurement/joint_geometry.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/python/transport/bridge_server.py" beforeDir="false" afterPath="$PROJECT_DIR$/python/transport/bridge_server.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/smartray_pitch_dll/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/smartray_pitch_dll/README.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/Bridge/BridgeDtos.cs" beforeDir="false" afterPath="$PROJECT_DIR$/src/Bridge/BridgeDtos.cs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/Bridge/PythonBridge.cs" beforeDir="false" afterPath="$PROJECT_DIR$/src/Bridge/PythonBridge.cs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/Bridge.ConcurrentTests/Program.cs" beforeDir="false" afterPath="$PROJECT_DIR$/tests/Bridge.ConcurrentTests/Program.cs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/fake_concurrent_server.py" beforeDir="false" afterPath="$PROJECT_DIR$/tests/fake_concurrent_server.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/pipeline_fakes.py" beforeDir="false" afterPath="$PROJECT_DIR$/tests/pipeline_fakes.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/test_board_queue_diagnostics.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/test_concurrent_pipeline.py" beforeDir="false" afterPath="$PROJECT_DIR$/tests/test_concurrent_pipeline.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/test_cpu_2d_process.py" beforeDir="false" afterPath="$PROJECT_DIR$/tests/test_cpu_2d_process.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/test_early_joint_pipeline.py" beforeDir="false" afterPath="$PROJECT_DIR$/tests/test_early_joint_pipeline.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/test_height_point_coordinates.py" beforeDir="false" afterPath="$PROJECT_DIR$/tests/test_height_point_coordinates.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/test_joint_process.py" beforeDir="false" afterPath="$PROJECT_DIR$/tests/test_joint_process.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/test_production_pitch.py" beforeDir="false" afterPath="$PROJECT_DIR$/tests/test_production_pitch.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/test_raw_depth_input.py" beforeDir="false" afterPath="$PROJECT_DIR$/tests/test_raw_depth_input.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/test_registration_process.py" beforeDir="false" afterPath="$PROJECT_DIR$/tests/test_registration_process.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/test_registration_stage_pipeline.py" beforeDir="false" afterPath="$PROJECT_DIR$/tests/test_registration_stage_pipeline.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/test_split_stage_pools.py" beforeDir="false" afterPath="$PROJECT_DIR$/tests/test_split_stage_pools.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/visualization/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/README.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/visualization/build_detection_flow.py" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/build_detection_flow.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/visualization/detect_and_view.py" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/detect_and_view.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/visualization/detection-flow.html" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/detection-flow.html" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/visualization/detection_flow_data.py" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/detection_flow_data.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/visualization/detection_flow_template.html" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/detection_flow_template.html" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/visualization/tests/test_pitch_parallel.py" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/tests/test_pitch_parallel.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/visualization/tests/test_repeat_detection.py" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/tests/test_repeat_detection.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/visualization/tests/test_request_submission.py" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/tests/test_request_submission.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/visualization/tests/test_validation_lab.py" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/tests/test_validation_lab.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/visualization/tests/test_validation_workflow.cjs" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/tests/test_validation_workflow.cjs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/visualization/validation_lab/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/validation_lab/README.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/visualization/validation_lab/app.js" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/validation_lab/app.js" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/visualization/validation_lab/index.html" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/validation_lab/index.html" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/visualization/validation_lab/pairing.js" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/validation_lab/pairing.js" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/visualization/validation_lab/server.py" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/validation_lab/server.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/visualization/viewer.js" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/viewer.js" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -105,25 +157,27 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent">{
-  &quot;keyToString&quot;: {
-    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.typescript.service.memoryLimit.init&quot;: &quot;true&quot;,
-    &quot;codeWithMe.voiceChat.enabledByDefault&quot;: &quot;false&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;yinxkj&quot;,
-    &quot;ignore.virus.scanning.warn.message&quot;: &quot;true&quot;,
-    &quot;last_opened_file_path&quot;: &quot;D:/projects/247-likai&quot;,
-    &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
-    &quot;node.js.detected.package.tslint&quot;: &quot;true&quot;,
-    &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
-    &quot;node.js.selected.package.tslint&quot;: &quot;(autodetect)&quot;,
-    &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
-    &quot;python.packages.toolwindow.project.migrated.to.right.top.v2&quot;: &quot;true&quot;,
-    &quot;settings.editor.selected.configurable&quot;: &quot;advanced.settings&quot;
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "ModuleVcsDetector.initialDetectionPerformed": "true",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
+    "RunOnceActivity.git.unshallow": "true",
+    "RunOnceActivity.typescript.service.memoryLimit.init": "true",
+    "codeWithMe.voiceChat.enabledByDefault": "false",
+    "git-widget-placeholder": "yinxkj",
+    "ignore.virus.scanning.warn.message": "true",
+    "last_opened_file_path": "D:/python_programs/LXD_project/247-likai",
+    "node.js.detected.package.eslint": "true",
+    "node.js.detected.package.tslint": "true",
+    "node.js.selected.package.eslint": "(autodetect)",
+    "node.js.selected.package.tslint": "(autodetect)",
+    "nodejs_package_manager_path": "npm",
+    "python.packages.toolwindow.project.migrated.to.right.top.v2": "true",
+    "settings.editor.selected.configurable": "com.jetbrains.python.configuration.PyActiveSdkModuleConfigurable",
+    "vue.rearranger.settings.migration": "true"
   }
-}</component>
+}]]></component>
   <component name="RunManager">
     <configuration name="main" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
       <module name="yinxkj" />
@@ -139,8 +193,6 @@
       <option name="ADD_CONTENT_ROOTS" value="true" />
       <option name="ADD_SOURCE_ROOTS" value="true" />
       <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
-      <option name="RUN_TOOL" value="" />
-      <option name="RUN_AS_SCRIPT" value="" />
       <option name="SCRIPT_NAME" value="$PROJECT_DIR$/main.py" />
       <option name="PARAMETERS" value="" />
       <option name="SHOW_COMMAND_LINE" value="false" />
@@ -154,7 +206,8 @@
   <component name="SharedIndexes">
     <attachedChunks>
       <set>
-        <option value="bundled-python-sdk-34611be1ca5a-e0583fc556d1-com.jetbrains.pycharm.pro.sharedIndexes.bundled-PY-263.7307.206" />
+        <option value="bundled-js-predefined-d6986cc7102b-3aa1da707db6-JavaScript-PY-252.27397.106" />
+        <option value="bundled-python-sdk-4e2b1448bda8-9a97661f3031-com.jetbrains.pycharm.pro.sharedIndexes.bundled-PY-252.27397.106" />
       </set>
     </attachedChunks>
   </component>
@@ -181,6 +234,7 @@
       <workItem from="1794126520608" duration="3501000" />
       <workItem from="1794196452229" duration="30292000" />
       <workItem from="1794911765751" duration="14201000" />
+      <workItem from="1795598537364" duration="9423000" />
     </task>
     <servers />
   </component>
@@ -232,6 +286,7 @@
                   </entry>
                 </map>
               </option>
+              <option name="LONG_EDGES_VISIBLE" value="true" />
             </State>
           </value>
         </entry>

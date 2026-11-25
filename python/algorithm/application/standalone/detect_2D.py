@@ -15,10 +15,14 @@ import torch
 from algorithm.runtime.config import (
     DEFAULT_ALGORITHM_PARAMETERS,
     feature_parameters,
+    inspection_parameters,
     load_runtime_config,
     parse_config_text,
 )
-from algorithm.application.defect_checks import detection_order, evaluate_in_order, silver_check, wire_bending_result
+from algorithm.application.defect_checks import silver_check, wire_bending_result
+from algorithm.runtime.defect_plan import (
+    CHECKS_2D, defect_orders, evaluate_in_order, require_configured_checks, unrun_checks,
+)
 from algorithm.vision2d import chip_alignment, chip_anomaly, circle_roi, silver_inspection, wire_roi_presence
 from algorithm.vision2d import defect_geometry as geometry
 from transport.shared_memory import read_shared_memory
@@ -38,7 +42,7 @@ class Detect2D:
         self.chip_alignment_config: Dict[str, Any] = {}
         self.chip_anomaly_config: Dict[str, Any] = {"configured": False}
         self.chip_anomaly_inspector = None
-        self.defect_order = ()
+        self.defect_order = self.height_order = None
         # Per-request diagnostic artifacts are kept outside the JSON protocol.
         # The visualization tool can consume them without forcing numpy/torch
         # objects through the bridge response.
@@ -92,7 +96,7 @@ class Detect2D:
             raise ValueError("2D config must be an object")
         self.config = config
         common = feature_parameters(config, "common_2d")
-        self.defect_order = detection_order(common.get("defect_priority", []))
+        self.defect_order, self.height_order = defect_orders(inspection_parameters(config, common))
         crop = common.get("crop") or {}
         if not isinstance(crop, dict):
             raise ValueError("crop must be an object")
@@ -175,6 +179,14 @@ class Detect2D:
             config, "chip_anomaly_2d", required=False
         )
         self.chip_anomaly_config = chip_anomaly.validate_config(raw_chip_anomaly)
+        if self.height_order is not None:
+            require_configured_checks(self.defect_order, {
+                "wire_bending_2d": self.wire_enabled,
+                "chip_rotation_2d": raw_chip_alignment is not None,
+                "chip_anomaly_2d": self.chip_anomaly_config.get("configured"),
+                "silver_overflow_2d": self.silver_overflow_enabled,
+                "silver_continuity_2d": self.silver_continuity_enabled,
+            })
 
     def _validate_gpu_requirement(self) -> None:
         if not torch.cuda.is_available():
@@ -261,7 +273,7 @@ class Detect2D:
                 "predictions": predictions,
                 "chip_anomaly": diagnostics["chip_anomaly_2d"].pop("_visualizations", []),
             }
-            if self.defect_order and first_ng is not None:
+            if self.defect_order is not None and first_ng is not None:
                 diagnostics["first_ng_check"] = first_ng
             return {"ok": True, "cmd": "detect", "stage": "2d", "elapsed_ms": self.elapsed_ms(start),
                     "results_2d": {"is_ok": bool(results) and first_ng is None
@@ -300,7 +312,9 @@ class Detect2D:
             return silver_check(name, config, instances, shape, crop_box=crop_box,
                                 circle=circle, image=image, base_dir=base_dir)
 
-        if self.defect_order:
+        if self.height_order is not None and not instances:
+            return unrun_checks(self.defect_order, CHECKS_2D), None
+        if self.defect_order is not None:
             checks = {
                 "wire_bending_2d": (lambda: wire_bending_result(*wires())) if self.wire_enabled else None,
                 "chip_rotation_2d": rotation if self.chip_alignment_config is not None else None,
@@ -310,7 +324,7 @@ class Detect2D:
                 "silver_continuity_2d": (lambda: silver("silver_continuity_2d", self.silver_config["continuity"]))
                                         if self.silver_continuity_enabled else None,
             }
-            return evaluate_in_order(self.defect_order, checks)
+            return evaluate_in_order(self.defect_order, checks, short_circuit=self.height_order is None)
 
         if self.wire_enabled:
             measurements, roi_checks = wires()

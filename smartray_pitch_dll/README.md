@@ -31,9 +31,7 @@ int width = data.Width;
 int height = data.CurrentHeight;
 ushort[] corrected = corrector.Correct(input, width, height);
 // corrected.Length == width * height，逐行排列，原input不变。
-// 矫正结束后再提交：检测端不再自动矫正，也不计入矫正耗时。
-// var result = await bridge.ThreeD.DetectBoardAsync(boardId, corrected, width, height, metadata);
-// metadata只描述上述矫正参数和applied=true，详见../config/3D/README.md。
+// 整板矫正结果可用于留档。逐片送检请使用下面的 CorrectPiece 示例。
 ```
 
 ## 逐片切分和矫正

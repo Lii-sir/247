@@ -70,20 +70,22 @@ class ValidationTests(unittest.TestCase):
         self.assertIsNone(lab.guess_numbers('custom.png','2d')['piece_id'])
         self.assertEqual(lab.board_number('002'),'2');self.assertEqual(lab.board_number(0),'0')
 
-    def test_validation_requires_exact_board_inputs(self):
-        board,images,depth=lab.board_inputs(self.rows,'2','joint',2)
-        self.assertEqual(board,'2');self.assertEqual([x['piece_id'] for x in images],[1,2])
-        self.assertEqual(depth['name'],'2.png')
-        for bad in (self.rows[:1],self.rows[:2],self.rows+[self.rows[0]],self.rows+[self.rows[2]]):
-            with self.assertRaises(ValueError):lab.board_inputs(bad,'2','joint',2)
-        one=lab.board_inputs(self.rows[:1],'2','2d',2)
-        self.assertEqual(len(one[1]),1);self.assertIsNone(one[2])
+    def test_validation_accepts_partial_2d_and_rejects_retired_modes(self):
+        board, images, depth = lab.board_inputs(self.rows[:1], "2", "2d", 2)
+        self.assertEqual(board, "2")
+        self.assertEqual([image["piece_id"] for image in images], [1])
+        self.assertIsNone(depth)
+        for mode in ("joint", "manual_board_3d"):
+            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, "未知验证方式"):
+                lab.board_inputs(self.rows, "2", mode, 2)
+        with self.assertRaisesRegex(ValueError, "重复"):
+            lab.board_inputs(self.rows + [self.rows[0]], "2", "2d", 2)
 
     def test_manual_numbering_and_board_isolation(self):
         rows=[*self.rows,dict(self.rows[0],board_id='3',piece_id=2)]
-        self.assertEqual(len(lab.board_inputs(rows,'2','joint',2)[1]),2)
+        self.assertEqual(len(lab.board_inputs(rows,'2','2d',2)[1]),2)
         rows[0]=dict(rows[0],piece_id=3)
-        with self.assertRaisesRegex(ValueError,'片号'):lab.board_inputs(rows,'2','joint',2)
+        with self.assertRaisesRegex(ValueError,'片号'):lab.board_inputs(rows,'2','2d',2)
 
     def make_runner(self, fail=None):
         clients=[]
@@ -99,10 +101,10 @@ class ValidationTests(unittest.TestCase):
         runner,clients=self.make_runner();self.addCleanup(runner.close)
         for n in range(2):
             folder=self.root/('run'+str(n));folder.mkdir()
-            result=runner.run(self.rows,'2','joint',2,folder,lambda x:None)
+            result=runner.run(self.rows,'2','2d',2,folder,lambda x:None)
             # New logical board after each cleanup for the fake's release tombstone.
             clients[0].released.clear()
-            self.assertTrue(result['ok']);self.assertFalse(result['product_is_ok'])
+            self.assertTrue(result['ok']);self.assertTrue(result['product_is_ok'])
             self.assertEqual(result['model_reused'],n==1)
             self.assertTrue((folder/'report.html').exists());self.assertTrue((folder/'timings.csv').exists())
             saved=json.loads((folder/'result.json').read_text(encoding='utf-8'))
@@ -113,45 +115,29 @@ class ValidationTests(unittest.TestCase):
         self.assertTrue(all(q['board_id']=='2' for q in requests))
         self.assertEqual([q['piece_id'] for q in requests],[1,2,1,2])
 
-    def test_submission_preprocessing_completes_before_detection_clock_starts(self):
-        runner,clients=self.make_runner();self.addCleanup(runner.close)
-        original=runner.mapper
-        clock=[1.0]
-        def mapper(stack,path,kind,piece_id=None,**kwargs):
-            if kind=='3d':
-                self.assertIn('pitch_settings',kwargs)
-                clock[0]+=50.0  # Deterministic preprocessing duration, no sleep/benchmark.
-            return original(stack,path,kind,piece_id,**kwargs)
-        runner.mapper=mapper
-        folder=self.root/'preprocessed';folder.mkdir()
-        with patch.object(lab.time,'perf_counter',side_effect=lambda:clock[0]):
-            result=runner.run(self.rows,'2','joint',2,folder,lambda _:None)
-        self.assertTrue(result['ok'],result)
-        self.assertEqual(0.,result['total_wall_ms'])
-        report=json.loads((folder/'result.json').read_text(encoding='utf-8'))
-        self.assertTrue(report['benchmark']['excludes_depth_preprocessing'])
-
     def test_partial_2d_and_failure_release_board(self):
-        for mode,fail,rows in [('2d',None,self.rows[:1]),('joint',1,self.rows)]:
+        for fail,rows in [(None,self.rows[:1]),(1,self.rows)]:
             runner,clients=self.make_runner(fail);self.addCleanup(runner.close)
-            folder=self.root/('case'+mode);folder.mkdir()
-            result=runner.run(rows,'2',mode,2,folder,lambda x:None)
+            folder=self.root/('case'+str(fail));folder.mkdir()
+            result=runner.run(rows,'2','2d',2,folder,lambda x:None)
             self.assertEqual(result['ok'],fail is None)
             self.assertTrue(any(q['cmd']=='release_board' for q in clients[0].requests))
-            if mode=='2d':self.assertFalse(any(q['cmd']=='detect_3d_board' for q in clients[0].requests))
-            else:
+            self.assertFalse(any(q['cmd'].startswith('detect_3d') for q in clients[0].requests))
+            if fail is not None:
                 self.assertIn('synthetic piece error',result['error'])
                 self.assertIn('1.9072',result['error'])
                 saved=json.loads((folder/'result.json').read_text(encoding='utf-8'))
                 self.assertNotEqual(saved['response']['message'],'board cache released')
 
-    def test_bad_depth_is_rejected_before_models_are_started(self):
-        Image.new('RGB',(4,4)).save(self.rows[2]['path'])
-        runner,clients=self.make_runner();self.addCleanup(runner.close)
-        folder=self.root/'bad-depth';folder.mkdir()
-        result=runner.run(self.rows,'2','joint',2,folder,lambda x:None)
-        self.assertFalse(result['ok']);self.assertIn('16位',result['error']);self.assertEqual(clients,[])
-        self.assertTrue((folder/'result.json').exists())
+    def test_manual_piece_rejects_invalid_depth_without_submitting_detection(self):
+        Image.new("RGB", (4, 4)).save(self.rows[2]["path"])
+        runner, clients = self.make_runner()
+        self.addCleanup(runner.close)
+        folder = self.root / "bad-depth"
+        folder.mkdir()
+        with self.assertRaisesRegex(ValueError, "16位"):
+            runner.run_manual(self.rows, "2", "manual_piece_3d", 1, 2, folder, lambda _: None)
+        self.assertFalse(any(q["cmd"].startswith("detect_") for q in clients[0].requests))
 
     def test_manual_clicks_keep_pairing_and_send_one_protocol_request(self):
         runner,clients=self.make_runner();self.addCleanup(runner.close)
@@ -166,9 +152,6 @@ class ValidationTests(unittest.TestCase):
             folder=self.root/str(n);folder.mkdir()
             return runner.run_manual(self.rows,'2',mode,piece,2,folder,lambda _:None)
 
-        with self.assertRaisesRegex(ValueError,'请先提交本板2D'):
-            click(0,'manual_board_3d')
-        self.assertFalse(any(q['cmd'].startswith('detect_') for q in clients[0].requests))
         two_d=click(1,'manual_2d',2)
         self.assertEqual(two_d['ready_piece_ids'],[2])
         single=click(2,'manual_piece_3d',2)
@@ -180,11 +163,11 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(missing['skip_3d_reason'],'missing_2d_result')
         click(4,'manual_2d',1)
         click(5,'manual_2d',2)
-        self.assertTrue(click(6,'manual_board_3d')['ok'])
+        self.assertTrue(click(6,'manual_piece_3d',1)['ok'])
         self.assertEqual(len(clients),1)
         detect=[(q['cmd'],q.get('piece_id')) for q in clients[0].requests if q['cmd'].startswith('detect_')]
         self.assertEqual(detect,[('detect_2d_piece',2),('detect_3d_piece',2),('detect_3d_piece',1),
-            ('detect_2d_piece',1),('detect_2d_piece',2),('detect_3d_board',None)])
+            ('detect_2d_piece',1),('detect_2d_piece',2),('detect_3d_piece',1)])
 
     def test_manual_affinity_uses_local_process_pools_when_core_budget_is_too_large(self):
         cfg={'common_2d':{'parameters':{'threading':{'cpu_process_affinity':{

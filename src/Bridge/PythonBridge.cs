@@ -46,12 +46,9 @@ public sealed class PythonBridge : IDisposable
         _pythonScript = pythonScript;
         _configPath = ResolveConfigPath(pythonScript);
         // 创建子接口
-        Board = new BridgeBoard(this);
         TwoD = new Bridge2D(this);
         ThreeD = new Bridge3D(this);
     }
-
-    public BridgeBoard Board { get; }
 
     public Bridge2D TwoD { get; }
 
@@ -394,70 +391,6 @@ public sealed class PythonBridge : IDisposable
         }
     }
 
-    internal DetectResponse Detect3D(
-        byte[] dataBytes,
-        Detect3DRequest request,
-        string bufferKey)
-    {
-        EnsureInitialized();
-
-        if (dataBytes.Length == 0)
-        {
-            throw new ArgumentException("3D data bytes is empty.", nameof(dataBytes));
-        }
-        PackedDepthInput.Validate(dataBytes.Length, request.ImageWidth, request.ImageHeight, request.DataFormat);
-
-        using (EnterDetection())
-        {
-            var totalWatch = Stopwatch.StartNew();
-            var shmWriteWatch = Stopwatch.StartNew();
-            SharedMemoryBuffer buffer = CreateSharedMemoryBuffer(bufferKey, dataBytes.Length);
-            try
-            {
-            buffer.Accessor.WriteArray(0, dataBytes, 0, dataBytes.Length);
-            shmWriteWatch.Stop();
-
-            request.ShmName = buffer.Name;
-            request.DataSize = dataBytes.Length;
-
-            return SendDetectLocked(
-                request,
-                totalWatch,
-                shmWriteWatch.Elapsed.TotalMilliseconds,
-                requestLifetime: buffer);
-            }
-            catch { buffer.Dispose(); throw; }
-        }
-    }
-
-    internal DetectResponse Detect3DSharedMemory(Detect3DRequest request)
-    {
-        EnsureInitialized();
-        Validate3DSharedMemory(request);
-
-        using (EnterDetection())
-        {
-            var totalWatch = Stopwatch.StartNew();
-            return SendDetectLocked(request, totalWatch, sharedMemoryWriteMs: 0);
-        }
-    }
-
-    internal DetectResponse Detect3DFile(string dataPath, Dictionary<string, object>? correction = null)
-    {
-        if (string.IsNullOrWhiteSpace(dataPath))
-        {
-            throw new ArgumentException("3D data file path is empty.", nameof(dataPath));
-        }
-
-        byte[] dataBytes = PackedDepthInput.ReadFile(dataPath, out int width, out int height);
-        var request = new Detect3DRequest
-        {
-            ImageWidth = width, ImageHeight = height, PitchCorrection = correction
-        };
-
-        return Detect3D(dataBytes, request, "3d_file");
-    }
-
     internal DetectResponse DetectStreamed3DFile(string dataPath, Detect3DRequest request)
     {
         if (string.IsNullOrWhiteSpace(request.BoardId))
@@ -522,78 +455,6 @@ public sealed class PythonBridge : IDisposable
         }
     }
 
-    internal DetectResponse DetectBoardFiles(
-        IReadOnlyList<string> image2DPaths,
-        string data3DPath,
-        string batchId,
-        Dictionary<string, object>? correction = null)
-    {
-        EnsureInitialized();
-        ValidateBoardFileInputs(image2DPaths, data3DPath);
-
-        using (EnterDetection())
-        {
-            var totalWatch = Stopwatch.StartNew();
-            var fileReadWatch = Stopwatch.StartNew();
-            var sharedMemoryWriteWatch = new Stopwatch();
-            var request = new DetectBoardRequest { BatchId = batchId ?? string.Empty };
-
-            var ownedBuffers = new List<SharedMemoryBuffer>();
-            try
-            {
-            for (int index = 0; index < image2DPaths.Count; index++)
-            {
-                string path = image2DPaths[index];
-                SharedMemoryBuffer buffer = WriteFileToSharedMemory(
-                    path,
-                    $"board_2d_{index + 1:D2}",
-                    sharedMemoryWriteWatch,
-                    out int imageSize);
-                ownedBuffers.Add(buffer);
-                request.Images2D.Add(new BoardImage2DInput
-                {
-                    PieceId = index + 1,
-                    ShmName = buffer.Name,
-                    ImageSize = imageSize,
-                    ImageFormat = "file"
-                });
-            }
-
-            byte[] depthBytes = PackedDepthInput.ReadFile(data3DPath, out int depthWidth, out int depthHeight);
-            SharedMemoryBuffer depthBuffer = WriteBytesToSharedMemory(depthBytes, "board_3d", sharedMemoryWriteWatch);
-            ownedBuffers.Add(depthBuffer);
-            request.Image3D = new BoardImage3DInput
-            {
-                ShmName = depthBuffer.Name,
-                DataSize = depthBytes.Length,
-                ImageWidth = depthWidth, ImageHeight = depthHeight, PitchCorrection = correction
-            };
-            fileReadWatch.Stop();
-
-            var lifetime = new BufferGroup(ownedBuffers);
-            ownedBuffers.Clear();
-            return SendDetectLocked(
-                request,
-                totalWatch,
-                sharedMemoryWriteWatch.Elapsed.TotalMilliseconds,
-                fileReadWatch.Elapsed.TotalMilliseconds,
-                lifetime);
-            }
-            finally { foreach (var buffer in ownedBuffers) buffer.Dispose(); }
-        }
-    }
-
-    internal DetectResponse DetectBoardSharedMemory(DetectBoardRequest request)
-    {
-        EnsureInitialized();
-        ValidateBoardSharedMemoryInputs(request);
-        using (EnterDetection())
-        {
-            var totalWatch = Stopwatch.StartNew();
-            return SendDetectLocked(request, totalWatch, sharedMemoryWriteMs: 0);
-        }
-    }
-
     internal DetectResponse DetectStreamed3DSharedMemory(Detect3DRequest request)
     {
         EnsureInitialized();
@@ -613,72 +474,6 @@ public sealed class PythonBridge : IDisposable
             // The caller owns the external mapping.
             return response;
         }
-    }
-
-    private SharedMemoryBuffer WriteFileToSharedMemory(
-        string path, string bufferKey, Stopwatch writeWatch, out int dataSize)
-    {
-        byte[] bytes = File.ReadAllBytes(path);
-        if (bytes.Length == 0) throw new InvalidDataException("Input file is empty: " + path);
-        dataSize = bytes.Length;
-        return WriteBytesToSharedMemory(bytes, bufferKey, writeWatch);
-    }
-
-    private SharedMemoryBuffer WriteBytesToSharedMemory(byte[] bytes, string bufferKey, Stopwatch writeWatch)
-    {
-        SharedMemoryBuffer buffer = CreateSharedMemoryBuffer(bufferKey, bytes.Length);
-        try
-        {
-            writeWatch.Start();
-            buffer.Accessor.WriteArray(0, bytes, 0, bytes.Length);
-            writeWatch.Stop();
-            return buffer;
-        }
-        catch { buffer.Dispose(); throw; }
-    }
-
-    private static void ValidateBoardFileInputs(
-        IReadOnlyList<string> image2DPaths,
-        string data3DPath)
-    {
-        if (image2DPaths == null || image2DPaths.Count != 10)
-        {
-            throw new ArgumentException("Board detection requires exactly 10 2D image paths.", nameof(image2DPaths));
-        }
-        for (int index = 0; index < image2DPaths.Count; index++)
-        {
-            if (string.IsNullOrWhiteSpace(image2DPaths[index]) || !File.Exists(image2DPaths[index]))
-            {
-                throw new FileNotFoundException($"2D image {index + 1} was not found.", image2DPaths[index]);
-            }
-        }
-        if (string.IsNullOrWhiteSpace(data3DPath) || !File.Exists(data3DPath))
-        {
-            throw new FileNotFoundException("3D image was not found.", data3DPath);
-        }
-    }
-
-    private static void ValidateBoardSharedMemoryInputs(DetectBoardRequest request)
-    {
-        if (request.Images2D.Count != 10)
-        {
-            throw new ArgumentException("Board detection requires exactly 10 2D shared-memory inputs.");
-        }
-        int[] pieceIds = request.Images2D.Select(item => item.PieceId).OrderBy(value => value).ToArray();
-        if (!pieceIds.SequenceEqual(Enumerable.Range(1, 10)))
-        {
-            throw new ArgumentException("2D piece IDs must be exactly 1 through 10.");
-        }
-        if (request.Images2D.Any(item => string.IsNullOrWhiteSpace(item.ShmName) || item.ImageSize <= 0))
-        {
-            throw new ArgumentException("Every 2D input requires a shared-memory name and positive size.");
-        }
-        if (string.IsNullOrWhiteSpace(request.Image3D.ShmName) || request.Image3D.DataSize <= 0)
-        {
-            throw new ArgumentException("The 3D input requires a shared-memory name and positive size.");
-        }
-        PackedDepthInput.Validate(request.Image3D.DataSize, request.Image3D.ImageWidth,
-            request.Image3D.ImageHeight, request.Image3D.DataFormat);
     }
 
     private static void Validate3DSharedMemory(Detect3DRequest request)
@@ -831,10 +626,10 @@ public sealed class PythonBridge : IDisposable
         }
 
         string normalizedStage = stage.Trim().ToLowerInvariant();
-        if (normalizedStage is not ("board" or "2d" or "3d"))
+        if (normalizedStage is not ("board" or "2d"))
         {
             throw new ArgumentException(
-                $"Unsupported algorithm stage: {stage}. Use board, 2d, or 3d.",
+                $"Unsupported algorithm stage: {stage}. Use board for per-piece 2D/3D, or 2d.",
                 nameof(stage));
         }
 
@@ -866,44 +661,47 @@ public sealed class PythonBridge : IDisposable
                 $"Stage configuration file not found: {(!File.Exists(config2DPath) ? config2DPath : config3DPath)}");
         }
 
+        string? inspectionPath = null;
+        if (manifest.TryGetProperty("config_inspection", out JsonElement policyPath))
+        {
+            if (policyPath.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(policyPath.GetString()))
+                throw new InvalidDataException("'config_inspection' must be a non-empty path.");
+            inspectionPath = ResolveConfigRelativePath(policyPath.GetString()!);
+        }
+        using JsonDocument? inspection = inspectionPath == null
+            ? null
+            : JsonDocument.Parse(File.ReadAllText(inspectionPath, Encoding.UTF8));
+        if (inspection != null && inspection.RootElement.ValueKind != JsonValueKind.Object)
+            throw new InvalidDataException("Inspection configuration must be an object.");
         string configText;
-        string configBasePath;
         using (JsonDocument config2D = JsonDocument.Parse(File.ReadAllText(config2DPath, Encoding.UTF8)))
         using (JsonDocument config3D = JsonDocument.Parse(File.ReadAllText(config3DPath, Encoding.UTF8)))
         {
-            if (normalizedStage == "2d")
+            using var merged = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(merged))
             {
-                configText = config2D.RootElement.GetRawText();
-                configBasePath = config2DPath;
-            }
-            else if (normalizedStage == "3d")
-            {
-                configText = config3D.RootElement.GetRawText();
-                configBasePath = config3DPath;
-            }
-            else
-            {
-                using var merged = new MemoryStream();
-                using (var writer = new Utf8JsonWriter(merged))
+                writer.WriteStartObject();
+                foreach (JsonProperty property in config2D.RootElement.EnumerateObject())
                 {
-                    writer.WriteStartObject();
-                    foreach (JsonProperty property in config2D.RootElement.EnumerateObject())
-                    {
+                    if (inspection == null || !property.NameEquals("inspection"))
                         property.WriteTo(writer);
-                    }
+                }
+                if (normalizedStage == "board")
+                {
                     foreach (JsonProperty property in config3D.RootElement.EnumerateObject())
                     {
-                        if (property.NameEquals("model_path"))
-                        {
-                            continue;
-                        }
-                        property.WriteTo(writer);
+                        if (!property.NameEquals("model_path") && (inspection == null || !property.NameEquals("inspection")))
+                            property.WriteTo(writer);
                     }
-                    writer.WriteEndObject();
                 }
-                configText = Encoding.UTF8.GetString(merged.ToArray());
-                configBasePath = config2DPath;
+                if (inspection != null)
+                {
+                    writer.WritePropertyName("inspection");
+                    inspection.RootElement.WriteTo(writer);
+                }
+                writer.WriteEndObject();
             }
+            configText = Encoding.UTF8.GetString(merged.ToArray());
         }
 
         using JsonDocument stageConfig = JsonDocument.Parse(configText);
@@ -929,7 +727,7 @@ public sealed class PythonBridge : IDisposable
                     $"Every entry in 'model_path' must contain a non-empty path.");
             }
             string resolvedPath = ResolveConfigRelativePathFrom(
-                model.Value.GetString()!, configBasePath);
+                model.Value.GetString()!, config2DPath);
             if (!File.Exists(resolvedPath))
             {
                 throw new FileNotFoundException(
@@ -947,7 +745,7 @@ public sealed class PythonBridge : IDisposable
         {
             Stage = normalizedStage,
             ModelPath = modelPaths,
-            ConfigPath = configBasePath,
+            ConfigPath = config2DPath,
             ConfigText = configText
         };
     }
@@ -1061,8 +859,6 @@ public sealed class PythonBridge : IDisposable
         {
             Detect2DRequest image => new[] { image.ShmName },
             Detect3DRequest depth => new[] { depth.ShmName },
-            DetectBoardRequest board => board.Images2D.Select(image => image.ShmName)
-                .Concat(new[] { board.Image3D.ShmName }),
             _ => Array.Empty<string>()
         };
         var mappings = new List<MemoryMappedFile>();
@@ -1160,99 +956,6 @@ public sealed class PythonBridge : IDisposable
             if (buffers == null) return;
             foreach (var buffer in buffers) buffer.Dispose();
         }
-    }
-}
-
-public sealed class BridgeBoard
-{
-    private readonly PythonBridge _bridge;
-
-    internal BridgeBoard(PythonBridge bridge)
-    {
-        _bridge = bridge;
-    }
-
-    public DetectResponse DetectFiles(IReadOnlyList<string> images2D, string depthPath, string batchId = "")
-        => DetectFiles(images2D, depthPath, batchId, null);
-
-    public Task<DetectResponse> DetectStreamingFilesAsync(IReadOnlyList<string> images2D,
-        string depthPath, string boardId, object? threshold = null)
-        => DetectStreamingFilesAsync(images2D, depthPath, boardId, threshold, null);
-
-    public DetectResponse DetectFiles(
-        IReadOnlyList<string> image2DPaths,
-        string data3DPath,
-        string batchId, Dictionary<string, object>? correction)
-    {
-        return _bridge.DetectBoardFiles(image2DPaths, data3DPath, batchId, correction);
-    }
-
-    /// <summary>Runs ten per-piece 2D requests and the single 3D scan concurrently, then returns the joined board result.</summary>
-    public async Task<DetectResponse> DetectStreamingFilesAsync(
-        IReadOnlyList<string> image2DPaths, string data3DPath, string boardId,
-        object? threshold, Dictionary<string, object>? correction)
-    {
-        if (image2DPaths == null || image2DPaths.Count != 10)
-            throw new ArgumentException("Streaming board detection requires exactly ten 2D images.", nameof(image2DPaths));
-        if (string.IsNullOrWhiteSpace(boardId))
-            throw new ArgumentException("Board ID is empty.", nameof(boardId));
-        if (string.IsNullOrWhiteSpace(data3DPath) || !File.Exists(data3DPath))
-            throw new FileNotFoundException("3D board image not found.", data3DPath);
-
-        Task<DetectResponse> scan = _bridge.ThreeD.DetectBoardFileAsync(boardId, data3DPath, correction);
-        try
-        {
-            DetectResponse[] pieces = await Task.WhenAll(image2DPaths.Select(
-                (path, index) => _bridge.TwoD.DetectPieceFileAsync(boardId, index + 1, path, threshold)))
-                .ConfigureAwait(false);
-            DetectResponse[] failures = pieces.Where(response => !response.Ok).ToArray();
-            if (failures.Length != 0)
-            {
-                try { _bridge.ReleaseBoard(boardId); } catch { }
-                try { await scan.ConfigureAwait(false); } catch { }
-                return new DetectResponse
-                {
-                    Ok = false,
-                    Cmd = "detect_3d_board",
-                    Stage = "board",
-                    BoardId = boardId,
-                    BatchId = boardId,
-                    Error = "2d_piece_failed",
-                    Message = string.Join("; ", failures.Select(item =>
-                        $"piece {item.PieceId}: {item.Error ?? item.Message}")),
-                    MissingPieceIds = failures.Where(item => item.PieceId.HasValue)
-                        .Select(item => item.PieceId!.Value).OrderBy(value => value).ToList()
-                };
-            }
-            return await scan.ConfigureAwait(false);
-        }
-        catch
-        {
-            try { _bridge.ReleaseBoard(boardId); } catch { }
-            try { await scan.ConfigureAwait(false); } catch { }
-            throw;
-        }
-    }
-
-    public DetectResponse DetectSharedMemory(
-        IReadOnlyList<BoardImage2DInput> images2D,
-        BoardImage3DInput image3D,
-        string batchId = "")
-    {
-        if (images2D == null)
-        {
-            throw new ArgumentNullException(nameof(images2D));
-        }
-        if (image3D == null)
-        {
-            throw new ArgumentNullException(nameof(image3D));
-        }
-        return _bridge.DetectBoardSharedMemory(new DetectBoardRequest
-        {
-            BatchId = batchId,
-            Images2D = images2D.ToList(),
-            Image3D = image3D
-        });
     }
 }
 
@@ -1449,56 +1152,6 @@ public sealed class Bridge3D
         _bridge = bridge;
     }
 
-    // Keep existing CLR signatures for already compiled callers. Metadata
-    // overloads only describe externally prepared pixels; none correct them.
-    public Task<DetectResponse> DetectBoardFileAsync(string boardId, string path)
-        => DetectBoardFileAsync(boardId, path, null);
-    public Task<DetectResponse> DetectBoardSharedMemoryAsync(string boardId, string name, int size, int width, int height)
-        => DetectBoardSharedMemoryAsync(boardId, name, size, width, height, null);
-    public DetectResponse DetectBoard(string boardId, ushort[] depth, int width, int height)
-        => DetectBoard(boardId, depth, width, height, null);
-    public Task<DetectResponse> DetectBoardAsync(string boardId, ushort[] depth, int width, int height)
-        => DetectBoardAsync(boardId, depth, width, height, null);
-    public DetectResponse Detect3D(ushort[] depth, int width, int height)
-        => Detect3D(depth, width, height, null);
-    public DetectResponse Detect3DFile(string path) => Detect3DFile(path, null);
-    public DetectResponse DetectBoardFile(string boardId, string path) => DetectBoardFile(boardId, path, null);
-    public DetectResponse Detect3DSharedMemory(string name, int size, int width, int height)
-        => Detect3DSharedMemory(name, size, width, height, null);
-    public DetectResponse DetectBoardSharedMemory(string boardId, string name, int size, int width, int height)
-        => DetectBoardSharedMemory(boardId, name, size, width, height, null);
-
-    public Task<DetectResponse> DetectBoardFileAsync(string boardId, string dataPath, Dictionary<string, object>? correction)
-    {
-        var metadata = correction == null ? null : new Dictionary<string, object>(correction);
-        return Task.Run(() => DetectBoardFile(boardId, dataPath, metadata));
-    }
-
-    public Task<DetectResponse> DetectBoardSharedMemoryAsync(
-        string boardId, string shmName, int dataSize, int width, int height, Dictionary<string, object>? correction)
-    {
-        var metadata = correction == null ? null : new Dictionary<string, object>(correction);
-        return Task.Run(() => DetectBoardSharedMemory(boardId, shmName, dataSize, width, height, metadata));
-    }
-
-    /// <summary>Submit a complete SDK depth array. Copies directly into request-owned shared memory.</summary>
-    public DetectResponse DetectBoard(string boardId, ushort[] depth, int width, int height, Dictionary<string, object>? correction)
-    {
-        if (string.IsNullOrWhiteSpace(boardId))
-            throw new ArgumentException("Board ID is empty.", nameof(boardId));
-        return _bridge.Detect3DValues(depth, new Detect3DRequest {
-            Cmd = "detect_3d_board", BoardId = boardId, PitchCorrection = correction }, width, height);
-    }
-
-    /// <summary>Snapshot synchronously so the SDK may reuse its array after this method returns.</summary>
-    public Task<DetectResponse> DetectBoardAsync(string boardId, ushort[] depth, int width, int height, Dictionary<string, object>? correction)
-    {
-        if (string.IsNullOrWhiteSpace(boardId))
-            throw new ArgumentException("Board ID is empty.", nameof(boardId));
-        return DetectDepthAsync(depth, width, height, new Detect3DRequest {
-            Cmd = "detect_3d_board", BoardId = boardId, PitchCorrection = correction });
-    }
-
     private Task<DetectResponse> DetectDepthAsync(ushort[] depth, int width, int height, Detect3DRequest request)
     {
         int size = PackedDepthInput.ByteCount(width, height);
@@ -1508,93 +1161,6 @@ public sealed class Bridge3D
         if (request.PitchCorrection != null)
             request.PitchCorrection = new Dictionary<string, object>(request.PitchCorrection);
         return Task.Run(() => _bridge.Detect3DValues(snapshot, request, width, height));
-    }
-
-    public DetectResponse Detect3D(ushort[] depth, int width, int height, Dictionary<string, object>? correction)
-        => _bridge.Detect3DValues(depth, new Detect3DRequest { PitchCorrection = correction }, width, height);
-
-    public DetectResponse Detect3DFile(string dataPath, Dictionary<string, object>? correction)
-    {
-        if (string.IsNullOrWhiteSpace(dataPath))
-        {
-            throw new ArgumentException("3D data path is empty.", nameof(dataPath));
-        }
-
-        if (!File.Exists(dataPath))
-        {
-            throw new FileNotFoundException("3D data file not found.", dataPath);
-        }
-
-        return _bridge.Detect3DFile(dataPath, correction);
-    }
-
-    // 新流程：提交一张包含整板十片的 3D 数据，并触发该 board 的合并。
-    public DetectResponse DetectBoardFile(string boardId, string dataPath, Dictionary<string, object>? correction)
-    {
-        if (string.IsNullOrWhiteSpace(boardId))
-        {
-            throw new ArgumentException("Board ID is empty.", nameof(boardId));
-        }
-        if (string.IsNullOrWhiteSpace(dataPath) || !File.Exists(dataPath))
-        {
-            throw new FileNotFoundException("3D board data file not found.", dataPath);
-        }
-        return _bridge.DetectStreamed3DFile(dataPath, new Detect3DRequest {
-            Cmd = "detect_3d_board", BoardId = boardId, PitchCorrection = correction });
-    }
-
-    public DetectResponse Detect3DSharedMemory(
-        string shmName,
-        int dataSize,
-        int width,
-        int height, Dictionary<string, object>? correction)
-    {
-        if (string.IsNullOrWhiteSpace(shmName))
-        {
-            throw new ArgumentException("Shared memory name is empty.", nameof(shmName));
-        }
-
-        if (dataSize <= 0)
-        {
-            throw new ArgumentException("3D data size must be greater than 0.", nameof(dataSize));
-        }
-
-        return _bridge.Detect3DSharedMemory(new Detect3DRequest
-        {
-            ShmName = shmName,
-            DataSize = dataSize,
-            ImageWidth = width, ImageHeight = height, PitchCorrection = correction
-        });
-    }
-
-    // 新流程：3D 共享内存中是一整板数据，boardId 用于关联前面的十张 2D。
-    public DetectResponse DetectBoardSharedMemory(
-        string boardId,
-        string shmName,
-        int dataSize,
-        int width,
-        int height, Dictionary<string, object>? correction)
-    {
-        if (string.IsNullOrWhiteSpace(boardId))
-        {
-            throw new ArgumentException("Board ID is empty.", nameof(boardId));
-        }
-        if (string.IsNullOrWhiteSpace(shmName))
-        {
-            throw new ArgumentException("Shared memory name is empty.", nameof(shmName));
-        }
-        if (dataSize <= 0)
-        {
-            throw new ArgumentException("3D data size must be greater than 0.", nameof(dataSize));
-        }
-        return _bridge.DetectStreamed3DSharedMemory(new Detect3DRequest
-        {
-            Cmd = "detect_3d_board",
-            BoardId = boardId,
-            ShmName = shmName,
-            DataSize = dataSize,
-            ImageWidth = width, ImageHeight = height, PitchCorrection = correction
-        });
     }
 
     /// <summary>Submit an already separated depth image for one piece.</summary>

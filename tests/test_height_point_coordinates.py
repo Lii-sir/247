@@ -98,24 +98,16 @@ class HeightPointTests(unittest.TestCase):
         self.assertEqual(result["wire_measurements"][0]["height_3d"]["point"]["y"], 1031)
         self.assertEqual(result["masks"][0]["height_3d"]["point"]["y"], 1031)
 
-    def test_batch_output_is_global(self):
-        detector, module, measurement = self.detector()
-        detector.expected_piece_count = 1
-        detector.model = object()
-        detector._synchronize_model = Mock()
-        detector._validate_descriptors = Mock(return_value=[{"piece_id": 1}])
-        detector._read_2d = Mock(return_value=np.zeros((8, 8, 3), np.uint8))
-        detector._read_3d = Mock(return_value=np.zeros((1400, 100), np.uint16))
-        detector._stream_crop = Mock(return_value=(np.zeros((8, 8, 3), np.uint8), (0, 0, 8, 8), (2, 2, 1), []))
-        detector._predict_batch = Mock(return_value=[object()])
-        detector._extract_instances = Mock(return_value=measurement["masks"])
-        with self.patches(module), patch.object(module, "segment_depth_image", return_value=[{"y1": 1000, "y2": 1200}]):
-            response = detector.handle_detect({"image_3d": {}, "images_2d": [], "batch_id": "A"})
-        self.assertTrue(response["ok"], response)
-        result = response["results_board"]["pieces"][0]
-        self.assertEqual(result["solder_measurements"][0]["height_3d"]["point"], {"x": 75, "y": 1031})
-        self.assertEqual(result["height_point_coordinate_space"], "board_3d")
-
+    def test_public_piece_depth_output_is_local(self):
+        detector, _, measurement = self.detector()
+        from algorithm.application.board.board_depth import piece_depth_geometry
+        entry = {"instances": measurement["masks"], "image_shape": [8, 8], "crop_box": (0, 0, 8, 8)}
+        piece, correction = piece_depth_geometry(dict(
+            shm_name="sample_depth", image_width=100, image_height=200, data_size=40000), 2)
+        result = detector.measure_registered_piece(2, entry, np.zeros((200, 100), np.uint16), piece,
+                                                  {"is_valid": True}, correction)
+        self.assertEqual(result["solder_measurements"][0]["height_3d"]["point"], {"x": 75, "y": 31})
+        self.assertEqual(result["height_point_coordinate_space"], "piece_3d")
 
 if __name__ == "__main__":
     unittest.main()

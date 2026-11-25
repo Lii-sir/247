@@ -33,7 +33,7 @@
   const result2dOfPiece = (piece) => piece?.results_2d || {};
   const hasStage = (piece, stage) => !workflow || piece?.workflow_stages?.[stage]?.status === "done";
   const skippedReasons = {missing_2d_result:"缺少或已过期的 2D 结果",
-    no_2d_result:"2D 无有效掩码", "2d_ng":"2D 已判为 NG"};
+    no_2d_result:"2D 无有效掩码", "2d_ng":"2D 已判为 NG", no_3d_checks:"未启用 3D 检测项"};
   const classColor = (name) => {
     const key = String(name || "").toLowerCase();
     if (key === "chip") return "#87abff";
@@ -150,7 +150,10 @@
     $("verdict-label").textContent = workflow ? "当前片结论" : response.results_board ? "算法整板结论" : "当前响应结论";
     setText("board-status", statusText(verdict), statusClass(verdict));
     const registration = workflow ? piece?.registration?.is_valid : boardResult.registration_ok;
-    setText("registration-status", statusText(registration), statusClass(registration));
+    const registrationDisabled = workflow ? piece?.registration?.status === "disabled"
+      : pieces().length > 0 && pieces().every((item) => item.registration?.status === "disabled");
+    setText("registration-status", registrationDisabled ? "未启用" : statusText(registration),
+      statusClass(registrationDisabled ? null : registration));
     setText("elapsed", response.elapsed_ms == null ? "—" : `${number(response.elapsed_ms, 1)} ms`);
     $("piece-count").textContent = `${pieces().length} 片 · 点击片号查看细节`;
     const warningText = [workflow && report.response?.error, ...(data.warnings || [])].filter(Boolean).join("\n");
@@ -174,10 +177,11 @@
     for (const item of entries.sort((a, b) => Number(a.sent_ms) - Number(b.sent_ms))) {
       const row = document.createElement("div"); row.className = "timeline-row";
       const label = document.createElement("span");
-      label.textContent = item.cmd === "detect_3d_board" ? "3D 整板" : `2D #${item.piece_id ?? "?"}`;
+      const isDepth = item.cmd === "detect_3d_board" || item.cmd === "detect_3d_piece";
+      label.textContent = item.cmd === "detect_3d_board" ? "3D 整板" : `${isDepth ? "3D" : "2D"} #${item.piece_id ?? "?"}`;
       const track = document.createElement("div"); track.className = "timeline-track";
       const bar = document.createElement("div");
-      bar.className = `timeline-bar ${item.cmd === "detect_3d_board" ? "timeline-3d" : "timeline-2d"}${item.ok ? "" : " timeline-failed"}`;
+      bar.className = `timeline-bar ${isDepth ? "timeline-3d" : "timeline-2d"}${item.ok ? "" : " timeline-failed"}`;
       bar.style.left = `${Math.max(0, (Number(item.sent_ms) - first) / span * 100)}%`;
       bar.style.width = `${Math.max(0.3, (Number(item.received_ms) - Number(item.sent_ms)) / span * 100)}%`;
       bar.title = `${label.textContent}: 发出 ${number(Number(item.sent_ms) - first, 1)} ms · 响应 ${number(Number(item.received_ms) - first, 1)} ms · 用时 ${number(item.duration_ms, 1)} ms · ${statusText(item.ok)}`;
@@ -513,19 +517,29 @@
     const root = $("checks");
     root.replaceChildren();
     const two = result2dOfPiece(piece);
+    const checkValue = (item) => item?.status === "disabled" ? "未启用"
+      : item?.status === "skipped" ? "跳过" : item?.is_ok;
+    const heights = piece?.defect_checks_3d;
+    const heightChecks = heights ? [
+      ["引线高度", checkValue(heights.wire_height_3d)],
+      ["平台侧焊点／焊脚高度", checkValue(heights.solder_platform_height_3d)],
+      ["芯片侧焊点／焊脚高度", checkValue(heights.solder_chip_height_3d)],
+    ] : [
+      ["引线高度", Array.isArray(piece?.wire_measurements) && piece.wire_measurements.length ? piece.wire_measurements.every((x) => x.height_3d?.is_ok === true) : null, "3d"],
+      ["焊脚高度", Array.isArray(piece?.solder_measurements) && piece.solder_measurements.length ? piece.solder_measurements.every((x) => x.height_3d?.is_ok === true) : null, "3d"],
+    ];
     const silverBoundaryLabel = (two.silver_overflow_2d || piece?.silver_overflow_2d)?.registration?.method === "roi_inset"
       ? "银浆边界生成" : "银浆边界配准";
     const checks = [
       ["片级结论", piece?.is_ok],
-      ["配准", piece?.registration?.is_valid, "3d"],
-      ["2D 引线 ROI", Array.isArray(piece?.wire_roi_checks) ? (piece.wire_roi_checks.length ? piece.wire_roi_checks.every((x) => x.is_ok === true) : null) : two.wire_bending_2d?.is_ok, "2d"],
-      ["芯片旋转", two.chip_rotation_2d?.is_ok, "2d"],
-      ["芯片外观", workflow ? two.chip_anomaly_2d?.is_ok : (piece?.chip_anomaly_2d?.is_ok ?? two.chip_anomaly_2d?.is_ok), "2d"],
-      ["银浆连通", (two.silver_continuity_2d || piece?.silver_continuity_2d)?.is_ok, "2d"],
-      ["银浆溢出", (two.silver_overflow_2d || piece?.silver_overflow_2d)?.is_ok, "2d"],
+      ["配准", piece?.registration?.status === "disabled" ? "未启用" : piece?.registration?.is_valid, "3d"],
+      ["2D 引线 ROI", checkValue(two.wire_bending_2d) ?? (piece?.wire_roi_checks?.length ? piece.wire_roi_checks.every((x) => x.is_ok === true) : null), "2d"],
+      ["芯片旋转", checkValue(two.chip_rotation_2d), "2d"],
+      ["芯片外观", checkValue(two.chip_anomaly_2d || (!workflow && piece?.chip_anomaly_2d)), "2d"],
+      ["银浆连通", checkValue(two.silver_continuity_2d || piece?.silver_continuity_2d), "2d"],
+      ["银浆溢出", checkValue(two.silver_overflow_2d || piece?.silver_overflow_2d), "2d"],
       [silverBoundaryLabel, (two.silver_overflow_2d || piece?.silver_overflow_2d)?.registration?.status === "not_configured" ? null : (two.silver_overflow_2d || piece?.silver_overflow_2d)?.registration?.is_valid, "2d"],
-      ["引线高度", Array.isArray(piece?.wire_measurements) && piece.wire_measurements.length ? piece.wire_measurements.every((x) => x.height_3d?.is_ok === true) : null, "3d"],
-      ["焊脚高度", Array.isArray(piece?.solder_measurements) && piece.solder_measurements.length ? piece.solder_measurements.every((x) => x.height_3d?.is_ok === true) : null, "3d"],
+      ...heightChecks,
       ["配准分数", piece?.registration?.score == null ? "—" : number(piece.registration.score, 4), "3d"],
     ];
     checks.forEach(([name, value, stage]) => {

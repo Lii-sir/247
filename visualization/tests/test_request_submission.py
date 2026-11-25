@@ -21,22 +21,22 @@ from detect_and_view import ProtocolClient
 class PacedSubmissionTests(unittest.TestCase):
     setUp = fixtures.ValidationTests.setUp
     make_runner = fixtures.ValidationTests.make_runner
-    def test_paced_sorted_2d_then_depth_and_actual_gaps(self):
+    def test_paced_sorted_2d_and_actual_gaps(self):
         runner, clients = self.make_runner()
         self.addCleanup(runner.close)
         folder = self.root / "paced"
         folder.mkdir()
-        result = runner.run(list(reversed(self.rows)), '2', 'joint', 2, folder, lambda _: None,
+        result = runner.run(list(reversed(self.rows)), '2', '2d', 2, folder, lambda _: None,
                             submission_mode='paced', request_interval_ms=30)
         self.assertTrue(result['ok'], result)
         requests = [q for q in clients[0].requests if q['cmd'].startswith('detect_')]
-        self.assertEqual([('detect_2d_piece', 1), ('detect_2d_piece', 2), ('detect_3d_board', None)],
+        self.assertEqual([('detect_2d_piece', 1), ('detect_2d_piece', 2)],
                          [(q['cmd'], q.get('piece_id')) for q in requests])
         document = json.loads((folder/'result.json').read_text(encoding='utf-8'))
         submission = document['submission']
         self.assertFalse(submission['aborted'])
         self.assertEqual(30, submission['request_interval_ms'])
-        self.assertEqual([1, 2, 3], [q['order'] for q in submission['requests']])
+        self.assertEqual([1, 2], [q['order'] for q in submission['requests']])
         for request in submission['requests'][1:]:
             self.assertGreaterEqual(request['gap_ms'], 29.9)
 
@@ -57,7 +57,7 @@ class PacedSubmissionTests(unittest.TestCase):
         self.addCleanup(runner.close)
         folder = self.root/'failed-paced'
         folder.mkdir()
-        result = runner.run(self.rows, '2', 'joint', 2, folder, lambda _: None,
+        result = runner.run(self.rows, '2', '2d', 2, folder, lambda _: None,
                             submission_mode='paced', request_interval_ms=100)
         self.assertFalse(result['ok'])
         self.assertIn('synthetic piece error', result['error'])
@@ -79,7 +79,7 @@ class PacedSubmissionTests(unittest.TestCase):
         class Client(FakeClient):
             def request(self, q, timeout, **kwargs):
                 result = super().request(q, timeout, **kwargs)
-                if q['cmd'] == 'detect_3d_board' and not result['ok']:
+                if q['cmd'] == 'release_board':
                     raise RuntimeError('cleanup transport closed')
                 return result
         runner, _ = self.make_runner()
@@ -89,7 +89,7 @@ class PacedSubmissionTests(unittest.TestCase):
         self.addCleanup(runner.close)
         folder = self.root/'transport-failure'
         folder.mkdir()
-        result = runner.run(self.rows, '2', 'joint', 2, folder, lambda _: None)
+        result = runner.run(self.rows, '2', '2d', 2, folder, lambda _: None)
         self.assertFalse(result['ok'])
         self.assertIn('synthetic piece error', result['error'])
         self.assertNotIn('cleanup transport closed', result['error'])
@@ -116,7 +116,7 @@ class PacedSubmissionTests(unittest.TestCase):
         folder.mkdir()
         original = os.environ.get('BRIDGE_BOARD_TIMEOUT_SECONDS')
         pool = ThreadPoolExecutor(1)
-        future = pool.submit(runner.run, self.rows, '2', 'joint', 2, folder, lambda _: None,
+        future = pool.submit(runner.run, self.rows, '2', '2d', 2, folder, lambda _: None,
                              submission_mode='paced', request_interval_ms=3600000)
         try:
             self.assertTrue(sent.wait(3))
@@ -125,7 +125,7 @@ class PacedSubmissionTests(unittest.TestCase):
             self.assertFalse(result['ok'])
             requests = [q for q in clients[0].requests if q['cmd'].startswith('detect_')]
             self.assertEqual(1, len(requests))
-            self.assertGreaterEqual(float(clients[0].env_overrides['BRIDGE_BOARD_TIMEOUT_SECONDS']), 7230)
+            self.assertGreaterEqual(float(clients[0].env_overrides['BRIDGE_BOARD_TIMEOUT_SECONDS']), 3630)
             self.assertEqual(original, os.environ.get('BRIDGE_BOARD_TIMEOUT_SECONDS'))
         finally:
             runner.stop()
@@ -151,14 +151,14 @@ class PacedSubmissionTests(unittest.TestCase):
         url = f'http://127.0.0.1:{server.server_port}/api/run'
         for options in ({'submission_mode': 'bad'}, {'submission_mode':'paced', 'request_interval_ms': -1},
                         {'submission_mode':'paced', 'request_interval_ms': float('nan')}):
-            request = dict(files=self.rows, board_id='2', mode='joint', **options)
+            request = dict(files=self.rows, board_id='2', mode='2d', **options)
             with self.assertRaises(HTTPError) as error:
                 urlopen(Request(url, data=json.dumps(request).encode()))
             self.assertEqual(400, error.exception.code)
         server.runner.run.assert_not_called()
         self.assertEqual({}, server.jobs)
         with patch.object(lab, 'defaults', return_value=dict(piece_count=2)):
-            request = dict(files=self.rows, board_id='2', mode='joint', submission_mode='paced', request_interval_ms=12.5)
+            request = dict(files=self.rows, board_id='2', mode='2d', submission_mode='paced', request_interval_ms=12.5)
             with urlopen(Request(url, data=json.dumps(request).encode())) as response:
                 key = json.load(response)['id']
         deadline = time.monotonic()+3
@@ -169,7 +169,7 @@ class PacedSubmissionTests(unittest.TestCase):
 
 
 class RealProtocolSubmissionTests(unittest.TestCase):
-    def test_transport_sends_depth_before_waiting_for_2d_responses(self):
+    def test_transport_sends_second_piece_before_waiting_for_first_response(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             worker = root/'worker.py'
@@ -181,11 +181,10 @@ for line in sys.stdin:
     q=json.loads(line);cmd=q['cmd']
     if cmd=='detect_2d_piece':
         pending.append(q)
-        continue
-    if cmd=='detect_3d_board':
-        emit(q,results_board=dict(is_ok=len(pending)==2,pieces=[]))
-        for image in pending:emit(image,piece_id=image['piece_id'],results_2d=dict(is_ok=True))
-        pending=[]
+        if len(pending)==2:
+            for image in reversed(pending):
+                emit(image,piece_id=image['piece_id'],results_2d=dict(is_ok=True))
+            pending=[]
     else:emit(q)
     if cmd=='release':break
 ''', encoding='utf-8')
@@ -205,21 +204,20 @@ for line in sys.stdin:
             output = root/'result'
             output.mkdir()
             pool = ThreadPoolExecutor(1)
-            future = pool.submit(runner.run, rows, '2', 'joint', 2, output, lambda _: None,
+            future = pool.submit(runner.run, rows, '2', '2d', 2, output, lambda _: None,
                                  submission_mode='paced', request_interval_ms=20)
             try:
                 result = future.result(8)
                 self.assertTrue(result['ok'], result)
                 document = json.loads((output/'result.json').read_text(encoding='utf-8'))
                 sends = document['submission']['requests']
-                self.assertEqual([1, 2, None], [q['piece_id'] for q in sends])
-                self.assertEqual(3, len({q['request_id'] for q in sends}))
+                self.assertEqual([1, 2], [q['piece_id'] for q in sends])
+                self.assertEqual(2, len({q['request_id'] for q in sends}))
                 for request in sends[1:]:
                     self.assertGreaterEqual(request['gap_ms'], 19.9)
                 timeline = document['timeline']
-                depth = next(q for q in timeline if q['cmd']=='detect_3d_board')
-                two_d = [q for q in timeline if q['cmd']=='detect_2d_piece']
-                self.assertTrue(all(q['received_ms'] >= depth['sent_ms'] for q in two_d))
+                two_d = {q['piece_id']: q for q in timeline if q['cmd']=='detect_2d_piece'}
+                self.assertGreaterEqual(two_d[1]['received_ms'], two_d[2]['sent_ms'])
             finally:
                 runner.close(force=True)
                 pool.shutdown(wait=True)

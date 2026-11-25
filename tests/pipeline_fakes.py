@@ -2,14 +2,16 @@
 import threading
 import time
 import numpy as np
-from importlib import import_module
+
+
+def depth_piece_request(board_id, piece_id=1, **overrides):
+    return dict(board_id=board_id, piece_id=piece_id, shm_name="synthetic_depth",
+                image_width=20, image_height=10, data_size=400) | overrides
 
 
 class FakeDetector:
     def __init__(self, count=10, delay=0.005):
         self.expected_piece_count = count
-        self.segmentation_config = import_module("algorithm.vision3d.depth.segment").SegmentationConfig(
-            expected_piece_count=count, max_internal_gap_height=0)
         self.delay = delay
         self.lock = threading.Lock()
         self.gpu_active = self.max_gpu_active = 0
@@ -107,10 +109,7 @@ class FakeDetector:
         self.depth_started.set()
         if req.get("fail_3d"):
             raise ValueError("synthetic depth decode failure")
-        depth = np.zeros((self.expected_piece_count * 10, 20), dtype=np.uint16)
-        for index in range(self.expected_piece_count):
-            depth[index * 10:index * 10 + 5] = 33000
-        return depth
+        return np.full((req["image_height"], req["image_width"]), 33000, dtype=np.uint16)
 
     def register_prepared_piece(self, piece_id, entry, depth, piece, pitch_correction=None):
         return dict(is_valid=True)

@@ -1,55 +1,39 @@
 # 3D 配置
 
-3D 配置采用 `description + parameters` 功能块，不使用 `enabled` 开关。
+- `common_3d` 保存每板的片号范围和工作进程参数。
+- `registration_3d`、`dynamic_affine_3d` 保存配准参数。
+- `height_measurement_3d` 保存参考面、焊脚和引线高度阈值。
+- `segmentation_3d` 和 `smartray_pitch_3d` 供验证台在提交前处理整板样本。产线由上位机调用矫正 DLL 准备单片深度。
+- 项目选择和 2D NG 跳过规则统一在 [inspection.json](../inspection.json)。
 
-- `common_3d`：板号关联所需片数。
-- `segmentation_3d`：一张整板深度图分成十片的参数。
-- `registration_3d`：初始尺度模板匹配参数。
-- `dynamic_affine_3d`：每片运行时仿射优化参数。
-- `smartray_pitch_3d`：调用侧提交前的SmartRay Pitch预处理参数；验证台使用，检测程序不执行。上位机使用独立矫正DLL先准备数据。
-- `height_measurement_3d`：芯片/引脚平台平面、焊脚和引线高度阈值。引脚平台 ROI 在 2D 图片上由 ROI 工具画定，以该片圆心/半径归一化后保存在本文件；每片处理时使用其透视矩阵映射到 3D，再排除所有对齐后的 YOLO 掩码拟合平台平面。未画 ROI 时平台参考面无效，不会退回固定 3D AOI。
-- `wire_height_3d`：独立 3D 接口的引线中心线 P95 参数。
+## 单片原始深度输入
 
-板级接口会把 `config/2D/config.json` 的 2D 结果缓存与本文件的 3D 参数组合；
-收到同一 `board_id` 的整板 3D 数据后完成配准、测高并释放十张 2D 缓存。
-
-## 原始16位深度输入接口
-
-3D算法入口仅接收原始深度像素，不再接收PNG压缩字节。流式`detect_3d_board`、批量`detect_board.image_3d`及独立`detect(stage=3d)`使用相同布局：
+上位机按相同板号、片号提交 2D 和 3D。传入的 3D 必须是已经分片的深度图。
 
 ```json
 {
-  "cmd": "detect_3d_board",
-  "stage": "3d",
+  "cmd": "detect_3d_piece",
   "board_id": "2",
-  "shm_name": "camera_depth_2",
+  "piece_id": 3,
+  "shm_name": "camera_depth_2_3",
   "data_format": "uint16",
   "image_width": 1200,
-  "image_height": 10000,
-  "data_size": 24000000
+  "image_height": 1000,
+  "data_size": 2400000
 }
 ```
 
-共享内存内按行排列小端无符号16位整数，严格`data_size = image_width × image_height × 2`。不包含文件头、行头或行尾填充；有行对齐填充时由提交方先去掉。尺寸必须为正整数，PNG/file格式、长度不符或未填宽高直接拒绝。检测端按传入像素原样分片、配准、测高，不再执行Pitch矫正。
-
-SDK接入请在确认**整幅采集完成**后提交，并检查`zMap.Length == width * height`。数组长度正确不代表采集已经完成，不应把`GetLastImageData()`中的半幅结果直接提交。C#新接口：
+共享内存每行紧密排列小端 `uint16`，字节数等于宽 × 高 × 2。上位机持有共享内存至本次响应完成。文件助手 `DetectPieceFile` 读取原始单片 16 位深度 PNG，C# 将其转换为相同的共享内存布局。
 
 ```csharp
-// ushort[] zMap，width/height取自完整采集结果；无需PNG保存或编码。
-Task<DetectResponse> pending = bridge.ThreeD.DetectBoardAsync(boardId, zMap, width, height);
-// 此方法返回Task前已复制快照，允许SDK随后复用原数组。
-DetectResponse result = await pending;
+DetectResponse result = await bridge.ThreeD.DetectPieceAsync(
+    boardId, pieceId, depth, width, height, pitchCorrection);
 
-// 若上位机已经维护原始共享内存，用此入口并持有映射直到响应完成：
-result = await bridge.ThreeD.DetectBoardSharedMemoryAsync(
-    boardId, shmName, checked(width * height * 2), width, height);
+result = await bridge.ThreeD.DetectPieceSharedMemoryAsync(
+    boardId, pieceId, shmName, checked(width * height * 2), width, height, pitchCorrection);
 ```
 
-同步SDK数组入口为`ThreeD.DetectBoard(boardId, zMap, width, height)`，独立3D入口为`ThreeD.Detect3D(zMap, width, height)`。原共享内存方法现需增加宽高参数；C# DTO `Detect3DRequest`及`BoardImage3DInput`也新增`ImageWidth/ImageHeight`。需同时更新Bridge.dll、Python代码与调用方。
-
-验证台与C# `DetectBoardFile`/批量文件辅助方法仍允许选择原始16位PNG样本：**调用侧**读取像素后以uint16写入共享内存，算法不再解码。8位/彩色预览不能作为深度样本。样本读取在请求前，不计入算法耗时；实时SDK数组路径完全不经过PNG。
-
-流式计时用`depth_read_ms`（共享内存读取及视图准备）、`depth_shared_memory_read_ms`、`depth_array_view_ms`及板级`shared_memory_read_ms`；不再输出`depth_image_decode_ms`。仍存在共享内存到bytes的复制，不能将本次改动称为整条链路零拷贝。
+返回对象 `ResultsPiece` 的测高点使用单片坐标。下文的整板时序或统计是历史基准，当前检测入口按片工作。线上接口和缓存语义详见[接口说明](../../process/OUTPUT_PARAMETERS.md)。
 
 ## 联合测高的引线边缘剔除
 
@@ -140,7 +124,6 @@ C# 方法和字段不增加。`SolderMeasurements[].Mask3DLocal` 是实际内缩
   "registration_affinity": {"enabled": true, "physical_cores": 4},
   "joint_workers": 7,
   "joint_affinity": {"enabled": true, "physical_cores": 14},
-  "early_joint_workers": 10,
   "instance_workers": 2
 }
 ```
@@ -151,7 +134,6 @@ C# 方法和字段不增加。`SolderMeasurements[].Mask3DLocal` 是实际内缩
 - `main_reserved_physical_cores`：主进程优先保护的高性能物理核数，缺省0兼容旧策略。非负整数；保护完整物理核及其SMT。此策略只约束启用亲和性的子进程组，关闭亲和性的组仍可能共享主进程CPU。
 - `joint_affinity`：第三组专用核，当前14物理核；至少等于joint_workers。映射、平台/芯片面、引线与焊脚均在此组完成。
 - `instance_workers`：**每个3D测高进程内部**的本地实例工作位，默认1。现在不是主进程全板共用的20/64/128线程池。每进程只分1个物理核时应设1；增加实例并发需要相应增加每进程分配的物理核，不是把线程数直接放大。旧同步接口的兼容实例执行器仍按此值配置，但正式流式不会在主进程调用它。
-- `early_joint_workers`：所有2D诊断完成前，进入联合链路但未结束的在途片数上限；覆盖配准、测高和中间排队。2D齐全后由进程池各自限并发。
 - `cpu_workers`：主进程输入、深度准备与早期2D几何线程；不执行正式映射测高。
 - `worker_budget`：只校验父进程桥接线程槽位（当前25），不包括13个常驻CPU进程、各子进程本地实例执行器或调用侧Pitch池。不是操作系统线程/核心总上限。
 
@@ -220,7 +202,7 @@ C# 方法和字段不增加。`SolderMeasurements[].Mask3DLocal` 是实际内缩
 
 透视配准阶段已移除，旧`perspective_registration_3d`块不再读取，不再输出对应的求解耗时；`homography_2d_to_3d`仍以3×3齐次矩阵表示仿射映射，底行为[0,0,1]。这不影响芯片外观裁剪等其他功能使用OpenCV的几何映射。
 
-`smartray_pitch_3d`现在只供调用侧预处理使用，不再由DetectBoard/Detect3D读取，也不会在算法初始化时创建Pitch池。验证台在发送请求前按此块的`enabled_3d`开关矫正；上位机先调用独立`SmartRay.PitchCorrection.dll`，再调用Bridge。已由SDK矫正的数据直接提交，不要重复矫正。启用前至少确认：
+`smartray_pitch_3d`现在只供调用侧预处理使用，检测端不读取，也不会在算法初始化时创建Pitch池。验证台在发送请求前按此块的`enabled_3d`开关矫正；上位机先调用独立`SmartRay.PitchCorrection.dll`，再调用Bridge。已由SDK矫正的数据直接提交，不要重复矫正。启用前至少确认：
 
 - 正式配置不再使用`input_state`。如果数据已由SDK补偿，请将`enabled_3d`设为`false`，否则会重复处理。旧`input_state`字段会被忽略，不再触发跳过。
 - `angle_deg`为实际Pitch角，`scan_axis=rows/columns`对应深度图扫描方向。
@@ -229,29 +211,15 @@ C# 方法和字段不增加。`SolderMeasurements[].Mask3DLocal` 是实际内缩
 - `gray_offset`、`z_step_mm`必须与测高配置的灰度零点、垂直分辨率一致；`z_origin_mm`是灰度零点对应的设备物理Z，并非旋转中心。
 - 此功能块仅包含3D参数；算法名在内部固定，配置不需要`model`、`enabled_2d`、`image_role`或`input_state`。旧配置中的默认2D字段可兼容读取，但尝试启用2D同步映射会报错。正式补偿返回信息也不再带2D映射字段。
 
-检测端在流式、同步缓存整板、批量板级和独立3D入口均直接使用传入的数据，不因配置开关或元数据再做矫正。验证台与CLI在3D预处理结束后才启动检测计时；返回`elapsed_ms`、`total_detect_ms`及验证台检测总耗时不包含矫正，不再输出`smartray_pitch_ms`/`pitch_projection_*`等检测计时字段。原始矫正函数及独立配准台仍可单独试验，那里记录的是预处理本身的耗时。
+检测端直接使用传入的单片深度，不因配置开关或元数据再做矫正。验证台与CLI在3D预处理结束后才启动检测计时；返回`elapsed_ms`、`total_detect_ms`及验证台检测总耗时不包含矫正，不再输出`smartray_pitch_ms`/`pitch_projection_*`等检测计时字段。原始矫正函数及独立配准台仍可单独试验，那里记录的是预处理本身的耗时。
 
-输入可携带`pitch_correction`元数据，只用于坐标标签、矩阵上下文和展示，不触发矫正。未携带时按收到的栅格标记为`board_3d`；携带`applied=true`时标记为`pitch_corrected_board_3d`。联合单片、测高点、mask和平面保持同一坐标空间。离线报告默认引用原始深度PNG，并依据元数据重建展示栅格；若报告引用的文件本身已经矫正，报告外层envelope设置`image_3d_preprocessed=true`，跳过展示阶段重复矫正，同时保留正确坐标标签。
-
-```csharp
-// 在调用检测接口之前执行；corrector来自独立SmartRay.PitchCorrection.dll。
-ushort[] corrected = corrector.Correct(zMap, width, height);
-var metadata = new Dictionary<string, object> {
-    ["applied"] = true, ["model"] = "smartray_pitch",
-    ["angle_deg"] = options.AngleDegrees, ["scan_pitch_mm"] = options.ScanPitchMm,
-    ["z_step_mm"] = options.ZStepMm, ["gray_offset"] = options.GrayOffset,
-    ["z_origin_mm"] = options.ZOriginMm,
-    ["scan_axis"] = options.Axis == ScanAxis.Rows ? "rows" : "columns",
-    ["transform_direction"] = options.Direction == TransformDirection.RecoverIdeal ? "recover_ideal" : "document_forward"
-};
-var result = await bridge.ThreeD.DetectBoardAsync(boardId, corrected, width, height, metadata);
-```
+输入可携带`pitch_correction`元数据，只用于坐标标签、矩阵上下文和展示，不触发矫正。未携带时标记为 `piece_3d`，携带 `applied=true` 时标记为 `pitch_corrected_piece_3d`。联合单片、测高点、mask和平面保持同一坐标空间。离线报告默认引用原始深度PNG，并依据元数据重建展示栅格；若报告引用的文件本身已经矫正，报告外层envelope设置`image_3d_preprocessed=true`，跳过展示阶段重复矫正，同时保留正确坐标标签。
 
 单片处理用 `corrector.CorrectPiece(rawDepth, width, height, startRow, endRow)`。返回后由上位机决定是否提交
 `ThreeD.DetectPieceAsync`，已补偿的检测点标为 `pitch_corrected_piece_3d`。
 行范围使用原始深度图坐标，矫正的投影边界以该片为准。 [单片调用示例](../../smartray_pitch_dll/README.md#逐片切分和矫正)
 
-C#数组/共享内存/文件辅助接口末尾可传可选`Dictionary<string, object> correction`；批量共享内存输入填`BoardImage3DInput.PitchCorrection`。C#文件辅助方法只读取像素，默认认为文件已由调用方准备，不再自动执行矫正。Python验证台/CLI文件适配器会按预处理配置先矫正，再发送像素和元数据。
+C#数组/共享内存/文件辅助接口末尾可传可选`Dictionary<string, object> correction`。C#文件辅助方法只读取像素，默认认为文件已由调用方准备，不再自动执行矫正。Python验证台/CLI文件适配器会按预处理配置先矫正，再发送像素和元数据。
 
 C# DTO新增元数据属性，现有测高点/掩码字段保持；源码已构建验证。上位机若继续引用旧DLL，新增属性不会出现在旧类型中，需要更新引用的构建产物。不要重复对SDK已矫正数据启用原始数据补偿。
 

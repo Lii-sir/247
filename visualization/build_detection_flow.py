@@ -31,7 +31,8 @@ def source_ref(path, symbol):
 def make_document():
     two = load_json(ROOT / 'config/2D/config.json')
     three = load_json(ROOT / 'config/3D/config.json')
-    config = {**two, **{key:value for key,value in three.items() if key != 'model_path'}}
+    config = {**two, **{key:value for key,value in three.items() if key != 'model_path'},
+              'inspection': load_json(ROOT / 'config/inspection.json')}
     scenes = build_flows()
     seen = set()
     for scene in scenes:
@@ -84,9 +85,9 @@ def make_document():
         ['crop局部2D','检测ROI左上角为(0,0)','YOLO原始掩码','公开mask_2d加crop偏移；bbox清理还需加mask_offset'],
         ['缩小2D','原图按preview_scale缩放','仿射内部sx/sy/kxy/kyx/cx/cy','参考点(1000,400)属于此坐标系；最后换回原图矩阵'],
         ['原始整板深度','原始PNG像素栅格','输入深度','Pitch关闭时与输出板坐标相同'],
-        ['补偿后整板深度','Pitch矫正后栅格','fixed_rois、分片起止行','Pitch开启时coordinate_space=pitch_corrected_board_3d'],
+        ['调用侧补偿深度','Pitch 矫正后的样本栅格','分片起止行','裁出单片后提交'],
         ['3D片局部','depth[y1:y2, :]','mask_3d_local、参考面、内部测高点','X保留整板全宽；局部Y从0开始'],
-        ['整板高度点','与当前深度坐标空间一致','公开Height3D.Point','x不变，y加depth_start_row；掩码轮廓不一起平移']]
+        ['单片高度点','piece_3d 或 pitch_corrected_piece_3d','公开 Height3D.Point','上位机可用裁剪原点投影到整板']]
     roi = [
         ['圆搜索ROI','common_2d.crop.circle_search_roi','限定Hough找圆范围','保留'],
         ['检测crop','common_2d.crop.detection_roi_offsets','限定YOLO看到的图像；圆相对偏移','保留'],
@@ -98,12 +99,10 @@ def make_document():
         ['测高目标选择ROI','旧引线ROI筛选/裁剪函数','曾跳过框外wire/thin中段','已删除：全部检测到的目标参与测高']]
     endpoints = [
         ['统一流式','init_algorithm(stage=board)','加载全套模型和配置','当前验证台走此模式'],
-        ['统一流式','detect_2d_piece','一片2D、明确board_id/piece_id','返回本片2D结果，同时发布joint_entry'],
-        ['统一流式','detect_3d_board','一张3D整板、board_id','允许先到；Future等整板所有2D诊断及联合结果'],
+        ['统一流式','detect_2d_piece','一片2D、明确board_id/piece_id','返回该片 2D 判定和缓存状态'],
+        ['统一流式','detect_3d_piece','已分片 3D 与 board_id/piece_id','使用同片完整 2D 结果，返回 results_piece'],
         ['缓存管理','release_board','明确板号','取消/失败/仅2D验证结束后释放，避免混板'],
-        ['旧整板批量','detect_board','N张2D + 整板深度','同类算法；批量YOLO后逐片处理，不是相同事件调度图'],
         ['旧独立2D','stage=2d','独立2D接口','不自动进入BoardPipeline；桥接层只允许单GPU工作资源配置'],
-        ['旧独立3D','stage=3d','纯深度中心线测高','按substrate_aois/wire_x_range处理，不是YOLO全实例联合测高'],
         ['配准台','registration_lab','一张2D + 整板/单片深度','CPU配准测试；可复用保存矩阵，正式流式仍动态求解'],
         ['验证台仅2D','validation_lab(mode=2d)','可少量2D片；手动板/片号','不提交深度；本次内存配置关闭Pitch，不写生产文件']]
     classes = [
@@ -126,9 +125,7 @@ def make_document():
         ['2D','silver_mask_checks_ms','inspect_masks溢胶+断连','内部两个主要检测项目前串行'],
         ['2D','public_2d_geometry_ms','全部公开几何完成的墙钟','work_ms是子任务时间总和，不相加'],
         ['2D','request_pipeline_ms','本片请求受理到完整2D响应','不同片不能简单相加当整板耗时'],
-        ['3D整板','depth_phase_ms','深度读取、Pitch、分片总墙钟','与2D输入路重叠'],
-        ['3D整板','smartray_pitch_ms','整板Pitch整体墙钟','pitch_projection_work_ms是条带工作和'],
-        ['3D整板','depth_segmentation_ms','真实分片函数耗时','segmentation_3d_ms为外层包裹计时'],
+        ['单片 3D','depth_phase_ms','读取已分片的深度缓冲区','调用侧分片和 Pitch 在此之前完成'],
         ['联合','matching_input_wait_ms','两路就绪时刻之差的绝对值','不说明谁先到；不是额外计算或完整等待'],
         ['联合','joint_queue_ms','兼容字段，等于registration_queue_ms','不代表测高池排队'],
         ['联合','registration_queue_ms / registration_phase_ms','提交到worker开始的延迟 / 子进程执行墙钟','前者含准备复制/IPC/队列；后者含共享区挂接、平台掩码、粗配准和仿射'],
@@ -145,10 +142,7 @@ def make_document():
         ['联合','height_wire_regions_ms','thin准备及所有引线完成墙钟','包含height_prepare_thin_ms；work不另加'],
         ['联合','height_solder_wall_ms','全部焊脚任务完成墙钟','work包含端点映射/膨胀；height_solder_ms是其内部累计工作'],
         ['联合','joint_phase_ms','配准与映射测高执行墙钟之和','不含中间排队，端到端看joint_pipeline_ms；各片不能相加当整板耗时'],
-        ['整板','board_max_registration_queue_ms / board_max_measurement_queue_ms','全板最大片提交等待','不要用第一片队列代表整板；另看process_wait剔除准备时间'],
-        ['整板','board_wait_2d_after_3d_ms','全部3D完成后仍等2D诊断','大于0说明最后汇合卡在2D；仍不能跳过其NG判定'],
-        ['整板','pipeline_diagnostics / pieces[].timeline','最后完成片、阶段容量及逐片事件位置','timeline从3D受理起算，2D早到可为负；不是可相加时长'],
-        ['整板','total_detect_ms','3D整板请求受理到所有结果齐全','不一定从第一张2D采集开始；不等于2D+深度+联合简单相加']]
+        ['单片 3D','total_detect_ms','该片 3D 请求受理到返回的耗时','含等待该片已开始的 2D 检测']]
     historical = {'request_pipeline_ms':2348.8998,'cpu_prepare_phase_ms':529.793,'gpu_phase_ms':1447.2737,
         'yolo_predict_wall_ms':1251.9292,'mask_extract_to_cpu_ms':78.8593,'efficientad_total_ms':112.7374,
         'geometry_phase_ms':48.2525,'silver_mask_checks_ms':277.4228,'public_2d_geometry_ms':34.7887,
@@ -157,9 +151,9 @@ def make_document():
         'height_wire_regions_ms':33.6691,'height_solder_wall_ms':58.1687,'joint_phase_ms':2238.7497}
     return dict(meta=dict(revision=revision,node_count=len(seen),step_count=sum(len(n['steps']) for s in scenes for n in s['nodes']),
         config_sha256=hashlib.sha256(json.dumps(config,sort_keys=True).encode()).hexdigest(),piece_count=three['common_3d']['parameters']['input']['piece_count'],
-        scope='统一板级正式流式检测；旧接口单列说明',timing_note='用户此前提供的历史日志，早于Pitch移出检测及全实例测高ROI删除；旧记录包含Pitch，当前检测不含，未重测，不作为当前性能承诺。'),
+        scope='按板号和片号的单片检测',timing_note='用户此前提供的历史日志，早于Pitch移出检测及全实例测高ROI删除；旧记录包含Pitch，当前检测不含，未重测，不作为当前性能承诺。'),
         scenes=scenes,config=config,pools=pools,pool_budget=budget,pool_effective=effective,
-        early_joint=t3.get('early_joint_workers',joint),coords=coords,roi=roi,endpoints=endpoints,classes=classes,timings=timing_rows,historical=historical)
+        coords=coords,roi=roi,endpoints=endpoints,classes=classes,timings=timing_rows,historical=historical)
 
 
 def static_book(data):

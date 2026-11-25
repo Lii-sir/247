@@ -76,12 +76,11 @@ public class Detect2DRequest
 public class Detect3DRequest
 {
     [JsonPropertyName("cmd")]
-    public string Cmd { get; set; } = "detect";
+    public string Cmd { get; set; } = "detect_3d_piece";
 
     [JsonPropertyName("stage")]
     public string Stage { get; set; } = "3d";
 
-    // Streaming mode identifier. It is optional for the legacy 3D-only API.
     [JsonPropertyName("board_id")]
     public string BoardId { get; set; } = string.Empty;
 
@@ -106,69 +105,6 @@ public class Detect3DRequest
 
     [JsonPropertyName("pitch_correction")]
     public Dictionary<string, object>? PitchCorrection { get; set; }
-}
-
-public class BoardImage2DInput
-{
-    [JsonPropertyName("piece_id")]
-    public int PieceId { get; set; }
-
-    [JsonPropertyName("shm_name")]
-    public string ShmName { get; set; } = string.Empty;
-
-    [JsonPropertyName("image_size")]
-    public int ImageSize { get; set; }
-
-    [JsonPropertyName("image_format")]
-    public string ImageFormat { get; set; } = "encoded";
-
-    [JsonPropertyName("image_width")]
-    public int ImageWidth { get; set; }
-
-    [JsonPropertyName("image_height")]
-    public int ImageHeight { get; set; }
-
-    [JsonPropertyName("image_channels")]
-    public int ImageChannels { get; set; } = 3;
-}
-
-public class BoardImage3DInput
-{
-    [JsonPropertyName("shm_name")]
-    public string ShmName { get; set; } = string.Empty;
-
-    [JsonPropertyName("data_size")]
-    public int DataSize { get; set; }
-
-    [JsonPropertyName("data_format")]
-    public string DataFormat { get; set; } = "uint16";
-
-    [JsonPropertyName("image_width")]
-    public int ImageWidth { get; set; }
-
-    [JsonPropertyName("image_height")]
-    public int ImageHeight { get; set; }
-
-    [JsonPropertyName("pitch_correction")]
-    public Dictionary<string, object>? PitchCorrection { get; set; }
-}
-
-public class DetectBoardRequest
-{
-    [JsonPropertyName("cmd")]
-    public string Cmd { get; set; } = "detect_board";
-
-    [JsonPropertyName("stage")]
-    public string Stage { get; set; } = "board";
-
-    [JsonPropertyName("batch_id")]
-    public string BatchId { get; set; } = string.Empty;
-
-    [JsonPropertyName("images_2d")]
-    public List<BoardImage2DInput> Images2D { get; set; } = new();
-
-    [JsonPropertyName("image_3d")]
-    public BoardImage3DInput Image3D { get; set; } = new();
 }
 
 public class ReleaseRequest
@@ -311,6 +247,9 @@ public class BoardPieceResult
     [JsonPropertyName("first_ng_check")]
     public string? FirstNgCheck { get; set; }
 
+    [JsonPropertyName("defect_checks_3d")]
+    public Dictionary<string, DefectCheckResult>? DefectChecks3D { get; set; }
+
     [JsonPropertyName("timeline")]
     public Dictionary<string, double> Timeline { get; set; } = new();
 
@@ -373,6 +312,18 @@ public class BoardPieceResult
 
     [JsonPropertyName("masks")]
     public List<AlignedMaskResult> Masks { get; set; } = new();
+}
+
+public class DefectCheckResult
+{
+    [JsonPropertyName("enabled")]
+    public bool Enabled { get; set; }
+
+    [JsonPropertyName("status")]
+    public string? Status { get; set; }
+
+    [JsonPropertyName("is_ok")]
+    public bool? IsOk { get; set; }
 }
 
 public class RegistrationResult

@@ -20,8 +20,9 @@ import numpy as np
 from algorithm.vision3d.measurement.height_measurement import HeightConfig
 from algorithm.execution.processes.joint_process import JointMeasurementProcesses
 from algorithm.execution.processes.registration_process import SharedBoardInputs
+from algorithm.runtime.defect_plan import CHIP_SOLDER_HEIGHT, PLATFORM_SOLDER_HEIGHT, WIRE_HEIGHT
 from transport.bridge_server import AlgorithmServer
-from pipeline_fakes import FakeDetector
+from pipeline_fakes import FakeDetector, depth_piece_request
 
 
 def fixture():
@@ -141,6 +142,32 @@ class JointProcessTests(unittest.TestCase):
         self.assertFalse(merged['is_ok'])
         self.assertEqual(before, merged['wire_measurements'])
 
+    def test_selected_wire_height_excludes_solder_checks_in_worker(self):
+        entry = {**self.entry, "height_order": (WIRE_HEIGHT,)}
+        relaxed = replace(self.config, max_wire_platform_height_mm=10.)
+        result = self.submit(entry=entry, height_config=relaxed).result(20)
+        self.assertTrue(result["is_ok"])
+        self.assertEqual([1, 5], [wire["instance_id"] for wire in result["wire_measurements"]])
+        self.assertEqual([], result["solder_measurements"])
+        checks = result["defect_checks_3d"]
+        self.assertEqual(checks[WIRE_HEIGHT]["status"], "ok")
+        self.assertEqual(checks[CHIP_SOLDER_HEIGHT]["status"], "disabled")
+        self.assertEqual(checks[PLATFORM_SOLDER_HEIGHT]["status"], "disabled")
+
+    def test_3d_solder_ng_preserves_other_selected_measurements(self):
+        entry = {**self.entry, "height_order": (CHIP_SOLDER_HEIGHT, WIRE_HEIGHT)}
+        invalid_reference = replace(self.config, chip_min_valid_points=1_000_000, max_wire_platform_height_mm=10.)
+        result = self.submit(entry=entry, height_config=invalid_reference).result(20)
+        self.assertFalse(result["is_ok"])
+        self.assertEqual(CHIP_SOLDER_HEIGHT, result["first_ng_check"])
+        self.assertTrue(result["solder_measurements"])
+        self.assertTrue(all(joint["location"] == "chip" for joint in result["solder_measurements"]))
+        self.assertEqual([1, 5], [wire["instance_id"] for wire in result["wire_measurements"]])
+        checks = result["defect_checks_3d"]
+        self.assertEqual(checks[CHIP_SOLDER_HEIGHT]["status"], "ng")
+        self.assertEqual(checks[WIRE_HEIGHT]["status"], "ok")
+        self.assertEqual(checks[PLATFORM_SOLDER_HEIGHT]["status"], "disabled")
+
     def test_formal_pipeline_never_calls_parent_mapping_or_height(self):
         from algorithm.application.board.detect_board import DetectBoard
         from algorithm.application.board.board_pipeline import BoardPipeline
@@ -155,32 +182,30 @@ class JointProcessTests(unittest.TestCase):
                 self.log = lambda _:None
                 self.height_config = replace(height,max_wire_platform_height_mm=10.,max_solder_platform_height_mm=10.,max_solder_chip_height_mm=10.)
                 self.min_component_area, self.crop_roi, self.wire_rois = 4, (0,0,240,180), []
-                self.segmentation_config = import_module('algorithm.vision3d.depth.segment').SegmentationConfig(
-                    expected_piece_count=1,mode='fixed',fixed_rois=((0,11,240,191),))
                 self._align_instances = Mock(side_effect=AssertionError('parent mapping executed'))
                 self._measure_piece = Mock(side_effect=AssertionError('parent height executed'))
 
-            def _read_3d(self,req):return depth
+            def _read_3d(self,req):return depth[11:]
             def register_prepared_piece(self,*args):return matrix
             def prepare_joint_piece(self,prepared):return {**source,'piece_id':1,'board_id':prepared['board_id']}
             def finish_2d_piece(self,prepared,*,publish_cache,on_joint_ready=None):
                 response, entry = super().finish_2d_piece(prepared,publish_cache=publish_cache)
-                entry.update(silver_overflow_2d=dict(status='overflow',is_ok=False))
+                entry.update(source, silver_overflow_2d=dict(status='overflow',is_ok=False))
                 return response, entry
 
         detector = Detector()
         with ThreadPoolExecutor(2) as cpu, ThreadPoolExecutor(1) as gpu, ThreadPoolExecutor(1) as joint:
             pipe = BoardPipeline(detector,cpu,gpu,joint_pool=joint)
-            board = pipe.submit_3d(dict(board_id='A'))
-            owner = pipe._boards['A'].registration_inputs
             self.assertTrue(pipe.submit_2d(dict(board_id='A',piece_id=1)).result(10)['ok'])
-            result = board.result(20)
+            owner = pipe._boards['A'].mask_inputs[1]
+            result = pipe.submit_3d_piece(depth_piece_request('A', image_height=180, image_width=240,
+                                                            data_size=180*240*2)).result(20)
             self.assertTrue(result['ok'],result)
-            piece = result['results_board']['pieces'][0]
+            piece = result['results_piece']
             self.assertNotEqual(os.getpid(),piece['joint_measurement_worker']['pid'])
             self.assertFalse(piece['is_ok'])
             self.assertEqual('overflow',piece['silver_overflow_2d']['status'])
-            self.assertEqual(11,piece['depth_start_row'])
+            self.assertEqual(0,piece['depth_start_row'])
             self.assertEqual({},owner._blocks)
             self.assertEqual(0,owner._leases)
             detector._align_instances.assert_not_called()

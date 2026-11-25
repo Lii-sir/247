@@ -69,44 +69,21 @@ class RawDepthInputTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 depth_from_uint16(bytes(size), 2, 2)
 
-    def test_standalone_3d_uses_raw_depth_and_reports_view_timing(self):
-        module = import_module('algorithm.application.standalone.detect_3D')
-        segment = import_module('algorithm.vision3d.depth.segment')
-        depth = np.zeros((20, 3), np.uint16)
-        depth[:5] = depth[10:15] = 33000
-        detector = module.Detect3D()
-        self.addCleanup(detector.release)
-        detector.segmentation_config = segment.SegmentationConfig(expected_piece_count=2, max_internal_gap_height=0)
-        with ExitStack() as stack:
-            request = self.shared(depth, stack)
-            with patch.object(module, 'measure_depth', side_effect=lambda image, pieces:
-                    [{**item, 'is_ok': True} for item in pieces]):
-                result = detector.handle_detect(request)
-        self.assertTrue(result['ok'], result)
-        self.assertEqual(2, len(result['results_3d']['pieces']))
-        self.assertIn('depth_array_view_ms', result['timings'])
-        self.assertNotIn('decode_ms', result['timings'])
-        self.assertFalse(detector.handle_detect({**request, 'data_format': 'png'})['ok'])
-
-    def test_formal_streaming_pipeline_accepts_raw_depth_then_joins_pieces(self):
+    def test_per_piece_pipeline_accepts_raw_depth(self):
         class Detector(FakeDetector):
             _read_3d = staticmethod(DetectBoard._read_3d)
-        depth = np.zeros((20, 3), np.uint16)
-        depth[:5] = depth[10:15] = 33000
+        depth = np.full((10, 3), 33000, dtype=np.uint16)
         with ExitStack() as stack, ThreadPoolExecutor(2) as cpu, ThreadPoolExecutor(1) as gpu:
             descriptor = self.shared(depth, stack)
             pipe = BoardPipeline(Detector(count=2), cpu, gpu)
-            try:
-                board = pipe.submit_3d(dict(board_id='raw', **descriptor))
-                for pid in (1, 2):
-                    self.assertTrue(pipe.submit_2d(dict(board_id='raw', piece_id=pid)).result(3)['ok'])
-                result = board.result(3)
-                self.assertTrue(result['ok'], result)
-                self.assertEqual(2, len(result['results_board']['pieces']))
-                self.assertIn('depth_read_ms', result['timings'])
-                self.assertNotIn('depth_image_decode_ms', result['timings'])
-            finally:
-                pipe.close()
+            self.addCleanup(pipe.close)
+            for pid in (2, 1):
+                self.assertTrue(pipe.submit_2d(dict(board_id="raw", piece_id=pid)).result(3)["ok"])
+                result = pipe.submit_3d_piece(dict(board_id="raw", piece_id=pid, **descriptor)).result(3)
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(pid, result["results_piece"]["piece_id"])
+                self.assertIn("depth_phase_ms", result["timings"])
+                self.assertNotIn("depth_image_decode_ms", result["timings"])
 
     def test_offline_sample_adapter_sends_packed_pixels_and_rejects_display_images(self):
         expected = np.array([[0, 1, 256], [32768, 65534, 65535]], np.uint16)

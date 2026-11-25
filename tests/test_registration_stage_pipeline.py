@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
 sys.path.insert(0, str(ROOT / "tests"))
 from algorithm.application.board.board_pipeline import BoardPipeline
-from pipeline_fakes import FakeDetector
+from pipeline_fakes import FakeDetector, depth_piece_request
 from transport.bridge_server import AlgorithmServer
 from test_split_stage_pools import config
 
@@ -54,12 +54,6 @@ class RegistrationSettingsTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "registration_workers"):
                 self.server._thread_settings(config(budget=100, registration_workers=value))
 
-    def test_independent_early_window_is_not_limited_by_measurement_workers(self):
-        settings = self.server._thread_settings(config(budget=18, registration_workers=3,
-                                                       joint_workers=2, early_joint_workers=4))
-        self.assertEqual(4, settings["early_joint_workers"])
-        self.assertEqual(2, settings["joint_workers"])
-
     def test_registration_pool_creation_failure_keeps_previous_executors(self):
         previous = self.server.cpu_pool
         created = []
@@ -101,7 +95,6 @@ class RegistrationSettingsTests(unittest.TestCase):
         self.assertEqual(4, settings["registration_workers"])
         self.assertEqual(4, settings["registration_affinity"]["physical_cores"])
         self.assertEqual(7, settings["joint_workers"])
-        self.assertEqual(10, settings["early_joint_workers"])
         self.assertEqual(2, settings["cpu_process_workers"])
         self.assertEqual(2, settings["cpu_process_affinity"]["physical_cores"])
         self.assertEqual(14, settings["joint_affinity"]["physical_cores"])
@@ -160,18 +153,18 @@ class RegistrationSchedulingTests(unittest.TestCase):
             return {**original(pid, entry, depth, piece, matrix, correction), "registration": matrix}
         self.detector.register_prepared_piece = register
         self.detector.measure_registered_piece = measure
-        board = self.pipeline.submit_3d(dict(board_id="A"))
+        scans = [self.pipeline.submit_3d_piece(depth_piece_request("A", pid)) for pid in range(1, 5)]
         try:
             self.assertTrue(measured.wait(2))
             self.assertTrue(all_registered.wait(2), "registration worker waited for measurement")
-            self.assertEqual([1], seen)
-            self.assertFalse(board.done())
+            self.assertEqual(1, len(seen))
+            self.assertTrue(any(not scan.done() for scan in scans))
         finally:
             gate.set()
-        result = board.result(3)
-        self.assertTrue(result["ok"], result)
+        results = [scan.result(3) for scan in scans]
+        self.assertTrue(all(result["ok"] for result in results), results)
         self.assertTrue(all(name.startswith("test-registration") for name in threads))
-        pieces = result["results_board"]["pieces"]
+        pieces = [result["results_piece"] for result in results]
         self.assertEqual([1, 2, 3, 4], [piece["piece_id"] for piece in pieces])
         for piece in pieces:
             timings = piece["timings"]
@@ -225,17 +218,17 @@ class RegistrationSchedulingTests(unittest.TestCase):
                     counts["measurement"] -= 1
         self.detector.register_prepared_piece = register
         self.detector.measure_registered_piece = measure
-        board = self.pipeline.submit_3d(dict(board_id="A"))
+        scans = [self.pipeline.submit_3d_piece(depth_piece_request("A", pid)) for pid in range(1, 5)]
         try:
             self.assertTrue(two_registering.wait(2))
             registration_gate.set()
             self.assertTrue(two_measuring.wait(2))
             self.assertTrue(all_registered.wait(2))
-            self.assertFalse(board.done())
+            self.assertTrue(any(not scan.done() for scan in scans))
         finally:
             registration_gate.set()
             measurement_gate.set()
-        self.assertTrue(board.result(3)["ok"])
+        self.assertTrue(all(scan.result(3)["ok"] for scan in scans))
         self.assertEqual(2, counts["peak_registration"])
         self.assertEqual(2, counts["peak_measurement"])
 
@@ -244,13 +237,12 @@ class RegistrationSchedulingTests(unittest.TestCase):
         original = self.detector.register_prepared_piece
         self.detector.register_prepared_piece = Mock(side_effect=ValueError("bad registration"))
         self.detector.measure_registered_piece = Mock(wraps=self.detector.measure_registered_piece)
-        result = self.pipeline.submit_3d(dict(board_id="A")).result(3)
-        self.assertEqual("joint_detection_failed", result["error"])
+        result = self.pipeline.submit_3d_piece(depth_piece_request("A")).result(3)
+        self.assertEqual("3d_piece_failed", result["error"])
         self.assertIn("bad registration", result["message"])
         self.detector.measure_registered_piece.assert_not_called()
         self.detector.register_prepared_piece = original
-        self.prepared()
-        self.assertTrue(self.pipeline.submit_3d(dict(board_id="A")).result(3)["ok"])
+        self.assertTrue(self.pipeline.submit_3d_piece(depth_piece_request("A")).result(3)["ok"])
 
     def test_release_during_registration_does_not_submit_old_result(self):
         self.prepared()
@@ -263,7 +255,7 @@ class RegistrationSchedulingTests(unittest.TestCase):
             return dict(is_valid=True)
         self.detector.register_prepared_piece = register
         self.detector.measure_registered_piece = Mock(wraps=self.detector.measure_registered_piece)
-        board = self.pipeline.submit_3d(dict(board_id="A"))
+        board = self.pipeline.submit_3d_piece(depth_piece_request("A"))
         self.assertTrue(started.wait(2))
         self.pipeline.release_board("A")
         self.assertEqual("board_released", board.result(2)["error"])
@@ -272,7 +264,7 @@ class RegistrationSchedulingTests(unittest.TestCase):
         self.assertTrue(drained.wait(2))
         self.registration.submit(lambda: None).result(2)
         self.detector.measure_registered_piece.assert_not_called()
-        self.assertEqual({}, self.pipeline._boards["A"].results)
+        self.assertEqual({}, self.pipeline._boards["A"].piece_requests)
 
     def test_queued_measurements_skip_released_board(self):
         self.prepared()
@@ -294,11 +286,11 @@ class RegistrationSchedulingTests(unittest.TestCase):
             return result
         self.measurement.submit = record
         self.detector.measure_registered_piece = Mock(wraps=self.detector.measure_registered_piece)
-        board = self.pipeline.submit_3d(dict(board_id="A"))
+        scans = [self.pipeline.submit_3d_piece(depth_piece_request("A", pid)) for pid in range(1, 5)]
         self.assertTrue(all_registered.wait(2))
         self.pipeline.release_board("A")
         gate.set()
-        self.assertEqual("board_released", board.result(2)["error"])
+        self.assertTrue(all(scan.result(2)["error"] == "board_released" for scan in scans))
         for future in calls:
             with self.assertRaisesRegex(RuntimeError, "released"):
                 future.result(2)
@@ -307,15 +299,15 @@ class RegistrationSchedulingTests(unittest.TestCase):
     def test_submission_failure_completes_board(self):
         self.prepared()
         with patch.object(self.measurement, "submit", side_effect=RuntimeError("pool unavailable")):
-            result = self.pipeline.submit_3d(dict(board_id="A")).result(3)
-        self.assertEqual("joint_detection_failed", result["error"])
+            result = self.pipeline.submit_3d_piece(depth_piece_request("A")).result(3)
+        self.assertEqual("3d_piece_failed", result["error"])
         self.assertIn("pool unavailable", result["message"])
 
     def test_measurement_failure_completes_board(self):
         self.prepared()
         self.detector.measure_registered_piece = Mock(side_effect=ValueError("bad measurement"))
-        result = self.pipeline.submit_3d(dict(board_id="A")).result(3)
-        self.assertEqual("joint_detection_failed", result["error"])
+        result = self.pipeline.submit_3d_piece(depth_piece_request("A")).result(3)
+        self.assertEqual("3d_piece_failed", result["error"])
         self.assertIn("bad measurement", result["message"])
 
     def test_released_board_work_drains_before_model_reload(self):
@@ -328,7 +320,7 @@ class RegistrationSchedulingTests(unittest.TestCase):
                 raise TimeoutError("reload drain gate")
             return original(*args)
         self.detector.measure_registered_piece = measure
-        board = self.pipeline.submit_3d(dict(board_id="A"))
+        board = self.pipeline.submit_3d_piece(depth_piece_request("A"))
         self.assertTrue(started.wait(2))
         self.pipeline.release_board("A")
         self.assertEqual("board_released", board.result(2)["error"])
@@ -344,8 +336,8 @@ class RegistrationSchedulingTests(unittest.TestCase):
     def test_registration_submission_failure_completes_board(self):
         self.prepared()
         with patch.object(self.registration, "submit", side_effect=RuntimeError("registration pool unavailable")):
-            result = self.pipeline.submit_3d(dict(board_id="A")).result(3)
-        self.assertEqual("joint_detection_failed", result["error"])
+            result = self.pipeline.submit_3d_piece(depth_piece_request("A")).result(3)
+        self.assertEqual("3d_piece_failed", result["error"])
         self.assertIn("registration pool unavailable", result["message"])
 
 

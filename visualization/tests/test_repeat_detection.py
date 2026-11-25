@@ -4,6 +4,7 @@ import csv
 import importlib.util
 import io
 import json
+import numpy as np
 from pathlib import Path
 import sys
 import tempfile
@@ -48,12 +49,11 @@ class FakeClient:
                 response.update(piece_id=pid, results_2d={"is_ok": False})
                 if self.fail_piece and pid == 3:
                     response.update(ok=False, error="piece failed")
-            elif command == "detect_3d_board":
-                if not self.condition.wait_for(lambda: len(self.pieces.get(board, set())) == 10, timeout=3):
-                    raise RuntimeError("missing piece in test")
-                response["results_board"] = {"is_ok": False, "pieces": []}
-            elif command == "detect_board":
-                response["results_board"] = {"is_ok": False, "pieces": []}
+            elif command == "detect_3d_piece":
+                pid = request["piece_id"]
+                if pid not in self.pieces.get(board, set()):
+                    raise RuntimeError("single-piece depth was sent before its 2D request")
+                response["results_piece"] = dict(piece_id=pid, is_ok=False, registration=dict(is_valid=True))
             received = (time.perf_counter() - self.started) * 1000
             self.timeline.append({"cmd": command, "stage": request.get("stage"),
                 "piece_id": request.get("piece_id"), "sent_ms": sent,
@@ -90,6 +90,14 @@ class RepeatDetectionTests(unittest.TestCase):
                 return {"piece_id": piece_id, "shm_name": str(path), "image_size": 1}
             return {"shm_name": str(path), "data_size": 2, "data_format": "uint16", "image_width": 1, "image_height": 1}
 
+        def map_bytes(stack, raw):
+            self.assertEqual(len(raw), 2)
+            self.mappings.append((self.depth, "3d", None))
+            stack.callback(self.closed_mappings.append, self.depth)
+            return "mock_piece_depth"
+
+        sample = (np.ones((10, 1), np.uint16), {pid: {"y1": pid-1, "y2": pid} for pid in range(1, 11)}, {})
+
         def render_report(document, path, **kwargs):
             self.assertEqual(self.fake.close_count, 1, "Render only after all inference and model release")
             return path
@@ -103,6 +111,8 @@ class RepeatDetectionTests(unittest.TestCase):
                 patch.object(client_module, "algorithm_request", return_value={"cmd": "init_algorithm", "stage": "board", "config_text": "{}"}), \
                 patch.object(client_module, "ProtocolClient", return_value=self.fake) as factory, \
                 patch.object(client_module, "mapped_file", side_effect=mapping), \
+                patch.object(client_module, "split_depth_sample", return_value=sample), \
+                patch.object(client_module, "_map_bytes", side_effect=map_bytes), \
                 patch.object(client_module, "render_report", side_effect=render_report) as render, \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             code = client_module.main()
@@ -119,7 +129,7 @@ class RepeatDetectionTests(unittest.TestCase):
         self.assertEqual(commands.count("init"), 1)
         self.assertEqual(commands.count("init_algorithm"), 1)
         self.assertEqual(commands.count("detect_2d_piece"), 20)
-        self.assertEqual(commands.count("detect_3d_board"), 2)
+        self.assertEqual(commands.count("detect_3d_piece"), 20)
         self.assertEqual(commands[-1], "release")
         self.assertEqual(self.fake.close_count, 1)
         self.assertEqual(self.render_count, 2)
@@ -129,8 +139,8 @@ class RepeatDetectionTests(unittest.TestCase):
         self.assertEqual(second["board_id"], "test-run-02")
         self.assertEqual(first["images_2d"], second["images_2d"])
         self.assertEqual(first["image_3d"], second["image_3d"])
-        self.assertEqual(len(first["timeline"]), 11)
-        self.assertEqual(len(second["timeline"]), 11)
+        self.assertEqual(len(first["timeline"]), 20)
+        self.assertEqual(len(second["timeline"]), 20)
         self.assertLessEqual(max(x["received_ms"] for x in first["timeline"]),
                              min(x["sent_ms"] for x in second["timeline"]))
         self.assertGreater(first["benchmark"]["startup_charged_ms"], 0)
@@ -141,8 +151,8 @@ class RepeatDetectionTests(unittest.TestCase):
         self.assertTrue(summary["success"])
         self.assertEqual(summary["startup"]["initialization_count"], 1)
         self.assertEqual({x["process_pid"] for x in summary["batches"]}, {12345})
-        self.assertEqual(len(self.mappings), 22)
-        self.assertEqual(len(self.closed_mappings), 22)
+        self.assertEqual(len(self.mappings), 40)
+        self.assertEqual(len(self.closed_mappings), 40)
 
     def test_one_batch_keeps_existing_output_paths(self):
         self.assertEqual(self.run_client(repeat=1), 0)
@@ -155,12 +165,7 @@ class RepeatDetectionTests(unittest.TestCase):
     def test_sequential_stream_reuses_models_too(self):
         self.assertEqual(self.run_client(parallel=False), 0)
         self.assertEqual(sum(x["cmd"] == "init_algorithm" for x in self.fake.requests), 1)
-        self.assertEqual(len(self.mappings), 22)
-
-    def test_board_mode_reuses_models(self):
-        self.assertEqual(self.run_client(mode="board", parallel=False), 0)
-        self.assertEqual(sum(x["cmd"] == "detect_board" for x in self.fake.requests), 2)
-        self.assertEqual(sum(x["cmd"] == "init_algorithm" for x in self.fake.requests), 1)
+        self.assertEqual(len(self.mappings), 40)
 
     def test_request_failure_stops_repeats_and_preserves_first_report(self):
         self.assertEqual(self.run_client(fail_piece=True), 1)

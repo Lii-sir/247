@@ -12,7 +12,6 @@ sys.path.insert(0,str(ROOT/'python'));sys.path.insert(0,str(Path(__file__).resol
 from algorithm.vision3d.depth.tilt_correction import correct_smartray_pitch, correct_smartray_depth
 from algorithm.execution.instance_tasks import InstanceTasks
 from algorithm.application.board.detect_board import DetectBoard
-from algorithm.application.standalone.detect_3D import Detect3D
 from algorithm.runtime.config import load_runtime_config
 from fixtures.pitch_reference import correct_smartray_pitch as reference
 
@@ -128,16 +127,12 @@ class PitchParallelTests(unittest.TestCase):
             self.assertEqual(actual[2]['collision_points'],1)
 
     def test_external_preprocessor_owns_pitch_work_instead_of_detectors(self):
-        board=DetectBoard(lambda _:None);standalone=Detect3D()
-        self.addCleanup(board.release);self.addCleanup(standalone.release)
+        board=DetectBoard(lambda _:None)
+        self.addCleanup(board.release)
         config=load_runtime_config((ROOT/'config/config.json').read_text(encoding='utf-8-sig'),str(ROOT/'config/config.json'))
         config['smartray_pitch_3d']['parameters'].update(projection_workers=3,enabled_3d=True)
         board._load_config(json.dumps(config))
         self.assertFalse(hasattr(board,'_pitch_tasks'))
-        response=standalone.handle_init(dict(config_text=json.dumps(config)))
-        self.assertTrue(response['ok']);self.assertFalse(hasattr(standalone,'_pitch_tasks'))
-        standalone.release()
-        self.assertTrue(standalone.handle_init(dict(config_text=json.dumps(config)))['ok'])
         depth=np.full((25,30),33000,np.uint16)
         from algorithm.vision3d.depth.depth_preprocessing import preprocessing_parameters, prepare_depth_for_detection
         settings=preprocessing_parameters(config)

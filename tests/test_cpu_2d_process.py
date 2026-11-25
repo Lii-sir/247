@@ -19,7 +19,7 @@ from algorithm.execution.processes.cpu_2d_process import Cpu2DProcesses
 from algorithm.execution.workers.cpu_2d_worker import compute
 from algorithm.runtime.timing import timing_context
 from algorithm.application.board.board_pipeline import BoardPipeline
-from pipeline_fakes import FakeDetector
+from pipeline_fakes import FakeDetector, depth_piece_request
 from transport.bridge_server import AlgorithmServer
 silver = import_module("algorithm.vision2d.silver_inspection")
 
@@ -178,7 +178,7 @@ class Cpu2DProcessTests(unittest.TestCase):
                 prepared = copy.deepcopy(original)
                 prepared.update(req, start=time.perf_counter(), image=np.zeros((140, 190, 3), np.uint8),
                     roi_boxes=[], read_decode_ms=0., circle_crop_ms=0., inference_ms=0.)
-                prepared["joint_entry"].update(piece_id=1, wire_measurements=[], wire_roi_checks=[],
+                prepared["joint_entry"].update(board_id=req["board_id"], piece_id=1, wire_measurements=[], wire_roi_checks=[],
                     chip_rotation_2d=dict(enabled=False), chip_anomaly_2d=dict(enabled=False))
                 return prepared
 
@@ -191,16 +191,15 @@ class Cpu2DProcessTests(unittest.TestCase):
         detector = Detector()
         with ThreadPoolExecutor(2) as cpu, ThreadPoolExecutor(1) as gpu, ThreadPoolExecutor(1) as post:
             pipe = BoardPipeline(detector, cpu, gpu, postprocess_pool=post)
-            board = pipe.submit_3d(dict(board_id="A"))
             response = pipe.submit_2d(dict(board_id="A", piece_id=1)).result(20)
             self.assertTrue(response["ok"], response)
             self.assertEqual("cpu_2d", response["cpu_2d_worker"]["role"])
             timings = response["timings"]
             self.assertEqual(timings["cpu_postprocess_phase_ms"], timings["cpu_2d_phase_ms"]+timings["cpu_postprocess_finalize_phase_ms"])
             self.assertGreaterEqual(timings["cpu_postprocess_pipeline_ms"], timings["cpu_postprocess_phase_ms"])
-            final = board.result(20)
+            final = pipe.submit_3d_piece(depth_piece_request("A")).result(20)
             self.assertTrue(final["ok"], final)
-            self.assertEqual(response["results_2d"]["is_ok"], final["results_board"]["pieces"][0]["is_ok"])
+            self.assertEqual(response["results_2d"]["is_ok"], final["results_piece"]["is_ok"])
             self.assertEqual(1, detector.closed_inputs)
             pipe.close()
 
@@ -293,28 +292,25 @@ class PostprocessSchedulingTests(unittest.TestCase):
         for pool in (self.cpu, self.gpu, self.post):
             pool.shutdown(wait=True)
 
-    def test_cpu_process_wait_does_not_occupy_parent_pool_or_block_early_3d(self):
-        board = self.pipe.submit_3d(dict(board_id="A"))
+    def test_cpu_process_wait_leaves_parent_free_and_blocks_only_matching_3d(self):
         piece = self.pipe.submit_2d(dict(board_id="A", piece_id=1))
         self.assertTrue(self.started.wait(2))
+        depth = self.pipe.submit_3d_piece(depth_piece_request("A"))
         self.assertEqual("free", self.post.submit(lambda: "free").result(1))
-        self.assertTrue(self.detector.measured.wait(2))
-        self.assertFalse(piece.done())
-        self.assertFalse(board.done())
+        self.assertFalse(self.detector.depth_started.is_set())
+        self.assertFalse(depth.done())
         self.pending.set_result(None)
         self.assertTrue(piece.result(2)["ok"])
-        self.assertTrue(board.result(2)["ok"])
+        self.assertTrue(depth.result(2)["ok"])
 
-    def test_process_failure_releases_image_and_fails_board(self):
-        board = self.pipe.submit_3d(dict(board_id="A"))
+    def test_process_failure_releases_image_and_skips_matching_3d(self):
         piece = self.pipe.submit_2d(dict(board_id="A", piece_id=1))
         self.assertTrue(self.started.wait(2))
-        self.assertTrue(self.detector.measured.wait(2))
+        depth = self.pipe.submit_3d_piece(depth_piece_request("A"))
         self.pending.set_exception(RuntimeError("2D CPU failed"))
         self.assertFalse(piece.result(2)["ok"])
-        self.assertFalse(board.result(2)["ok"])
+        self.assertEqual(depth.result(2)["results_piece"]["skip_3d_reason"], "missing_2d_result")
         self.assertEqual(1, self.detector.closed_inputs)
-
 
 if __name__ == "__main__":
     unittest.main()

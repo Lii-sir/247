@@ -30,9 +30,7 @@ class AlgorithmServer:
     def __init__(self):
         # Unified board algorithm is loaded only when it is initialized or used.
         self.board = None
-        # Keep the legacy modules loadable while callers migrate to detect_board.
         self.two_d = None
-        self.three_d = None
         self.cpu_pool = None
         self.postprocess_pool = None
         self.silver_pool = None
@@ -103,10 +101,6 @@ class AlgorithmServer:
                 if settings["gpu_workers"] > 1:
                     raise ValueError("multiple GPU workers are supported only by the unified board detector")
                 response = self.get_two_d().handle_init(req)
-            elif stage == "3d":
-                if settings["gpu_workers"] > 1:
-                    raise ValueError("multiple GPU workers are supported only by the unified board detector")
-                response = self.get_three_d().handle_init(req)
             else:
                 return {
                     "ok": False,
@@ -229,11 +223,6 @@ class AlgorithmServer:
         main_reserved = values_3d.get("main_reserved_physical_cores", 0)
         if type(main_reserved) is not int or main_reserved < 0:
             raise ValueError("main_reserved_physical_cores must be a nonnegative integer")
-        early_joint = self._thread_count(
-            "early_joint_workers", values_3d.get("early_joint_workers", joint)
-        )
-        if registration_pool_shared and early_joint > joint:
-            raise ValueError("early_joint_workers cannot exceed joint_workers")
         shared_cpu_pool = budget == 2 and cpu == 1 and postprocess == 1 and gpu == 1
         effective_total = cpu + gpu
         if not shared_cpu_pool:
@@ -271,7 +260,6 @@ class AlgorithmServer:
             "instance_workers": instance_workers,
             "main_reserved_physical_cores": main_reserved,
             "effective_workers": effective_total,
-            "early_joint_workers": early_joint,
         }
 
     def _configure_thread_pools(self, settings: Dict[str, Any], *, source: str) -> None:
@@ -346,8 +334,6 @@ class AlgorithmServer:
             # Do not import native libraries before configure_native_threads.
             "opencv_threads": sys.modules["cv2"].getNumThreads() if "cv2" in sys.modules else None,
         }
-        if self.pipeline is not None:
-            self.pipeline.early_joint_workers = settings["early_joint_workers"]
 
     def _configure_cpu_processes(self, settings):
         """Initialize once per detector load, never lazily during a measured request."""
@@ -424,22 +410,12 @@ class AlgorithmServer:
     def handle_detect(self, req: Dict[str, Any]) -> Dict[str, Any]:
         stage = str(req.get("stage", "board")).lower()
 
-        # Streaming requests are selected by explicit board/piece IDs. A
-        # plain stage=2d or stage=3d request remains a standalone call.
+        # A plain stage=2d request remains a standalone call.
         if stage == "2d" and req.get("board_id") and int(req.get("piece_id") or 0) > 0:
             return self.get_board().handle_detect_2d_piece(req)
 
-        if stage == "3d" and req.get("board_id"):
-            return self.get_board().handle_detect_3d_board(req)
-
-        if stage == "board":
-            return self.get_board().handle_detect(req)
-
         if stage == "2d":
             return self.get_two_d().handle_detect(req)
-
-        if stage == "3d":
-            return self.get_three_d().handle_detect(req)
 
         return {
             "ok": False,
@@ -463,14 +439,8 @@ class AlgorithmServer:
         if cmd == "detect_2d_piece":
             return self.get_board().handle_detect_2d_piece(req)
 
-        if cmd == "detect_3d_board":
-            return self.get_board().handle_detect_3d_board(req)
-
         if cmd == "release_board":
             return self.get_board().handle_release_board(req)
-
-        if cmd == "detect_board":
-            return self.get_board().handle_detect(req)
 
         if cmd == "reload_defect_config":
             return self.get_two_d().handle_reload_defect_config(req)
@@ -503,22 +473,12 @@ class AlgorithmServer:
 
         return self.board
 
-    def get_three_d(self):
-        if self.three_d is None:
-            from algorithm.application.standalone.detect_3D import Detect3D
-
-            self.three_d = Detect3D()
-
-        return self.three_d
-
     def handle_shutdown(self, cmd: str, message: str) -> Dict[str, Any]:
         release_start = time.perf_counter()
         if self.board is not None:
             self.board.release()
         if self.two_d is not None:
             self.two_d.release()
-        if self.three_d is not None:
-            self.three_d.release()
         return {
             "ok": True,
             "cmd": cmd,
@@ -537,7 +497,6 @@ class AlgorithmServer:
                 silver_pool=self.silver_pool,
                 joint_pool=self.joint_pool,
                 registration_pool=self.registration_pool,
-                early_joint_workers=self.threading_info["early_joint_workers"],
                 timeout_seconds=float(os.environ.get("BRIDGE_BOARD_TIMEOUT_SECONDS", "90")),
                 max_pending_boards=int(os.environ.get("BRIDGE_MAX_PENDING_BOARDS", "4")))
         return self.pipeline
@@ -549,15 +508,11 @@ class AlgorithmServer:
             return self.get_pipeline().submit_2d(req)
         if cmd == "detect_3d_piece":
             return self.get_pipeline().submit_3d_piece(req)
-        if cmd == "detect_3d_board" or (cmd == "detect" and stage == "3d" and board_id):
-            return self.get_pipeline().submit_3d(req)
         if cmd == "release_board":
             board_id = self.get_board()._stream_board_id(req)
             return self.get_pipeline().release_board(board_id)
-        if cmd in {"detect", "detect_board"}:
-            # The shared model has exactly one owner. No CPU worker blocks on GPU work.
-            pool = self.cpu_pool if cmd == "detect" and stage == "3d" else self.gpu_pool
-            return pool.submit(self.handle_request, req)
+        if cmd == "detect" and stage == "2d":
+            return self.gpu_pool.submit(self.handle_request, req)
         return self.handle_request(req)
 
     def _write_response(self, stream, req, response):

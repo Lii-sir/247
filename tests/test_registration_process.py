@@ -265,10 +265,10 @@ class ProcessPipelineIntegrationTests(unittest.TestCase):
         self.assertIn("worker init failed", response["error"])
         detector.release.assert_called_once()
 
-    def test_bridge_initialization_and_two_complete_boards_use_same_processes(self):
+    def test_bridge_initialization_and_pieces_from_two_boards_use_same_processes(self):
         from algorithm.application.board.detect_board import DetectBoard
         from importlib import import_module
-        from pipeline_fakes import FakeDetector
+        from pipeline_fakes import FakeDetector, depth_piece_request
         from transport.bridge_server import AlgorithmServer
         from algorithm.vision3d.alignment.registration import register_arrays
         entry, local, registration_config, affine = fixture()
@@ -282,17 +282,19 @@ class ProcessPipelineIntegrationTests(unittest.TestCase):
                 self.log = lambda text: None
                 self.registration_config = registration_config
                 self.dynamic_affine_config = affine
-                self.segmentation_config = import_module("algorithm.vision3d.depth.segment").SegmentationConfig(
-                    expected_piece_count=2, mode="fixed", fixed_rois=((0, 0, 128, 96), (0, 96, 128, 192)))
 
             def handle_init(self, req):
                 return dict(ok=True, stage="board")
 
             def _read_3d(self, req):
-                return np.tile(local, (2, 1))
+                return local
 
             def prepare_joint_piece(self, prepared):
                 return {**prepared, **entry}
+
+            def finish_2d_piece(self, prepared, **kwargs):
+                reply, pieces = super().finish_2d_piece(prepared, **kwargs)
+                return reply, {**pieces, **entry}
 
             def measure_registered_piece(self, pid, source, depth, piece, matrix, correction):
                 return {**self.measure_prepared_piece(pid, source, depth, piece, correction), "registration": matrix}
@@ -303,7 +305,7 @@ class ProcessPipelineIntegrationTests(unittest.TestCase):
         server.board = Detector()
         config = dict(common_2d=dict(parameters=dict(threading=dict(gpu_workers=1, postprocess_workers=1))),
                       common_3d=dict(parameters=dict(threading=dict(worker_budget=7, cpu_workers=2,
-                          registration_workers=2, joint_workers=1, early_joint_workers=2))))
+                          registration_workers=2, joint_workers=1))))
         response = server.handle_init_algorithm(dict(stage="board", config_text=json.dumps(config)))
         self.assertTrue(response["ok"], response)
         info = response["threading"]["registration_execution"]
@@ -314,19 +316,22 @@ class ProcessPipelineIntegrationTests(unittest.TestCase):
         for board_id in ("A", "B"):
             replies = [pipe.submit_2d(dict(board_id=board_id, piece_id=pid, marker=f"{board_id}:{pid}")) for pid in (1, 2)]
             self.assertTrue(all(reply.result(10)["ok"] for reply in replies))
-            resources = pipe._boards[board_id].registration_inputs
-            result = pipe.submit_3d(dict(board_id=board_id)).result(20)
-            self.assertTrue(result["ok"], result)
-            for piece in result["results_board"]["pieces"]:
+            owners = dict(pipe._boards[board_id].mask_inputs)
+            height, width = local.shape
+            for pid in (1, 2):
+                result = pipe.submit_3d_piece(depth_piece_request(board_id, pid, image_height=height,
+                    image_width=width, data_size=height * width * 2)).result(20)
+                self.assertTrue(result["ok"], result)
+                piece = result["results_piece"]
                 matrix = piece["registration"]
                 self.assertIn(matrix["registration_worker"]["pid"], pids)
                 self.assertEqual(expected["matrix_2d_to_3d"], matrix["matrix_2d_to_3d"])
                 self.assertEqual(expected["affine_score_after"], matrix["affine_score_after"])
                 self.assertGreaterEqual(piece["timings"]["registration_shared_memory_ms"], 0)
                 self.assertGreaterEqual(piece["timings"]["registration_result_transfer_ms"], 0)
-            self.assertTrue(resources._closed)
-            self.assertEqual(0, resources._leases)
-            self.assertEqual({}, resources._blocks)
+                self.assertTrue(owners[pid]._closed)
+                self.assertEqual(0, owners[pid]._leases)
+                self.assertEqual({}, owners[pid]._blocks)
 
     def test_formal_submit_requires_initialized_process_service(self):
         from algorithm.application.board.detect_board import DetectBoard

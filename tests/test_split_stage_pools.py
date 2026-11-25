@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT / "python"))
 sys.path.insert(0, str(ROOT / "tests"))
 from algorithm.application.board.board_pipeline import BoardPipeline
 from transport.bridge_server import AlgorithmServer
-from pipeline_fakes import FakeDetector
+from pipeline_fakes import FakeDetector, depth_piece_request
 import test_early_joint_pipeline as early
 
 
@@ -36,7 +36,7 @@ class SplitPoolSettingsTests(unittest.TestCase):
 
     def test_explicit_config_builds_and_injects_five_distinct_pools(self):
         pipeline = self.server.get_pipeline()
-        settings = self.server._thread_settings(config(early_joint_workers=3))
+        settings = self.server._thread_settings(config())
         self.server._configure_thread_pools(settings, source="test")
         pools = []
         for stage in ("cpu", "gpu", "postprocess", "silver", "joint"):
@@ -47,7 +47,6 @@ class SplitPoolSettingsTests(unittest.TestCase):
             self.assertTrue(pool.submit(lambda: threading.current_thread().name).result(2)
                             .startswith("bridge-" + stage))
         self.assertEqual(len({id(pool) for pool in pools}), 5)
-        self.assertEqual(pipeline.early_joint_workers, 3)
 
     def test_missing_keys_preserve_old_sharing(self):
         cfg = config(budget=14, gpu_workers=2, postprocess_workers=5, cpu_workers=7)
@@ -57,24 +56,17 @@ class SplitPoolSettingsTests(unittest.TestCase):
         self.server._configure_thread_pools(settings, source="test")
         self.assertIs(self.server.silver_pool, self.server.postprocess_pool)
         self.assertIs(self.server.joint_pool, self.server.cpu_pool)
-        self.assertEqual(settings["early_joint_workers"], 7)
 
     def test_independent_pools_are_included_in_budget(self):
         with self.assertRaisesRegex(ValueError, "effective_total=15"):
             self.server._thread_settings(config(budget=14))
 
     def test_invalid_new_counts_are_rejected(self):
-        for key in ("silver_workers", "joint_workers", "early_joint_workers"):
+        for key in ("silver_workers", "joint_workers"):
             for value in (0, -1, True, 1.5, "bad", None):
                 with self.subTest(key=key, value=value):
                     with self.assertRaisesRegex(ValueError, key):
                         self.server._thread_settings(config(**{key: value}))
-
-    def test_early_limit_is_bounded_by_joint_not_preparation_pool(self):
-        settings = self.server._thread_settings(config(early_joint_workers=3))
-        self.assertGreater(settings["early_joint_workers"], settings["cpu_workers"])
-        with self.assertRaisesRegex(ValueError, "cannot exceed joint_workers"):
-            self.server._thread_settings(config(early_joint_workers=5))
 
     def test_environment_fallback_reserves_new_pools(self):
         with patch.dict(os.environ, {"BRIDGE_MAX_WORKERS": "13",
@@ -114,15 +106,6 @@ class SplitPoolSettingsTests(unittest.TestCase):
                          current["common_2d"]["parameters"]["threading"]["silver_workers"])
         self.assertEqual(settings["joint_workers"],
                          current["common_3d"]["parameters"]["threading"]["joint_workers"])
-
-    def test_early_limit_only_update_preserves_executors(self):
-        pipeline = self.server.get_pipeline()
-        self.server._configure_thread_pools(self.server._thread_settings(config()), source="test")
-        original = self.server.joint_pool
-        self.server._configure_thread_pools(
-            self.server._thread_settings(config(early_joint_workers=1)), source="test")
-        self.assertIs(self.server.joint_pool, original)
-        self.assertEqual(pipeline.early_joint_workers, 1)
 
     def test_aliases_are_shutdown_only_once(self):
         pools = {self.server.cpu_pool, self.server.gpu_pool, self.server.postprocess_pool}
@@ -219,19 +202,20 @@ class SplitPoolSchedulingTests(unittest.TestCase):
                 raise TimeoutError("joint gate")
             return measure(*args)
         self.detector.measure_prepared_piece = blocked
-        board = self.pipeline.submit_3d(dict(board_id="A"))
         first = self.pipeline.submit_2d(dict(board_id="A", piece_id=1, marker="A:1"))
+        self.assertTrue(first.result(2)["ok"])
+        depth = self.pipeline.submit_3d_piece(depth_piece_request("A", 1))
         try:
             self.assertTrue(started.wait(2))
             second = self.pipeline.submit_2d(dict(board_id="A", piece_id=2, marker="A:2"))
             self.assertTrue(second.result(2)["ok"])
             self.assertTrue(first.result(2)["ok"])
-            self.assertFalse(board.done())
+            self.assertFalse(depth.done())
         finally:
             self.gate.set()
-        result = board.result(3)
+        result = depth.result(3)
         self.assertTrue(result["ok"])
-        self.assertEqual([p["marker"] for p in result["results_board"]["pieces"]], ["A:1", "A:2"])
+        self.assertEqual(result["results_piece"]["marker"], "A:1")
         self.assertEqual(self.detector.closed_inputs, 2)
 
 

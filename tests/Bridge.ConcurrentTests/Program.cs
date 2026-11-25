@@ -1,10 +1,7 @@
 using Bridge;
-using System.Diagnostics;
 using System.IO.MemoryMappedFiles;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Windows.Media;
-using System.Windows.Media.Imaging;
 
 static class Program
 {
@@ -19,175 +16,80 @@ static class Program
                 ? Path.Combine(root, "python", "transport", "bridge_server.py")
                 : Path.Combine(root, "tests", "fake_concurrent_server.py");
             using var bridge = new PythonBridge(python, fixture, 13);
-            if (real)
-            {
-                Environment.SetEnvironmentVariable("BRIDGE_BOARD_TIMEOUT_SECONDS", "900");
-                bridge.RequestTimeoutMilliseconds = 900000;
-            }
             bridge.Init();
+            bridge.InitAlgorithm("board");
             if (real)
             {
-                bridge.InitAlgorithm("board");
-                string[] files = Directory.GetFiles(Path.Combine(root, "demodatasets", "2D"), "*.png")
-                    .OrderBy(path => path, StringComparer.OrdinalIgnoreCase).ToArray();
-                if (files.Length != 10) throw new InvalidDataException($"Expected ten sample 2D images, found {files.Length}.");
-                string depthFile = Directory.GetFiles(Path.Combine(root, "demodatasets", "3D"), "*.png").Single();
-                string boardId = "real-" + Guid.NewGuid().ToString("N");
-                var scan = bridge.ThreeD.DetectBoardFileAsync(boardId, depthFile);
-                Thread.Sleep(100);
-                var tasks = files.Select((file, index) => bridge.TwoD.DetectPieceFileAsync(boardId, index + 1, file)).ToArray();
-                Check(Task.WaitAll(tasks, 900000), "Real 2D sample requests timed out.");
-                Check(scan.Wait(900000), "Real board registration/measurement timed out.");
-                Check(tasks.All(task => task.Result.Ok), "At least one real 2D sample failed.");
-                Check(scan.Result.Ok && scan.Result.ResultsBoard?.Pieces.Count == 10,
-                    "Real 3D board result did not contain ten pieces.");
-                Console.WriteLine($"REAL PASS: ten 2D samples + one 3D board; board_ok={scan.Result.ResultsBoard!.IsOk}.");
+                if (args.Length != 4)
+                    throw new ArgumentException("Usage: Bridge.ConcurrentTests.exe <root> --real <2d> <depth-piece>");
+                Check(bridge.TwoD.DetectPieceFile("sample", 1, args[2]).Ok, "Sample 2D input failed.");
+                Check(bridge.ThreeD.DetectPieceFile("sample", 1, args[3]).ResultsPiece?.PieceId == 1, "Sample 3D input failed.");
                 return 0;
             }
+
             ThreadPool.SetMinThreads(16, 16);
-            ushort[] depthValues = Enumerable.Range(0, 300).Select(i =>
-                i / 3 % 10 < 5 ? (ushort)(33000 + i) : (ushort)0).ToArray();
-            depthValues[0] = 1; depthValues[1] = 256; depthValues[2] = 32768; depthValues[3] = 65535;
-            byte[] depthBytes = new byte[600];
-            Buffer.BlockCopy(depthValues, 0, depthBytes, 0, depthBytes.Length);
-            using var depth = Mapping(depthBytes);
-            var inputs = Enumerable.Range(1, 10).Select(pid => Mapping(new byte[] { (byte)pid, 2, 3 })).ToArray();
-            try
+            ushort[] values = Enumerable.Range(0, 30).Select(i => (ushort)(33000 + i)).ToArray();
+            values[0] = 1; values[1] = 256; values[2] = 32768; values[3] = 65535;
+            byte[] bytes = new byte[60];
+            Buffer.BlockCopy(values, 0, bytes, 0, bytes.Length);
+            using var depth = Mapping(bytes);
+            using var image = Mapping(new byte[] { 1, 2, 3 });
+
+            var ids = Enumerable.Range(0, 13).Select(index => (Board: "board-" + index / 10, Piece: index % 10 + 1)).ToArray();
+            var twoD = ids.Select(id => bridge.TwoD.DetectPieceSharedMemoryAsync(
+                id.Board, id.Piece, image.Name, 3, 1, 1, 3, "bgr8")).ToArray();
+            Check(Task.WaitAll(twoD, 10000) && twoD.All(task => task.Result.Ok), "Parallel 2D requests failed.");
+            Check(twoD.Select(task => task.Result.RequestId).Distinct().Count() == ids.Length, "Request IDs were reused.");
+
+            var threeD = ids.Select(id => bridge.ThreeD.DetectPieceSharedMemoryAsync(
+                id.Board, id.Piece, depth.Name, 60, 3, 10)).ToArray();
+            Check(Task.WaitAll(threeD, 10000) && threeD.All(task => task.Result.Ok), "Parallel 3D requests failed.");
+            for (int index = 0; index < threeD.Length; index++)
             {
-                // A depth request arrives first, yet all ten camera calls must keep progressing.
-                var scan = bridge.ThreeD.DetectBoardSharedMemoryAsync("test-board", depth.Name, 600, 3, 100);
-                Thread.Sleep(50);
-                Check(!scan.IsCompleted, "3D must wait for matching pieces, not fail early.");
-                var images = inputs.Select((mapping, index) =>
-                    bridge.TwoD.DetectPieceSharedMemoryAsync("test-board", index + 1,
-                        mapping.Name, 3, 1, 1, 3, "bgr8")).ToArray();
-                Check(Task.WaitAll(images, 10000), "2D tasks did not finish (serialization/deadlock).");
-                Check(scan.Wait(10000), "3D aggregation did not finish.");
-                Check(images.All(task => task.Result.Ok), "2D failed.");
-                Check(images.Select(task => task.Result.PieceId).OrderBy(x => x)
-                    .SequenceEqual(Enumerable.Range(1, 10).Select(x => (int?)x)), "Replies were misrouted.");
-                Check(images.Select(task => task.Result.RequestId).Distinct().Count() == 10,
-                    "Requests do not have unique correlation IDs.");
-                Check(scan.Result.Ok && scan.Result.ResultsBoard?.Pieces.Count == 10,
-                    "Final board must contain exactly ten matching pieces.");
-                Check(scan.Result.ResultsBoard!.PipelineDiagnostics != null &&
-                    scan.Result.ResultsBoard.PipelineDiagnostics["piece_count"].GetInt32() == 10,
-                    "Board critical-path diagnostics were lost during DTO mapping.");
-                Check(scan.Result.ResultsBoard.Pieces.All(piece => piece.Timeline.ContainsKey("joint_completed_ms")),
-                    "Per-piece board-relative timeline was lost during DTO mapping.");
-                Check(scan.Result.ResultsBoard?.DepthCoordinateSpace == "board_3d",
-                    "Board depth coordinate tag was lost during DTO mapping.");
-                Check(scan.Result.ResultsBoard?.PitchCorrection != null &&
-                    scan.Result.ResultsBoard.PitchCorrection.TryGetValue("applied", out var applied) && !applied.GetBoolean(),
-                    "Pitch correction metadata was lost during DTO mapping.");
-
-                Check(bridge.TwoD.DetectPieceSharedMemory("piece-board", 4,
-                    inputs[3].Name, 3, 1, 1, 3, "bgr8").Ok, "Single piece 2D failed.");
-                var pieceDepth = depthValues.Take(30).ToArray();
-                var pieceScan = bridge.ThreeD.DetectPieceAsync("piece-board", 4, pieceDepth, 3, 10);
-                Array.Clear(pieceDepth, 0, pieceDepth.Length);
-                Check(pieceScan.Wait(5000) && pieceScan.Result.Ok && pieceScan.Result.PieceId == 4 &&
-                    pieceScan.Result.ResultsPiece is { PieceId: 4, DepthCoordinateSpace: "piece_3d", DepthEndRow: 10 },
-                    "Piece-based 3D deserialization or array snapshot failed.");
-                using (var pieceMapping = Mapping(depthBytes.Take(60).ToArray()))
-                {
-                    Check(bridge.TwoD.DetectPieceSharedMemory("piece-board", 5,
-                        inputs[4].Name, 3, 1, 1, 3, "bgr8").Ok, "Shared-memory piece 2D failed.");
-                    var mappingScan = bridge.ThreeD.DetectPieceSharedMemory(
-                        "piece-board", 5, pieceMapping.Name, 60, 3, 10);
-                    Check(mappingScan.Ok && mappingScan.ResultsPiece?.PieceId == 5,
-                        "Piece-based shared-memory request failed.");
-                    var skipped = bridge.ThreeD.DetectPieceSharedMemory(
-                        "piece-board", 6, pieceMapping.Name, 60, 3, 10);
-                    Check(skipped.Ok && skipped.ResultsPiece is { IsOk: false, Skip3DReason: "missing_2d_result" },
-                        "Missing 2D should return a skipped NG piece.");
-                }
-
-                var orphan = bridge.ThreeD.DetectBoardSharedMemoryAsync("orphan-board", depth.Name, 600, 3, 100);
-                Thread.Sleep(50);
-                Check(bridge.ReleaseBoard("orphan-board").Ok, "Explicit release failed.");
-                Check(orphan.Wait(5000) && !orphan.Result.Ok, "Released pending request remained blocked.");
-
-                // Thirteen simultaneous callers all use the same bridge/reader.
-                var concurrent = Enumerable.Range(1, 13).Select(pid => Task.Run(() =>
-                    bridge.TwoD.DetectPieceSharedMemory("parallel-" + ((pid - 1) / 10), (pid - 1) % 10 + 1,
-                        inputs[0].Name, 3, 1, 1, 3, "bgr8"))).ToArray();
-                Check(Task.WaitAll(concurrent, 10000) && concurrent.All(t => t.Result.Ok),
-                    "Thirteen simultaneous requests failed.");
-                bridge.ReleaseBoard("parallel-0");
-                bridge.ReleaseBoard("parallel-1");
-
-                string temp = Path.Combine(Path.GetTempPath(), "bridge-stream-" + Guid.NewGuid().ToString("N"));
-                Directory.CreateDirectory(temp);
-                try
-                {
-                    string[] files = Enumerable.Range(1, 10).Select(pid =>
-                    {
-                        string file = Path.Combine(temp, pid.ToString("D2") + ".png");
-                        File.WriteAllBytes(file, new byte[] { (byte)pid, 2, 3 });
-                        return file;
-                    }).ToArray();
-                    string depthFile = Path.Combine(temp, "depth.png");
-                    var source = BitmapSource.Create(3, 100, 96, 96, PixelFormats.Gray16, null, depthValues, 6);
-                    var encoder = new PngBitmapEncoder();
-                    encoder.Frames.Add(BitmapFrame.Create(source));
-                    using (var file = File.Create(depthFile)) encoder.Save(file);
-                    DetectResponse joined = bridge.Board.DetectStreamingFilesAsync(
-                        files, depthFile, "high-level-board").GetAwaiter().GetResult();
-                    Check(joined.Ok && joined.ResultsBoard?.Pieces.Count == 10,
-                        "High-level 2D/3D orchestration failed.");
-                    string piecePath = Path.Combine(temp, "piece.png");
-                    var pieceImage = BitmapSource.Create(3, 10, 96, 96, PixelFormats.Gray16, null,
-                        depthValues.Take(30).ToArray(), 6);
-                    var pieceEncoder = new PngBitmapEncoder();
-                    pieceEncoder.Frames.Add(BitmapFrame.Create(pieceImage));
-                    using (var file = File.Create(piecePath)) pieceEncoder.Save(file);
-                    Check(bridge.TwoD.DetectPieceFileAsync("piece-file", 1, files[0]).GetAwaiter().GetResult().Ok,
-                        "Piece file 2D failed.");
-                    var fromFile = bridge.ThreeD.DetectPieceFileAsync("piece-file", 1, piecePath)
-                        .GetAwaiter().GetResult();
-                    Check(fromFile.Ok && fromFile.ResultsPiece?.PieceId == 1, "Piece-based depth file failed.");
-                }
-                finally { Directory.Delete(temp, recursive: true); }
-
-                var correction = new Dictionary<string, object> {
-                    ["applied"] = true, ["model"] = "smartray_pitch", ["angle_deg"] = 6.0,
-                    ["scan_axis"] = "rows", ["scan_pitch_mm"] = .02,
-                    ["z_step_mm"] = .00105, ["gray_offset"] = 32768.0,
-                    ["z_origin_mm"] = 0.0, ["transform_direction"] = "recover_ideal"
-                };
-                var sdk = bridge.ThreeD.DetectBoardAsync("sdk-array", depthValues, 3, 100, correction);
-                correction["angle_deg"] = 59.0;
-                // The SDK is allowed to overwrite the original after submission.
-                Array.Clear(depthValues, 0, depthValues.Length);
-                var sdkImages = Enumerable.Range(1, 10).Select(pid =>
-                    bridge.TwoD.DetectPieceSharedMemoryAsync("sdk-array", pid, inputs[0].Name, 3, 1, 1, 3, "bgr8")).ToArray();
-                Check(Task.WaitAll(sdkImages, 10000) && sdk.Wait(10000) && sdk.Result.Ok,
-                    "SDK ushort array submission or its synchronous snapshot failed.");
-                Check(sdk.Result.ResultsBoard?.DepthCoordinateSpace == "pitch_corrected_board_3d",
-                    "Externally prepared depth coordinate metadata was lost.");
-                Check(sdk.Result.ResultsBoard!.PitchCorrection!["angle_deg"].GetDouble() == 6.0,
-                    "Async correction metadata was not snapshotted before returning.");
-                Check(sdk.Result.Timings != null && !sdk.Result.Timings.ContainsKey("smartray_pitch_ms"),
-                    "Detection time unexpectedly includes preprocessing.");
-                bool rejected = false;
-                try { bridge.ThreeD.DetectBoardSharedMemory("bad-size", depth.Name, 599, 3, 100); }
-                catch (ArgumentException) { rejected = true; }
-                Check(rejected, "Raw shared depth size mismatch was not rejected.");
-
-                bridge.RequestTimeoutMilliseconds = 150;
-                bool timedOut = false;
-                try { bridge.ThreeD.DetectBoardSharedMemory("never-complete", depth.Name, 600, 3, 100); }
-                catch (TimeoutException) { timedOut = true; }
-                Check(timedOut, "Request timeout did not terminate a stalled worker.");
-                bridge.RequestTimeoutMilliseconds = 120000;
-                bridge.Init();
-                Check(bridge.TwoD.DetectPieceSharedMemory("restart", 1,
-                    inputs[0].Name, 3, 1, 1, 3, "bgr8").Ok, "Restart after timeout failed.");
-                bridge.ReleaseBoard("restart");
+                var result = threeD[index].Result;
+                Check(result.BoardId == ids[index].Board && result.ResultsPiece?.PieceId == ids[index].Piece,
+                    "3D result was routed to the wrong board or piece.");
             }
-            finally { foreach (var input in inputs) input.Dispose(); }
-            Console.WriteLine("PASS: 3D-first/10 camera tasks, correlation, 13 concurrent callers, release, timeout/restart.");
+
+            var correction = new Dictionary<string, object> {
+                ["applied"] = true, ["model"] = "smartray_pitch", ["angle_deg"] = 6.0,
+                ["scan_axis"] = "rows", ["scan_pitch_mm"] = .02, ["z_step_mm"] = .00105,
+                ["gray_offset"] = 32768.0, ["z_origin_mm"] = 0.0, ["transform_direction"] = "recover_ideal"
+            };
+            Check(bridge.TwoD.DetectPieceSharedMemory("sdk", 4, image.Name, 3, 1, 1, 3, "bgr8").Ok, "Array fixture 2D failed.");
+            var sdk = bridge.ThreeD.DetectPieceAsync("sdk", 4, values, 3, 10, correction);
+            Array.Clear(values, 0, values.Length);
+            correction["angle_deg"] = 59.0;
+            Check(sdk.Wait(5000) && sdk.Result.Ok &&
+                sdk.Result.ResultsPiece is { PieceId: 4, DepthCoordinateSpace: "pitch_corrected_piece_3d", DepthEndRow: 10 },
+                "Array snapshot or coordinate metadata was lost.");
+            Check(sdk.Result.ResultsPiece!.PitchCorrection!["angle_deg"].GetDouble() == 6.0,
+                "Correction metadata was not snapshotted.");
+
+            var skipped = bridge.ThreeD.DetectPieceSharedMemory("missing", 1, depth.Name, 60, 3, 10);
+            Check(skipped.Ok && skipped.ResultsPiece is { IsOk: false, Skip3DReason: "missing_2d_result" },
+                "Missing 2D did not return a skipped NG piece.");
+            bool rejected = false;
+            try { bridge.ThreeD.DetectPieceSharedMemory("invalid", 1, depth.Name, 59, 3, 10); }
+            catch (ArgumentException) { rejected = true; }
+            Check(rejected, "Raw shared depth size mismatch was accepted.");
+
+            var pending = bridge.TwoD.DetectPieceSharedMemoryAsync("release-pending", 1, image.Name, 3, 1, 1, 3, "bgr8");
+            Thread.Sleep(100);
+            Check(bridge.ReleaseBoard("release-pending").Ok, "Explicit release failed.");
+            Check(pending.Wait(5000) && !pending.Result.Ok, "Released request did not fail.");
+
+            bridge.RequestTimeoutMilliseconds = 150;
+            bool timedOut = false;
+            try { bridge.TwoD.DetectPieceSharedMemory("never-complete", 1, image.Name, 3, 1, 1, 3, "bgr8"); }
+            catch (TimeoutException) { timedOut = true; }
+            Check(timedOut, "Request timeout did not terminate a stalled worker.");
+            bridge.RequestTimeoutMilliseconds = 120000;
+            bridge.Init();
+            Check(bridge.TwoD.DetectPieceSharedMemory("restart", 1, image.Name, 3, 1, 1, 3, "bgr8").Ok,
+                "Restart after timeout failed.");
+            bridge.ReleaseBoard("restart");
+            Console.WriteLine("PASS: per-piece concurrency, metadata, missing 2D, release, and timeout/restart.");
             return 0;
         }
         catch (Exception exception)

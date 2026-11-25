@@ -46,61 +46,41 @@ def build_flows():
     def e(a, b, label='', kind='serial'):
         current['edges'].append(dict(source=a, target=b, label=label, kind=kind))
 
-    scene('overview', '运行总览', '一板N片2D + 一张3D整板；各路按就绪事件推进', [
-        '实线表示前置依赖；横向分支可重叠执行，不表示实际耗时。紫色代表并行投递，橙色代表汇合条件。',
-        '联合入口需要本片joint_entry和整板深度；不需要等本片银胶检查完成，也不需要等所有2D片先到齐。',
-        '整板最终响应仍需全部N份2D诊断及N份联合结果；单片先完成不等于整板已经返回。'])
-    n('o-entry', '协议入口与板缓存', 'board_id / piece_id / request_id', 1, 0,
-      '读取一行JSON请求并检查并发容量|按board_id建立或定位板缓存|2D片号由调用方指定，不按到达顺序编号|2D与3D请求可任意先后到达', kind='data', src=(T, '_accept'))
-    n('o-2d', '每片2D输入', 'N片可并发准备', 0, 1,
-      '校验板号和片号|读取共享内存图像|圆定位并裁剪检测图|构造粗配准平台掩码', pool='cpu', src=(B, 'prepare_2d_piece'))
-    n('o-depth', '3D整板输入', '完整原始uint16数组', 2, 1,
-      '按board_id接收完整整板深度及宽高|读取packed小端uint16共享内存，无PNG解码|保留全部16位像素值，禁止用彩色预览替代', pool='cpu', src=(P, 'submit_3d'))
-    n('o-fork', '2D准备完成，投递两支', 'GPU支路 + 银胶边界支路', 0, 2,
-      '同一prepared对象由两个只读/受控分支消费|投递silver_prepare和gpu任务|回调计数器保护分支生命周期|不占用工作线程等待尚未到达的输入', pool='cpu', kind='parallel', src=(P, 'submit_2d'))
-    n('o-gpu', 'YOLO → 掩码 → EfficientAD', '同一资源内顺序调用', 0, 3,
-      '借用GPU模型资源槽位|YOLO分割后批量传回CPU掩码|逐个芯片进行EfficientAD|归还该资源的CUDA流和模型槽位', pool='gpu', src=(B, 'infer_2d_piece'))
-    n('o-boundary', '银胶允许边界准备', '当前：检测crop四边内缩', 1, 3,
-      '仅依赖图像/crop/圆定位，不依赖YOLO掩码|当前roi_inset模式生成允许矩形|可与YOLO和EfficientAD重叠|可选旧模板模式另走SIFT标定分支', pool='silver', src=(B, 'prepare_silver_boundary'))
-    n('o-pitch', '调用侧提交前Pitch矫正', '不计入检测耗时', 2, 0,
-      'SDK调用独立DLL，验证台在提交前准备深度|启用时仅矫正一次|矫正后的uint16像素和元数据一起提交|检测程序只分片、配准、测高，不再次矫正', pool='pitch', kind='parallel', src=(DP, 'prepare_depth_for_detection'))
-    n('o-slices', '3D整板分片', '当前fixed；上到下1…N', 2, 3,
-      'fixed模式直接验证并读取配置矩形|不扫描整图有效值|联合路径只按y1:y2取全宽深度视图|发布depth和pieces', pool='cpu', times=('depth_segmentation_ms',), src=(SEG, 'segment_depth_image'))
-    n('o-geometry', '2D几何 + joint_entry', '弯曲 / 缺线 / 旋转 / 灰度', 0, 4,
-      'GPU完成后在CPU准备联合输入|依次计算2D弯曲、ROI存在性和芯片旋转|缓存完整原图灰度|发布joint_entry，允许联合工作提前启动', pool='cpu', times=('geometry_phase_ms',), src=(B, 'prepare_joint_piece'))
-    n('o-postgate', '2D后处理汇合', '等待边界与几何均完成', 0, 5,
-      '分支计数归零后才投递2D CPU任务准备|此处是事件汇合，不是额外计算线程|若某分支失败，释放输入并返回片级失败', kind='gate', src=(P, 'submit_2d'))
-    n('o-joingate', '本片联合就绪门', 'depth + 本片joint_entry', 2, 5,
-      '整板深度就绪且该片joint_entry已发布|同片未被claimed，防止重复计算|受early_joint_workers约束|不等待银胶检查结束', kind='gate', src=(P, '_schedule_ready'))
-    n('o-post', '2D共享mask与异步派发', '不传模型、GPU Tensor或整张照片', 0, 6,
-      '只复制实例mask到只读共享区|携带必要公开字段与已准备Boundary|父准备线程不等待worker完成|不影响早期joint_entry发布', pool='postprocess', src=(P2, 'submit_piece'))
-    n('o-cpu2d', '2D独立CPU进程', '银浆溢出 → 断连 → 公开几何', 0, 7,
-      '独立于配准和主进程的核组|无Torch，OpenCV/BLAS为1|本片内按原实例顺序处理，不用3D instance池|返回诊断与公开几何，原始实例只读', pool='cpu_2d_process', src=(D2, 'compute'), times=('cpu_2d_phase_ms',))
-    n('o-finalize2d', '父进程轻量合并', '不重复银浆与公开几何计算', 0, 8,
-      '回填完整entry的银浆诊断|汇总原2D检测结论|构造响应并释放原图owner|整板最终仍需等待本次完整2D诊断', pool='postprocess', src=(B, 'finish_2d_piece'))
-    n('o-shared', '共享输入与异步派发', '每板一份深度；每片gray/mask', 2, 6,
-      '父准备线程复制并发布共享区|整板补偿后深度所有片复用|只向常驻子进程发送描述和数值配置|租约保护取消/释放期间的真实任务输入', pool='registration', times=('registration_shared_memory_ms',), src=(RP, 'prepare'))
-    n('o-registration', '常驻进程独立配准', '粗配准 → 仿射；专用物理核组', 2, 7,
-      '按registration_workers限制进程数|不加载Torch和模型，原生线程均为1|主进程与配准使用不同物理核组|只读共享区，每片拟合一个全局矩阵|矩阵和诊断返回后立即投递测高', pool='registration_process', times=('registration_phase_ms',), src=(R, 'register_arrays'))
-    n('o-jointprep', '测高共享输入与派发', '复用整板深度＋原2D实例mask', 2, 8,
-      '深度复用配准发布的同一共享块|追加当前片只读原2D实例mask|仅发送高度配置、几何元数据和当前矩阵|父joint线程不等待测高进程', pool='joint', src=(JP,'submit_piece'),times=('joint_measurement_shared_memory_ms',))
-    n('o-joint', '独立进程映射与全实例测高', '第三核组；本进程实例执行器', 2, 9,
-      '按joint_workers限制进程数|映射、参考面、引线及焊脚都在worker完成|instance_workers仅属于当前测高进程，当前2|不加载Torch，主进程不执行实例或测高任务|全部wire/thin/bond参与，CPU结果回主进程最后合并2D诊断', pool='joint_measurement_process', times=('joint_measurement_phase_ms',), src=(J, 'measure_registered_piece'))
-    n('o-2ddone', '本片2D响应 / entry就绪', '2D请求独立返回', 0, 9,
-      '输出2D检查、公开掩码和阶段耗时|记录完整entry|尝试推进整板汇合', kind='data', src=(P, 'submit_2d'))
-    n('o-3ddone', '本片联合结果就绪', '几何 / 平面 / 高度 / 配准', 2, 10,
-      '保存结果到state.results[piece_id]|将高度点转换到整板坐标|掩码轮廓仍为片局部坐标|后续仍会合并完整2D诊断', kind='data', src=(P, '_measured'))
-    n('o-all', '整板最终汇合', 'N个entries + N个results + 无inflight', 1, 11,
-      '必须收齐所有2D诊断和联合结果|按片号排序|再次合并银胶、外观等晚到诊断|单片NG与接口错误分别处理|标出最后完成片和汇合分支|汇总全板最大队列与最慢执行阶段', kind='gate', src=((P,'_complete_if_ready'),(P,'_pipeline_diagnostics')))
-    n('o-return', '整板JSON响应与释放', 'request_id匹配；stdout单行', 1, 12,
-      '整板registration_ok与is_ok分别汇总|返回released板信息|删除本板缓存并完成Future|桥接层写JSON响应并归还请求容量', kind='data', src=(T, '_accept'))
-    for a,b,label,kind in [('o-entry','o-2d','逐片提交','fork'),('o-entry','o-depth','整板提交','fork'),
-        ('o-2d','o-fork','','serial'),('o-fork','o-gpu','','fork'),('o-fork','o-boundary','','fork'),
-        ('o-pitch','o-depth','矫正后才提交3D','serial'),('o-depth','o-slices','','serial'),('o-gpu','o-geometry','','serial'),
-        ('o-geometry','o-postgate','','wait'),('o-boundary','o-postgate','','wait'),
-        ('o-geometry','o-joingate','提前发布','data'),('o-slices','o-joingate','','wait'),
-        ('o-postgate','o-post','','serial'),('o-joingate','o-shared','','serial'),('o-shared','o-registration','跨进程描述','data'),('o-registration','o-jointprep','回调交接','data'),('o-jointprep','o-joint','共享输入','data'),('o-post','o-cpu2d','共享mask','data'),('o-cpu2d','o-finalize2d','结果回传','data'),('o-finalize2d','o-2ddone','','serial'),
-        ('o-joint','o-3ddone','','serial'),('o-2ddone','o-all','','wait'),('o-3ddone','o-all','','wait'),('o-all','o-return','','serial')]:e(a,b,label,kind)
+    scene('overview', '运行总览', '按板号和片号提交 2D 和单片 3D', [
+        '银浆边界准备与 GPU 推理可重叠。不同片可以同时处于不同阶段。',
+        '上位机负责发出请求。该片完整 2D 就绪后，联合 3D 才判断是否需要读入深度。'])
+    n('o-2d', '接收单片 2D', 'board_id + piece_id', 0, 0,
+      '读取共享内存图像|圆定位和裁剪|准备配准所需输入', pool='cpu', src=(B, 'prepare_2d_piece'))
+    n('o-gpu', 'YOLO 和芯片外观', '按检测配置启用', 0, 1,
+      'YOLO 生成原始语义掩码|已启用时执行 EfficientAD|GPU 完成后计算引线和旋转诊断',
+      pool='gpu', src=(B, 'infer_2d_piece'))
+    n('o-boundary', '银浆边界准备', '可与 GPU 推理重叠', 1, 1,
+      '按 ROI 或标定数据准备允许边界|配置清单控制银浆检测项', pool='silver', src=(B, 'prepare_silver_boundary'))
+    n('o-finalize2d', '完成并缓存本片 2D', '银浆检查和结果整理', 0, 2,
+      '等待几何和边界准备|独立 CPU 进程处理银浆和公开几何|发布完整 2D 结果并释放原图',
+      pool='cpu_2d_process', src=(B, 'finish_2d_piece'))
+    n('o-pitch', '调用侧分片和矫正', '上位机或样本工具', 2, 0,
+      '上位机调用 Pitch DLL 准备单片深度|准备就绪后提交该片 3D', pool='pitch', src=(DP, 'prepare_depth_for_detection'))
+    n('o-depth', '接收单片 3D', 'board_id + piece_id', 2, 1,
+      '校验宽、高和 packed uint16 长度|等待同片已开始的 2D 请求|缺失 2D 时返回跳过',
+      kind='gate', src=(P, 'submit_3d_piece'))
+    n('o-joingate', '判断是否需测高', '独立检测策略', 2, 2,
+      '缺少有效 2D 掩码时跳过|策略开启且 2D 判 NG 时跳过|需要测高时才打开该片深度缓冲区',
+      kind='decision', src=(P, '_start_piece_if_ready'))
+    n('o-registration', '配准', '粗配准 → 仿射', 2, 3,
+      '发布本片共享输入|配准进程计算本片矩阵|回调提交测高', pool='registration_process', src=(P, '_submit_joint'))
+    n('o-joint', '映射和测高', '只执行已选测高项目', 2, 4,
+      '复用本片深度和实例掩码|拟合参考面|返回单片坐标的掩码和测高点',
+      pool='joint_measurement_process', src=(J, 'measure_registered_piece'))
+    n('o-return', '返回单片结果', 'results_piece', 1, 5,
+      '合并同片 2D 与 3D 结论|返回跳过原因或测量结果|消费该片缓存并结束本次请求',
+      kind='data', src=(P, '_finish_piece_request'))
+    for a, b, kind in [('o-2d','o-gpu','fork'),('o-2d','o-boundary','fork'),
+        ('o-gpu','o-finalize2d','serial'),('o-boundary','o-finalize2d','wait'),
+        ('o-pitch','o-depth','serial'),('o-depth','o-joingate','wait'),('o-finalize2d','o-joingate','data'),
+        ('o-joingate','o-registration','serial'),('o-registration','o-joint','serial'),
+        ('o-joint','o-return','data'),('o-joingate','o-return','optional')]:
+        e(a,b,kind=kind)
 
     scene('initialization', '初始化与资源', '协议初始化、算法初始化、模型副本和线程池', [
         '构造YOLO对象不等于完成首次predictor设置和预热；首次predict仍可能产生额外耗时。',
@@ -129,7 +109,7 @@ def build_flows():
         'YOLO与EfficientAD在同一资源内顺序执行；silver_prepare是独立并发支路。',
         'joint_entry发布后即可参与3D配准，完整2D响应需等后续银胶和公开几何。'])
     n('d-input','校验与读取图像','encoded 或 raw BGR8',0,0,
-      '验证board_id非空、piece_id范围|同片inflight或已claimed时拒绝重复|encoded路径读取字节后解码|raw BGR8路径建立只读SharedImage视图并持有owner',pool='cpu',src=(B,'prepare_2d_piece'),times=('input_shared_memory_read_ms','input_image_decode_ms','input_read_decode_ms'))
+      '验证board_id非空、piece_id范围|同片 2D 或 3D 请求在途时拒绝重复|encoded路径读取字节后解码|raw BGR8路径建立只读SharedImage视图并持有owner',pool='cpu',src=(B,'prepare_2d_piece'),times=('input_shared_memory_read_ms','input_image_decode_ms','input_read_decode_ms'))
     n('d-circle','在搜索框内找圆','灰度 → 高斯 → Hough',0,1,
       '验证circle_search_roi在原图范围内|裁搜索图并转灰度，9×9高斯平滑|固定半径±容差，按param2=35/28/22逐级尝试|优先选接近搜索区中心与期望半径的候选|加回搜索框偏移，输出完整2D圆心与半径',pool='cpu',src=(C,'find_circle'),params=('common_2d.parameters.crop',),times=('circle_find_ms',))
     n('d-crop','圆相对裁剪与2D诊断ROI','原图 → 检测crop',0,2,
@@ -154,8 +134,8 @@ def build_flows():
       '使用已清理的弯曲结果选择ROI归属|缺少候选引线时给wire_missing|掩码被清理拒绝时给bending_unavailable|返回ROI框、关联实例和OK/NG|此ROI不限制后续3D测高目标',pool='cpu',src=('python/algorithm/vision2d/wire_roi_presence.py','check_wire_roi_presence'),times=('wire_roi_presence_ms',))
     n('d-rotation','芯片旋转 + 灰度缓存','geometry支路顺序收尾',0,11,
       '各chip轮廓求最小面积矩形|长边角度折算到最近坐标轴偏差[-45,45)|abs偏差与max_angle_deg比较|原图灰度通过gray_lock只转换一次|构建joint_entry并对实例字典做浅拷贝',pool='cpu',src=(B,'prepare_joint_piece'),params=('chip_rotation_2d.parameters',),times=('chip_rotation_ms','cache_gray_image_ms'))
-    n('d-ready','提前发布联合输入','不等待银胶检查',0,12,
-      '保存joint_entries[piece_id]|记录_2d_ready_at|立即尝试_schedule_ready|如depth已就绪，可投递本片联合任务',kind='data',src=(P,'submit_2d'))
+    n('d-ready','准备本片联合输入','等待完整 2D 诊断',0,12,
+      '保存灰度和掩码|组装本片几何诊断|后处理结束后再发布缓存',kind='data',src=(P,'submit_2d'))
     n('d-join','边界 + geometry汇合','两支都成功才进入2D最终处理',1,13,
       '回调remaining计数归零|合并各支路计时|先处理支路错误并释放图像owner|成功时投递postprocess池，不在原线程阻塞等待',kind='gate',src=(P,'submit_2d'))
     n('d-dispatch','只读mask准备与进程派发','每片独立共享区租约',1,14,
@@ -166,8 +146,8 @@ def build_flows():
       '逐实例读取只读mask|使用相同面积、包围框、轮廓函数|按原实例顺序输出|不占用3D instance池，也不修改父进程实例',pool='cpu_2d_process',src=(IG,'public_instance'),times=('public_2d_geometry_ms','public_2d_geometry_work_ms'))
     n('d-finalize','父进程轻量finalize','合并诊断与原有2D检查',1,17,
       '将worker诊断回填完整entry|不重复银浆和公开几何计算|构造实例与总OK/NG|记录子进程计算和父finalize之和，以及完整后处理链路',pool='postprocess',src=(B,'finish_2d_piece'),times=('cpu_postprocess_finalize_phase_ms','cpu_postprocess_pipeline_ms'))
-    n('d-return','返回本片2D结果','保留缓存等待整板最终汇合',1,18,
-      '汇总实例、缺线、旋转、外观与银胶结论|响应ok表示接口成功，不等于产品is_ok|写入完整state.entries并清除inflight|归还原图共享内存owner|尝试整板完成门',kind='data',src=(P,'submit_2d'),times=('request_pipeline_ms',))
+    n('d-return','返回本片2D结果','保留缓存等待该片 3D 请求',1,18,
+      '汇总实例、缺线、旋转、外观与银胶结论|响应ok表示接口成功，不等于产品is_ok|写入完整state.entries并清除inflight|归还原图共享内存owner|推进已提交的该片 3D 请求',kind='data',src=(P,'submit_2d'),times=('request_pipeline_ms',))
     chain=['d-input','d-circle','d-crop','d-platform','d-slot','d-yolo','d-masks','d-anomaly','d-gpudone','d-bending','d-presence','d-rotation','d-ready','d-join','d-dispatch','d-silver','d-public','d-finalize','d-return']
     for a,b in zip(chain,chain[1:]):e(a,b)
     e('d-platform','d-boundary','并发投递','fork');e('d-boundary','d-join','等待边界','wait')
@@ -205,41 +185,28 @@ def build_flows():
     for chain in [['s-boundary','s-union','s-overflow','s-labels','s-sectors','s-summary'],['a-chip','a-rectify','a-route','a-infer','a-score','a-boxes']]:
         for a,b in zip(chain,chain[1:]):e(a,b)
 
-    scene('depth','提交前预处理与3D分片','Pitch在请求与检测计时之外执行',[
-        'Pitch只矫正深度，同栅格强度图可在独立测试函数里同步；正式2D相机照片不使用Pitch公式。',
-        'fixed_rois是已补偿整板上的固定分片矩形；它和已删除的“测高目标选择ROI”是不同用途。'])
-    n('z-input','检测入口：共享内存与数组视图','接收已准备的单通道uint16',1,5,
-      '校验shm_name、板号及正整数image_width/image_height|要求data_format=uint16，data_size严格等于宽×高×2|读取完整原始深度字节，不接受PNG压缩流|按小端uint16建立二维视图，不解码、不拉伸灰度|行按顺序紧密排列，无行尾对齐填充；保留0/65535原值',pool='cpu',src=(B,'_read_3d'),times=('depth_shared_memory_read_ms','depth_array_view_ms','depth_read_ms'))
-    n('z-switch','调用侧：是否启用Pitch','检测算法不读取此开关',1,0,
-      '验证台在提交前消费smartray_pitch_3d参数|SDK由上位机独立DLL负责矫正|关闭时提交原始像素，开启时提交矫正像素|元数据只描述坐标，不触发检测端矫正|不得对已矫正的SDK数据重复执行预处理',kind='decision',src=(DP,'preprocessing_parameters'),params=('smartray_pitch_3d.parameters',))
-    n('z-strips','调用侧：沿非扫描轴分条带','rows分列；columns分行',1,1,
-      '条带数取配置线程数、可用池容量和非扫描轴尺寸的最小值|每条带覆盖完整扫描轴|连续验证复用调用侧Pitch池|各条带清零并直接写整幅输出的独立区域|大位移仍不会跨条带写同一目标像素',pool='pitch',kind='parallel',src=(Z,'correct_smartray_pitch'),params=('smartray_pitch_3d.parameters.projection_workers',))
-    n('z-project','调用侧每条带：投影深度点','有效值 → 毫米 → 平移与Z修正',1,2,
-      '仅枚举0 < raw < 65535的输入点|按标定缓存65536项深度和连续位移查表|查表公式保留原来的Z解码、正向或还原以及编码计算顺序|每个点直接查到连续位移和有效深度编码|连续位移加到扫描行/列后才np.rint|过滤坐标越界和无效输出编码',pool='pitch',src=((Z,'_depth_lookup'),(Z,'correct_smartray_pitch')))
-    n('z-collision','调用侧每条带：解决投影碰撞','np.maximum.at；深度越大获胜',1,3,
-      '同一目标像素多个投影时保留最大矫正深度|独立测试的强度图复用同一批投影点|矫正深度平局时取最大源索引对应强度|不插值填洞，空位保持0|这些计算不属于检测请求或其计时',pool='pitch',src=(Z,'correct_smartray_pitch'))
-    n('z-merge','调用侧合并后提交深度','像素与坐标元数据一起传入',1,4,
-      '条带已直接写入整幅输出，仅合并统计|在预处理锁内生成独立字节快照后再复用缓冲|附带pitch_correction元数据供坐标标签与展示使用|正式2D照片保持原样|预处理结束后才提交3D请求并开始检测计时|后续只分片配准和测高',pool='cpu',src=(DP,'encode'))
-    n('z-mode','选择分片模式','当前配置见参数表',1,6,
-      '读取segmentation_3d.parameters|expected_piece_count必须和板片数一致|fixed和auto走不同边界定位路径|配置或边界错误直接抛错，不静默改变片数',kind='decision',src=(SEG,'segment_depth_image'),params=('segmentation_3d.parameters',))
-    n('z-fixed','fixed：直接取标定矩形','不读像素有效性统计',0,7,
-      '矩形数必须等于expected_piece_count|每项为整数[x1,y1,x2,y2]，右/下边界不含|校验正面积、图内、由上到下且行范围不重叠|不加padding、不裁越界、不回退auto|按列表顺序分配piece_id=1…N',pool='cpu',src=(SEG,'segment_depth_image'),times=('depth_segmentation_ms',))
-    n('z-auto','auto：有效像素定位','行占比 → 带区间 → 列范围',2,7,
-      'depth > min_valid_depth生成有效掩码|统计每行有效占比并填短断口|筛选满足最小片高的带区间|初始阈值不满足片数时尝试观测到的更高占比|每片按列有效占比取X边界并加padding|检测片数不符返回piece_count_mismatch',pool='cpu',src=(SEG,'segment_depth_image'))
-    n('z-ready','发布整板深度和片描述','depth_ready_at',1,8,
-      '整板深度仍只有一份|联合路径实际取depth[y1:y2, :]，X保留全宽|不复制每片深度数组|记录本板深度就绪时刻|尝试为已有joint_entry调度对应片',kind='data',src=(P,'submit_3d'))
-    e('z-switch','z-strips','提交前启用');e('z-switch','z-input','关闭：原样提交','optional')
-    for a,b in zip(['z-strips','z-project','z-collision','z-merge','z-input'],['z-project','z-collision','z-merge','z-input','z-mode']):e(a,b)
-    e('z-mode','z-fixed','fixed');e('z-mode','z-auto','auto');e('z-fixed','z-ready');e('z-auto','z-ready')
+    scene('depth','提交前分片与矫正','Pitch 和分片由调用侧完成',[
+        '验证台可从整板样本取片，再按片提交。产线按矫正 DLL 返回的片号和像素组织请求。'])
+    n('z-input','整板深度样本','原始 uint16',0,0,
+      '读取深度像素和标定参数|分片与矫正在调用侧执行',
+      pool='pitch',src=(DP,'prepare_depth_for_detection'))
+    n('z-mode','按片号准备单片','使用外部矫正元数据',1,0,
+      '验证台选中片后提取深度区域|上位机使用矫正 DLL 得到已准备的片图',
+      pool='pitch',src=(SEG,'segment_depth_image'))
+    n('z-ready','发送该片已准备深度','detect_3d_piece',2,0,
+      '提交板号、片号、本片宽高、像素缓冲区|服务在需要测高时读取对应缓冲区',
+      kind='data',src=(P,'submit_3d_piece'))
+    e('z-input','z-mode')
+    e('z-mode','z-ready')
 
     scene('registration','配准与掩码映射','每片一套矩阵；评分区不代表分别变换',[
         '当前正式路径是粗配准+6参数Powell仿射，没有额外透视求解。R1/R2/R3共同约束同一个矩阵。',
         'score_mode默认full，仍只在所选ROI计算损失。ROI自建坐标映射为手动试验路径，曾发生耗时回退。',
         '停止优化不等于对齐合格；当前合格逻辑不要求optimizer.success=True。'])
     n('r-gate','本片联合工作启动','depth + joint_entry已就绪',1,0,
-      '输入全就绪后的准入等待单独记录|父准备线程构造共享输入并异步派发|像素复制不持生命周期全局锁，不阻塞后续片租约|整板深度仅复制一次，每片gray/mask各一次|只发送当前片行范围和数值配置，不发送检测器或模型|无需等银胶最终诊断',pool='registration',src=(B,'submit_registration'),times=('joint_admission_wait_ms','registration_dispatch_queue_ms','registration_shared_memory_ms','matching_input_wait_ms'))
+      '输入全就绪后的准入等待单独记录|父准备线程构造共享输入并异步派发|像素复制不持生命周期全局锁，不阻塞后续片租约|同片深度在配准和测高间复用|只发送当前片行范围和数值配置，不发送检测器或模型|完整 2D 诊断已就绪',pool='registration',src=(B,'submit_registration'),times=('joint_admission_wait_ms','registration_dispatch_queue_ms','registration_shared_memory_ms','matching_input_wait_ms'))
     n('r-worker','子进程挂接只读共享区','CPU专用核组；不加载模型',1,1,
-      '常驻worker取到本片描述|进程投递至执行的process_wait单列，不含共享准备|挂接gray/mask/整板深度并设只读|按y1:y2取全宽深度视图|执行与直接求解相同的register_arrays|此处开始记录registration_phase_ms',pool='registration_process',src=(RW,'run'),times=('registration_queue_ms','registration_process_wait_ms','registration_phase_ms'))
+      '常驻worker取到本片描述|进程投递至执行的process_wait单列，不含共享准备|挂接灰度、掩码和单片深度并设为只读|执行与直接求解相同的register_arrays|此处开始记录registration_phase_ms',pool='registration_process',src=(RW,'run'),times=('registration_queue_ms','registration_process_wait_ms','registration_phase_ms'))
     n('r-platform','构造3D平台掩码','depth_piece > 0并闭运算',1,1,
       '对片深度的非零像素二值化|按registration_3d.morphology_kernel_size闭运算|2D平台掩码此前已在准备阶段生成|两幅掩码进入固定尺度模板匹配',pool='joint_measurement_process',src=(R,'platform_mask_3d'),times=('platform_mask_3d_ms',))
     n('r-coarse','粗配准模板匹配','TM_CCOEFF_NORMED',1,2,
@@ -314,40 +281,33 @@ def build_flows():
     e('h-ownership','h-localplane','不在chip');e('h-ownership','h-chipplane','在chip')
     e('h-localplane','h-solderpoint');e('h-chipplane','h-solderpoint');e('h-solderpoint','h-merge','有序汇合','wait')
 
-    scene('output','坐标与结果发布','跨坐标系的变换只做一次；整板合格与接口成功分开',[
-        '仿射矩阵映射完整原图2D坐标到本片局部深度坐标；不是crop局部矩阵，也未包含整板行偏移。',
-        'Pitch开启后，整板高度点属于补偿后栅格；不能直接叠到原始未矫正深度PNG上。'])
-    n('u-crop','crop局部 → 完整2D','加crop左上角',0,0,
-      'YOLO掩码在检测crop局部坐标中|输出mask_2d几何时加crop原点|若清理用bbox，再额外加mask_offset|不要再把同一crop偏移加第二次',kind='data',src=(J, '_align_instance'))
-    n('u-affine','完整2D → 3D片局部','全片一个H',1,1,
-      '完整原图点乘H_full得到片局部点|crop掩码使用H_full×T_crop_to_full|输出mask_3d_local、参考平面和采样区均保留片局部坐标|不因为存在多个评分ROI而分开扭曲图像',kind='data',src=(R,'align_crop_mask_to_depth'))
-    n('u-global','片局部高度点 → 整板高度点','x不变，y加depth_start_row',1,2,
-      '联合路径每片保留全宽，故X已是整板X|只给高度point.y加分片起始行|为每条测高记录标记坐标空间|已有整板坐标的点不重复偏移|完整掩码轮廓仍是片局部，不能跟着全部平移',kind='data',src=(H,'height_points_to_board'),times=('height_points_to_board_ms',))
-    n('u-quality','本片联合质量','高度 + 2D检查 + 晚到诊断',1,3,
-      '高度组件合格来自所有已测高度结果|流式片结果同时检查2D wire_roi_checks|银胶/旋转/外观诊断齐全后再合并|disabled项不强行当作失败|产品NG仍可返回ok=True',kind='gate',src=(B,'finalize_joint_piece'))
-    n('u-all','收齐整板N片','entries/results/inflight门',1,4,
-      'len(results)=N且len(entries)=N|不能还有inflight片|按片号升序合并|再次使用完整entry合并晚到2D诊断|registration_ok要求各片registration.is_valid',kind='gate',src=(P,'_complete_if_ready'))
-    n('u-json','整板响应与缓存释放','ok / registration_ok / is_ok分层',1,5,
-      'ok：协议/算法请求是否成功|registration_ok：全部配准质量是否通过|is_ok：配准且所有片最终产品检查通过|返回片数组、耗时、Pitch和released信息|从板缓存删除本板并完成Future',kind='data',src=(P,'_complete_if_ready'))
-    n('u-client','调用方关联响应','request_id，不按响应先后配对',1,6,
-      '桥接层stdout只写一行JSON|ProtocolClient按request_id唤醒对应等待者|2D请求可先于或后于3D完成|日志写stderr不进入JSON解析|子进程退出时唤醒全部未完成请求',kind='data',src=('visualization/detect_and_view.py','ProtocolClient'))
-    n('u-report','验证台报告与交互','展示不重新求解、不改判定',1,7,
-      '保存原响应JSON、阶段CSV和日志|按实际矩阵叠加原彩色2D和深度伪彩|按测量编号关联全部高度与2D弯曲|彩色预览只用于观察，毫米值读取算法结果|历史输入/结果保留，不因清空页面清单删除文件',kind='data',src=(V,'run'))
-    for a,b in zip(['u-crop','u-affine','u-global','u-quality','u-all','u-json','u-client'],['u-affine','u-global','u-quality','u-all','u-json','u-client','u-report']):e(a,b)
+    scene('output','单片坐标与结果','上位机按板号和片号收集结果',[
+        '测高点和深度掩码使用该片的原点。上位机保留裁剪原点即可映射回整板。'])
+    n('u-local','单片深度坐标','piece_3d 或 pitch_corrected_piece_3d',0,0,
+      '配准将原图 2D 映射到单片深度坐标|公开掩码和测高点使用同一片局部坐标',
+      kind='data',src=(J,'measure_registered_piece'))
+    n('u-result','按片合并 2D 和 3D','results_piece',1,0,
+      '联合结果保留 2D 判定和已测高度|请求状态与产品状态分别返回',
+      kind='data',src=(B,'finalize_joint_piece'))
+    n('u-release','消费片缓存和返回响应','使用 request_id 对应响应',2,0,
+      '释放这片的共享内存|同一板其他片保持可用|空板退出缓存',
+      kind='data',src=(P,'_finish_piece_request'))
+    e('u-local','u-result')
+    e('u-result','u-release')
 
     scene('lifecycle','异常与生命周期','正常NG、输入错误、失败传播、超时和停止',[
-        '90秒是板缓存等待缺失输入的空闲期限，不是单片计算时间上限；活跃计算期间不按此规则清理。',
+        '90 秒是未消费 2D 缓存的默认空闲期限。活动请求期间保留所需缓存。',
         '验证台request超时900秒与Powell的停止条件无关。停止验证台会先中断子进程，再等待工作池退出。'])
     n('f-check','输入与请求校验','不合法请求不等于产品NG',0,0,
-      '片号越界/重复inflight/已claimed时拒绝|超过26个挂起协议请求时server_busy|超过最大挂起板数拒绝新板|验证台另检查每板片号齐全、无重复、深度唯一',src=(T,'_accept'))
+      '片号越界或请求重复时拒绝|超过26个挂起协议请求时server_busy|超过最大挂起板数拒绝新板|验证台检查单片编号和样本配对',src=(T,'_accept'))
     n('f-piece','2D支路失败','圆/模型范围/编码/分支异常',0,1,
-      '清理该片inflight与joint_entry|未被联合认领时先返回片级失败，允许调用方处理|若该片已claimed，终止相应整板|释放原图owner，避免共享内存被永久持有|不把异常转换成正常产品OK',src=(P,'submit_2d'))
-    n('f-board','深度或联合失败','整板Future进入失败终态',0,2,
-      '原始深度格式/尺寸/补偿/分片错误返回3d_board_failed|联合函数异常返回joint_detection_failed|删除本板缓存并完成等待中的整板Future|已在运行的任务用_current检查避免污染下一板',src=(P,'_terminate'))
+      '清理该片在途状态和缓存|2D 请求返回片级执行失败|等待中的同片 3D 返回 missing_2d_result|释放原图和掩码共享内存',src=(P,'submit_2d'))
+    n('f-board','深度或联合失败','单片请求返回执行失败',0,2,
+      '深度描述无效返回 invalid_piece|深度读取或测高异常返回 3d_piece_failed|2D 缓存仍可用于重试|主动释放会结束当前板的待处理请求',src=(P,'_terminate'))
     n('f-validate','验证台看到任一失败','显式release_board',0,3,
       '记录最初失败原因，不用后续board released覆盖|发送release_board解除等待|仅2D模式结束也释放本板缓存|验证报告区分产品NG和请求失败',src=(V,'run'))
     n('f-expire','等待缺失输入的空闲超时','当前90秒；活跃任务不误删',0,4,
-      '周期检查pending boards|有inflight/depth_inflight/未完成claimed任务则仍为活跃|只有不活跃且touched超过期限才超时|返回missing_piece_ids并终止该板',kind='decision',src=(P,'expire_pending'))
+      '周期清理没有活动请求的过期板缓存|过期后请求该片 3D 返回 missing_2d_result',kind='decision',src=(P,'expire_pending'))
     n('f-request','客户端请求超时或进程退出','验证台每个请求900秒',0,5,
       '900秒超时会kill检测子进程，防止晚响应串到下个请求|协议stdout EOF会通知全部pending等待队列|后续请求遇closed立即失败|正常close先尝试release，强制stop跳过长等待',src=('visualization/detect_and_view.py','request'))
     n('f-start','验证台启动/重复启动','--open只负责打开网页',2,0,

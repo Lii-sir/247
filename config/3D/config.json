@@ -19,7 +19,6 @@
           "enabled": true,
           "physical_cores": 14
         },
-        "early_joint_workers": 10,
         "instance_workers": 2
       }
     }
@@ -91,36 +90,6 @@
           9165
         ]
       ]
-    }
-  },
-  "wire_height_3d": {
-    "description": "3D独立接口的引线中心线P95高度检测",
-    "parameters": {
-      "substrate_aois": [
-        [
-          0.02,
-          0.0,
-          0.18,
-          0.35
-        ],
-        [
-          0.02,
-          0.65,
-          0.18,
-          1.0
-        ]
-      ],
-      "wire_x_range": [
-        280,
-        420
-      ],
-      "mask_threshold_gray": 80.0,
-      "mask_percentile": 65.0,
-      "min_component_area_px": 300,
-      "depth_percentile": 95.0,
-      "gray_offset": 32768.0,
-      "vertical_resolution_mm": 0.0021,
-      "max_wire_substrate_height_mm": 0.8
     }
   },
   "registration_3d": {

@@ -7,7 +7,6 @@
   "common_2d": {
     "description": "2D通用参数：圆定位、检测裁剪、YOLO推理和基础掩码处理",
     "parameters": {
-      "defect_priority": [],
       "crop": {
         "circle_search_roi": [
           3100,

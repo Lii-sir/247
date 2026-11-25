@@ -14,10 +14,11 @@ import threading
 import time
 import uuid
 import webbrowser
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
+from PIL import Image
 
 from generate_report import image_files, render_report
 
@@ -192,6 +193,9 @@ def algorithm_request(score_mode: str | None, score_pool_kernel: int | None,
     first = json.loads(first_path.read_text(encoding="utf-8-sig"))
     second = json.loads(second_path.read_text(encoding="utf-8-sig"))
     combined = {**first, **{k: v for k, v in second.items() if k != "model_path"}}
+    if "config_inspection" in manifest:
+        settings_path = (ROOT / "config" / manifest["config_inspection"]).resolve()
+        combined["inspection"] = json.loads(settings_path.read_text(encoding="utf-8-sig"))
     chip_config = combined.get("chip_anomaly_2d", {}).get("parameters", {})
     if silver_calibration is not None:
         calibration_path = silver_calibration.resolve()
@@ -239,12 +243,7 @@ def mapped_file(stack: ExitStack, path: Path, kind: str, piece_id: int | None = 
             raw = depth.astype("<u2", copy=False).tobytes(order="C")
     else:
         raw = path.read_bytes()
-    if not raw:
-        raise ValueError(f"Empty input image: {path}")
-    name = "result_viewer_" + uuid.uuid4().hex
-    mapping = mmap.mmap(-1, len(raw), tagname=name, access=mmap.ACCESS_WRITE)
-    stack.callback(mapping.close)
-    mapping.write(raw)
+    name = _map_bytes(stack, raw)
     if kind == "2d":
         return {"piece_id": piece_id, "shm_name": name, "image_size": len(raw), "image_format": "encoded"}
     descriptor = {"shm_name": name, "data_size": len(raw), "data_format": "uint16",
@@ -252,6 +251,32 @@ def mapped_file(stack: ExitStack, path: Path, kind: str, piece_id: int | None = 
     if correction is not None:
         descriptor['pitch_correction'] = correction
     return descriptor
+
+
+def _map_bytes(stack, raw):
+    if not raw:
+        raise ValueError("Empty input image")
+    name = "result_viewer_" + uuid.uuid4().hex
+    mapping = mmap.mmap(-1, len(raw), tagname=name, access=mmap.ACCESS_WRITE)
+    stack.callback(mapping.close)
+    mapping.write(raw)
+    return name
+
+
+def split_depth_sample(path, config, preprocessor):
+    """Prepare a sample scan on the calling side before sending per-piece requests."""
+    import numpy as np
+    from algorithm.runtime.config import feature_parameters
+    from algorithm.vision3d.depth.segment import SegmentationConfig, segment_depth_image
+
+    with Image.open(path) as image:
+        if image.format != "PNG" or image.mode not in {"I", "I;16", "I;16B", "I;16L"}:
+            raise ValueError("3D须为原始16位单通道深度PNG")
+        pixels = np.asarray(image, dtype=np.uint16).copy()
+    corrected, metadata = preprocessor.prepare(pixels)
+    pieces = segment_depth_image(corrected, SegmentationConfig.from_dict(
+        feature_parameters(config, "segmentation_3d")))
+    return corrected, {piece["piece_id"]: piece for piece in pieces}, metadata
 
 
 def summarize_2d_latency(timeline, *, expected_count=None, target_ms=1000.):
@@ -295,104 +320,80 @@ def save_timing_csv(envelope: dict, path: Path) -> None:
 
 
 def detect_batch(client: ProtocolClient, args, paths: list[Path], depth: Path,
-                 envelope: dict, *, pitch_settings=None, pitch_preprocessor=None) -> None:
-    """Run one board on an already initialized service; never reload models."""
+                 envelope: dict, *, config, pitch_preprocessor) -> None:
+    """Prepare one sample scan locally and send only per-piece requests."""
     board_id = envelope["board_id"]
-    started = None
     timeline_index = len(client.timeline)
-    input_prepare_ms = 0.0
-    depth_stack = ExitStack()
-
-    def send(request):
-        response = client.request(request, args.timeout)
-        label = (f"2D #{request['piece_id']}" if request.get("piece_id")
-                 else "3D board" if request["cmd"] == "detect_3d_board" else "Batch board")
-        print(f"[{board_id}] {label} returned: request_ok={response.get('ok')}, "
-              f"algorithm_ms={response.get('elapsed_ms', 'not provided')}", flush=True)
-        timings = response.get("timings", {})
-        keys = ("gpu_queue_ms", "cuda_before_yolo_ms", "yolo_predict_wall_ms", "cuda_after_yolo_ms",
-                "mask_extract_to_cpu_ms", "efficientad_total_ms", "silver_total_ms",
-                "cpu_postprocess_queue_ms")
-        details = "; ".join(f"{key}={timings[key]:.1f}ms" for key in keys if key in timings)
-        if details:
-            print(f"[{board_id}] {label} timings: {details}", flush=True)
-        return response
-
-    def map_image(stack, path, kind, piece_id=None):
-        nonlocal input_prepare_ms
-        if kind == '3d':
-            return prepared_depth
-        start = time.perf_counter()
-        value = mapped_file(stack, path, kind, piece_id)
-        input_prepare_ms += (time.perf_counter() - start) * 1000
-        return value
+    started = None
+    prepared_at = time.perf_counter()
 
     try:
-        # Depth file decoding and Pitch complete before any detection request
-        # or detection benchmark starts. Keep its mapping through the reply.
-        prepared_depth = mapped_file(depth_stack, depth, '3d', pitch_settings=pitch_settings,
-                                    pitch_preprocessor=pitch_preprocessor)
+        corrected, geometry, correction = split_depth_sample(depth, config, pitch_preprocessor)
+        elapsed_prepare = (time.perf_counter() - prepared_at) * 1000
+
+        def inspect_one(item):
+            piece_id, path = item
+            with ExitStack() as stack:
+                image = mapped_file(stack, path, "2d", piece_id)
+                two_d = client.request({"cmd": "detect_2d_piece", "board_id": board_id,
+                                        **threshold_request(args.threshold), **image}, args.timeout)
+            if not two_d.get("ok"):
+                return two_d, None
+
+            piece = geometry[piece_id]
+            start, end = piece["y1"], piece["y2"]
+            pixels = corrected[start:end, :]
+            height, width = pixels.shape
+            raw = pixels.astype("<u2", copy=False).tobytes(order="C")
+            with ExitStack() as stack:
+                three_d = client.request(dict(cmd="detect_3d_piece", board_id=board_id, piece_id=piece_id,
+                    shm_name=_map_bytes(stack, raw), data_format="uint16", data_size=len(raw),
+                    image_width=width, image_height=height, pitch_correction=correction), args.timeout)
+            return two_d, three_d
+
         started = time.perf_counter()
-        if args.mode == "stream" and args.parallel:
-            print("Parallel stream: submit 10 2D pieces and 1 3D board scan...", flush=True)
-            with ExitStack() as stack, ThreadPoolExecutor(max_workers=11) as pool:
-                descriptors = [map_image(stack, path, "2d", index)
-                               for index, path in enumerate(paths, 1)]
-                depth_descriptor = map_image(stack, depth, "3d")
-                depth_future = pool.submit(send, {"cmd": "detect_3d_board", "stage": "3d",
-                                                 "board_id": board_id, **depth_descriptor})
-                piece_futures = [pool.submit(send, {
-                    "cmd": "detect_2d_piece", "stage": "2d", "board_id": board_id,
-                    **threshold_request(args.threshold), **descriptor}) for descriptor in descriptors]
-                for future in as_completed(piece_futures):
-                    envelope["responses_2d"].append(future.result())
-                failures = [item for item in envelope["responses_2d"] if not item.get("ok")]
-                if failures:
-                    client.request({"cmd": "release_board", "board_id": board_id}, args.timeout)
-                response = depth_future.result()
-                if failures:
-                    response = {"ok": False, "cmd": "detect_3d_board", "board_id": board_id,
-                                "error": "2d_piece_failed", "message": "; ".join(
-                                    f"piece {item.get('piece_id')}: {item.get('message') or item.get('error')}"
-                                    for item in failures)}
-        elif args.mode == "stream":
-            for index, path in enumerate(paths, 1):
-                print(f"2D piece {index}/10: {path.name}", flush=True)
-                with ExitStack() as stack:
-                    piece_response = send({"cmd": "detect_2d_piece", "stage": "2d",
-                        "board_id": board_id, **threshold_request(args.threshold),
-                        **map_image(stack, path, "2d", index)})
-                envelope["responses_2d"].append(piece_response)
-                if not piece_response.get("ok"):
-                    raise RuntimeError(piece_response.get("error") or f"2D piece {index} failed")
-            with ExitStack() as stack:
-                response = send({"cmd": "detect_3d_board", "stage": "3d", "board_id": board_id,
-                                 **map_image(stack, depth, "3d")})
+        items = list(enumerate(paths, 1))
+        if args.parallel:
+            with ThreadPoolExecutor(max_workers=min(len(items), 13)) as pool:
+                replies = list(pool.map(inspect_one, items))
         else:
-            with ExitStack() as stack:
-                response = send({"cmd": "detect_board", "stage": "board", "batch_id": board_id,
-                    "images_2d": [map_image(stack, path, "2d", index + 1)
-                                  for index, path in enumerate(paths)],
-                    "image_3d": map_image(stack, depth, "3d")})
-        envelope["response"] = response
-    except (OSError, ValueError, RuntimeError, TimeoutError) as exc:
+            replies = [inspect_one(item) for item in items]
+        envelope["responses_2d"] = [two_d for two_d, _ in replies]
+        envelope["responses_3d"] = [three_d for _, three_d in replies if three_d is not None]
+        errors = [reply for pair in replies for reply in pair if reply is not None and not reply.get("ok")]
+        display_pieces = []
+        for piece_id, (_, reply) in enumerate(replies, 1):
+            if reply and reply.get("ok") and reply.get("results_piece"):
+                piece = geometry[piece_id]
+                # Preview slices use the source-scan rows; measured points stay piece-local.
+                display_pieces.append({**reply["results_piece"], "depth_start_row": piece["y1"],
+                                       "depth_end_row": piece["y2"]})
+        registration_ok = all(piece.get("registration", {}).get("is_valid") or
+                              piece.get("skip_3d_reason") == "no_3d_checks" for piece in display_pieces)
+        envelope["response"] = dict(ok=not errors, board_id=board_id, cmd="validate_pieces",
+            results_board=dict(pieces=display_pieces, pitch_correction=correction, registration_ok=registration_ok,
+                               is_ok=not errors and all(piece.get("is_ok") is True for piece in display_pieces)))
+        if errors:
+            envelope["response"]["error"] = errors[0].get("message") or errors[0].get("error")
+    except (KeyError, OSError, ValueError, RuntimeError, TimeoutError) as exc:
         envelope["response"] = {"ok": False, "board_id": board_id, "error": str(exc)}
         print(f"Detection did not complete: {exc}", file=sys.stderr)
     finally:
         elapsed = (time.perf_counter() - started) * 1000 if started is not None else 0.
-        depth_stack.close()
-        envelope["responses_2d"].sort(key=lambda item: int(item.get("piece_id") or 0))
         envelope["timeline"] = [dict(item) for item in client.timeline[timeline_index:]
-                                if item["cmd"] in {"detect_2d_piece", "detect_3d_board", "detect_board"}]
+                                if item["cmd"] in {"detect_2d_piece", "detect_3d_piece"}]
         entries = envelope["timeline"]
         envelope["benchmark"] = {
             "batch_wall_ms": elapsed,
-            "input_prepare_ms": input_prepare_ms,
+            "input_prepare_ms": elapsed_prepare if started is not None else 0.,
             "request_window_ms": (max(item["received_ms"] for item in entries)
                                   - min(item["sent_ms"] for item in entries)) if entries else None,
+            "two_d_latency": summarize_2d_latency(entries, expected_count=len(paths)),
         }
-        envelope['benchmark']['two_d_latency'] = summarize_2d_latency(entries, expected_count=len(paths))
-
+        try:
+            client.request({"cmd": "release_board", "board_id": board_id}, args.timeout)
+        except (OSError, RuntimeError, TimeoutError) as exc:
+            envelope.setdefault("warnings", []).append(f"板缓存释放失败：{exc}")
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run the existing Bridge Python service independently, save JSON, and generate an offline report.")
@@ -400,10 +401,9 @@ def main() -> int:
     parser.add_argument("--depth", type=Path)
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument("--board-id", default="")
-    parser.add_argument("--mode", choices=("stream", "board"), default="stream",
-                        help="stream runs all configured single-piece 2D checks; board matches the current batch Demo")
+    parser.add_argument("--mode", choices=("stream",), default="stream")
     parser.add_argument("--parallel", action="store_true",
-                        help="submit ten 2D pieces and the 3D board scan concurrently; stream mode only")
+                        help="inspect different pieces concurrently")
     parser.add_argument("--repeat", type=int, default=1,
                         help="Run N batches using the same images and ONE initialized service; N=2 compares first/reused inference")
     parser.add_argument("--output-dir", type=Path)
@@ -420,8 +420,6 @@ def main() -> int:
         parser.error("The existing algorithm transport uses Windows named shared memory.")
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
-    if args.parallel and args.mode != "stream":
-        parser.error("--parallel only works with --mode stream")
     if args.repeat < 1:
         parser.error("--repeat must be positive")
     try:
@@ -441,8 +439,6 @@ def main() -> int:
             raise ValueError("--score-pool-kernel must be a positive odd integer")
         if args.silver_calibration is not None and not args.silver_calibration.is_file():
             raise FileNotFoundError(args.silver_calibration)
-        if args.threshold is not None and args.mode != "stream":
-            raise ValueError("--threshold is an inference request option and requires --mode stream")
         if isinstance(args.threshold, dict):
             allowed = {"chip_short", "chip_long"}
             unknown = set(args.threshold) - allowed
@@ -518,7 +514,7 @@ def main() -> int:
                                            "method": "sift_ransac"}
             print(f"\nBatch {index}/{args.repeat}: {current_id} | "
                   f"{'first inference' if index == 1 else 'reuse loaded models, NO initialization'}", flush=True)
-            detect_batch(client, args, paths, depth, envelope, pitch_settings=pitch_settings,
+            detect_batch(client, args, paths, depth, envelope, config=client_config,
                          pitch_preprocessor=depth_preprocessor)
             benchmark = envelope["benchmark"]
             benchmark.update(batch_index=index, process_pid=client.process.pid,

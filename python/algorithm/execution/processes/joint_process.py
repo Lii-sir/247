@@ -22,6 +22,7 @@ class JointMeasurementProcesses(RegistrationProcesses):
             return dict(arrays=arrays, instances=instances, piece_id=piece_id, piece=dict(piece),
                 registration=registration, correction=correction, height_config=asdict(height_config),
                 min_component_area=min_component_area, crop_roi=tuple(crop_roi), wire_rois=list(wire_rois),
-                entry={key: entry[key] for key in ("crop_box", "circle", "roi_boxes", "image_shape", "wire_roi_checks")
+                entry={key: entry[key] for key in ("crop_box", "circle", "roi_boxes", "image_shape",
+                                                  "wire_roi_checks", "height_order")
                        if key in entry}, metadata=metadata)
         return self.submit_task(preparation_pool, inputs, payload, timings, metadata, is_current, log)

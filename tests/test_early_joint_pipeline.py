@@ -3,7 +3,7 @@ import sys
 from pathlib import Path
 import threading
 import unittest
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -11,7 +11,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
 sys.path.insert(0, str(ROOT / "tests"))
 from algorithm.application.board.board_pipeline import BoardPipeline
-from pipeline_fakes import FakeDetector
+from algorithm.runtime.defect_plan import WIRE_HEIGHT, defect_orders, detection_order, evaluate_in_order
+from pipeline_fakes import FakeDetector, depth_piece_request
 
 
 class GatedDetector(FakeDetector):
@@ -53,84 +54,44 @@ class EarlyJointTests(unittest.TestCase):
         self.post.shutdown(wait=True)
         self.cpu.shutdown(wait=True)
 
-    def test_3d_runs_before_diagnostics_but_board_waits_for_final_ng(self):
-        board = self.pipeline.submit_3d(dict(board_id="A"))
+    def test_3d_waits_for_complete_diagnostics_and_merges_2d_ng(self):
         piece = self.pipeline.submit_2d(dict(board_id="A", piece_id=1, diagnostics_ng=True))
         self.assertTrue(self.detector.diagnostics_started.wait(1))
-        try:
-            self.assertTrue(self.detector.measured.wait(1), "3D waited for heavy 2D diagnostics")
-            self.assertFalse(piece.done())
-            self.assertFalse(board.done(), "board returned without final 2D diagnostics")
-        finally:
-            self.detector.diagnostics_gate.set()
+        depth = self.pipeline.submit_3d_piece(depth_piece_request("A"))
+        self.assertFalse(self.detector.depth_started.is_set())
+        self.assertFalse(depth.done())
+        self.detector.diagnostics_gate.set()
         self.assertTrue(piece.result(2)["ok"])
-        result = board.result(2)
+        result = depth.result(2)
         self.assertTrue(result["ok"])
-        self.assertFalse(result["results_board"]["is_ok"])
-        self.assertFalse(result["results_board"]["pieces"][0]["diagnostics_ok"])
+        self.assertFalse(result["results_piece"]["is_ok"])
+        self.assertFalse(result["results_piece"]["diagnostics_ok"])
         self.assertEqual(self.detector.closed_inputs, 1)
 
-    def test_3d_arriving_during_diagnostics_uses_early_input(self):
-        piece = self.pipeline.submit_2d(dict(board_id="A", piece_id=1))
-        self.assertTrue(self.detector.diagnostics_started.wait(1))
-        board = self.pipeline.submit_3d(dict(board_id="A"))
-        try:
-            self.assertTrue(self.detector.measured.wait(1))
-            self.assertFalse(board.done())
-        finally:
-            self.detector.diagnostics_gate.set()
-        self.assertTrue(piece.result(2)["ok"])
-        self.assertTrue(board.result(2)["ok"])
-
-    def test_diagnostics_exception_after_measurement_fails_board(self):
-        board = self.pipeline.submit_3d(dict(board_id="A"))
+    def test_diagnostics_exception_skips_waiting_depth(self):
         piece = self.pipeline.submit_2d(dict(board_id="A", piece_id=1, fail_diagnostics=True))
-        try:
-            self.assertTrue(self.detector.diagnostics_started.wait(1))
-            self.assertTrue(self.detector.measured.wait(1))
-        finally:
-            self.detector.diagnostics_gate.set()
-        self.assertFalse(piece.result(2)["ok"])
-        self.assertFalse(board.result(2)["ok"])
-        self.assertFalse(self.pipeline.has_pending)
-        self.assertEqual(self.detector.closed_inputs, 1)
-
-    def test_release_during_both_branches_does_not_resurrect_board(self):
-        board = self.pipeline.submit_3d(dict(board_id="A"))
-        piece = self.pipeline.submit_2d(dict(board_id="A", piece_id=1))
         self.assertTrue(self.detector.diagnostics_started.wait(1))
-        self.pipeline.release_board("A")
+        depth = self.pipeline.submit_3d_piece(depth_piece_request("A"))
         self.detector.diagnostics_gate.set()
-        self.assertEqual(board.result(2)["error"], "board_released")
         self.assertFalse(piece.result(2)["ok"])
+        self.assertEqual(depth.result(2)["results_piece"]["skip_3d_reason"], "missing_2d_result")
+        self.assertFalse(self.detector.depth_started.is_set())
         self.assertFalse(self.pipeline.has_pending)
-
-    def test_failure_before_3d_can_retry_without_stale_early_input(self):
-        self.detector.diagnostics_gate.set()
-        failed = self.pipeline.submit_2d(dict(board_id="A", piece_id=1,
-                                            fail_diagnostics=True, marker="old"))
-        self.assertFalse(failed.result(2)["ok"])
-        piece = self.pipeline.submit_2d(dict(board_id="A", piece_id=1, marker="new"))
-        self.assertTrue(piece.result(2)["ok"])
-        board = self.pipeline.submit_3d(dict(board_id="A"))
-        self.assertEqual(board.result(2)["results_board"]["pieces"][0]["marker"], "new")
 
     def test_completed_piece_replacement_cannot_pair_old_data_with_depth(self):
         self.detector.diagnostics_gate.set()
-        old = self.pipeline.submit_2d(dict(board_id="A", piece_id=1, marker="old"))
-        self.assertTrue(old.result(2)["ok"])
+        self.assertTrue(self.pipeline.submit_2d(dict(board_id="A", piece_id=1, marker="old")).result(2)["ok"])
         self.detector.gpu_gate.clear()
         self.detector.gpu_started.clear()
         replacement = self.pipeline.submit_2d(dict(board_id="A", piece_id=1, marker="new"))
         self.assertTrue(self.detector.gpu_started.wait(1))
-        board = self.pipeline.submit_3d(dict(board_id="A"))
+        depth = self.pipeline.submit_3d_piece(depth_piece_request("A"))
         try:
-            self.assertTrue(self.detector.depth_started.wait(1))
-            self.assertFalse(self.detector.measured.wait(0.05))
+            self.assertFalse(self.detector.depth_started.is_set())
         finally:
             self.detector.gpu_gate.set()
         self.assertTrue(replacement.result(2)["ok"])
-        self.assertEqual(board.result(2)["results_board"]["pieces"][0]["marker"], "new")
+        self.assertEqual(depth.result(2)["results_piece"]["marker"], "new")
 
     def test_boundary_work_overlaps_gpu_and_keeps_source_until_both_finish(self):
         boundary_started = threading.Event()
@@ -144,20 +105,17 @@ class EarlyJointTests(unittest.TestCase):
 
         self.detector.prepare_silver_boundary = boundary
         self.detector.diagnostics_gate.set()
-        board = self.pipeline.submit_3d(dict(board_id="A"))
         piece = self.pipeline.submit_2d(dict(board_id="A", piece_id=1))
         try:
             self.assertTrue(boundary_started.wait(1))
             self.assertTrue(self.detector.gpu_started.wait(1), "GPU waited for boundary preparation")
-            self.assertTrue(self.detector.measured.wait(1), "3D waited for boundary preparation")
-            self.assertEqual(self.detector.closed_inputs, 0)
             self.assertFalse(piece.done())
-            self.assertFalse(board.done())
+            self.assertEqual(self.detector.closed_inputs, 0)
         finally:
             boundary_gate.set()
         self.assertTrue(piece.result(2)["ok"])
-        self.assertTrue(board.result(2)["ok"])
         self.assertEqual(self.detector.closed_inputs, 1)
+
 
     def test_gpu_failure_waits_for_boundary_reader_before_releasing_source(self):
         boundary_started = threading.Event()
@@ -208,15 +166,12 @@ class DetectionPolicyTests(unittest.TestCase):
         import numpy as np
         import torch
         from algorithm.application.board import detect_board
-        from algorithm.application.defect_checks import detection_order
 
         self.module = detect_board
         self.detector = detector = detect_board.DetectBoard(lambda _: None)
         self.order = detection_order(["chip_rotation_2d", "silver_overflow_2d"])
         image = np.zeros((16, 16, 3), np.uint8)
         detector.expected_piece_count = 1
-        detector.segmentation_config = detect_board.SegmentationConfig(
-            expected_piece_count=1, mode="fixed", fixed_rois=((0, 0, 16, 16),))
         detector.model = object()
         detector.chip_anomaly_inspector = Mock()
         detector._read_2d = Mock(return_value=image)
@@ -230,22 +185,22 @@ class DetectionPolicyTests(unittest.TestCase):
         detector._predict_batch = Mock(return_value=[self.prediction])
         detector.submit_registration = Mock(side_effect=AssertionError("3D registration must be skipped"))
         detector.submit_joint_measurement = Mock(side_effect=AssertionError("3D heights must be skipped"))
+        detector.submit_2d_postprocess = Mock(side_effect=lambda pool, *args: pool.submit(lambda: None))
 
     def run_stream(self):
         with ThreadPoolExecutor(2) as cpu, ThreadPoolExecutor(1) as gpu:
             pipeline = BoardPipeline(self.detector, cpu, gpu)
             self.addCleanup(pipeline.close)
-            board = pipeline.submit_3d({"board_id": "A"})
             piece = pipeline.submit_2d({"board_id": "A", "piece_id": 1}).result(3)
             self.assertTrue(piece["ok"], piece)
-            response = board.result(3)
+            response = pipeline.submit_3d_piece(depth_piece_request("A")).result(3)
             self.assertTrue(response["ok"], response)
             self.assertFalse(pipeline.has_pending)
-            return piece["results_2d"], response["results_board"]
+            return piece["results_2d"], response["results_piece"]
 
     def assert_3d_skipped(self, result, reason):
         self.assertFalse(result["is_ok"])
-        piece, = result["pieces"]
+        piece = result
         self.assertEqual(piece["skip_3d_reason"], reason)
         self.assertEqual(piece["registration"], {"is_valid": False, "status": "skipped"})
         self.assertEqual(piece["wire_measurements"], [])
@@ -307,7 +262,6 @@ class DetectionPolicyTests(unittest.TestCase):
         self.detector.submit_registration.assert_not_called()
 
     def test_priority_continues_after_pass_and_skips_later_checks(self):
-        from algorithm.application.defect_checks import detection_order, evaluate_in_order
         rotation, silver, *later = self.order
         checks = {name: Mock(return_value={"is_ok": True}) for name in self.order}
         checks[silver].return_value = {"status": "uncertain", "is_ok": None}
@@ -322,13 +276,148 @@ class DetectionPolicyTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 detection_order(invalid)
 
-    def test_batch_empty_masks_skips_synchronous_registration(self):
-        self.prediction.masks = None
-        with patch.object(self.module, "register_platform_masks") as register:
-            response = self.detector.handle_detect({"images_2d": [{"piece_id": 1}], "image_3d": {}})
+    def test_selected_sequence_preserves_order_within_each_stage(self):
+        rotation = "chip_rotation_2d"
+        self.assertEqual(defect_orders({}), (None, None))
+        self.assertEqual(defect_orders({"defect_sequence": []}), ((), ()))
+        self.assertEqual(defect_orders({"defect_sequence": [WIRE_HEIGHT]}), ((), (WIRE_HEIGHT,)))
+        self.assertEqual(defect_orders({"defect_sequence": [rotation]}), ((rotation,), ()))
+        self.assertEqual(defect_orders({"defect_sequence": [WIRE_HEIGHT, rotation]}), ((rotation,), (WIRE_HEIGHT,)))
+        self.assertEqual(defect_orders({"defect_sequence": None}), (None, None))
+        for sequence in ("invalid", [rotation, rotation], ["unknown"]):
+            with self.subTest(sequence=sequence), self.assertRaisesRegex(ValueError, "defect_sequence"):
+                defect_orders({"defect_sequence": sequence})
+
+    def test_selected_2d_checks_stop_single_piece_3d_without_reading_depth(self):
+        detector = self.detector
+        rotation, silver = "chip_rotation_2d", "silver_overflow_2d"
+        detector.defect_order, detector.height_order = defect_orders(
+            {"defect_sequence": [rotation, silver, WIRE_HEIGHT]})
+        detector.skip_3d_on_2d_ng = True
+        detector.chip_alignment_config = {}
+        detector.silver_config = {"overflow": {}}
+        with ThreadPoolExecutor(2) as cpu, ThreadPoolExecutor(1) as gpu, \
+             patch.object(self.module._chip_alignment, "measure_chip_alignment",
+                          return_value={"enabled": True, "status": "ng", "is_ok": False}), \
+             patch.object(self.module._silver_inspection, "inspect_masks", return_value=dict(
+                 enabled=True, silver_overflow=dict(status="ok", is_ok=True),
+                 disconnection=dict(status="disabled", is_ok=None))) as check_silver, \
+             patch.object(detector, "_check_wires") as check_wires:
+            pipeline = BoardPipeline(detector, cpu, gpu)
+            self.addCleanup(pipeline.close)
+            response = pipeline.submit_2d(dict(board_id="A", piece_id=1)).result(3)
+            self.assertTrue(response["ok"], response)
+            two_d = response["results_2d"]
+            self.assertEqual(two_d["first_ng_check"], rotation)
+            self.assertEqual(two_d[silver]["status"], "ok")
+            self.assertEqual(two_d["wire_bending_2d"]["status"], "disabled")
+            result = pipeline.submit_3d_piece(dict(
+                board_id="A", piece_id=1, shm_name="unopened_depth",
+                data_size=512, image_width=16, image_height=16)).result(3)
+            self.assertFalse(pipeline.has_pending)
+        self.assertTrue(result["ok"], result)
+        piece = result["results_piece"]
+        self.assertEqual(piece["skip_3d_reason"], "2d_ng")
+        self.assertEqual(piece["defect_checks_3d"][WIRE_HEIGHT]["status"], "skipped")
+        self.assertFalse(piece["is_ok"])
+        check_silver.assert_called_once()
+        check_wires.assert_not_called()
+        detector._read_3d.assert_not_called()
+        detector.submit_registration.assert_not_called()
+
+    def test_gate_only_controls_3d_for_the_matching_piece(self):
+        detector = self.detector
+        detector.expected_piece_count = 2
+        detector.skip_3d_on_2d_ng = True
+        detector.defect_order, detector.height_order = defect_orders(
+            {"defect_sequence": ["silver_overflow_2d", WIRE_HEIGHT]})
+
+        def silver(pool, inputs, prepared, timings, metadata, is_current):
+            passed = prepared["piece_id"] == 2
+            overflow = dict(status="ok" if passed else "overflow", is_ok=passed)
+            return pool.submit(lambda: dict(
+                diagnostics=dict(enabled=True, silver_overflow=overflow,
+                                 disconnection=dict(status="disabled", is_ok=None)),
+                public_instances=[], mask_postprocess_ms=0., cpu_2d_worker={}))
+
+        def joint(state, piece, entry, depth, correction, inputs, timings, request_id):
+            timings.update(registration_queue_ms=0., registration_phase_ms=0., joint_measurement_phase_ms=0.)
+            completed = Future()
+            completed.set_result(dict(piece_id=piece["piece_id"], registration=dict(is_valid=True), is_ok=True))
+            return completed
+
+        with ThreadPoolExecutor(2) as cpu, ThreadPoolExecutor(1) as gpu:
+            pipeline = BoardPipeline(detector, cpu, gpu)
+            self.addCleanup(pipeline.close)
+            with patch.object(detector, "submit_2d_postprocess", side_effect=silver), \
+                 patch.object(pipeline, "_submit_joint", side_effect=joint) as measured:
+                first, second = (pipeline.submit_2d(dict(board_id="A", piece_id=pid)) for pid in (1, 2))
+                self.assertFalse(first.result(3)["results_2d"]["is_ok"])
+                self.assertTrue(second.result(3)["results_2d"]["is_ok"])
+                rejected, passed = (pipeline.submit_3d_piece(depth_piece_request("A", pid)).result(3)["results_piece"]
+                                    for pid in (1, 2))
+                self.assertEqual(rejected["skip_3d_reason"], "2d_ng")
+                self.assertTrue(passed["is_ok"])
+                measured.assert_called_once()
+                self.assertEqual(measured.call_args.args[1]["piece_id"], 2)
+
+                detector.skip_3d_on_2d_ng = False
+                self.assertFalse(pipeline.submit_2d(dict(board_id="A", piece_id=1)).result(3)["results_2d"]["is_ok"])
+                result = pipeline.submit_3d_piece(depth_piece_request("A")).result(3)["results_piece"]
+                self.assertEqual(result["first_ng_check"], "silver_overflow_2d")
+                self.assertFalse(result["is_ok"])
+                self.assertEqual(measured.call_count, 2)
+
+
+    def test_only_2d_checks_pass_the_board_without_3d_registration(self):
+        rotation = "chip_rotation_2d"
+        self.detector.defect_order, self.detector.height_order = defect_orders(
+            {"defect_sequence": [rotation]})
+        self.detector.chip_alignment_config = {}
+        with patch.object(self.module._chip_alignment, "measure_chip_alignment",
+                          return_value={"enabled": True, "status": "ok", "is_ok": True}):
+            two_d, board = self.run_stream()
+        self.assertTrue(two_d["is_ok"])
+        self.assertTrue(board["is_ok"])
+        piece = board
+        self.assertEqual(piece["skip_3d_reason"], "no_3d_checks")
+        self.assertTrue(all(check["status"] == "disabled" for check in piece["defect_checks_3d"].values()))
+        self.detector.submit_registration.assert_not_called()
+        self.detector.submit_joint_measurement.assert_not_called()
+
+    def test_only_3d_checks_keep_segmentation_without_any_2d_defect_checks(self):
+        self.detector.defect_order, self.detector.height_order = defect_orders(
+            {"defect_sequence": [WIRE_HEIGHT]})
+        with ThreadPoolExecutor(2) as cpu, ThreadPoolExecutor(1) as gpu, \
+             patch.object(self.detector, "_check_wires") as check_wires, \
+             patch.object(self.module._chip_alignment, "measure_chip_alignment") as check_rotation:
+            pipeline = BoardPipeline(self.detector, cpu, gpu)
+            self.addCleanup(pipeline.close)
+            response = pipeline.submit_2d(dict(board_id="A", piece_id=1)).result(3)
         self.assertTrue(response["ok"], response)
-        self.assert_3d_skipped(response["results_board"], "no_2d_result")
-        register.assert_not_called()
+        two_d = response["results_2d"]
+        self.assertTrue(two_d["is_ok"])
+        self.assertTrue(two_d["instances"])
+        self.assertEqual(two_d["wire_bending_2d"]["status"], "disabled")
+        self.assertEqual(two_d["chip_rotation_2d"]["status"], "disabled")
+        check_wires.assert_not_called()
+        check_rotation.assert_not_called()
+        self.detector.chip_anomaly_inspector.inspect.assert_not_called()
+
+    def test_independent_inspection_policy_loaded_for_joint_initialization(self):
+        import json
+        from algorithm.runtime.config import load_runtime_config
+
+        manifest = ROOT / "config" / "config.json"
+        config = load_runtime_config(manifest.read_text(encoding="utf-8-sig"), str(manifest))
+        self.assertIn("inspection", config)
+        self.assertNotIn("skip_3d_on_2d_ng", config["common_2d"]["parameters"])
+        config["inspection"] = {"defect_sequence": [WIRE_HEIGHT], "skip_3d_on_2d_ng": True}
+        self.detector.config_path = str(manifest)
+        self.detector._load_config(json.dumps(config))
+        self.assertEqual(self.detector.defect_order, ())
+        self.assertEqual(self.detector.height_order, (WIRE_HEIGHT,))
+        self.assertTrue(self.detector.skip_3d_on_2d_ng)
 
 
 if __name__ == "__main__":

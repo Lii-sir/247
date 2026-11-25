@@ -1,7 +1,6 @@
 # 2D 配置
 
-2D 配置采用“功能块存在即启用”的结构，不再配置 `enabled`。每个功能块包含
-`description` 与 `parameters`；现场只需修改参数内容。
+每个 2D 功能块包含 `description` 和 `parameters`。项目启用与 3D 跳过规则参见[检测策略](../README.md#检测策略)。
 
 - `common_2d.parameters`：圆搜索、检测裁剪、板级 2D 兜底裁剪/引线 ROI、
   竖向分割、掩码和 YOLO 参数。
@@ -11,19 +10,6 @@
 - `silver_overflow_2d.parameters`：检测 ROI 四边内缩生成的银浆允许边界、容差和最小缺陷面积。
 - `chip_rotation_2d.parameters`：芯片外接矩形角度阈值。
 - `chip_anomaly_2d.parameters`：芯片外观异常和 EfficientAD 模型区间映射。
-
-## 缺陷检测优先级
-
-在 `common_2d.parameters` 中设置 `defect_priority`，修改后重新初始化算法。例如：
-
-```json
-"defect_priority": ["chip_rotation_2d", "wire_bending_2d"]
-```
-
-列表按从左到右的顺序执行。已启用但未列出的检测随后执行，默认顺序依次为引线弯曲、芯片旋转、
-芯片外观、银浆溢出、银浆断连。空列表沿用默认检测流程。优先级按片生效，YOLO 分割仍是各项检测的共同输入。
-首项 NG 写入 `first_ng_check`，后续已启用项目返回 `status=skipped` 和 `is_ok=null`。
-联合检测会跳过该片的 3D 配准和测高，其余片独立处理。
 
 引线弯曲使用清理后的单个 `wire/thin` 实例，在重叠像素最多的 ROI 中寻找两端与边界的接触区间，
 各取两个端点连接成评估四边形。ROI 为 `[x1,x2) × [y1,y2)`，右/下边界像素为 `x2-1/y2-1`。

@@ -1,4 +1,4 @@
-"""Streaming board flow: circle-relative 2D pieces, 3D split and alignment."""
+"""Circle-relative 2D and joint 3D inspection of individual pieces."""
 from __future__ import annotations
 
 import gc
@@ -19,8 +19,8 @@ import torch.nn.functional as torch_functional
 from algorithm.runtime.config import (
     DEFAULT_ALGORITHM_PARAMETERS,
     feature_parameters,
+    inspection_parameters,
     load_runtime_config,
-    parse_config_text,
 )
 from algorithm.vision3d.measurement.height_measurement import (
     HeightConfig,
@@ -37,7 +37,6 @@ from algorithm.vision3d.measurement.height_measurement import (
 )
 from algorithm.vision3d.alignment.registration import (
     RegistrationConfig,
-    affine_coordinate_context,
     align_crop_mask_to_depth,
     platform_mask_2d,
     platform_mask_3d,
@@ -45,7 +44,6 @@ from algorithm.vision3d.alignment.registration import (
     register_arrays,
     register_platform_masks,
 )
-from algorithm.vision3d.depth.segment import PieceCountMismatchError, SegmentationConfig, segment_depth_image
 from algorithm.vision2d import (
     chip_alignment as _chip_alignment,
     chip_anomaly as _chip_anomaly,
@@ -60,9 +58,11 @@ from transport.shared_memory import read_shared_memory, SharedImage
 from algorithm.runtime.timing import timed_call, measure, note, record_duration, current_timings
 from algorithm.execution.instance_tasks import InstanceTasks
 from algorithm.vision3d.measurement.joint_geometry import JointGeometry
-from algorithm.application.board.board_depth import read_board_depth
-from algorithm.application.board.board_results import board_results, join_piece_diagnostics, skipped_3d_piece
-from algorithm.application.defect_checks import detection_order, evaluate_in_order, silver_check, wire_bending_result
+from algorithm.application.board.board_results import join_piece_diagnostics
+from algorithm.application.defect_checks import silver_check, wire_bending_result
+from algorithm.runtime.defect_plan import (
+    CHECKS_2D, defect_orders, evaluate_in_order, failed_check, require_configured_checks, unrun_checks,
+)
 
 
 class DetectBoard(JointGeometry):
@@ -83,7 +83,6 @@ class DetectBoard(JointGeometry):
         self.wire_rois = [(280, 350, 1120, 520), (380, 1400, 1230, 2460)]
         self.rectangle_ratio_threshold = 0.75
         self.yolo_parameters = dict(DEFAULT_ALGORITHM_PARAMETERS)
-        self.segmentation_config = SegmentationConfig(expected_piece_count=10)
         self.registration_config = RegistrationConfig()
         self.height_config = HeightConfig()
         self.dynamic_affine_config: Dict[str, Any] = {}
@@ -95,7 +94,8 @@ class DetectBoard(JointGeometry):
         self.chip_alignment_config: Dict[str, Any] = {}
         self.chip_anomaly_config: Dict[str, Any] = {"configured": False}
         self.chip_anomaly_inspector = None
-        self.defect_order = ()
+        self.defect_order = self.height_order = None
+        self.skip_3d_on_2d_ng = False
         # Streaming mode stores only decoded/preprocessed 2D data and YOLO
         # masks.  The source shared-memory block is read synchronously and is
         # never retained by Python.
@@ -255,7 +255,11 @@ class DetectBoard(JointGeometry):
         self.config = config
 
         common_2d = feature_parameters(config, "common_2d")
-        self.defect_order = detection_order(common_2d.get("defect_priority", []))
+        policy = inspection_parameters(config, common_2d)
+        self.defect_order, self.height_order = defect_orders(policy)
+        self.skip_3d_on_2d_ng = policy.get("skip_3d_on_2d_ng", False)
+        if type(self.skip_3d_on_2d_ng) is not bool:
+            raise ValueError("inspection.skip_3d_on_2d_ng must be a boolean")
         common_3d = feature_parameters(config, "common_3d")
         input_config = _dict(common_3d.get("input"), "common_3d.parameters.input")
         self.expected_piece_count = int(input_config.get("piece_count", 10))
@@ -291,15 +295,6 @@ class DetectBoard(JointGeometry):
             if key in allowed
         }
 
-        segmentation_values = _dict(
-            feature_parameters(config, "segmentation_3d"),
-            "segmentation_3d.parameters",
-        )
-        self.segmentation_config = SegmentationConfig.from_dict(segmentation_values)
-        if self.segmentation_config.expected_piece_count != self.expected_piece_count:
-            raise ValueError(
-                "input.piece_count and segmentation_3d.expected_piece_count must match"
-            )
         self.registration_config = RegistrationConfig.from_dict(
             _dict(
                 feature_parameters(config, "registration_3d"),
@@ -338,7 +333,20 @@ class DetectBoard(JointGeometry):
         raw_chip_anomaly = feature_parameters(
             config, "chip_anomaly_2d", required=False
         )
+        if self.height_order is not None and "chip_anomaly_2d" not in self.defect_order:
+            raw_chip_anomaly = None
         self.chip_anomaly_config = _chip_anomaly.validate_config(raw_chip_anomaly)
+        if self.height_order is not None:
+            require_configured_checks(self.defect_order, {
+                "chip_rotation_2d": raw_chip_alignment is not None,
+                "chip_anomaly_2d": self.chip_anomaly_config.get("configured"),
+                "silver_overflow_2d": raw_overflow is not None,
+                "silver_continuity_2d": raw_continuity is not None,
+            })
+            self.silver_config = {
+                "overflow": raw_overflow if "silver_overflow_2d" in self.defect_order else None,
+                "continuity": raw_continuity if "silver_continuity_2d" in self.defect_order else None,
+            }
         self.dynamic_affine_config = dict(
             feature_parameters(config, "dynamic_affine_3d") or {}
         )
@@ -390,7 +398,9 @@ class DetectBoard(JointGeometry):
             crop, crop_box, circle, roi_boxes = timed_call("roi_prepare_ms", self._stream_crop, image)
             crop = timed_call("roi_copy_ms", crop.copy)
             circle_crop_ms = self.elapsed_ms(circle_start)
-            registration_mask = timed_call("platform_mask_2d_ms", platform_mask_2d, image, self.registration_config)
+            registration_mask = None
+            if self.height_order != ():
+                registration_mask = timed_call("platform_mask_2d_ms", platform_mask_2d, image, self.registration_config)
         except Exception:
             image = None
             if owner is not None:
@@ -478,7 +488,8 @@ class DetectBoard(JointGeometry):
                 "mask_extract_to_cpu_ms", self._extract_instances,
                 predictions[0], crop.shape[:2],
             )
-            if not self.defect_order:
+            if (self.defect_order is None or
+                    (self.height_order is not None and instances and "chip_anomaly_2d" in self.defect_order)):
                 prepared["chip_anomaly_diagnostics"] = timed_call(
                     "efficientad_total_ms", inspector.inspect,
                     image, instances, crop_box, threshold=prepared.get("threshold"),
@@ -522,13 +533,25 @@ class DetectBoard(JointGeometry):
     def prepare_joint_piece(self, prepared: Dict[str, Any]) -> Dict[str, Any]:
         """Build immutable joint inputs after inference, before heavy diagnostics."""
         crop_box, instances = prepared["crop_box"], prepared["instances"]
-        wire_measurements, wire_roi_checks = self._check_wires(prepared)
-        chip_diagnostics = timed_call("chip_rotation_ms", _chip_alignment.measure_chip_alignment,
-            instances, self.chip_alignment_config, crop_box[:2])
+        selection = self.defect_order if getattr(self, "height_order", None) is not None else None
+        checks = unrun_checks(selection, CHECKS_2D) if selection is not None else {}
+        wire_measurements, wire_roi_checks = [], []
+        if selection is None or (instances and "wire_bending_2d" in selection):
+            wire_measurements, wire_roi_checks = self._check_wires(prepared)
+            if selection is not None:
+                checks["wire_bending_2d"] = wire_bending_result(wire_measurements, wire_roi_checks)
+        chip_diagnostics = checks.get("chip_rotation_2d")
+        if selection is None or (instances and "chip_rotation_2d" in selection):
+            chip_diagnostics = timed_call("chip_rotation_ms", _chip_alignment.measure_chip_alignment,
+                instances, self.chip_alignment_config, crop_box[:2])
+        appearance = prepared.get("chip_anomaly_diagnostics", checks.get("chip_anomaly_2d"))
+        if selection is not None:
+            checks.update(chip_rotation_2d=chip_diagnostics, chip_anomaly_2d=appearance)
+            prepared["selected_checks"] = checks
         entry = self._build_2d_entry(prepared, wire_measurements, wire_roi_checks,
-                                     chip_diagnostics, prepared["chip_anomaly_diagnostics"])
+                                      chip_diagnostics, appearance)
         prepared["joint_entry"] = entry
-        return {**entry, "instances": [dict(item) for item in instances]}
+        return entry
 
     def _check_wires(self, prepared):
         instances, roi_boxes, crop_box = (prepared[key] for key in ("instances", "roi_boxes", "crop_box"))
@@ -556,18 +579,23 @@ class DetectBoard(JointGeometry):
             "chip_anomaly_2d": chip_anomaly_diagnostics,
             "received_at": time.time(),
         }
+        height_order = getattr(self, "height_order", None)
+        if height_order is not None:
+            entry["height_order"] = height_order
         if first_ng is not None:
             entry["first_ng_check"] = first_ng
         if not instances:
             entry["skip_3d_reason"] = "no_2d_result"
-        elif first_ng is not None:
+        elif first_ng is not None and (height_order is None or self.skip_3d_on_2d_ng):
             entry["skip_3d_reason"] = "2d_ng"
+        elif height_order == ():
+            entry["skip_3d_reason"] = "no_3d_checks"
         else:
             entry["gray_image"] = self._prepared_gray_image(prepared)
             entry["registration_mask"] = prepared["registration_mask"]
         return entry
 
-    def _run_ordered_checks(self, prepared):
+    def _2d_check_functions(self, prepared):
         image, instances, crop_box = (prepared[key] for key in ("image", "instances", "crop_box"))
 
         def anomaly():
@@ -581,7 +609,7 @@ class DetectBoard(JointGeometry):
                                 base_dir=self._silver_config_base_dir())
 
         overflow, continuity = self.silver_config.get("overflow"), self.silver_config.get("continuity")
-        checks = {
+        return {
             "wire_bending_2d": lambda: wire_bending_result(*self._check_wires(prepared)),
             "chip_rotation_2d": (lambda: timed_call("chip_rotation_ms", _chip_alignment.measure_chip_alignment,
                 instances, self.chip_alignment_config, crop_box[:2])) if self.chip_alignment_config is not None else None,
@@ -589,10 +617,13 @@ class DetectBoard(JointGeometry):
             "silver_overflow_2d": (lambda: silver("silver_overflow_2d", overflow)) if overflow is not None else None,
             "silver_continuity_2d": (lambda: silver("silver_continuity_2d", continuity)) if continuity is not None else None,
         }
-        return evaluate_in_order(self.defect_order, checks)
 
     def _ordered_2d_entry(self, prepared):
-        diagnostics, first_ng = self._run_ordered_checks(prepared)
+        if self.skip_3d_on_2d_ng and not prepared["instances"]:
+            diagnostics, first_ng = unrun_checks(self.defect_order, CHECKS_2D), None
+        else:
+            diagnostics, first_ng = evaluate_in_order(
+                self.defect_order, self._2d_check_functions(prepared))
         wire = diagnostics["wire_bending_2d"]
         entry = self._build_2d_entry(
             prepared, wire.get("measurements", []), wire.get("roi_checks", []),
@@ -602,8 +633,7 @@ class DetectBoard(JointGeometry):
                      silver_continuity_2d=diagnostics["silver_continuity_2d"])
         return entry, diagnostics
 
-    def finish_2d_piece(self, prepared: Dict[str, Any], *, publish_cache: bool = True,
-                        on_joint_ready=None):
+    def finish_2d_piece(self, prepared: Dict[str, Any], *, publish_cache: bool = True):
         """Publish full 2D results only after all independent branches finish."""
         start, board_id, piece_id = (prepared[key] for key in ("start", "board_id", "piece_id"))
         image, crop, crop_box, circle, roi_boxes = (
@@ -612,7 +642,7 @@ class DetectBoard(JointGeometry):
             prepared[key] for key in ("read_decode_ms", "circle_crop_ms", "inference_ms"))
         postprocess_start = time.perf_counter()
         ordered = None
-        if getattr(self, "defect_order", ()):
+        if getattr(self, "defect_order", None) is not None and getattr(self, "height_order", None) is None:
             prepared["joint_entry"], ordered = self._ordered_2d_entry(prepared)
         if "joint_entry" not in prepared:
             self.prepare_joint_piece(prepared)
@@ -620,8 +650,7 @@ class DetectBoard(JointGeometry):
         instances = entry["instances"]
         wire_measurements, wire_roi_checks = entry["wire_measurements"], entry["wire_roi_checks"]
         chip_diagnostics, chip_anomaly_diagnostics = entry["chip_rotation_2d"], entry["chip_anomaly_2d"]
-        if on_joint_ready is not None and not entry.get("skip_3d_reason"):
-            on_joint_ready({**entry, "instances": [dict(item) for item in instances]})
+        gate_3d = getattr(self, "skip_3d_on_2d_ng", False)
         computed = prepared.get("cpu_2d_result")
         if ordered is not None:
             diagnostics = dict(enabled=True, silver_overflow=ordered["silver_overflow_2d"],
@@ -643,16 +672,18 @@ class DetectBoard(JointGeometry):
             diagnostics = computed["diagnostics"]
             postprocess_ms = computed["mask_postprocess_ms"]
 
+        selected = prepared.get("selected_checks")
+        if selected is not None:
+            diagnostics = dict(diagnostics)
+            for output, name in (("silver_overflow", "silver_overflow_2d"), ("disconnection", "silver_continuity_2d")):
+                if instances and name in self.defect_order:
+                    selected[name] = {"enabled": True, **diagnostics[output]}
+                diagnostics[output] = selected[name]
+            first_ng = next((name for name in self.defect_order if failed_check(selected[name])), None)
+            if first_ng is not None:
+                entry["first_ng_check"] = first_ng
         entry.update(silver_overflow_2d=diagnostics["silver_overflow"],
                      silver_continuity_2d=diagnostics["disconnection"])
-        replaced = False
-        cache_state = {}
-        if publish_cache:
-            with self._piece_cache_lock:
-                board_cache = self._piece_cache.setdefault(board_id, {})
-                replaced = piece_id in board_cache
-                board_cache[piece_id] = entry
-                cache_state = self._cache_state_locked(board_id)
         public_instances = (computed["public_instances"] if computed is not None else
                             timed_call("public_2d_geometry_ms", self._public_2d_instances, instances, crop_box))
         total_ms = self.elapsed_ms(start)
@@ -671,6 +702,22 @@ class DetectBoard(JointGeometry):
                 and check.get("is_ok") is not True
             ):
                 checks.append(False)
+        has_explicit_checks = ordered is not None or selected is not None
+        is_ok = bool(instances) and ("first_ng_check" not in entry if has_explicit_checks else all(checks))
+        if gate_3d:
+            if instances and not is_ok:
+                entry["skip_3d_reason"] = "2d_ng"
+                entry.pop("gray_image", None)
+                entry.pop("registration_mask", None)
+        replaced = False
+        cache_state = {}
+        if publish_cache:
+            with self._piece_cache_lock:
+                board_cache = self._piece_cache.setdefault(board_id, {})
+                replaced = piece_id in board_cache
+                board_cache[piece_id] = entry
+                cache_state = self._cache_state_locked(board_id)
+        wire_diagnostics = ordered if ordered is not None else selected
         response = {
             "ok": True,
             "cmd": "detect_2d_piece",
@@ -678,7 +725,7 @@ class DetectBoard(JointGeometry):
             "board_id": board_id,
             "piece_id": piece_id,
             "results_2d": {
-                "is_ok": bool(instances) and ("first_ng_check" not in entry if ordered is not None else all(checks)),
+                "is_ok": is_ok,
                 "circle": ({"x": circle[0], "y": circle[1], "radius": circle[2]}
                            if circle is not None else None),
                 "crop_box": list(crop_box),
@@ -692,7 +739,7 @@ class DetectBoard(JointGeometry):
                 "instances": public_instances,
                 "wire_measurements": wire_measurements,
                 "wire_roi_checks": wire_roi_checks,
-                "wire_bending_2d": ordered["wire_bending_2d"] if ordered is not None else {
+                "wire_bending_2d": wire_diagnostics["wire_bending_2d"] if wire_diagnostics is not None else {
                     "enabled": True,
                     "is_ok": bool(wire_roi_checks) and all(
                         item["is_ok"] for item in wire_roi_checks
@@ -722,67 +769,6 @@ class DetectBoard(JointGeometry):
         if "first_ng_check" in entry:
             response["results_2d"]["first_ng_check"] = entry["first_ng_check"]
         return response if publish_cache else (response, entry)
-
-    def handle_detect_3d_board(self, req: Dict[str, Any]) -> Dict[str, Any]:
-        """Consume one 3D board against the currently cached 2D results."""
-        start = time.perf_counter()
-        try:
-            board_id = self._stream_board_id(req)
-        except ValueError as exc:
-            return self._stream_failure("invalid_board_id", str(exc), board_id="")
-        try:
-            with self._piece_cache_lock:
-                entries = self._piece_cache.pop(board_id, {})
-
-            scan = read_board_depth(req, self._read_3d, self.segmentation_config,
-                                    self.expected_piece_count, segment=segment_depth_image)
-
-            align_start = time.perf_counter()
-            results = []
-            for piece in scan.pieces:
-                piece_id = int(piece["piece_id"])
-                entry = entries.get(piece_id)
-                reason = "missing_2d_result" if entry is None else entry.get("skip_3d_reason")
-                if reason:
-                    result = skipped_3d_piece(piece, scan.correction, reason, entry)
-                    if entry is not None:
-                        result = self.finalize_joint_piece(result, entry)
-                else:
-                    result = self.measure_prepared_piece(piece_id, entry, scan.image, piece, scan.correction)
-                results.append(result)
-            alignment_ms = self.elapsed_ms(align_start)
-            total_ms = self.elapsed_ms(start)
-            return {
-                "ok": True,
-                "cmd": "detect_3d_board",
-                "stage": "3d",
-                "board_id": board_id,
-                "batch_id": board_id,
-                "results_board": board_results(results, scan.correction),
-                "missing_piece_ids": [piece["piece_id"] for piece in results
-                                      if piece.get("skip_3d_reason") == "missing_2d_result"],
-                "released": {
-                    "board_id": board_id,
-                    "released_2d_count": len(entries),
-                    "released_3d": True,
-                },
-                "elapsed_ms": total_ms,
-                "timings": {
-                    "shared_memory_read_ms": scan.read_ms,
-                    "segmentation_3d_ms": scan.segmentation_ms,
-                    "registration_and_mask_alignment_ms": alignment_ms,
-                    "total_detect_ms": total_ms,
-                },
-                "message": "3D board aligned with cached 2D piece masks",
-            }
-        except PieceCountMismatchError as exc:
-            return self._stream_failure(
-                "piece_count_mismatch", str(exc), board_id=board_id
-            )
-        except (ValueError, OSError, RuntimeError) as exc:
-            return self._stream_failure(
-                "3d_board_failed", str(exc), board_id=board_id
-            )
 
     def measure_prepared_piece(self, piece_id: int, entry: Dict[str, Any],
                                depth: np.ndarray, piece: Dict[str, Any],
@@ -912,8 +898,8 @@ class DetectBoard(JointGeometry):
             state = self._cache_state_locked(board_id)
         response: Dict[str, Any] = {
             "ok": False,
-            "cmd": "detect_2d_piece" if piece_id is not None else "detect_3d_board",
-            "stage": "2d" if piece_id is not None else "3d",
+            "cmd": "detect_2d_piece" if piece_id is not None else "release_board",
+            "stage": "2d" if piece_id is not None else "board",
             "error": error,
             "message": message,
             "board_id": board_id,
@@ -924,148 +910,6 @@ class DetectBoard(JointGeometry):
         if missing_piece_ids is not None:
             response["missing_piece_ids"] = missing_piece_ids
         return response
-
-    def handle_detect(self, req: Dict[str, Any]) -> Dict[str, Any]:
-        start = time.perf_counter()
-        try:
-            descriptors = self._validate_descriptors(req.get("images_2d"))
-            depth_descriptor = _dict(req.get("image_3d"), "image_3d")
-
-            read_start = time.perf_counter()
-            crops = []
-            registration_masks = []
-            image_shapes = []
-            crop_metadata = []
-            gray_images = []
-            ordered_sources = []
-            for descriptor in descriptors:
-                image = self._read_2d(descriptor)
-                if self.defect_order:
-                    ordered_sources.append(image)
-                image_shapes.append([int(image.shape[1]), int(image.shape[0])])
-                registration_masks.append(platform_mask_2d(image, self.registration_config))
-                crop, crop_box, circle, roi_boxes = self._stream_crop(image)
-                crops.append(crop.copy())
-                crop_metadata.append((crop_box, circle, roi_boxes))
-                gray_images.append(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
-            read_2d_ms = self.elapsed_ms(read_start)
-            scan = read_board_depth(depth_descriptor, self._read_3d, self.segmentation_config,
-                                    self.expected_piece_count, segment=segment_depth_image)
-            depth, pitch_correction = scan.image, scan.correction
-
-            if self.model is None:
-                raise RuntimeError("YOLO model is not initialized")
-            inference_start = time.perf_counter()
-            self._synchronize_model()
-            predictions = self._predict_batch(crops)
-            self._synchronize_model()
-            inference_ms = self.elapsed_ms(inference_start)
-            if len(predictions) != self.expected_piece_count:
-                raise RuntimeError(
-                    f"YOLO returned {len(predictions)} results for "
-                    f"{self.expected_piece_count} images"
-                )
-
-            align_start = time.perf_counter()
-            results = []
-            for index, (descriptor, crop, prediction, piece) in enumerate(
-                zip(descriptors, crops, predictions, scan.pieces)
-            ):
-                crop_box, circle, roi_boxes = crop_metadata[index]
-                instances = self._extract_instances(prediction, crop.shape[:2])
-                if self.defect_order:
-                    entry, _ = self._ordered_2d_entry(dict(
-                        piece_id=int(descriptor["piece_id"]), image=ordered_sources[index], crop=crop,
-                        instances=instances, crop_box=crop_box, circle=circle, roi_boxes=roi_boxes,
-                        gray_image=gray_images[index], registration_mask=registration_masks[index],
-                        threshold=descriptor.get("threshold"),
-                    ))
-                    ordered_sources[index] = None
-                    reason = entry.get("skip_3d_reason")
-                    if reason:
-                        result = skipped_3d_piece(piece, pitch_correction, reason, entry)
-                        results.append(self.finalize_joint_piece(result, entry))
-                    else:
-                        results.append(self.measure_prepared_piece(
-                            entry["piece_id"], entry, depth, piece, pitch_correction))
-                    continue
-                if not instances:
-                    results.append(skipped_3d_piece(piece, pitch_correction, "no_2d_result", {
-                        "image_shape": image_shapes[index], "crop_box": crop_box,
-                        "roi_boxes": roi_boxes,
-                    }))
-                    continue
-                y1, y2 = int(piece["y1"]), int(piece["y2"])
-                local_depth = depth[y1:y2]
-                registration = register_platform_masks(
-                    registration_masks[index],
-                    platform_mask_3d(local_depth, self.registration_config),
-                    self.registration_config,
-                )
-                registration = refine_affine_registration(
-                    gray_images[index], local_depth, registration, self.dynamic_affine_config,
-                    context=affine_coordinate_context(gray_images[index].shape, local_depth.shape, pitch_correction),
-                )
-                aligned_masks = self._align_instances(instances, local_depth.shape, registration, crop_box)
-                measurement = self._measure_piece(
-                    local_depth, aligned_masks, registration,
-                    crop_box=crop_box, circle=circle,
-                )
-                results.append(
-                    height_points_to_board({
-                        "piece_id": int(descriptor["piece_id"]),
-                        "image_2d_size": image_shapes[index],
-                        "crop_2d": list(crop_box),
-                        "wire_rois_2d": [list(roi) for roi in roi_boxes],
-                        "depth_start_row": y1,
-                        "depth_end_row": y2,
-                        "pitch_correction": pitch_correction,
-                        "depth_coordinate_space": depth_coordinate_space(pitch_correction),
-                        "registration": registration,
-                        "is_ok": measurement["is_ok"],
-                        "reference_planes": measurement["reference_planes"],
-                        "wire_measurements": measurement["wire_measurements"],
-                        "solder_measurements": measurement["solder_measurements"],
-                        "masks": [self._public_instance(item) for item in aligned_masks],
-                    })
-                )
-            alignment_ms = self.elapsed_ms(align_start)
-            elapsed_ms = self.elapsed_ms(start)
-            return {
-                "ok": True,
-                "cmd": "detect_board",
-                "stage": "board",
-                "batch_id": str(req.get("batch_id") or ""),
-                "results_board": board_results(results, pitch_correction),
-                "elapsed_ms": elapsed_ms,
-                "timings": {
-                    "shared_memory_read_decode_ms": read_2d_ms + scan.read_ms,
-                    "segmentation_3d_ms": scan.segmentation_ms,
-                    "yolo_batch_inference_ms": inference_ms,
-                    "registration_and_mask_alignment_ms": alignment_ms,
-                    "total_detect_ms": elapsed_ms,
-                },
-                "message": "board masks aligned to 3D pieces",
-            }
-        except PieceCountMismatchError as exc:
-            return self._failure("piece_count_mismatch", str(exc))
-        except (ValueError, OSError, RuntimeError) as exc:
-            return self._failure("board_detection_failed", str(exc))
-
-    def _validate_descriptors(self, value: Any) -> list[Dict[str, Any]]:
-        if not isinstance(value, list):
-            raise ValueError("images_2d must be a list")
-        if len(value) != self.expected_piece_count:
-            raise ValueError(
-                f"expected {self.expected_piece_count} 2D images, received {len(value)}"
-            )
-        descriptors = [_dict(item, "images_2d item") for item in value]
-        descriptors.sort(key=lambda item: int(item.get("piece_id", 0)))
-        piece_ids = [int(item.get("piece_id", 0)) for item in descriptors]
-        expected_ids = list(range(1, self.expected_piece_count + 1))
-        if piece_ids != expected_ids:
-            raise ValueError(f"2D piece_id values must be exactly {expected_ids}")
-        return descriptors
 
     def _read_2d(self, descriptor: Dict[str, Any]) -> np.ndarray:
         size = int(descriptor.get("image_size", 0))
@@ -1287,17 +1131,6 @@ class DetectBoard(JointGeometry):
     ) -> Dict[str, Any]:
         """Serialize a cached pre-alignment YOLO instance for the 2D reply."""
         return _instance_geometry.public_instance(instance, crop_box or self.crop_roi, geometry=_mask_geometry)
-
-    @staticmethod
-    def _failure(error: str, message: str) -> Dict[str, Any]:
-        return {
-            "ok": False,
-            "cmd": "detect_board",
-            "stage": "board",
-            "error": error,
-            "message": message,
-            "results_board": {"registration_ok": False, "pieces": []},
-        }
 
     def release(self) -> None:
         self._instance_tasks.close()

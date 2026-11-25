@@ -2,7 +2,7 @@
 const $=id=>document.getElementById(id);
 let files=[],config=null,busy=false,uploading=false,revision=0;
 const workflow=[];
-const detectionTypes={manual_2d:'单片 2D',manual_piece_3d:'单片 3D',manual_board_3d:'整板 3D'};
+const detectionTypes={manual_2d:'单片 2D',manual_piece_3d:'单片 3D'};
 const actions={...detectionTypes,delay:'延时触发'};
 const palette=[['addDetection','manual_2d'],['addDelay','delay']];
 const savedWorkflowKey='validation-lab.workflow-templates.v1';
@@ -12,14 +12,14 @@ async function api(url,options){const r=await fetch(url,options),d=await r.json(
 const post=(url,body)=>api(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
 function status(text,error=false){$('progress').textContent=text;$('progress').className=error?'error':'';}
 function assess(){
- const d=Pairing.check(files,$('board').value,$('mode').value,config?.piece_count||0);
+ const d=Pairing.check(files,$('board').value,config?.piece_count||0);
  const paced=$('submissionMode').value==='paced',raw=$('requestInterval').value.trim(),interval=Number(raw),max=config?.max_request_interval_ms??3600000;
  const valid=!paced||(raw!==''&&Number.isFinite(interval)&&interval>=0&&interval<=max);
  $('checks').textContent=valid?d.message:'请求间隔须为0～'+max+'毫秒的有限数值';$('checks').className=d.ok&&valid?'good':'bad';$('run').disabled=!config||!d.ok||!valid||busy||uploading;
  $('requestInterval').disabled=busy||uploading||!paced;
- $('submissionHint').textContent=paced?'按片号升序发送2D'+($('mode').value==='joint'?'，最后发送3D':'')+'；不等待上一张检测完成。间隔按相邻请求开始发送计，0ms仍保持顺序；实际发送时刻保存到结果JSON。':'并发发送所选板的请求，间隔设置不生效。';
+ $('submissionHint').textContent=paced?'按片号升序发送 2D 请求。间隔按相邻请求开始发送计，实际发送时刻保存到结果 JSON。':'并发发送所选板的 2D 请求。';
  $('demo').disabled=busy||uploading;$('clear').disabled=busy||uploading;
- for(const id of ['upload2','upload3','board','mode','submissionMode'])$(id).disabled=busy||uploading;
+ for(const id of ['upload2','upload3','board','submissionMode'])$(id).disabled=busy||uploading;
  $('releaseBoard').disabled=busy||uploading||!$('board').value;
  updateWorkflow();
  return {...d,ok:d.ok&&valid};
@@ -44,7 +44,7 @@ for(const [id,kind] of [['upload2','2d'],['upload3','3d']])$(id).onchange=async 
 };
 $('demo').onclick=()=>{files=structuredClone(config.samples);revision++;renderFiles();status('项目旧命名样本明确归为 demo 板，片号为1～'+config.piece_count+'，可手动修改。');};
 $('clear').onclick=()=>{files=[];revision++;renderFiles();status('清单已清空，磁盘文件与已生成报告保留。');};
-$('board').onchange=$('mode').onchange=assess;
+$('board').onchange=assess;
 $('requestInterval').value=$('requestInterval').value||'100';
 $('submissionMode').onchange=$('requestInterval').oninput=()=>{revision++;assess();};
 function links(id,workflow=false){
@@ -63,7 +63,7 @@ function showResult(id,job){
  const r=job.result;
  $('summary').textContent=r?'板 '+r.board_id+' · '+(r.ok?(r.product_is_ok?'检测完成 · OK':'检测完成 · NG（算法判定）'):'检测请求失败')+' · '+r.pieces+'片 · '+(r.total_wall_ms/1000).toFixed(2)+'秒 · '+(r.model_reused?'复用已加载模型':'本次初始化模型')+(r.submission_mode==='paced'?' · 按间隔提交 '+r.request_interval_ms+'ms':r.submission_mode==='concurrent'?' · 并发提交':'')+(r.error?'\n'+r.error:'')+'\n输出：'+r.output_dir:'验证失败：'+(job.error||'未知错误');
  if(r?.submission_mode==='manual'){
-  const skipped={missing_2d_result:'缺少或已过期的2D结果',no_2d_result:'2D无有效掩码','2d_ng':'2D已判为NG'};
+  const skipped={missing_2d_result:'缺少或已过期的2D结果',no_2d_result:'2D无有效掩码','2d_ng':'2D已判为NG',no_3d_checks:'未启用3D检测项'};
   const target=r.piece_id==null?'':' · 第'+r.piece_id+'片';
   $('summary').textContent='板 '+r.board_id+target+' · '+r.action+' · '+(r.ok?(r.product_is_ok?'OK':'NG'):'请求失败')+
    (r.skip_3d_reason?' · '+(skipped[r.skip_3d_reason]||r.skip_3d_reason):'')+
@@ -132,7 +132,7 @@ function showJobError(job){
 }
 $('run').onclick=async()=>{
  if(!assess().ok||busy||uploading||!config)return;
- return runExclusive(()=>runValidation({files:structuredClone(files),board_id:$('board').value,mode:$('mode').value,
+ return runExclusive(()=>runValidation({files:structuredClone(files),board_id:$('board').value,mode:'2d',
   submission_mode:$('submissionMode').value,request_interval_ms:$('submissionMode').value==='paced'?Number($('requestInterval').value):0}));
 };
 
@@ -148,11 +148,11 @@ function nodeCheck(node){
    ?{ok:true,message:''}:{ok:false,message:'等待时间须为0～'+max+'毫秒的有限数值'};
  }
  const count=config?.piece_count||0;
- const pieces=node.mode==='manual_board_3d'?[null]:Pairing.pieceNumbers(node.piece_spec,count);
+ const pieces=Pairing.pieceNumbers(node.piece_spec,count);
  if(!pieces.length)return {ok:false,message:'请填写 1～'+count+' 的片号，支持用逗号和范围'};
  for(const piece of pieces){
   const check=Pairing.checkManual(files,node.board_id,node.mode,piece,count);
-  if(!check.ok)return {ok:false,message:(piece===null?'':'第'+piece+'片：')+check.message};
+  if(!check.ok)return {ok:false,message:'第'+piece+'片：'+check.message};
  }
  return {ok:true,message:'',pieces};
 }
@@ -182,10 +182,10 @@ async function runDetection(node,run){
  let finished=0,ng=0;
  for(const piece_id of pieces){
   if(run.stopped)break;
-  node.status=piece_id===null?'执行中':`第 ${piece_id} 片 · ${finished+1}/${pieces.length}`;
+  node.status=`第 ${piece_id} 片 · ${finished+1}/${pieces.length}`;
   node.outcome='running';updateWorkflow();
   const snapshot=files.filter(row=>Pairing.board(row.board_id)===board_id&&
-   (row.kind==='3d'?mode!=='manual_2d':piece_id===null||row.piece_id===piece_id));
+   (row.kind==='3d'?mode!=='manual_2d':row.piece_id===piece_id));
   const job=await runValidation({mode,board_id,piece_id,files:structuredClone(snapshot)});
   if(job.status!=='done'){
    node.outcome='failed';node.status='请求失败';node.message=job.error||'';
@@ -294,6 +294,10 @@ function appendOption(select,value,text){
  const option=document.createElement('option');option.value=value;option.textContent=text;select.append(option);
 }
 function nodeSetup({mode,board_id,piece_spec,delay_ms}){
+ if(mode==='manual_board_3d'){
+  const count=config?.piece_count||1;
+  return {mode:'manual_piece_3d',board_id,piece_spec:count>1?'1-'+count:'1'};
+ }
  return mode==='delay'?{mode,delay_ms}:{mode,board_id,piece_spec};
 }
 function workflowSetup(){
@@ -301,14 +305,15 @@ function workflowSetup(){
 }
 function validWorkflow(entry){
  const validNode=node=>node&&(node.mode==='delay'?typeof node.delay_ms==='string':
-  Object.hasOwn(detectionTypes,node.mode)&&typeof node.board_id==='string'&&typeof node.piece_spec==='string');
+   typeof node.board_id==='string'&&(node.mode==='manual_board_3d'||
+    Object.hasOwn(detectionTypes,node.mode)&&typeof node.piece_spec==='string'));
  return entry&&typeof entry.name==='string'&&entry.name.trim()&&
   Array.isArray(entry.nodes)&&entry.nodes.length&&entry.nodes.every(validNode);
 }
 function readSavedWorkflows(){
  const entries=JSON.parse(window.localStorage.getItem(savedWorkflowKey)||'[]');
  if(!Array.isArray(entries)||!entries.every(validWorkflow))throw Error('已保存的流程格式有误');
- return entries;
+ return entries.map(entry=>({...entry,nodes:entry.nodes.map(nodeSetup)}));
 }
 function showSavedWorkflows(entries,selected=$('savedWorkflow').value){
  const list=$('savedWorkflow');
@@ -408,9 +413,8 @@ function detectionFields(node,boards,locked){
  addField(fields,'板号',board);
  const pieces=document.createElement('input');pieces.type='text';pieces.value=node.piece_spec;
  pieces.placeholder='如 1 或 1,3-5';pieces.disabled=locked;
- const pieceField=addField(fields,'片号',pieces);
- pieceField.hidden=node.mode==='manual_board_3d';
- type.onchange=()=>{pieceField.hidden=type.value==='manual_board_3d';editNode(node,{mode:type.value});};
+  addField(fields,'片号',pieces);
+  type.onchange=()=>editNode(node,{mode:type.value});
  board.onchange=()=>editNode(node,{board_id:board.value});
  pieces.oninput=()=>editNode(node,{piece_spec:pieces.value});
  return fields;
@@ -490,7 +494,7 @@ $('releaseBoard').onclick=async()=>{
  catch(error){status(error.message,true);}finally{busy=false;assess();}
 };
 api('/api/defaults').then(d=>{
- config=d;$('pieceCount').textContent=d.piece_count;
+ config=d;
  const p=d.pitch;$('config').textContent='每板 '+d.piece_count+'片 · 粗配准 + 仿射 · Pitch '+(p.enabled_3d?'启用，'+p.angle_deg+'°，步距'+p.scan_pitch_mm+' mm/profile':'关闭');
  renderFiles();status('就绪，请添加文件或载入项目样本。');
  try{showSavedWorkflows(readSavedWorkflows());}catch(error){status('读取已保存流程失败：'+error.message,true);}
