@@ -242,6 +242,28 @@ class DetectionPolicyTests(unittest.TestCase):
         self.assertEqual(two_d["instances"], [])
         self.assert_3d_skipped(board, "no_2d_result")
 
+    def test_invalid_chip_geometry_does_not_fail_the_2d_request_or_appearance_verdict(self):
+        import torch
+
+        detector = self.detector
+        detector.min_component_area = 1
+        self.prediction.masks.data = torch.zeros((1, 16, 16), dtype=torch.uint8)
+        self.prediction.masks.data[0, 3, 3] = 1
+        self.prediction.masks.data[0, 9:14, 9] = 1
+        detector.chip_anomaly_inspector = self.module._chip_anomaly.ChipAnomalyInspector({
+            "device": "cpu", "aspect_ratio_models": [{"range": [.9, 1.1], "model": "chip"}],
+        }, {})
+        with ThreadPoolExecutor(2) as cpu, ThreadPoolExecutor(1) as gpu, \
+             patch.object(self.module._chip_alignment, "measure_chip_alignment", return_value={"enabled": False}):
+            pipeline = BoardPipeline(detector, cpu, gpu)
+            self.addCleanup(pipeline.close)
+            reply = pipeline.submit_2d(dict(board_id="A", piece_id=1)).result(3)
+        self.assertTrue(reply["ok"], reply)
+        self.assertTrue(reply["results_2d"]["is_ok"])
+        appearance = reply["results_2d"]["chip_anomaly_2d"]
+        self.assertEqual("skipped", appearance["status"])
+        self.assertEqual(2, len(appearance["skipped_chips"]))
+
     def test_single_piece_with_empty_2d_never_opens_the_depth_buffer(self):
         self.prediction.masks = None
         self.detector.chip_anomaly_inspector.inspect.return_value = {"enabled": False}

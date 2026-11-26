@@ -139,6 +139,12 @@ def validate_config(config: Dict[str, Any] | None) -> Dict[str, Any]:
     }
 
 
+class _InvalidChipGeometry(ValueError):
+    def __init__(self, reason, message):
+        super().__init__(message)
+        self.reason = reason
+
+
 def rectified_chip_crop(
     image: np.ndarray,
     points: np.ndarray,
@@ -149,7 +155,7 @@ def rectified_chip_crop(
     rect = cv2.minAreaRect(points.astype(np.float32))
     (cx, cy), (rw, rh), angle = rect
     if rw <= 1 or rh <= 1:
-        raise ValueError("degenerate chip rectangle")
+        raise _InvalidChipGeometry("degenerate_rectangle", "degenerate chip rectangle")
     corners = cv2.boxPoints(rect).astype(np.float32)
     raw_angle = float((angle + 45.0) % 90.0 - 45.0)
     correction = float(np.clip(raw_angle, -max_rotation_deg, max_rotation_deg))
@@ -181,13 +187,13 @@ def _chip_contour_points(mask: np.ndarray, offset: Sequence[int]) -> np.ndarray:
     binary = source if source.dtype == np.uint8 else (source > 0).astype(np.uint8)
     x, y, width, height = cv2.boundingRect(binary)
     if not width or not height:
-        raise ValueError("chip mask has fewer than three contour points")
+        raise _InvalidChipGeometry("insufficient_contour_points", "chip mask has fewer than three contour points")
     contours, _ = cv2.findContours(
         binary[y:y + height, x:x + width], cv2.RETR_EXTERNAL,
         cv2.CHAIN_APPROX_NONE, offset=(x, y))
     contours = [contour for contour in contours if len(contour) >= 3]
     if not contours:
-        raise ValueError("chip mask has fewer than three contour points")
+        raise _InvalidChipGeometry("insufficient_contour_points", "chip mask has fewer than three contour points")
     contour = max(contours, key=cv2.contourArea).reshape(-1, 2).astype(np.float32)
     contour += np.asarray(offset[:2], dtype=np.float32)
     return contour
@@ -525,14 +531,21 @@ class ChipAnomalyInspector:
         if not chips:
             return {"enabled": True, "status": "no_chip", "is_ok": False, "chips": []}
 
-        results = []
+        results, skipped = [], []
         visualizations = []
         for instance in chips:
             note("efficientad_chip_begin", instance_id=instance.get("instance_id"), cuda_sync=cuda_sync_enabled())
-            points = timed_call("efficientad_chip_contour_ms", _chip_contour_points, instance["mask"], crop_box[:2])
-            crop, ratio, correction, corners, matrix = timed_call("efficientad_chip_rectify_ms", rectified_chip_crop,
-                image, points, self.config["padding_ratio"], self.config["max_rotation_deg"]
-            )
+            try:
+                points = timed_call("efficientad_chip_contour_ms", _chip_contour_points, instance["mask"], crop_box[:2])
+                crop, ratio, correction, corners, matrix = timed_call(
+                    "efficientad_chip_rectify_ms", rectified_chip_crop,
+                    image, points, self.config["padding_ratio"], self.config["max_rotation_deg"],
+                )
+            except _InvalidChipGeometry as error:
+                instance_id = int(instance.get("instance_id", 0))
+                skipped.append(dict(instance_id=instance_id, reason=error.reason, message=str(error)))
+                note("efficientad_chip_skipped", instance_id=instance_id, reason=error.reason)
+                continue
             model_rule = self._model_rule(ratio)
             model_name = str(model_rule["model"])
             predictor = self.predictors.get(model_name)
@@ -586,10 +599,11 @@ class ChipAnomalyInspector:
                     "display_max": artifacts["display_max"],
                     "result": result,
                 })
+        is_ok = all(item["is_ok"] for item in results) if results else None
         output = {
             "enabled": True,
-            "status": "ok" if all(item["is_ok"] for item in results) else "anomaly",
-            "is_ok": all(item["is_ok"] for item in results),
+            "status": "skipped" if is_ok is None else "ok" if is_ok else "anomaly",
+            "is_ok": is_ok,
             "ratio_definition": "long_side / short_side",
             "aspect_ratio_models": [
                 {
@@ -600,6 +614,8 @@ class ChipAnomalyInspector:
             ],
             "chips": results,
         }
+        if skipped:
+            output["skipped_chips"] = skipped
         if include_visualization:
             output["_visualizations"] = visualizations
         return output

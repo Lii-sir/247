@@ -21,7 +21,7 @@ from algorithm.runtime.config import (
 )
 from algorithm.application.defect_checks import silver_check, wire_bending_result
 from algorithm.runtime.defect_plan import (
-    CHECKS_2D, defect_orders, evaluate_in_order, require_configured_checks, unrun_checks,
+    CHECKS_2D, defect_orders, evaluate_in_order, failed_check, require_configured_checks, unrun_checks,
 )
 from algorithm.vision2d import chip_alignment, chip_anomaly, circle_roi, silver_inspection, wire_roi_presence
 from algorithm.vision2d import defect_geometry as geometry
@@ -344,8 +344,7 @@ class Detect2D:
             "silver_continuity_2d": {"enabled": self.silver_continuity_enabled, **silver_results["disconnection"]},
         }
         first_ng = next(
-            (name for name, result in results.items() if result.get("enabled")
-             and result.get("status") != "disabled" and result.get("is_ok") is not True), None)
+            (name for name, result in results.items() if result.get("enabled") and failed_check(result)), None)
         return results, first_ng
 
     def _convert_predictions(self, predictions: Any, roi: np.ndarray, box, roi_boxes):

@@ -11,8 +11,8 @@
         "circle_search_roi": [
           3100,
           650,
-          5150,
-          2300
+          5100,
+          2250
         ],
         "detection_roi_offsets": [
           -4.0773,
@@ -21,7 +21,7 @@
           2.1634
         ],
         "circle_radius": 560,
-        "radius_tolerance_pixels": 20
+        "radius_tolerance_pixels": 60
       },
       "crop_2d": {
         "roi": [
@@ -55,9 +55,9 @@
       },
       "yolo": {
         "imgsz": 640,
-        "conf": 0.3,
-        "iou": 0.3,
-        "max_det": 50,
+        "conf": 0.25,
+        "iou": 0.7,
+        "max_det": 300,
         "device": "0",
         "end2end": false
       },
@@ -154,7 +154,7 @@
         {
           "range": [
             1.31,
-            2.0
+            7.0
           ],
           "model": "chip_long"
         }

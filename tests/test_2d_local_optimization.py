@@ -5,7 +5,7 @@ import sys
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import cv2
 import numpy as np
@@ -89,6 +89,39 @@ class Local2DTests(unittest.TestCase):
                 self.assertEqual(_mask_geometry(view, (200, -30), 1.0),
                                  _mask_geometry(view.astype(bool), (200, -30), 1.0))
             np.testing.assert_array_equal(mask, original)
+
+    def test_efficientad_skips_invalid_chips_and_checks_remaining_chips(self):
+        shape = (32, 48)
+        pixel = np.zeros(shape, dtype=np.uint8)
+        pixel[2, 2] = 255
+        line = np.zeros_like(pixel)
+        line[5:12, 5] = 255
+        valid = np.zeros_like(pixel)
+        valid[14:30, 24:40] = 255
+        image = np.zeros((*shape, 3), dtype=np.uint8)
+        inspector = anomaly.ChipAnomalyInspector({
+            "device": "cpu", "aspect_ratio_models": [{"range": [.9, 1.1], "model": "chip"}],
+        }, {})
+        predictor = Mock(image_size=16)
+        predictor.predict.return_value = ({"is_ok": False}, {"boxes": []})
+        inspector.predictors["chip"] = predictor
+        instances = [dict(instance_id=i, class_name="chip", mask=mask, is_ok=True)
+                     for i, mask in enumerate((pixel, line, valid), 1)]
+
+        output = inspector.inspect(image, instances[:2], (0, 0, 48, 32))
+        predictor.predict.assert_not_called()
+        self.assertEqual("skipped", output["status"])
+        self.assertIsNone(output["is_ok"])
+        self.assertEqual([], output["chips"])
+        self.assertEqual([(1, "insufficient_contour_points"), (2, "degenerate_rectangle")],
+                         [(chip["instance_id"], chip["reason"]) for chip in output["skipped_chips"]])
+
+        output = inspector.inspect(image, instances, (0, 0, 48, 32))
+        predictor.predict.assert_called_once()
+        self.assertEqual([3], [chip["instance_id"] for chip in output["chips"]])
+        self.assertEqual("anomaly", output["status"])
+        self.assertFalse(output["is_ok"])
+        self.assertTrue(all(instance["is_ok"] for instance in instances[:2]))
 
 
 if __name__ == "__main__":

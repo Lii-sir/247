@@ -692,7 +692,7 @@ class DetectBoard(JointGeometry):
         if chip_diagnostics.get("enabled") and chip_diagnostics.get("is_ok") is not True:
             checks.append(False)
         if (chip_anomaly_diagnostics.get("enabled")
-                and chip_anomaly_diagnostics.get("is_ok") is not True):
+                and failed_check(chip_anomaly_diagnostics)):
             checks.append(False)
         for check in (diagnostics.get("silver_overflow"), diagnostics.get("disconnection")):
             if (

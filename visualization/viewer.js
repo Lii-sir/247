@@ -537,12 +537,13 @@
     ];
     const silverBoundaryLabel = (two.silver_overflow_2d || piece?.silver_overflow_2d)?.registration?.method === "roi_inset"
       ? "银浆边界生成" : "银浆边界配准";
+    const appearance = two.chip_anomaly_2d || (!workflow && piece?.chip_anomaly_2d);
     const checks = [
       ["片级结论", piece?.is_ok],
       ["配准", piece?.registration?.status === "disabled" ? "未启用" : piece?.registration?.is_valid, "3d"],
       ["2D 引线 ROI", checkValue(two.wire_bending_2d) ?? (piece?.wire_roi_checks?.length ? piece.wire_roi_checks.every((x) => x.is_ok === true) : null), "2d"],
       ["芯片旋转", checkValue(two.chip_rotation_2d), "2d"],
-      ["芯片外观", checkValue(two.chip_anomaly_2d || (!workflow && piece?.chip_anomaly_2d)), "2d"],
+      ["芯片外观", checkValue(appearance), "2d"],
       ["银浆连通", checkValue(two.silver_continuity_2d || piece?.silver_continuity_2d), "2d"],
       ["银浆溢出", checkValue(two.silver_overflow_2d || piece?.silver_overflow_2d), "2d"],
       [silverBoundaryLabel, (two.silver_overflow_2d || piece?.silver_overflow_2d)?.registration?.status === "not_configured" ? null : (two.silver_overflow_2d || piece?.silver_overflow_2d)?.registration?.is_valid, "2d"],
@@ -556,6 +557,11 @@
       const label = document.createElement("div"); label.textContent = name;
       const result = document.createElement("strong"); result.className = valueClass; result.textContent = typeof value === "boolean" || value == null ? statusText(value) : String(value);
       card.append(label, result);
+      if (name === "芯片外观" && appearance?.skipped_chips?.length) {
+        const note = document.createElement("p");
+        note.textContent = `跳过 ${appearance.skipped_chips.length} 个几何无效的芯片掩码`;
+        card.appendChild(note);
+      }
       if (name === "银浆溢出" || name === silverBoundaryLabel) {
         const overflow = two.silver_overflow_2d || piece?.silver_overflow_2d;
         const status = { not_configured: "未标定", uncertain: "配准/测量不确定", overflow: "存在越界银浆", ok: "通过" };
