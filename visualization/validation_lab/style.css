@@ -362,6 +362,13 @@ td button:hover { color: var(--danger); }
 .flow-status.done { color: #15803d; }
 .flow-status.failed { color: var(--danger); }
 .flow-status.running { color: #0369a1; }
+.node-request-times { font-variant-numeric: tabular-nums; }
+.node-request-times thead { position: static; }
+.node-request-times th { width: auto; font-size: 10px; }
+.node-request-times th:first-child { width: 38px; }
+.node-request-times th, .node-request-times td { padding: 4px 6px; white-space: nowrap; }
+.node-request-times td { font-size: 10px; color: var(--text-muted); }
+.node-request-times tr:last-child td { border-bottom: 0; }
 
 /* Report Panel */
 .report-panel { padding: 18px; }

@@ -235,7 +235,7 @@ class ValidationTests(unittest.TestCase):
         done=threading.Event()
         def manual(*args, on_sent, on_finished):
             on_sent(10.0)
-            on_finished(10.6)
+            on_finished(10.6, True)
             done.set()
             return {'ok':True,'piece_id':2}
         with patch.object(server.runner,'run_manual',side_effect=manual) as exact, patch.object(server.runner,'run') as batch:
@@ -257,6 +257,8 @@ class ValidationTests(unittest.TestCase):
             self.assertEqual(job['piece_id'], 2)
             self.assertEqual(job['request_sent_at'], 10.0)
             self.assertEqual(job['request_finished_at'], 10.6)
+            self.assertEqual(accepted['submitted_at'], job['submitted_at'])
+            self.assertAlmostEqual(job['received_at'] - job['submitted_at'], .6, places=5)
 
     def test_http_submits_same_piece_3d_while_2d_result_is_pending(self):
         release_2d = threading.Event()

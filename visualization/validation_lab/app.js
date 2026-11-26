@@ -8,6 +8,8 @@ const palette=[['addDetection','manual_2d'],['addDelay','delay']];
 const savedWorkflowKey='validation-lab.workflow-templates.v1';
 const workflowFileFormat='validation-lab-workflow';
 const workflowVersion=2;
+const requestClock=new Intl.DateTimeFormat('zh-CN',{hour:'2-digit',minute:'2-digit',second:'2-digit',
+ fractionalSecondDigits:3,hourCycle:'h23'});
 let nodeID=0, activeRun=null, cancelCountdown=null, refreshCards=[];
 async function api(url,options){const r=await fetch(url,options),d=await r.json();if(!r.ok)throw Error(d.error||'HTTP '+r.status);return d;}
 const post=(url,body)=>api(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -98,12 +100,12 @@ $('history').onchange=async()=>{
   showResult(id,job);status('正在查看历史结果；报告对应当时选用的文件。');
  }catch(e){status(e.message,true);}
 };
-async function waitForJob(id,onProgress){
+async function waitForJob(id,onUpdate){
  while(true){
   await new Promise(r=>setTimeout(r,800));
   const job=await api('/api/jobs/'+id);
+  onUpdate?.(job);
   if(job.status!=='running')return job;
-  onProgress?.(job.phase);
  }
 }
 async function runValidation(request){
@@ -111,7 +113,7 @@ async function runValidation(request){
  status('正在提交验证…');
  try{
   const {id}=await post('/api/run',request);
-  const job=await waitForJob(id,status);
+  const job=await waitForJob(id,job=>{if(job.status==='running')status(job.phase);});
   if(job.result)showResult(id,job);else showJobError(job);
   try{await history();$('history').value=id;}catch(error){console.warn('历史验证记录刷新失败',error);}
   const latencyMiss=job.result?.two_d_latency?.meets_target===false;
@@ -186,10 +188,13 @@ async function runDetection(node,run){
  if(!ok){status(message,true);return false;}
  const {mode}=node;
  node.runBoardId=board_id;
- const ids=[];
+ node.requestTimes=[];
+ const ids=[],results=[];
  let error='';
  for(const piece_id of pieces){
   if(run.stopped)break;
+  const timing={piece_id,phase:'submitting'};
+  node.requestTimes.push(timing);
   node.status=`正在提交第 ${piece_id} 片 · ${ids.length+1}/${pieces.length}`;
   node.outcome='running';updateWorkflow();
   const snapshot=files.filter(row=>Pairing.board(row.board_id)===board_id&&
@@ -197,11 +202,16 @@ async function runDetection(node,run){
   try{
    const accepted=await post('/api/run',{mode,board_id,piece_id,files:structuredClone(snapshot)});
    ids.push(accepted.id);run.runIds.push(accepted.id);
+   timing.submittedAt=accepted.submitted_at;
+   timing.phase=accepted.submitted===false?'unsent':'pending';
+   results.push(trackRequest(accepted.id,timing));
+   refreshWorkflowControls();
    if(accepted.submitted===false){
     error=accepted.error||'检测请求未发出';
     break;
    }
   }catch(e){
+   timing.phase='unsent';
    error=e.message;
    break;
   }
@@ -210,12 +220,29 @@ async function runDetection(node,run){
  node.outcome=ids.length?'running':error?'failed':'';
  node.status=ids.length?`已提交 ${ids.length}/${pieces.length} · 等待结果`:error?'请求失败':'已停止';
  updateWorkflow();
- run.results.push(collectNode(node,workflow.indexOf(node),ids,pieces.length,error));
+ run.results.push(collectNode(node,workflow.indexOf(node),ids,results,pieces.length,error));
  return !error&&!run.stopped;
 }
-async function collectNode(node,index,ids,count,submissionError){
- const jobs=await Promise.all(ids.map(id=>waitForJob(id)
-  .catch(error=>({status:'failed',error:error.message}))));
+function trackRequest(id,timing){
+ return waitForJob(id,job=>{
+  const receivedAt=job.received_at??null;
+  let phase=timing.phase;
+  if(Number.isFinite(receivedAt))phase='received';
+  else if(phase!=='unsent'){
+   if(job.status==='done')phase='unavailable';
+   else if(job.status!=='running'||job.request_finished_at!=null)phase='unreceived';
+  }
+  if(timing.phase===phase&&timing.receivedAt===receivedAt)return;
+  timing.phase=phase;timing.receivedAt=receivedAt;
+  refreshWorkflowControls();
+ }).catch(error=>{
+  if(timing.phase==='pending')timing.phase='unreceived';
+  refreshWorkflowControls();
+  return {status:'failed',error:error.message};
+ });
+}
+async function collectNode(node,index,ids,results,count,submissionError){
+ const jobs=await Promise.all(results);
  const failure=jobs.find(job=>job.status!=='done');
  const error=submissionError||failure?.error||(failure?'检测请求失败':'');
  const finished=jobs.filter(job=>job.status==='done').length;
@@ -279,7 +306,7 @@ $('startWorkflow').onclick=async()=>{
  if(issue){status(issue,true);return;}
  if(!workflow.length||workflow.some(node=>node.outcome==='running'))return;
  const submission=await runExclusive(async run=>{
-  for(const node of workflow){node.outcome='';node.status='待执行';node.message='';}
+  for(const node of workflow){node.outcome='';node.status='待执行';node.message='';node.requestTimes=[];}
   let error='';
   for(const [index,node] of workflow.entries()){
    if(run.stopped)break;
@@ -451,7 +478,7 @@ $('workflowFileInput').onchange=event=>{
  });
 };
 function editNode(node,changes){
- Object.assign(node,changes,{status:'待执行',outcome:'',message:''});
+ Object.assign(node,changes,{status:'待执行',outcome:'',message:'',requestTimes:[]});
  refreshWorkflowControls();
 }
 function detectionFields(node,boards,locked){
@@ -475,6 +502,29 @@ function detectionFields(node,boards,locked){
  pieces.oninput=()=>editNode(node,{piece_spec:pieces.value});
  return fields;
 }
+function renderRequestTimes(table,timings){
+ table.hidden=!timings?.length;
+ table.replaceChildren();
+ if(table.hidden)return;
+ const header=document.createElement('thead'),columns=document.createElement('tr');
+ for(const name of ['片号','提交时间','收到结果']){
+  const cell=document.createElement('th');cell.scope='col';cell.textContent=name;columns.append(cell);
+ }
+ header.append(columns);
+ const body=document.createElement('tbody');
+ for(const timing of timings){
+  const row=document.createElement('tr');
+  const submitted=Number.isFinite(timing.submittedAt)?requestClock.format(timing.submittedAt*1000):
+   timing.phase==='submitting'?'提交中':timing.phase==='unsent'?'未提交':'—';
+  const received=Number.isFinite(timing.receivedAt)?requestClock.format(timing.receivedAt*1000):
+   timing.phase==='pending'?'等待中':timing.phase==='unreceived'?'未收到':'—';
+  for(const value of [timing.piece_id,submitted,received]){
+   const cell=document.createElement('td');cell.textContent=String(value);row.append(cell);
+  }
+  body.append(row);
+ }
+ table.append(header,body);
+}
 function updateWorkflow(){
  const locked=busy||uploading||!config;
  const boards=Pairing.boards(files);
@@ -492,6 +542,8 @@ function updateWorkflow(){
    event.preventDefault();moveNode(node.id,Math.max(0,Math.min(workflow.length-1,index+offset)));
   };
   const footer=document.createElement('div');footer.className='flow-footer';
+  const times=isDelay?null:document.createElement('table');
+  if(times){times.className='node-request-times';times.setAttribute('aria-label','各片请求时间');}
   const state=document.createElement('span');
   const execute=document.createElement('button');
   const refresh=()=>{
@@ -502,6 +554,7 @@ function updateWorkflow(){
    execute.textContent=isDelay?'开始计时':node.outcome==='done'?'重跑':'执行';
    const check=isDelay?delayCheck(node,index):nodeCheck(node);
     execute.disabled=locked||node.outcome==='running'||!check.ok;execute.title=check.message;
+   if(times)renderRequestTimes(times,node.requestTimes);
   };
   let description;
   if(isDelay){
@@ -519,7 +572,9 @@ function updateWorkflow(){
   const remove=document.createElement('button');remove.textContent='×';remove.title='移除节点';remove.disabled=locked;
   remove.setAttribute('aria-label','移除节点 '+(index+1));
   remove.onclick=()=>{workflow.splice(index,1);updateWorkflow();};
-  footer.append(state,execute,remove);card.append(grip,description,footer);$('flowNodes').append(card);
+  footer.append(state,execute,remove);card.append(grip,description,footer);
+  if(times)card.append(times);
+  $('flowNodes').append(card);
  }
  refreshWorkflowControls();
 }

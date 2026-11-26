@@ -310,11 +310,13 @@ class Runner:
 
             started = time.perf_counter()
             progress(f"等待{label}响应")
+            received = False
             try:
                 reply = client.request(dict(cmd=command, board_id=board_id, **descriptor), 900, on_sent=sent)
+                received = True
             finally:
                 if request_id is not None and on_finished is not None:
-                    on_finished(time.perf_counter())
+                    on_finished(time.perf_counter(), received)
         elapsed = (time.perf_counter() - started) * 1000
         with self._state_lock:
             ready_pieces = sorted(pid for pid, source in known.items() if source["ready"])
@@ -747,13 +749,18 @@ class Handler(BaseHTTPRequestHandler):
                     self.server.jobs[key].update(mode=mode, piece_id=piece_id)
             folder = self.server.folder / key;folder.mkdir()
             submitted = threading.Event()
-            sent = False
+            request_sent_at = submitted_at = None
 
             def on_sent(sent_at):
-                nonlocal sent
-                update(request_sent_at=sent_at)
-                sent = True
+                nonlocal request_sent_at, submitted_at
+                request_sent_at = sent_at
+                submitted_at = time.time() - (time.perf_counter() - sent_at)
+                update(request_sent_at=sent_at, submitted_at=submitted_at)
                 submitted.set()
+
+            def on_finished(ended, received):
+                received_at = submitted_at + (ended - request_sent_at) if received else None
+                update(request_finished_at=ended, received_at=received_at)
 
             def update(**values):
                 with self.server.lock:
@@ -764,7 +771,7 @@ class Handler(BaseHTTPRequestHandler):
                     if manual:
                         result = self.server.runner.run_manual(
                             rows, board, mode, piece_id, count, folder, progress, on_sent=on_sent,
-                            on_finished=lambda ended: update(request_finished_at=ended))
+                            on_finished=on_finished)
                     else:
                         result = self.server.runner.run(rows, board, mode, count, folder, progress, **options)
                     update(status="done" if result["ok"] else "failed", result=result, error=result.get("error"))
@@ -775,8 +782,9 @@ class Handler(BaseHTTPRequestHandler):
                 future.add_done_callback(lambda _: submitted.set())
                 submitted.wait()
                 with self.server.lock:
+                    sent = submitted_at is not None
                     error = self.server.jobs[key].get("error") if not sent else None
-                return self.send(202, {"id": key, "submitted": sent, "error": error})
+                return self.send(202, dict(id=key, submitted=sent, submitted_at=submitted_at, error=error))
             self.send(202, {"id":key})
         except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
             self.send(400, {"error":str(exc)})

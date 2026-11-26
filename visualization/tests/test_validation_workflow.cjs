@@ -25,7 +25,9 @@ async function boot(latency=null,timers={},failRequest=()=>false,browser={},hook
     const submitted=hooks.submit?.(q)!==false;
     if(!submitted||failRequest(q))history.unshift({id,board_id:q.board_id,status:'failed',error:'synthetic request failure'});
     else history.unshift({id,board_id:q.board_id,status:'done',result:{ok:true,product_is_ok:false,board_id:q.board_id,pieces:2,total_wall_ms:1000,output_dir:'/output',model_reused:false,submission_mode:q.submission_mode,request_interval_ms:q.request_interval_ms,two_d_latency:latency}});
-    data={id,submitted,error:submitted?null:'synthetic request failure'};}
+    const timing=hooks.timing?.(q)??{};
+    Object.assign(history[0],timing);
+    data={id,submitted,submitted_at:timing.submitted_at,error:submitted?null:'synthetic request failure'};}
    else if(url==='/api/workflows'){
     const q=JSON.parse(opt.body);groups.push(q);
     data={id:'a'.repeat(32),kind:'workflow',title:'流程 '+groups.length,status:q.outcome,boards:2,runs:q.run_ids.length,error:q.error,total_wall_ms:1750};
@@ -320,6 +322,33 @@ test('another node can be clicked while a submitted result is pending',async()=>
  assert.deepEqual(requests.map(q=>q.piece_id),[1,2]);
  releaseResults();
  await Promise.all([first,second]);
+});
+
+test('a multi-piece node displays each submission and updates the response times independently',async()=>{
+ const release=new Map();
+ const waits=new Map([1,2].map(id=>[id,new Promise(resolve=>release.set(id,resolve))]));
+ const base=new Date(2026,10,26,14,3,5).getTime()/1000;
+ const {nodes}=await boot(null,{},()=>false,{}, {
+  timing:({piece_id})=>({submitted_at:base+piece_id-.75,received_at:base+(piece_id===1?3.5:2.75)}),
+  beforePoll:url=>waits.get(Number(url.split('/').at(-1))),
+ });
+ nodes.get('demo').onclick();
+ nodes.get('addDetection').onclick();
+ const card=()=>nodes.get('flowNodes').children[0];
+ const timing=()=>card().children[3];
+ const rows=()=>timing().children[1].children.map(tr=>tr.children.map(cell=>cell.textContent));
+ assert.equal(timing().hidden,true);
+ setDetection(card(),{pieces:'1-2'});
+ const run=execute(card()).onclick();
+ await new Promise(setImmediate);
+ assert.deepEqual(timing().children[0].children[0].children.map(cell=>cell.textContent),['片号','提交时间','收到结果']);
+ assert.deepEqual(rows(),[['1','14:03:05.250','等待中'],['2','14:03:06.250','等待中']]);
+ release.get(2)();
+ await new Promise(setImmediate);
+ assert.deepEqual(rows(),[['1','14:03:05.250','等待中'],['2','14:03:06.250','14:03:07.750']]);
+ release.get(1)();
+ await run;
+ assert.deepEqual(rows(),[['1','14:03:05.250','14:03:08.500'],['2','14:03:06.250','14:03:07.750']]);
 });
 
 test('a named setup survives reload, restores its node parameters and sends no requests',async()=>{
