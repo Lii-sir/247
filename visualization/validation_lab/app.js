@@ -96,32 +96,32 @@ $('history').onchange=async()=>{
   showResult(id,job);status('正在查看历史结果；报告对应当时选用的文件。');
  }catch(e){status(e.message,true);}
 };
+async function waitForJob(id,onProgress){
+ while(true){
+  await new Promise(r=>setTimeout(r,800));
+  const job=await api('/api/jobs/'+id);
+  if(job.status!=='running')return job;
+  onProgress?.(job.phase);
+ }
+}
 async function runValidation(request){
  const snapshot=revision;
- const group=activeRun?.kind==='workflow'?activeRun:null;
  status('正在提交验证…');
  try{
   const {id}=await post('/api/run',request);
-  if(group)group.runIds.push(id);
-  while(true){
-   await new Promise(r=>setTimeout(r,800));
-   const job=await api('/api/jobs/'+id);
-   if(job.status==='running'){status(job.phase);continue;}
-   if(!group){
-    if(job.result)showResult(id,job);else showJobError(job);
-    try{await history();$('history').value=id;}catch(error){console.warn('历史验证记录刷新失败',error);}
-   }
-   const latencyMiss=job.result?.two_d_latency?.meets_target===false;
-   status(job.status==='done'?(latencyMiss?'验证完成；2D请求未满足1秒目标，请查看超标片号。':'验证完成，可在下方复核。'):job.error||'验证失败，请检查报告与服务日志。',job.status!=='done'||latencyMiss);
-   if(snapshot!==revision)status('验证已完成；报告对应提交时的文件。');
-   return job;
-  }
+  const job=await waitForJob(id,status);
+  if(job.result)showResult(id,job);else showJobError(job);
+  try{await history();$('history').value=id;}catch(error){console.warn('历史验证记录刷新失败',error);}
+  const latencyMiss=job.result?.two_d_latency?.meets_target===false;
+  status(job.status==='done'?(latencyMiss?'验证完成；2D请求未满足1秒目标，请查看超标片号。':'验证完成，可在下方复核。'):job.error||'验证失败，请检查报告与服务日志。',job.status!=='done'||latencyMiss);
+  if(snapshot!==revision)status('验证已完成；报告对应提交时的文件。');
+  return job;
  }catch(e){status(e.message,true);return {status:'failed',error:e.message};}
 }
 async function runExclusive(work,kind=null){
  if(busy||uploading||!config)return;
  busy=true;
- activeRun=kind?{kind,stopped:false,runIds:[]}:null;
+ activeRun=kind?{kind,stopped:false,runIds:[],results:[]}:null;
  renderFiles();
  try{return await work(activeRun);}
  finally{activeRun=null;busy=false;renderFiles();}
@@ -179,27 +179,46 @@ async function runDetection(node,run){
  const {ok,message,pieces}=nodeCheck(node);
  if(!ok){status(message,true);return false;}
  const {mode,board_id}=node;
- let finished=0,ng=0;
+ const ids=[];
+ let error='';
  for(const piece_id of pieces){
   if(run.stopped)break;
-  node.status=`第 ${piece_id} 片 · ${finished+1}/${pieces.length}`;
+  node.status=`正在提交第 ${piece_id} 片 · ${ids.length+1}/${pieces.length}`;
   node.outcome='running';updateWorkflow();
   const snapshot=files.filter(row=>Pairing.board(row.board_id)===board_id&&
    (row.kind==='3d'?mode!=='manual_2d':row.piece_id===piece_id));
-  const job=await runValidation({mode,board_id,piece_id,files:structuredClone(snapshot)});
-  if(job.status!=='done'){
-   node.outcome='failed';node.status='请求失败';node.message=job.error||'';
-   updateWorkflow();return false;
+  try{
+   const accepted=await post('/api/run',{mode,board_id,piece_id,files:structuredClone(snapshot)});
+   ids.push(accepted.id);run.runIds.push(accepted.id);
+   if(accepted.submitted===false){
+    error=accepted.error||'检测请求未发出';
+    break;
+   }
+  }catch(e){
+   error=e.message;
+   break;
   }
-  finished++;
-  if(!job.result?.product_is_ok)ng++;
  }
- node.outcome=finished===pieces.length?'done':'';
- node.status=finished<pieces.length?`已停止 · ${finished}/${pieces.length}`:
-  pieces.length===1?(ng?'完成 · NG':'完成 · OK'):`完成 ${finished} 片 · ${ng} 片 NG`;
- node.message='';
+ node.message=error;
+ node.outcome=ids.length?'running':error?'failed':'';
+ node.status=ids.length?`已提交 ${ids.length}/${pieces.length} · 等待结果`:error?'请求失败':'已停止';
  updateWorkflow();
- return !run.stopped;
+ run.results.push(collectNode(node,workflow.indexOf(node),ids,pieces.length,error));
+ return !error&&!run.stopped;
+}
+async function collectNode(node,index,ids,count,submissionError){
+ const jobs=await Promise.all(ids.map(id=>waitForJob(id)
+  .catch(error=>({status:'failed',error:error.message}))));
+ const failure=jobs.find(job=>job.status!=='done');
+ const error=submissionError||failure?.error||(failure?'检测请求失败':'');
+ const finished=jobs.filter(job=>job.status==='done').length;
+ const ng=jobs.filter(job=>job.status==='done'&&!job.result?.product_is_ok).length;
+ node.outcome=error?'failed':finished===count?'done':'';
+ node.status=error?'请求失败':finished<count?`已停止 · ${finished}/${count}`:
+  count===1?(ng?'完成 · NG':'完成 · OK'):`完成 ${finished} 片 · ${ng} 片 NG`;
+ node.message=error;
+ updateWorkflow();
+ return {index,error,id:ids.at(-1),job:jobs.at(-1)};
 }
 function waitDelay(node,next){
  const duration=Math.ceil(Number(node.delay_ms)),deadline=Date.now()+duration;
@@ -220,16 +239,26 @@ function waitDelay(node,next){
   updateWorkflow();tick();
  });
 }
-function runSingleNode(node,index){
- if(node.mode!=='delay')return runExclusive(run=>runDetection(node,run),'detection');
- const check=delayCheck(node,index);
+async function runSingleNode(node,index){
+ const isDelay=node.mode==='delay',next=isDelay?workflow[index+1]:node;
+ if(next?.outcome==='running')return;
+ const check=isDelay?delayCheck(node,index):nodeCheck(node);
  if(!check.ok){status(check.message,true);return;}
- const next=workflow[index+1];
- return runExclusive(async run=>{
-  const elapsed=await waitDelay(node,next);
-  if(elapsed)await runDetection(next,run);
-  if(run.stopped)status(elapsed?'后续请求已停止。':'计时已取消。');
- },'delay');
+ const run=await runExclusive(async run=>{
+  if(!isDelay||await waitDelay(node,next))await runDetection(next,run);
+  if(run.stopped)status(isDelay&&!run.runIds.length?'计时已取消。':'后续请求已停止。');
+  return run;
+ },isDelay?'delay':'detection');
+ if(!run)return;
+ const [result]=await Promise.all(run.results);
+ if(!result)return;
+ if(!busy){
+  if(result.job?.result)showResult(result.id,result.job);
+  else if(result.error)showJobError({error:result.error});
+  status(result.error||(run.stopped?'后续请求已停止。':'验证完成，可在下方复核。'),!!result.error);
+ }
+ try{await history();if(!busy&&result.id)$('history').value=result.id;}
+ catch(error){console.warn('历史验证记录刷新失败',error);}
 }
 function workflowIssue(){
  for(const [index,node] of workflow.entries()){
@@ -238,11 +267,11 @@ function workflowIssue(){
  }
  return '';
 }
-$('startWorkflow').onclick=()=>{
+$('startWorkflow').onclick=async()=>{
  const issue=workflowIssue();
  if(issue){status(issue,true);return;}
- if(!workflow.length)return;
- return runExclusive(async run=>{
+ if(!workflow.length||workflow.some(node=>node.outcome==='running'))return;
+ const submission=await runExclusive(async run=>{
   for(const node of workflow){node.outcome='';node.status='待执行';node.message='';}
   let error='';
   for(const [index,node] of workflow.entries()){
@@ -253,18 +282,24 @@ $('startWorkflow').onclick=()=>{
     break;
    }
   }
-  const outcome=run.stopped?'stopped':error?'failed':'done';
-  status('正在汇总流程结果…');
-  try{
-   const group=await post('/api/workflows',{run_ids:run.runIds,outcome,error});
-   showWorkflow(group.id,group);
-   await history();$('history').value=group.id;
-   status(error||(run.stopped?'流程已停止。':'流程执行完成。'),!!error);
-  }catch(err){
-   await history().catch(()=>{});
-   status([error,'流程结果汇总失败：'+err.message].filter(Boolean).join('\n'),true);
-  }
+  return {run,error};
  },'workflow');
+ if(!submission)return;
+ const {run}=submission;
+ if(!busy)status(submission.error||(run.stopped?'后续提交已停止，等待已提交的检测结果…':'请求已提交，等待检测结果…'),!!submission.error);
+ const results=await Promise.all(run.results);
+ const failure=results.find(result=>result.error);
+ const error=submission.error||(failure?`节点 ${failure.index+1}：${failure.error}`:'');
+ const outcome=run.stopped?'stopped':error?'failed':'done';
+ try{
+  const group=await post('/api/workflows',{run_ids:run.runIds,outcome,error});
+  if(!busy)showWorkflow(group.id,group);
+  await history();if(!busy)$('history').value=group.id;
+  if(!busy)status(error||(run.stopped?'流程已停止。':'流程执行完成。'),!!error);
+ }catch(err){
+  await history().catch(()=>{});
+  if(!busy)status([error,'流程结果汇总失败：'+err.message].filter(Boolean).join('\n'),true);
+ }
 };
 function refreshWorkflowControls(){
  const locked=busy||uploading||!config;
@@ -272,7 +307,7 @@ function refreshWorkflowControls(){
  const issue=config&&workflow.length?workflowIssue():'';
  $('flowEmpty').hidden=workflow.length>0;
  $('clearFlow').disabled=locked||!workflow.length;
- $('startWorkflow').disabled=locked||!workflow.length||!!issue;
+ $('startWorkflow').disabled=locked||!workflow.length||!!issue||workflow.some(node=>node.outcome==='running');
  $('workflowName').disabled=locked;
  $('savedWorkflow').disabled=locked;
  $('saveWorkflow').disabled=locked||!workflow.length||!$('workflowName').value.trim();
@@ -443,7 +478,7 @@ function updateWorkflow(){
    state.className='flow-status '+(node.outcome||'');state.textContent=node.status;state.title=node.message||'';
    execute.textContent=isDelay?'开始计时':node.outcome==='done'?'重跑':'执行';
    const check=isDelay?delayCheck(node,index):nodeCheck(node);
-   execute.disabled=locked||!check.ok;execute.title=check.message;
+    execute.disabled=locked||node.outcome==='running'||!check.ok;execute.title=check.message;
   };
   let description;
   if(isDelay){
@@ -485,7 +520,7 @@ $('stopWorkflow').onclick=()=>{
  if(!activeRun||activeRun.stopped)return;
  activeRun.stopped=true;
  if(cancelCountdown)cancelCountdown();
- else{refreshWorkflowControls();status('当前请求完成后停止。');}
+ else{refreshWorkflowControls();status('已停止后续提交，已经发出的请求继续检测。');}
 };
 $('releaseBoard').onclick=async()=>{
  if(busy||uploading||!$('board').value)return;

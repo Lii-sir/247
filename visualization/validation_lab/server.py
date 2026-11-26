@@ -144,8 +144,10 @@ class Runner:
         self._depth_preprocessor = None
         self._depth_settings_key = None
         self._state_lock = threading.RLock()
+        self._submission_lock = threading.Lock()
         self._stopping = threading.Event()
         self._manual_boards = {}
+        self._manual_active = 0
 
     def close(self, *, force=False):
         with self._state_lock:
@@ -194,6 +196,8 @@ class Runner:
             if self.client is not None and self.client.process.poll() is None and fingerprint == self.fingerprint:
                 return dict(model_reused=True, process_pid=self.client.process.pid,
                             threading=self._startup_threading)
+            if self._manual_active:
+                raise RuntimeError("检测配置已变更或进程已退出，请等已提交的请求结束后重试")
             self.close()
             progress("初始化模型（首次需要加载CUDA模型）")
             args = (Path(sys.executable), ROOT / "python/transport/bridge_server.py", self.folder / "python.log")
@@ -221,7 +225,7 @@ class Runner:
         Image.fromarray(corrected[piece["y1"]:piece["y2"], :]).save(asset)
         return asset, metadata
 
-    def run_manual(self, rows, board_id, mode, piece_id, count, folder, progress):
+    def run_manual(self, rows, board_id, mode, piece_id, count, folder, progress, on_sent=None):
         board_id, images, depth = board_inputs(rows, board_id, mode, count, piece_id=piece_id)
         if mode == "manual_2d":
             with Image.open(images[0]["path"]) as image:
@@ -234,27 +238,55 @@ class Runner:
         affinity_note = fit_manual_affinity(config)
         config.pop("smartray_pitch_3d", None)
         init["config_text"] = json.dumps(config, ensure_ascii=True)
-        # A click must use the same service configuration for 2D and 3D.
-        startup = self._ensure(init, progress)
-        client = self.client
         idle_timeout = float(os.environ.get("BRIDGE_BOARD_TIMEOUT_SECONDS", "90"))
-        now = time.monotonic()
-        for key, cached in list(self._manual_boards.items()):
-            if now - cached["touched"] >= idle_timeout:
-                self._manual_boards.pop(key, None)
-        state = self._manual_boards.setdefault(board_id, dict(images={}, touched=now))
-        known = state["images"]
         chosen = {r["piece_id"]: r["path"] for r in images}
-        if mode == "manual_piece_3d" and piece_id in known and known[piece_id] != chosen.get(piece_id):
-            raise ValueError("该片2D文件已变更，请重新提交对应2D")
-
         command = {"manual_2d": "detect_2d_piece", "manual_piece_3d": "detect_3d_piece"}[mode]
         label = {"manual_2d": "2D", "manual_piece_3d": "单片3D"}[mode]
         title = f"板 {board_id} · 第{piece_id}片 · {label}"
         envelope = dict(viewer_version=1, mode="stream", board_id=board_id, title=title,
                         images_2d=images, responses_2d=[], warnings=[affinity_note] if affinity_note else [])
-        progress(f"准备{label}输入")
-        with ExitStack() as stack:
+        reply, request_id = {}, None
+        with ExitStack() as submission, ExitStack() as stack:
+            # Serialize input preparation and pipe writes only. Response waits
+            # and report generation belong to the individual jobs.
+            submission.enter_context(self._submission_lock)
+            startup = self._ensure(init, progress)
+            with self._state_lock:
+                if self._stopping.is_set():
+                    raise RuntimeError("验证台正在停止")
+                client = self.client
+                now = time.monotonic()
+                for key, cached in list(self._manual_boards.items()):
+                    if not cached["active"] and now - cached["touched"] >= idle_timeout:
+                        self._manual_boards.pop(key, None)
+                state = self._manual_boards.setdefault(board_id, dict(images={}, active=0, touched=now))
+                known = state["images"]
+                record = known.get(piece_id)
+                if mode == "manual_piece_3d" and record is not None and record["path"] != chosen.get(piece_id):
+                    raise ValueError("该片2D文件已变更，请重新提交对应2D")
+                if mode == "manual_2d":
+                    record = None
+                state["active"] += 1
+                self._manual_active += 1
+
+            def finish_request():
+                with self._state_lock:
+                    self._manual_active -= 1
+                    state["active"] -= 1
+                    if self._manual_boards.get(board_id) is not state:
+                        return
+                    state["touched"] = time.monotonic()
+                    remove = not reply.get("ok") if mode == "manual_2d" else reply.get("ok")
+                    if record is not None and known.get(piece_id) is record:
+                        if remove:
+                            known.pop(piece_id, None)
+                        elif mode == "manual_2d":
+                            record["ready"] = True
+                    if not known and not state["active"]:
+                        self._manual_boards.pop(board_id, None)
+
+            stack.callback(finish_request)
+            progress(f"准备{label}输入")
             if mode == "manual_2d":
                 descriptor = self.mapper(stack, Path(images[0]["path"]), "2d", piece_id)
             else:
@@ -264,21 +296,24 @@ class Runner:
                 envelope.update(image_3d=str(asset), image_3d_preprocessed=True)
             if self._stopping.is_set():
                 raise RuntimeError("验证台正在停止")
-            start_index, started = len(client.timeline), time.perf_counter()
-            progress(f"等待{label}响应")
-            reply = client.request(dict(cmd=command, board_id=board_id, **descriptor), 900)
-        elapsed = (time.perf_counter() - started) * 1000
-        state["touched"] = time.monotonic()
-        if mode == "manual_2d":
-            known.pop(piece_id, None)
-            if reply.get("ok"):
-                known[piece_id] = chosen[piece_id]
-        elif reply.get("ok"):
-            known.pop(piece_id, None)
-        if not known:
-            self._manual_boards.pop(board_id, None)
+            if mode == "manual_2d":
+                with self._state_lock:
+                    record = known[piece_id] = {"path": chosen[piece_id], "ready": False}
 
-        timeline = client.timeline[start_index:]
+            def sent(identifier, _):
+                nonlocal request_id
+                request_id = identifier
+                submission.close()
+                if on_sent is not None:
+                    on_sent()
+
+            started = time.perf_counter()
+            progress(f"等待{label}响应")
+            reply = client.request(dict(cmd=command, board_id=board_id, **descriptor), 900, on_sent=sent)
+        elapsed = (time.perf_counter() - started) * 1000
+        with self._state_lock:
+            ready_pieces = sorted(pid for pid, source in known.items() if source["ready"])
+        timeline = [row for row in client.timeline if row.get("request_id") == request_id]
         envelope.update(response=reply, timeline=timeline,
                         submission=dict(submission_mode="manual", requests=timeline))
         (folder / "result.json").write_text(json.dumps(envelope, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -290,7 +325,7 @@ class Runner:
         latency = summarize_2d_latency(timeline, expected_count=1) if mode == "manual_2d" else None
         return dict(ok=bool(reply.get("ok")), product_is_ok=detail.get("is_ok"),
                     board_id=board_id, piece_id=piece_id, submission_mode="manual", action=label,
-                     ready_piece_ids=sorted(known), pieces=1,
+                     ready_piece_ids=ready_pieces, pieces=1,
                     total_wall_ms=elapsed, error=(reply.get("message") or reply.get("error")) if not reply.get("ok") else None,
                     two_d_latency=latency, skip_3d_reason=detail.get("skip_3d_reason"), note=affinity_note,
                     output_dir=str(folder), model_reused=startup.get("model_reused", False))
@@ -513,7 +548,8 @@ class Server(ThreadingHTTPServer):
         self.runner, self.jobs = Runner(self.folder), {}
         self.workflows, self.grouped_runs = {}, set()
         self.workflow_number = 0
-        self.pool, self.lock = ThreadPoolExecutor(1), threading.Lock()
+        # Match the bridge's bound of 26 protocol requests in flight.
+        self.pool, self.lock = ThreadPoolExecutor(26), threading.Lock()
 
     def finish_workflow(self, request):
         ids, outcome = request.get("run_ids"), request.get("outcome")
@@ -685,15 +721,25 @@ class Handler(BaseHTTPRequestHandler):
             board, images, depth = board_inputs(request.get("files"), request.get("board_id"), mode, count, piece_id=piece_id)
             rows = images + ([depth] if depth else [])
             with self.server.lock:
-                if any(j["status"] == "running" for j in self.server.jobs.values()):
-                    return self.send(409, {"error": "已有验证运行中，请等待完成"})
-                if len(self.server.jobs) >= 32:
-                    self.server.jobs.pop(next(iter(self.server.jobs)))
+                running = [j for j in self.server.jobs.values() if j["status"] == "running"]
+                if running and (not manual or any(j.get("mode") not in MANUAL_MODES for j in running)):
+                    return self.send(409, {"error": "批量验证须单独运行，请等待当前请求完成"})
+                if manual and any(j.get("board_id") == board and j.get("piece_id") == piece_id and
+                                  (j.get("mode") == mode or mode == "manual_2d") for j in running):
+                    return self.send(409, {"error": f"板 {board} 第 {piece_id} 片已有冲突请求正在处理"})
                 key = uuid.uuid4().hex
                 self.server.jobs[key] = dict(status="running", phase="准备验证", board_id=board, created=time.time())
                 if manual:
                     self.server.jobs[key].update(mode=mode, piece_id=piece_id)
             folder = self.server.folder / key;folder.mkdir()
+            submitted = threading.Event()
+            sent = False
+
+            def on_sent():
+                nonlocal sent
+                sent = True
+                submitted.set()
+
             def update(**values):
                 with self.server.lock:
                     self.server.jobs[key].update(values)
@@ -701,13 +747,19 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     progress = lambda phase: update(phase=phase)
                     if manual:
-                        result = self.server.runner.run_manual(rows, board, mode, piece_id, count, folder, progress)
+                        result = self.server.runner.run_manual(rows, board, mode, piece_id, count, folder, progress, on_sent)
                     else:
                         result = self.server.runner.run(rows, board, mode, count, folder, progress, **options)
                     update(status="done" if result["ok"] else "failed", result=result, error=result.get("error"))
                 except Exception as exc:
                     update(status="failed", error=str(exc))
-            self.server.pool.submit(execute)
+            future = self.server.pool.submit(execute)
+            if manual:
+                future.add_done_callback(lambda _: submitted.set())
+                submitted.wait()
+                with self.server.lock:
+                    error = self.server.jobs[key].get("error") if not sent else None
+                return self.send(202, {"id": key, "submitted": sent, "error": error})
             self.send(202, {"id":key})
         except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
             self.send(400, {"error":str(exc)})

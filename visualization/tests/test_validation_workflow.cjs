@@ -4,7 +4,7 @@ function browserStorage(){
  const values=new Map();
  return {getItem:key=>values.get(key)??null,setItem:(key,value)=>values.set(key,value)};
 }
-async function boot(latency=null,timers={},failRequest=()=>false,browser={}){
+async function boot(latency=null,timers={},failRequest=()=>false,browser={},hooks={}){
  const nodes=new Map(),requests=[],history=[],groups=[];
  class Node{
   constructor(){this.value='';this.textContent='';this.hidden=false;this.disabled=false;this.children=[];this.dataset={};}
@@ -22,16 +22,20 @@ async function boot(latency=null,timers={},failRequest=()=>false,browser={}){
    else if(url==='/api/history')data=history;
    else if(url.startsWith('/api/upload?')){const kind=new URL(url,'http://local').searchParams.get('kind'),name=opt.body.name,m=name.match(/^(.+)_(\d+)\./);data={kind,name,path:'/uploads/'+name,board_id:kind==='3d'?name.split('.')[0]:m?.[1]||'',piece_id:kind==='2d'&&m?Number(m[2]):null};}
    else if(url==='/api/run'){const q=JSON.parse(opt.body);requests.push(q);const id=String(requests.length).padStart(32,'0');
-    if(failRequest(q))history.unshift({id,board_id:q.board_id,status:'failed',error:'synthetic request failure'});
+    const submitted=hooks.submit?.(q)!==false;
+    if(!submitted||failRequest(q))history.unshift({id,board_id:q.board_id,status:'failed',error:'synthetic request failure'});
     else history.unshift({id,board_id:q.board_id,status:'done',result:{ok:true,product_is_ok:false,board_id:q.board_id,pieces:2,total_wall_ms:1000,output_dir:'/output',model_reused:false,submission_mode:q.submission_mode,request_interval_ms:q.request_interval_ms,two_d_latency:latency}});
-    data={id};}
+    data={id,submitted,error:submitted?null:'synthetic request failure'};}
    else if(url==='/api/workflows'){
     const q=JSON.parse(opt.body);groups.push(q);
     data={id:'a'.repeat(32),kind:'workflow',title:'流程 '+groups.length,status:q.outcome,boards:2,runs:q.run_ids.length,error:q.error};
     for(const id of q.run_ids){const index=history.findIndex(job=>job.id===id);if(index>=0)history.splice(index,1);}
     history.unshift(data);
    }
-   else if(url.startsWith('/api/jobs/'))data=history.find(job=>job.id===url.split('/').at(-1));
+   else if(url.startsWith('/api/jobs/')){
+    await hooks.beforePoll?.(url);
+    data=history.find(job=>job.id===url.split('/').at(-1));
+   }
    else throw Error(url);
    return {ok:true,json:async()=>data};
   }});
@@ -204,7 +208,9 @@ test('a configurable delay only triggers its adjacent detection when the timer e
 
 test('one click runs a configured range and delay, then opens one grouped workflow report',async()=>{
  const {timers,pending,delays}=deferredTimers();
- const {nodes,requests,config,groups}=await boot(null,timers);
+ let releaseResults;
+ const results=new Promise(resolve=>{releaseResults=resolve;});
+ const {nodes,requests,config,groups}=await boot(null,timers,()=>false,{}, {beforePoll:()=>results});
  config.samples.push({kind:'2d',name:'3_1.png',path:'/3_1.png',board_id:'3',piece_id:1});
  nodes.get('demo').onclick();
  const cards=nodes.get('flowNodes');
@@ -223,8 +229,11 @@ test('one click runs a configured range and delay, then opens one grouped workfl
  assert.deepEqual(requests.map(q=>[q.board_id,q.piece_id]),[['2',2],['2',1]]);
  assert.deepEqual(delays,[1000]);
  pending.values().next().value();
- await run;
+ for(let n=0;requests.length<3&&n<10;n++)await new Promise(setImmediate);
  assert.deepEqual(requests.map(q=>[q.board_id,q.piece_id]),[['2',2],['2',1],['3',1]]);
+ assert.equal(groups.length,0);
+ releaseResults();
+ await run;
  assert.deepEqual(groups,[{run_ids:[1,2,3].map(id=>String(id).padStart(32,'0')),outcome:'done',error:''}]);
  assert.equal(nodes.get('history').children.length,2);
  assert.equal(nodes.get('report').src,'/runs/'+'a'.repeat(32)+'/report.html');
@@ -246,8 +255,8 @@ test('stopping during an active request prevents remaining pieces from being sen
  assert.match(nodes.get('progress').textContent,/流程已停止/);
 });
 
-test('an interface error stops a flow before submitting the next piece or node',async()=>{
- const {nodes,requests}=await boot(null,{},q=>q.mode==='manual_2d');
+test('an error before sending stops subsequent submissions',async()=>{
+ const {nodes,requests}=await boot(null,{},()=>false,{}, {submit:q=>q.mode!=='manual_2d'});
  nodes.get('demo').onclick();
  nodes.get('addDetection').onclick();
  nodes.get('addDetection').onclick();
@@ -257,6 +266,38 @@ test('an interface error stops a flow before submitting the next piece or node',
  await nodes.get('startWorkflow').onclick();
  assert.equal(requests.length,1);
  assert.match(nodes.get('progress').textContent,/节点 1.*synthetic request failure/);
+});
+
+test('failed detection results are collected without delaying later submissions',async()=>{
+ const {nodes,requests,groups}=await boot(null,{},q=>q.mode==='manual_2d');
+ nodes.get('demo').onclick();
+ nodes.get('addDetection').onclick();
+ nodes.get('addDetection').onclick();
+ setDetection(nodes.get('flowNodes').children[1],{mode:'manual_piece_3d'});
+ await nodes.get('startWorkflow').onclick();
+ assert.deepEqual(requests.map(q=>q.mode),['manual_2d','manual_piece_3d']);
+ assert.equal(groups[0].outcome,'failed');
+ assert.match(groups[0].error,/节点 1.*synthetic request failure/);
+});
+
+test('another node can be clicked while a submitted result is pending',async()=>{
+ let releaseResults;
+ const results=new Promise(resolve=>{releaseResults=resolve;});
+ const {nodes,requests}=await boot(null,{},()=>false,{}, {beforePoll:()=>results});
+ nodes.get('demo').onclick();
+ nodes.get('addDetection').onclick();
+ nodes.get('addDetection').onclick();
+ const cards=nodes.get('flowNodes');
+ setDetection(cards.children[1],{pieces:'2'});
+ const first=execute(cards.children[0]).onclick();
+ await new Promise(setImmediate);
+ assert.equal(execute(cards.children[0]).disabled,true);
+ assert.equal(execute(cards.children[1]).disabled,false);
+ const second=execute(cards.children[1]).onclick();
+ await new Promise(setImmediate);
+ assert.deepEqual(requests.map(q=>q.piece_id),[1,2]);
+ releaseResults();
+ await Promise.all([first,second]);
 });
 
 test('a named setup survives reload, restores its node parameters and sends no requests',async()=>{

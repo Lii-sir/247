@@ -27,8 +27,10 @@ class FakeClient:
         self.condition=threading.Condition();self.pieces={};self.released=set();self.fail_piece=None
     def request(self, q, timeout, *, on_sent=None):
         with self.condition:
-            self.requests.append(q);self.timeline.append({'cmd':q['cmd'],'piece_id':q.get('piece_id'),'duration_ms':1})
-            if on_sent is not None:on_sent('fake-'+str(len(self.requests)),time.perf_counter())
+            self.requests.append(q)
+            request_id='fake-'+str(len(self.requests))
+            self.timeline.append({'cmd':q['cmd'],'piece_id':q.get('piece_id'),'duration_ms':1,'request_id':request_id})
+            if on_sent is not None:on_sent(request_id,time.perf_counter())
             board=q.get('board_id');cmd=q['cmd']
             response=dict(ok=True,cmd=cmd,board_id=board,timings={})
             if cmd=='init_algorithm':response['threading']={'main_cpu_ids':list(range(8)),'main_reserved_cpu_ids':list(range(8))}
@@ -232,6 +234,7 @@ class ValidationTests(unittest.TestCase):
                 headers={'Content-Type':'application/json'}))
         done=threading.Event()
         def manual(*args):
+            args[-1]()
             done.set()
             return {'ok':True,'piece_id':2}
         with patch.object(server.runner,'run_manual',side_effect=manual) as exact, patch.object(server.runner,'run') as batch:
@@ -240,7 +243,9 @@ class ValidationTests(unittest.TestCase):
             self.assertEqual(invalid.exception.code,400)
             with post(body) as response:
                 self.assertEqual(response.status,202)
-                job_id=json.load(response)['id']
+                accepted=json.load(response)
+                self.assertTrue(accepted['submitted'])
+                job_id=accepted['id']
             self.assertTrue(done.wait(2))
             args=exact.call_args.args
             self.assertEqual((args[1],args[2],args[3]),('2','manual_2d',2))
@@ -248,6 +253,62 @@ class ValidationTests(unittest.TestCase):
             batch.assert_not_called()
         with urlopen(base+'/api/jobs/'+job_id) as response:
             self.assertEqual(json.load(response)['piece_id'],2)
+
+    def test_http_submits_same_piece_3d_while_2d_result_is_pending(self):
+        release_2d = threading.Event()
+
+        class DelayedClient(FakeClient):
+            def request(self, q, timeout, *, on_sent=None):
+                reply = super().request(q, timeout, on_sent=on_sent)
+                if q['cmd'] == 'detect_2d_piece' and not release_2d.wait(5):
+                    raise TimeoutError("test did not release 2D")
+                return reply
+
+        server = lab.Server(0, self.root/'overlapping-api')
+        runner, _ = self.make_runner()
+        runner.client_factory = DelayedClient
+        server.runner = runner
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(release_2d.set)
+        base = f'http://127.0.0.1:{server.server_port}'
+
+        def submit(mode):
+            payload = dict(files=self.rows, board_id='02', mode=mode, piece_id=2)
+            request = Request(base+'/api/run', data=json.dumps(payload).encode(),
+                              headers={'Content-Type': 'application/json'})
+            with urlopen(request, timeout=3) as response:
+                accepted = json.load(response)
+            self.assertTrue(accepted['submitted'], accepted)
+            return accepted['id']
+
+        def completed(job_id):
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                with urlopen(base+'/api/jobs/'+job_id, timeout=3) as response:
+                    item = json.load(response)
+                if item['status'] != 'running':
+                    self.assertEqual('done', item['status'], item)
+                    return json.loads((server.folder/job_id/'result.json').read_text(encoding='utf-8'))
+                time.sleep(.01)
+            self.fail("job did not finish")
+
+        with patch.object(lab, 'defaults', return_value=dict(piece_count=2)), \
+             patch.object(runner, '_manual_piece_depth', return_value=(Path(self.rows[2]['path']), {})):
+            two_d = submit('manual_2d')
+            three_d = submit('manual_piece_3d')
+            try:
+                with urlopen(base+'/api/jobs/'+two_d, timeout=3) as response:
+                    self.assertEqual('running', json.load(response)['status'])
+                result_3d = completed(three_d)
+                self.assertTrue(result_3d['response']['results_piece']['is_ok'])
+            finally:
+                release_2d.set()
+            result_2d = completed(two_d)
+        self.assertEqual(['detect_2d_piece'], [row['cmd'] for row in result_2d['timeline']])
+        self.assertEqual(['detect_3d_piece'], [row['cmd'] for row in result_3d['timeline']])
+        self.assertNotIn('2', runner._manual_boards)
 
     def test_http_workflow_publishes_one_history_entry_and_combined_report(self):
         server=lab.Server(0,self.root/'workflow-api')
