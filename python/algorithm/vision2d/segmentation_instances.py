@@ -114,7 +114,10 @@ def _label_group(group, image_shape, min_area, class_id, class_name):
         ranks = np.zeros((bottom-top, right-left), dtype=dtype)
         for rank, (_, _, (x1, y1, x2, y2), crop) in enumerate(group, 1):
             np.copyto(ranks[y1-top:y2-top, x1-left:x2-left], rank, where=crop != 0)
-        foreground = ranks if dtype == np.uint8 else cv2.compare(ranks, 0, cv2.CMP_GT)
+        foreground = ranks
+        if dtype != np.uint8:
+            foreground = np.empty(ranks.shape, dtype=np.uint8)
+            np.greater(ranks, 0, out=foreground)
 
     if foreground.size < min_area:
         return
@@ -123,13 +126,15 @@ def _label_group(group, image_shape, min_area, class_id, class_name):
         if area < min_area:
             continue
         region = np.s_[y:y+height, x:x+width]
-        component = cv2.compare(labels[region], label, cv2.CMP_EQ)
+        x0, y0 = int(left+x), int(top+y)
+        mask = np.zeros(image_shape, dtype=np.uint8)
+        component = mask[y0:y0+height, x0:x0+width]
+        # OpenCV 5's scalar compare can reject a 1x1 label region.
+        np.equal(labels[region], label, out=component)
         if ranks is not None:
             _, best_rank, _, _ = cv2.minMaxLoc(ranks[region], mask=component)
             source, score = group[int(best_rank) - 1][:2]
-        x0, y0 = int(left+x), int(top+y)
-        mask = np.zeros(image_shape, dtype=np.uint8)
-        mask[y0:y0+height, x0:x0+width] = component
+        component *= 255
         yield source, dict(class_id=class_id, class_name=class_name, confidence=score, mask=mask,
             _mask_bbox=(x0, y0, int(width), int(height)), _mask_area_px=int(area), _mask_binary_255=True,
             rectangle=None, rectangle_ratio=1., is_ok=True)

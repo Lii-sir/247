@@ -126,6 +126,38 @@ class MaskMappingInputTests(unittest.TestCase):
         self.assertEqual(2, instance["_mask_area_px"])
         self.assertAlmostEqual(.8, instance["confidence"])
 
+    def test_single_pixel_region_survives_with_its_own_confidence(self):
+        import torch
+        from algorithm.vision2d.segmentation_instances import extract_instances
+
+        masks = torch.zeros((2, 8, 8), dtype=torch.uint8)
+        masks[0, 1:3, 1:3] = 1
+        masks[:, 5, 6] = 1
+        result = SimpleNamespace(masks=SimpleNamespace(data=masks),
+            boxes=SimpleNamespace(cls=torch.tensor([1, 1]), conf=torch.tensor([.55, .95])),
+            names={1: "wire"})
+        rectangle, pixel = extract_instances(result, (8, 8), 1)
+        self.assertEqual((1, 1, 2, 2), rectangle["_mask_bbox"])
+        self.assertEqual((6, 5, 1, 1), pixel["_mask_bbox"])
+        self.assertAlmostEqual(.55, rectangle["confidence"])
+        self.assertAlmostEqual(.95, pixel["confidence"])
+        expected = np.zeros((8, 8), dtype=np.uint8)
+        expected[5, 6] = 255
+        np.testing.assert_array_equal(pixel["mask"], expected)
+
+    def test_single_pixel_with_more_than_255_confidence_ranks(self):
+        import torch
+        from algorithm.vision2d.segmentation_instances import extract_instances
+
+        masks = torch.zeros((256, 5, 5), dtype=torch.uint8)
+        masks[:, 2, 3] = 1
+        result = SimpleNamespace(masks=SimpleNamespace(data=masks),
+            boxes=SimpleNamespace(cls=torch.ones(256), conf=torch.linspace(.1, .9, 256)), names={1: "wire"})
+        instance, = extract_instances(result, (5, 5), 1)
+        self.assertEqual((3, 2, 1, 1), instance["_mask_bbox"])
+        self.assertEqual(255, instance["mask"][2, 3])
+        self.assertAlmostEqual(.9, instance["confidence"])
+
 
 class AffineScoreTests(unittest.TestCase):
     def test_only_selected_regions_contribute_to_objective(self):

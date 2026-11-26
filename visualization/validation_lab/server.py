@@ -423,20 +423,34 @@ class Runner:
                 if request_id is not None and on_finished is not None:
                     on_finished(time.perf_counter(), received)
         elapsed = (time.perf_counter() - started) * 1000
+        artifact_errors = {}
         if prepared_piece is not None:
             asset = folder / "piece-depth.png"
-            Image.fromarray(prepared_piece.pixels).save(asset)
-            envelope.update(image_3d=str(asset), image_3d_preprocessed=True, pitch_ready_at=prepared_piece.ready_at)
+            envelope["pitch_ready_at"] = prepared_piece.ready_at
+            try:
+                Image.fromarray(prepared_piece.pixels).save(asset)
+                envelope.update(image_3d=str(asset), image_3d_preprocessed=True)
+            except (OSError, ValueError) as exc:
+                artifact_errors["piece-depth.png"] = f"深度预览保存失败：{exc}"
         with self._state_lock:
             ready_pieces = sorted(pid for pid, source in known.items() if source["ready"])
         timeline = [row for row in client.timeline if row.get("request_id") == request_id]
         envelope.update(response=reply, timeline=timeline,
                         submission=dict(submission_mode="manual", requests=timeline))
         (folder / "result.json").write_text(json.dumps(envelope, ensure_ascii=False, indent=2), encoding="utf-8")
-        save_timing_csv(envelope, folder / "timings.csv")
-        self.reporter(envelope, folder / "report.html", base_dir=folder, force=True)
+        try:
+            save_timing_csv(envelope, folder / "timings.csv")
+        except Exception as exc:
+            artifact_errors["timings.csv"] = f"耗时 CSV 导出失败：{exc}"
+        try:
+            self.reporter(envelope, folder / "report.html", base_dir=folder, force=True)
+        except Exception as exc:
+            artifact_errors["report.html"] = f"报告生成失败：{exc}"
         if (self.folder / "python.log").exists():
-            shutil.copyfile(self.folder / "python.log", folder / "python.log")
+            try:
+                shutil.copyfile(self.folder / "python.log", folder / "python.log")
+            except OSError as exc:
+                artifact_errors["python.log"] = f"检测日志复制失败：{exc}"
         detail = reply.get("results_2d") or reply.get("results_piece", {})
         latency = summarize_2d_latency(timeline, expected_count=1) if mode == "manual_2d" else None
         return dict(ok=bool(reply.get("ok")), product_is_ok=detail.get("is_ok"),
@@ -444,7 +458,8 @@ class Runner:
                      ready_piece_ids=ready_pieces, pieces=1,
                     total_wall_ms=elapsed, error=(reply.get("message") or reply.get("error")) if not reply.get("ok") else None,
                     two_d_latency=latency, skip_3d_reason=detail.get("skip_3d_reason"), note=affinity_note,
-                    output_dir=str(folder), model_reused=startup.get("model_reused", False))
+                    output_dir=str(folder), model_reused=startup.get("model_reused", False),
+                    artifact_errors=artifact_errors)
 
     def release_manual(self, board_id):
         self._pitch.release(board_id)
@@ -709,6 +724,9 @@ class Server(ThreadingHTTPServer):
                 result = dict(board_id=job["board_id"], response=dict(ok=False, error=job.get("error")))
             else:
                 raise ValueError("找不到流程中的检测记录")
+            artifact_errors = (job.get("result") or {}).get("artifact_errors")
+            if artifact_errors:
+                result["artifact_errors"] = artifact_errors
             runs.append(dict(id=key, board_id=job.get("board_id"), piece_id=job.get("piece_id"),
                              mode=job.get("mode"), document=result))
             timings = child / "timings.csv"

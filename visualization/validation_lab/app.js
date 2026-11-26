@@ -14,7 +14,12 @@ const requestClock=new Intl.DateTimeFormat('zh-CN',{hour:'2-digit',minute:'2-dig
  fractionalSecondDigits:3,hourCycle:'h23'});
 let nodeID=0, activeRun=null, cancelCountdown=null, refreshCards=[];
 const pendingPitchRuns=new Set();
-async function api(url,options){const r=await fetch(url,options),d=await r.json();if(!r.ok)throw Error(d.error||'HTTP '+r.status);return d;}
+async function api(url,options){
+ const response=await fetch(url,options);
+ if(response.ok)return response.json();
+ const detail=await response.json().catch(()=>null);
+ throw Object.assign(Error(detail?.error||'HTTP '+response.status),{httpStatus:response.status});
+}
 const post=(url,body)=>api(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
 function status(text,error=false){$('progress').textContent=text;$('progress').className=error?'error':'';}
 function assess(){
@@ -53,9 +58,12 @@ $('clear').onclick=()=>{files=[];revision++;renderFiles();status('清单已清�
 $('board').onchange=assess;
 $('requestInterval').value=$('requestInterval').value||'100';
 $('submissionMode').onchange=$('requestInterval').oninput=()=>{revision++;assess();};
-function links(id,workflow=false){
- for(const [key,file] of [['reportLink','report.html'],['jsonLink','result.json'],['csvLink','timings.csv'],['logLink','python.log']])$(key).href='/runs/'+id+'/'+file;
- $('links').hidden=false;$('logLink').hidden=workflow;
+function links(id,workflow=false,unavailable={}){
+ for(const [key,file] of [['reportLink','report.html'],['jsonLink','result.json'],['csvLink','timings.csv'],['logLink','python.log']]){
+  $(key).href='/runs/'+id+'/'+file;
+  $(key).hidden=!!unavailable[file]||(workflow&&key==='logLink');
+ }
+ $('links').hidden=false;
 }
 const workflowStatus={done:'完成',stopped:'已停止',failed:'失败'};
 function showWorkflow(id,group){
@@ -66,19 +74,24 @@ function showWorkflow(id,group){
   (group.error?'\n'+group.error:'');
 }
 function showResult(id,job){
- links(id);$('resultEmpty').hidden=true;$('report').hidden=false;$('report').src='/runs/'+id+'/report.html';
  const r=job.result;
- $('summary').textContent=r?'板 '+r.board_id+' · '+(r.ok?(r.product_is_ok?'检测完成 · OK':'检测完成 · NG（算法判定）'):'检测请求失败')+' · '+r.pieces+'片 · '+(r.total_wall_ms/1000).toFixed(2)+'秒 · '+(r.model_reused?'复用已加载模型':'本次初始化模型')+(r.submission_mode==='paced'?' · 按间隔提交 '+r.request_interval_ms+'ms':r.submission_mode==='concurrent'?' · 并发提交':'')+(r.error?'\n'+r.error:'')+'\n输出：'+r.output_dir:'验证失败：'+(job.error||'未知错误');
+ const artifactErrors=r?.artifact_errors||{};
+ links(id,false,artifactErrors);$('resultEmpty').hidden=true;$('report').hidden=!!artifactErrors['report.html'];
+ if(!$('report').hidden)$('report').src='/runs/'+id+'/report.html';
+ const verdict=r?.product_is_ok===true?'OK':r?.product_is_ok===false?'NG':'未判定';
+ $('summary').textContent=r?'板 '+r.board_id+' · '+(r.ok?'检测完成 · '+verdict:'检测请求失败')+' · '+r.pieces+'片 · '+(r.total_wall_ms/1000).toFixed(2)+'秒 · '+(r.model_reused?'复用已加载模型':'本次初始化模型')+(r.submission_mode==='paced'?' · 按间隔提交 '+r.request_interval_ms+'ms':r.submission_mode==='concurrent'?' · 并发提交':'')+(r.error?'\n'+r.error:'')+'\n输出：'+r.output_dir:'验证失败：'+(job.error||'未知错误');
  if(r?.submission_mode==='manual'){
   const skipped={missing_2d_result:'缺少或已过期的2D结果',no_2d_result:'2D无有效掩码','2d_ng':'2D已判为NG',no_3d_checks:'未启用3D检测项'};
   const target=r.piece_id==null?'':' · 第'+r.piece_id+'片';
-  $('summary').textContent='板 '+r.board_id+target+' · '+r.action+' · '+(r.ok?(r.product_is_ok?'OK':'NG'):'请求失败')+
+  $('summary').textContent='板 '+r.board_id+target+' · '+r.action+' · '+(r.ok?verdict:'请求失败')+
    (r.skip_3d_reason?' · '+(skipped[r.skip_3d_reason]||r.skip_3d_reason):'')+
    (r.error?'\n'+r.error:'')+'\n用时 '+(r.total_wall_ms/1000).toFixed(2)+'秒';
   if(r.note)$('summary').textContent+='\n'+r.note;
  }
  const latency=r?.two_d_latency;
  if(latency&&Number.isFinite(latency.max_ms))$('summary').textContent+='\n2D请求≤'+latency.target_ms+'ms：'+(latency.meets_target?'达标':'未达标')+' · 最大 '+latency.max_ms.toFixed(1)+'ms'+(latency.over_target_piece_ids?.length?' · 超标片号 '+latency.over_target_piece_ids.join(', '):'');
+ const warnings=Object.values(artifactErrors);
+ if(warnings.length)$('summary').textContent+='\n'+warnings.join('\n');
 }
 async function history(){
  const list=await api('/api/history'),old=$('history').value;
@@ -104,9 +117,17 @@ $('history').onchange=async()=>{
  }catch(e){status(e.message,true);}
 };
 async function waitForJob(id,onUpdate){
+ let consecutiveErrors=0;
  while(true){
   await new Promise(r=>setTimeout(r,800));
-  const job=await api('/api/jobs/'+id);
+  let job;
+  try{
+   job=await api('/api/jobs/'+id);
+  }catch(error){
+   if((error.httpStatus>=400&&error.httpStatus<500)||++consecutiveErrors>=3)throw error;
+   continue;
+  }
+  consecutiveErrors=0;
   onUpdate?.(job);
   if(job.status!=='running')return job;
  }
@@ -218,11 +239,13 @@ async function runDetection(node,run){
    refreshWorkflowControls();
    if(accepted.submitted===false){
     error=accepted.error||'检测请求未发出';
+    timing.error=error;
     break;
    }
   }catch(e){
    timing.phase='unsent';
    error=e.message;
+   timing.error=error;
    break;
   }
  }
@@ -238,6 +261,7 @@ function trackRequest(id,timing){
   const receivedAt=job.received_at??null;
   const submittedAt=job.submitted_at??timing.submittedAt;
   const pitchReadyAt=job.pitch_ready_at??null;
+  const error=job.status==='failed'?job.error||'检测请求失败':timing.error;
   let phase=timing.phase;
   if(Number.isFinite(receivedAt))phase='received';
   else if(phase!=='unsent'){
@@ -246,25 +270,34 @@ function trackRequest(id,timing){
    else if(Number.isFinite(submittedAt))phase='pending';
   }
   if(timing.phase===phase&&timing.receivedAt===receivedAt&&timing.submittedAt===submittedAt&&
-   timing.pitchReadyAt===pitchReadyAt)return;
-  Object.assign(timing,{phase,receivedAt,submittedAt,pitchReadyAt});
+   timing.pitchReadyAt===pitchReadyAt&&timing.error===error)return;
+  Object.assign(timing,{phase,receivedAt,submittedAt,pitchReadyAt,error});
   refreshWorkflowControls();
  }).catch(error=>{
-  if(timing.phase==='pending'||timing.phase==='pitch_pending')timing.phase='unreceived';
+  timing.phase='poll_failed';
+  timing.error='读取结果状态失败：'+error.message;
   refreshWorkflowControls();
-  return {status:'failed',error:error.message};
+  return {status:'unavailable',error:timing.error};
  });
 }
 async function collectNode(node,index,ids,results,count,submissionError){
  const jobs=await Promise.all(results);
- const failure=jobs.find(job=>job.status!=='done');
+ const failure=jobs.find(job=>job.status==='failed')||jobs.find(job=>job.status!=='done');
  const error=submissionError||failure?.error||(failure?'检测请求失败':'');
- const finished=jobs.filter(job=>job.status==='done').length;
- const ng=jobs.filter(job=>job.status==='done'&&!job.result?.product_is_ok).length;
+ const succeeded=jobs.filter(job=>job.status==='done');
+ const finished=succeeded.length;
+ const ng=succeeded.filter(job=>job.result?.product_is_ok===false).length;
+ const undecided=succeeded.filter(job=>typeof job.result?.product_is_ok!=='boolean').length;
+ const rejected=submissionError&&ids.length<node.requestTimes.length?1:0;
+ const requestFailed=Math.max(submissionError?1:0,jobs.filter(job=>job.status==='failed').length+rejected);
+ const failureLabel=requestFailed?(finished?`${requestFailed} 条请求失败`:'请求失败'):'结果状态读取失败';
  node.outcome=error?'failed':finished===count?'done':'';
- node.status=error?'请求失败':finished<count?`已停止 · ${finished}/${count}`:
-  count===1?(ng?'完成 · NG':'完成 · OK'):`完成 ${finished} 片 · ${ng} 片 NG`;
- node.message=error;
+ node.status=error?(finished?`完成 ${finished}/${count} · ${failureLabel}`:failureLabel):
+  finished<count?`已停止 · ${finished}/${count}`:
+  count===1?`完成 · ${ng?'NG':undecided?'未判定':'OK'}`:
+  `完成 ${finished} 片 · ${ng} 片 NG`+(undecided?` · ${undecided} 片未判定`:'');
+ const details=node.requestTimes.filter(timing=>timing.error).map(timing=>`第 ${timing.piece_id} 片：${timing.error}`);
+ node.message=(details.length?details:[error]).filter(Boolean).join('\n');
  updateWorkflow();
  return {index,error,id:ids.at(-1),job:jobs.at(-1)};
 }
@@ -579,10 +612,11 @@ function renderRequestTimes(table,timings,pitch){
  const body=document.createElement('tbody');
  for(const timing of timings){
   const row=document.createElement('tr');
+  if(timing.error)row.title=timing.error;
   const submitted=Number.isFinite(timing.submittedAt)?requestClock.format(timing.submittedAt*1000):
    timing.phase==='submitting'?'提交中':timing.phase==='unsent'?'未提交':timing.phase==='pitch_pending'?'等待中':'—';
   const received=Number.isFinite(timing.receivedAt)?requestClock.format(timing.receivedAt*1000):
-   timing.phase==='pending'?'等待中':timing.phase==='unreceived'?'未收到':'—';
+   timing.phase==='pending'?'等待中':timing.phase==='unreceived'?'未收到':timing.phase==='poll_failed'?'读取失败':'—';
   const values=[timing.piece_id];
   if(pitch)values.push(Number.isFinite(timing.pitchReadyAt)?requestClock.format(timing.pitchReadyAt*1000):'—');
   values.push(submitted,received);

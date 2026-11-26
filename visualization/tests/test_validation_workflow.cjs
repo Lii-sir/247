@@ -27,6 +27,7 @@ async function boot(latency=null,timers={},failRequest=()=>false,browser={},hook
     else history.unshift({id,board_id:q.board_id,status:'done',result:{ok:true,product_is_ok:false,board_id:q.board_id,pieces:2,total_wall_ms:1000,output_dir:'/output',model_reused:false,submission_mode:q.submission_mode,request_interval_ms:q.request_interval_ms,two_d_latency:latency}});
     const timing=hooks.timing?.(q)??{};
     Object.assign(history[0],timing);
+    if(history[0].result)Object.assign(history[0].result,hooks.result?.(q)??{});
     data=q.mode==='pitch_piece_3d'?{id,pitch_waiting:true}:{id,submitted,submitted_at:timing.submitted_at,error:submitted?null:'synthetic request failure'};}
    else if(url==='/api/pitch/start'){
     pitchStarts.push(JSON.parse(opt.body));
@@ -307,6 +308,46 @@ test('failed detection results are collected without delaying later submissions'
  assert.deepEqual(requests.map(q=>q.mode),['manual_2d','manual_piece_3d']);
  assert.equal(groups[0].outcome,'failed');
  assert.match(groups[0].error,/节点 1.*synthetic request failure/);
+});
+
+test('a temporary status read error does not turn a returned result into a request failure',async()=>{
+ let polls=0;
+ const {nodes,requests}=await boot(null,{},()=>false,{}, {
+  beforePoll:()=>{if(++polls===1)throw Error('temporary connection interruption');},
+ });
+ nodes.get('demo').onclick();
+ nodes.get('addDetection').onclick();
+ const card=()=>nodes.get('flowNodes').children[0];
+ await execute(card()).onclick();
+ assert.equal(requests.length,1);
+ assert.equal(polls,2);
+ assert.equal(card().children[2].children[0].textContent,'完成 · NG');
+});
+
+test('a multi-piece node shows the completed count and the failed piece separately',async()=>{
+ const {nodes}=await boot(null,{},q=>q.piece_id===2);
+ nodes.get('demo').onclick();
+ nodes.get('addDetection').onclick();
+ const card=()=>nodes.get('flowNodes').children[0];
+ setDetection(card(),{pieces:'1-2'});
+ await execute(card()).onclick();
+ const state=card().children[2].children[0];
+ assert.equal(state.textContent,'完成 1/2 · 1 条请求失败');
+ assert.match(state.title,/第 2 片.*synthetic request failure/);
+});
+
+test('a report export error preserves the detection verdict and the JSON link',async()=>{
+ const {nodes}=await boot(null,{},()=>false,{}, {
+  result:()=>({product_is_ok:true,artifact_errors:{'report.html':'报告生成失败：文件无法写入'}}),
+ });
+ nodes.get('demo').onclick();
+ nodes.get('addDetection').onclick();
+ const card=()=>nodes.get('flowNodes').children[0];
+ await execute(card()).onclick();
+ assert.equal(card().children[2].children[0].textContent,'完成 · OK');
+ assert.match(nodes.get('summary').textContent,/报告生成失败/);
+ assert.equal(nodes.get('reportLink').hidden,true);
+ assert.equal(nodes.get('jsonLink').hidden,false);
 });
 
 test('another node can be clicked while a submitted result is pending',async()=>{

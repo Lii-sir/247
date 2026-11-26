@@ -180,6 +180,20 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(detect,[('detect_2d_piece',2),('detect_3d_piece',2),('detect_3d_piece',1),
             ('detect_2d_piece',1),('detect_2d_piece',2),('detect_3d_piece',1)])
 
+    def test_returned_detection_is_kept_if_the_html_report_cannot_be_written(self):
+        runner, _ = self.make_runner()
+        self.addCleanup(runner.stop)
+        folder = self.root/"report-write-error"
+        folder.mkdir()
+        with patch.object(runner, "reporter", side_effect=OSError("report file unavailable")):
+            result = runner.run_manual(self.rows, "2", "manual_2d", 1, 2, folder, lambda _: None)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["product_is_ok"])
+        self.assertIn("report file unavailable", result["artifact_errors"]["report.html"])
+        saved = json.loads((folder/"result.json").read_text(encoding="utf-8"))
+        self.assertTrue(saved["response"]["results_2d"]["is_ok"])
+        self.assertTrue((folder/"timings.csv").is_file())
+
     def test_manual_affinity_uses_local_process_pools_when_core_budget_is_too_large(self):
         cfg={'common_2d':{'parameters':{'threading':{'cpu_process_affinity':{
             'enabled':True,'physical_cores':2}}}},'common_3d':{'parameters':{'threading':{
