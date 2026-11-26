@@ -7,6 +7,7 @@ const actions={...detectionTypes,delay:'延时触发'};
 const palette=[['addDetection','manual_2d'],['addDelay','delay']];
 const savedWorkflowKey='validation-lab.workflow-templates.v1';
 const workflowFileFormat='validation-lab-workflow';
+const workflowVersion=2;
 let nodeID=0, activeRun=null, cancelCountdown=null, refreshCards=[];
 async function api(url,options){const r=await fetch(url,options),d=await r.json();if(!r.ok)throw Error(d.error||'HTTP '+r.status);return d;}
 const post=(url,body)=>api(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -347,13 +348,25 @@ function validWorkflow(entry){
  const validNode=node=>node&&(node.mode==='delay'?typeof node.delay_ms==='string':
    typeof node.board_id==='string'&&(node.mode==='manual_board_3d'||
     Object.hasOwn(detectionTypes,node.mode)&&typeof node.piece_spec==='string'));
- return entry&&typeof entry.name==='string'&&entry.name.trim()&&
+ return entry&&(entry.version===undefined||entry.version===1||entry.version===workflowVersion)&&
+  typeof entry.name==='string'&&entry.name.trim()&&
   Array.isArray(entry.nodes)&&entry.nodes.length&&entry.nodes.every(validNode);
+}
+function restoreWorkflow(entry){
+ const savedBoards=new Set(entry.nodes.map(node=>Pairing.board(node.board_id)).filter(Boolean));
+ // Older single-board templates saved the current board even when it was just a default.
+ const followCurrent=entry.version!==workflowVersion&&savedBoards.size===1;
+ const nodes=entry.nodes.map(node=>{
+  const setup=nodeSetup(node);
+  if(followCurrent&&setup.mode!=='delay')setup.board_id='';
+  return setup;
+ });
+ return {...entry,version:workflowVersion,nodes};
 }
 function readSavedWorkflows(){
  const entries=JSON.parse(window.localStorage.getItem(savedWorkflowKey)||'[]');
  if(!Array.isArray(entries)||!entries.every(validWorkflow))throw Error('已保存的流程格式有误');
- return entries.map(entry=>({...entry,nodes:entry.nodes.map(nodeSetup)}));
+ return entries.map(restoreWorkflow);
 }
 function showSavedWorkflows(entries,selected=$('savedWorkflow').value){
  const list=$('savedWorkflow');
@@ -369,10 +382,11 @@ $('saveWorkflow').onclick=()=>{
  try{
   const name=$('workflowName').value.trim(),nodes=workflowSetup();
   const entries=readSavedWorkflows(),index=entries.findIndex(entry=>entry.name===name);
-  if(index<0)entries.push({name,nodes});
+  const entry={version:workflowVersion,name,nodes};
+  if(index<0)entries.push(entry);
   else{
    if(!window.confirm('更新已保存的流程「'+name+'」？'))return;
-   entries[index]={name,nodes};
+   entries[index]=entry;
   }
   window.localStorage.setItem(savedWorkflowKey,JSON.stringify(entries));
   $('workflowName').value=name;
@@ -380,7 +394,7 @@ $('saveWorkflow').onclick=()=>{
  }catch(error){status('保存流程失败：'+error.message,true);}
 };
 function applySavedWorkflow(entry,stored=[]){
- const current=JSON.stringify(workflowSetup()),nodes=entry.nodes.map(nodeSetup);
+ const current=JSON.stringify(workflowSetup()),{nodes}=restoreWorkflow(entry);
  if(workflow.length&&current!==JSON.stringify(nodes)&&
   !stored.some(item=>JSON.stringify(item.nodes)===current)&&
   !window.confirm('载入「'+entry.name+'」将替换当前画布，是否继续？'))return;
@@ -402,7 +416,7 @@ $('saveWorkflowFile').onclick=()=>{
  if($('saveWorkflowFile').disabled)return;
  return runExclusive(async()=>{
   const name=$('workflowName').value.trim()||'检测流程';
-  const body=JSON.stringify({format:workflowFileFormat,version:1,name,nodes:workflowSetup()},null,2)+'\n';
+  const body=JSON.stringify({format:workflowFileFormat,version:workflowVersion,name,nodes:workflowSetup()},null,2)+'\n';
   const filename='流程-'+name.replace(/[<>:"/\\|?*\u0000-\u001f]/g,'_').slice(0,100)+'.json';
   try{
    if(typeof window.showSaveFilePicker==='function'){
@@ -429,7 +443,7 @@ $('workflowFileInput').onchange=event=>{
  return runExclusive(async()=>{
   try{
    const document=JSON.parse(await file.text());
-   if(document?.format!==workflowFileFormat||document.version!==1||!validWorkflow(document))
+   if(document?.format!==workflowFileFormat||!Number.isInteger(document.version)||!validWorkflow(document))
     throw Error('请选择验证台导出的流程 JSON');
    applySavedWorkflow(document);
   }catch(error){status('载入流程文件失败：'+error.message,true);}

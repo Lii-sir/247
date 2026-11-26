@@ -336,7 +336,7 @@ test('a named setup survives reload, restores its node parameters and sends no r
  const name=nodes.get('workflowName');name.value='A 板逐片复核';name.oninput();
  nodes.get('saveWorkflow').onclick();
  const key='validation-lab.workflow-templates.v1';
- assert.deepEqual(JSON.parse(localStorage.getItem(key)),[{name:'A 板逐片复核',nodes:[
+ assert.deepEqual(JSON.parse(localStorage.getItem(key)),[{version:2,name:'A 板逐片复核',nodes:[
   {mode:'manual_2d',board_id:'',piece_spec:'2,1'},
   {mode:'delay',delay_ms:'725'},
   {mode:'manual_piece_3d',board_id:'',piece_spec:'2'}
@@ -392,7 +392,7 @@ test('workflow JSON uses the save picker and can be loaded in a different browse
  await nodes.get('saveWorkflowFile').onclick();
  assert.equal(selected.suggestedName,'流程-逐片流程.json');
  assert.equal(closed,true);
- assert.deepEqual(JSON.parse(content),{format:'validation-lab-workflow',version:1,name:'逐片流程',nodes:[
+ assert.deepEqual(JSON.parse(content),{format:'validation-lab-workflow',version:2,name:'逐片流程',nodes:[
   {mode:'manual_2d',board_id:'',piece_spec:'1-2'},{mode:'delay',delay_ms:'1000'}
  ]});
  assert.equal(requests.length,0);
@@ -405,4 +405,36 @@ test('workflow JSON uses the save picker and can be loaded in a different browse
  await file.onchange({target:{value:'report.json',files:[{text:async()=>'{"mode":"workflow","runs":[]}' }]}});
  assert.match(other.nodes.get('progress').textContent,/请选择验证台导出的流程 JSON/);
  assert.equal(other.nodes.get('flowNodes').children.length,2);
+});
+
+test('imported legacy single-board flows update when files are loaded or the current board changes',async()=>{
+ const {nodes,requests}=await boot();
+ const file=nodes.get('workflowFileInput');
+ const document={format:'validation-lab-workflow',version:1,name:'旧流程',nodes:[
+  {mode:'manual_2d',board_id:'demo',piece_spec:'1'},
+ ]};
+ await file.onchange({target:{value:'legacy.json',files:[{text:async()=>JSON.stringify(document)}]}});
+ const card=()=>nodes.get('flowNodes').children[0];
+ const board=()=>card().children[1].children[1].children[0];
+ assert.match(board().children[0].textContent,/等待载入/);
+ await nodes.get('upload2').onchange({target:{files:[{name:'8_1.png'},{name:'9_1.png'}],value:'files'}});
+ assert.match(board().children[0].textContent,/自动.*板 8/);
+ nodes.get('board').value='9';nodes.get('board').onchange();
+ assert.match(board().children[0].textContent,/自动.*板 9/);
+ await execute(card()).onclick();
+ assert.deepEqual(requests.map(q=>[q.board_id,q.files[0].name]),[['9','9_1.png']]);
+});
+
+test('import preserves explicit fixed boards and legacy cross-board workflows',async()=>{
+ const {nodes}=await boot();
+ nodes.get('demo').onclick();
+ const file=nodes.get('workflowFileInput');
+ const load=(version,ids)=>file.onchange({target:{value:'fixed.json',files:[{text:async()=>JSON.stringify({
+  format:'validation-lab-workflow',version,name:'固定板号',nodes:ids.map(board_id=>({mode:'manual_2d',board_id,piece_spec:'1'}))
+ })}]}});
+ const boards=()=>nodes.get('flowNodes').children.map(card=>card.children[1].children[1].children[0].value);
+ await load(2,['42']);
+ assert.deepEqual(boards(),['42']);
+ await load(1,['42','43']);
+ assert.deepEqual(boards(),['42','43']);
 });
