@@ -83,6 +83,27 @@ test('batch file upload displays original names and permits manual board editing
  assert.match(nodes.get('counts').textContent,/2个已编号板号/);
  nodes.get('board').value='2';nodes.get('board').onchange();assert.equal(nodes.get('run').disabled,false);
 });
+test('new detection nodes follow loaded boards and allow a fixed board',async()=>{
+ const {nodes,requests}=await boot();
+ const cards=nodes.get('flowNodes');
+ const boardField=()=>cards.children[0].children[1].children[1].children[0];
+ nodes.get('addDetection').onclick();
+ assert.match(boardField().children[0].textContent,/等待载入/);
+ assert.equal(execute(cards.children[0]).disabled,true);
+ await nodes.get('upload2').onchange({target:{files:[{name:'63_1.png'},{name:'72_1.png'}],value:'files'}});
+ assert.match(boardField().children[0].textContent,/板 63/);
+ await execute(cards.children[0]).onclick();
+ nodes.get('board').value='72';nodes.get('board').onchange();
+ assert.match(boardField().children[0].textContent,/板 72/);
+ await execute(cards.children[0]).onclick();
+ setDetection(cards.children[0],{board:'63'});
+ nodes.get('board').onchange();
+ assert.equal(boardField().value,'63');
+ await execute(cards.children[0]).onclick();
+ assert.deepEqual(requests.map(q=>[q.board_id,q.files[0].name]),[
+  ['63','63_1.png'],['72','72_1.png'],['63','63_1.png'],
+ ]);
+});
 test('paced submission carries interval and keeps report snapshot',async()=>{
  const {nodes,requests}=await boot();nodes.get('demo').onclick();
  assert.equal(nodes.get('requestInterval').disabled,true);
@@ -316,9 +337,9 @@ test('a named setup survives reload, restores its node parameters and sends no r
  nodes.get('saveWorkflow').onclick();
  const key='validation-lab.workflow-templates.v1';
  assert.deepEqual(JSON.parse(localStorage.getItem(key)),[{name:'A 板逐片复核',nodes:[
-  {mode:'manual_2d',board_id:'2',piece_spec:'2,1'},
+  {mode:'manual_2d',board_id:'',piece_spec:'2,1'},
   {mode:'delay',delay_ms:'725'},
-  {mode:'manual_piece_3d',board_id:'2',piece_spec:'2'}
+  {mode:'manual_piece_3d',board_id:'',piece_spec:'2'}
  ]}]);
  nodes.get('clearFlow').onclick();
  assert.equal(cards.children.length,0);
@@ -335,8 +356,10 @@ test('a named setup survives reload, restores its node parameters and sends no r
  assert.match(threeD.children[0].textContent,/单片 3D/);
  assert.equal(threeD.children[2].children[0].textContent,'待执行');
  assert.equal(page.get('startWorkflow').disabled,true);
- page.get('demo').onclick();
+ await page.get('upload2').onchange({target:{files:[{name:'8_1.png'},{name:'8_2.png'}],value:'files'}});
+ await page.get('upload3').onchange({target:{files:[{name:'8.png'}],value:'files'}});
  assert.equal(page.get('startWorkflow').disabled,false);
+ assert.match(page.get('flowNodes').children[2].children[1].children[1].children[0].children[0].textContent,/板 8/);
  assert.equal(reloaded.requests.length,0);
 });
 
@@ -370,7 +393,7 @@ test('workflow JSON uses the save picker and can be loaded in a different browse
  assert.equal(selected.suggestedName,'流程-逐片流程.json');
  assert.equal(closed,true);
  assert.deepEqual(JSON.parse(content),{format:'validation-lab-workflow',version:1,name:'逐片流程',nodes:[
-  {mode:'manual_2d',board_id:'2',piece_spec:'1-2'},{mode:'delay',delay_ms:'1000'}
+  {mode:'manual_2d',board_id:'',piece_spec:'1-2'},{mode:'delay',delay_ms:'1000'}
  ]});
  assert.equal(requests.length,0);
  const other=await boot(),file=other.nodes.get('workflowFileInput');

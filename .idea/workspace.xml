@@ -6,11 +6,6 @@
   <component name="ChangeListManager">
     <list default="true" id="f45a9d93-da79-4d4c-b621-f1da0bf4d833" name="更改" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/visualization/tests/test_validation_lab.py" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/tests/test_validation_lab.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/visualization/tests/test_validation_workflow.cjs" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/tests/test_validation_workflow.cjs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/visualization/validation_lab/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/validation_lab/README.md" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/visualization/validation_lab/app.js" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/validation_lab/app.js" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/visualization/validation_lab/server.py" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/validation_lab/server.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -183,7 +178,7 @@
       <workItem from="1794126520608" duration="3501000" />
       <workItem from="1794196452229" duration="30292000" />
       <workItem from="1794911765751" duration="14201000" />
-      <workItem from="1795598537364" duration="19005000" />
+      <workItem from="1795598537364" duration="20196000" />
     </task>
     <servers />
   </component>

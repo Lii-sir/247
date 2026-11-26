@@ -138,7 +138,10 @@ $('run').onclick=async()=>{
 
 function target(mode){
  if(mode==='delay')return {mode,delay_ms:'1000'};
- return {mode,board_id:$('board').value,piece_spec:'1'};
+ return {mode,board_id:'',piece_spec:'1'};
+}
+function nodeBoardId(node){
+ return Pairing.board(node.board_id)||$('board').value;
 }
 function nodeCheck(node){
  if(node.mode==='delay'){
@@ -150,11 +153,12 @@ function nodeCheck(node){
  const count=config?.piece_count||0;
  const pieces=Pairing.pieceNumbers(node.piece_spec,count);
  if(!pieces.length)return {ok:false,message:'请填写 1～'+count+' 的片号，支持用逗号和范围'};
+ const board_id=nodeBoardId(node);
  for(const piece of pieces){
-  const check=Pairing.checkManual(files,node.board_id,node.mode,piece,count);
+  const check=Pairing.checkManual(files,board_id,node.mode,piece,count);
   if(!check.ok)return {ok:false,message:'第'+piece+'片：'+check.message};
  }
- return {ok:true,message:'',pieces};
+ return {ok:true,message:'',pieces,board_id};
 }
 function delayCheck(node,index){
  const duration=nodeCheck(node);
@@ -176,9 +180,10 @@ function moveNode(id,index){
  updateWorkflow();
 }
 async function runDetection(node,run){
- const {ok,message,pieces}=nodeCheck(node);
+ const {ok,message,pieces,board_id}=nodeCheck(node);
  if(!ok){status(message,true);return false;}
- const {mode,board_id}=node;
+ const {mode}=node;
+ node.runBoardId=board_id;
  const ids=[];
  let error='';
  for(const piece_id of pieces){
@@ -225,7 +230,7 @@ function waitDelay(node,next){
  const tick=()=>{
   const remaining=Math.max(0,deadline-Date.now());
   status('等待 '+(remaining<1000?remaining+' ms':(remaining/1000).toFixed(1)+' 秒')+
-   ' · 板 '+next.board_id+' · '+actions[next.mode]);
+   ' · 板 '+nodeBoardId(next)+' · '+actions[next.mode]);
  };
  node.status='计时中';node.outcome='running';
  return new Promise(resolve=>{
@@ -441,7 +446,8 @@ function detectionFields(node,boards,locked){
  type.value=node.mode;
  addField(fields,'检测类型',type);
  const board=document.createElement('select');board.disabled=locked;
- appendOption(board,'','选择板号');
+ const currentBoard=$('board').value;
+ appendOption(board,'',currentBoard?'自动 · 板 '+currentBoard:'自动 · 等待载入文件');
  for(const id of boards)appendOption(board,id,'板 '+id);
  if(node.board_id&&!boards.includes(node.board_id))appendOption(board,node.board_id,'板 '+node.board_id+'（未载入）');
  board.value=node.board_id;
@@ -475,7 +481,9 @@ function updateWorkflow(){
   const execute=document.createElement('button');
   const refresh=()=>{
    grip.textContent=(index+1)+' · '+actions[node.mode];
-   state.className='flow-status '+(node.outcome||'');state.textContent=node.status;state.title=node.message||'';
+    const otherBoard=!isDelay&&node.outcome&&node.runBoardId&&node.runBoardId!==nodeBoardId(node);
+    state.className='flow-status '+(node.outcome||'');
+    state.textContent=otherBoard?'板 '+node.runBoardId+' · '+node.status:node.status;state.title=node.message||'';
    execute.textContent=isDelay?'开始计时':node.outcome==='done'?'重跑':'执行';
    const check=isDelay?delayCheck(node,index):nodeCheck(node);
     execute.disabled=locked||node.outcome==='running'||!check.ok;execute.title=check.message;
@@ -490,7 +498,7 @@ function updateWorkflow(){
    input.setAttribute('aria-label','节点 '+(index+1)+' 等待时间（毫秒）');
    input.oninput=()=>editNode(node,{delay_ms:input.value});
    description.append(input);
-  }else description=detectionFields(node,boards,locked);
+   }else description=detectionFields(node,boards,locked||node.outcome==='running');
   refreshCards.push(refresh);
   execute.onclick=()=>runSingleNode(node,index);
   const remove=document.createElement('button');remove.textContent='×';remove.title='移除节点';remove.disabled=locked;
