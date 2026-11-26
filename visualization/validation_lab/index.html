@@ -1,18 +1,152 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>整板检测验证台</title><link rel="stylesheet" href="/style.css"></head>
-<body><header><div><h1>整板检测验证台 <span>LOCAL VALIDATION</span></h1><p>选图配对 → 正式检测 → 交互复核</p></div><span class="badge">本机运行 · 正式算法</span></header>
-<main><aside><section><h2>01 选择输入</h2><div class="buttons"><label class="file">添加 2D 片图<input id="upload2" type="file" multiple accept=".png,.jpg,.jpeg,.bmp,.tif,.tiff"></label><label class="file">添加 3D 整板<input id="upload3" type="file" multiple accept=".png"></label><button id="demo">载入项目样本</button><button id="clear">清空清单</button></div><p class="hint">命名规则：2D 为“板号_片号.png”，3D 为“板号.png”。例如 2_6.png 对应板2第6片；编号可在下表修改。</p>
-<div class="table-wrap"><table><thead><tr><th>文件</th><th>板号</th><th>片号</th><th></th></tr></thead><tbody id="files"></tbody></table><p id="empty">还没有文件。可一次选择多张图。</p></div><p id="counts" class="hint"></p></section>
-<section><h2>流程组件</h2><div class="palette"><button id="addDetection" type="button" draggable="true">＋ 检测</button><button id="addDelay" type="button" draggable="true">＋ 延时触发</button></div><p class="hint">点击添加或拖入画布，在检测节点里设置类型、板号和片号。</p><label>批量验证 / 释放缓存的板号<select id="board"><option value="">请选择板号</option></select></label><button id="releaseBoard" type="button" disabled>释放此板缓存</button></section>
-<details class="batch"><summary>批量 2D 验证</summary><div class="batch-fields"><div id="checks" role="status"></div><label>提交模式<select id="submissionMode"><option value="concurrent">并发提交</option><option value="paced">按间隔提交 2D</option></select></label><label>相邻请求间隔（ms）<input id="requestInterval" class="interval" type="number" min="0" max="3600000" step="0.1" value="100" disabled></label><p id="submissionHint" class="hint">并发发送所选板的请求。</p><button id="run" type="button" disabled>开始批量验证</button></div></details>
-<details><summary>当前正式配置 / 使用说明</summary><p id="config" class="hint">加载中…</p><p class="hint">使用 config 下的正式参数和模型；Pitch仅作用于3D，配准为粗配准+仿射。修改配置后再次运行会重新初始化模型，文件清单不写回生产配置。首次加载模型需要CUDA，后续相同配置复用模型。</p><p class="hint">文件和报告保存在 visualization/output/validation-lab。刷新后文件清单需重新选择；已运行记录可从右侧历史中打开。上传文件保留，不在关闭服务时删除。</p></details>
-<div class="run"><p id="progress" role="status">正在加载配置…</p></div></aside>
-<article><section class="workflow" aria-labelledby="flowTitle">
-<div class="workflow-header"><div><h2 id="flowTitle">检测流程画布</h2><p class="hint">拖动节点调整顺序，也可单独执行任意节点。</p><p id="workflowIssue" class="hint error" role="status" hidden></p></div>
-<div class="workflow-actions"><button id="startWorkflow" type="button" disabled>一键启动流程</button><button id="stopWorkflow" type="button" hidden>停止流程</button><button id="clearFlow" type="button" disabled>清空画布</button></div></div>
-<div class="workflow-library" aria-label="流程模板">
-<div><input id="workflowName" type="text" aria-label="流程名称" placeholder="输入流程名称"><button id="saveWorkflow" type="button" disabled>保存流程</button></div>
-<div><select id="savedWorkflow" aria-label="已保存的流程"><option value="">选择已保存的流程</option></select><button id="loadWorkflow" type="button" disabled>载入流程</button></div>
-<div><button id="saveWorkflowFile" type="button" disabled>另存为流程文件</button><button id="openWorkflowFile" type="button" disabled>从文件载入</button><input id="workflowFileInput" type="file" accept=".json,application/json" hidden></div>
-</div>
-<div id="flowCanvas" class="workflow-canvas"><p id="flowEmpty">从左侧添加检测节点</p><ol id="flowNodes" aria-label="检测节点顺序"></ol></div>
-</section><div class="report-head"><div><h2>检测结果与交互复核</h2><p id="summary">完成验证后，可切换图层、缩放图像、点击引线或测高结果定位。</p></div><select id="history" aria-label="历史验证记录"><option value="">历史验证记录</option></select></div><div class="links" id="links" hidden><a id="reportLink" target="_blank" rel="noopener">独立打开报告</a><a id="jsonLink" download="result.json">结果JSON</a><a id="csvLink" download="timings.csv">耗时CSV</a><a id="logLink" target="_blank" rel="noopener">服务日志</a></div><div id="resultEmpty"><strong>准备一组图像开始验证</strong><p>板号负责配对整板，片号负责对应2D片图和深度分片。</p><p>可以先载入项目样本，或按命名规则选择自己的文件。</p></div><iframe id="report" title="检测结果交互报告" hidden></iframe></article></main><script src="/pairing.js"></script><script src="/app.js"></script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>整板检测验证台</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-title">
+      <h1>整板检测验证台</h1>
+      <p>选图配对 · 流程编排 · 结果复核</p>
+    </div>
+    <span class="badge">本机正式算法</span>
+  </header>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <section class="card">
+        <div class="section-head">
+          <h2>输入图像</h2>
+          <p id="counts" class="counts"></p>
+        </div>
+        <div class="buttons">
+          <label class="file primary-soft">添加 2D<input id="upload2" type="file" multiple accept=".png,.jpg,.jpeg,.bmp,.tif,.tiff"></label>
+          <label class="file primary-soft">添加 3D<input id="upload3" type="file" multiple accept=".png"></label>
+          <button id="demo" type="button">载入样本</button>
+          <button id="clear" type="button" class="ghost">清空</button>
+        </div>
+        <p class="hint">命名：2D 为 <code>板号_片号.png</code>，3D 为 <code>板号.png</code>，编号可在下表直接修改。</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>文件</th><th>板号</th><th>片号</th><th></th></tr>
+            </thead>
+            <tbody id="files"></tbody>
+          </table>
+          <p id="empty">尚未选择文件，可一次多选导入。</p>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <h2>流程组件</h2>
+        </div>
+        <div class="palette">
+          <button id="addDetection" type="button" draggable="true">＋ 检测节点</button>
+          <button id="addDelay" type="button" draggable="true">＋ 延时触发</button>
+        </div>
+        <p class="hint">点击或拖入右侧画布，在节点中设置类型、板号与片号。</p>
+        <div class="board-row">
+          <label>板号<select id="board"><option value="">请选择板号</option></select></label>
+          <button id="releaseBoard" type="button" class="ghost" disabled>释放缓存</button>
+        </div>
+      </section>
+
+      <details class="card fold batch">
+        <summary>批量 2D 验证</summary>
+        <div class="batch-fields">
+          <div id="checks" role="status"></div>
+          <label>提交模式
+            <select id="submissionMode">
+              <option value="concurrent">并发提交</option>
+              <option value="paced">按间隔提交 2D</option>
+            </select>
+          </label>
+          <label>请求间隔（ms）
+            <input id="requestInterval" class="interval" type="number" min="0" max="3600000" step="0.1" value="100" disabled>
+          </label>
+          <p id="submissionHint" class="hint">并发发送所选板的请求。</p>
+          <button id="run" type="button" class="btn-accent" disabled>开始批量验证</button>
+        </div>
+      </details>
+
+      <details class="card fold">
+        <summary>配置与说明</summary>
+        <div class="fold-body">
+          <p id="config" class="hint">加载中…</p>
+          <p class="hint">使用 <code>config</code> 下的正式参数与模型；结果保存至 <code>visualization/output/validation-lab</code>。</p>
+        </div>
+      </details>
+
+      <div class="run">
+        <p id="progress" role="status">正在加载配置…</p>
+      </div>
+    </aside>
+
+    <article class="workspace">
+      <section class="workflow card" aria-labelledby="flowTitle">
+        <div class="workflow-header">
+          <div>
+            <h2 id="flowTitle">检测流程画布</h2>
+            <p class="hint">拖动节点调整顺序，支持单步执行或一键运行。</p>
+            <p id="workflowIssue" class="hint error" role="status" hidden></p>
+          </div>
+          <div class="workflow-actions">
+            <button id="startWorkflow" type="button" disabled>一键启动流程</button>
+            <button id="stopWorkflow" type="button" hidden>停止流程</button>
+            <button id="clearFlow" type="button" class="ghost" disabled>清空画布</button>
+          </div>
+        </div>
+
+        <div class="workflow-library" aria-label="流程模板">
+          <div class="lib-group">
+            <input id="workflowName" type="text" aria-label="流程名称" placeholder="输入流程名称">
+            <button id="saveWorkflow" type="button" disabled>保存</button>
+          </div>
+          <div class="lib-group">
+            <select id="savedWorkflow" aria-label="已保存的流程"><option value="">选择已保存流程</option></select>
+            <button id="loadWorkflow" type="button" disabled>载入</button>
+          </div>
+          <div class="lib-group lib-files">
+            <button id="saveWorkflowFile" type="button" disabled>导出 JSON</button>
+            <button id="openWorkflowFile" type="button" disabled>导入 JSON</button>
+            <input id="workflowFileInput" type="file" accept=".json,application/json" hidden>
+          </div>
+        </div>
+
+        <div id="flowCanvas" class="workflow-canvas">
+          <p id="flowEmpty">点击左侧「＋ 检测节点」或拖入此处开始编排</p>
+          <ol id="flowNodes" aria-label="检测节点顺序"></ol>
+        </div>
+      </section>
+
+      <section class="report-panel card">
+        <div class="report-head">
+          <div>
+            <h2>检测结果与复核</h2>
+            <p id="summary">完成检测后可切换板片、缩放图像并定位各项结果。</p>
+          </div>
+          <select id="history" aria-label="历史验证记录"><option value="">历史验证记录</option></select>
+        </div>
+        <div class="links" id="links" hidden>
+          <a id="reportLink" target="_blank" rel="noopener">新窗口打开报告</a>
+          <a id="jsonLink" download="result.json">结果 JSON</a>
+          <a id="csvLink" download="timings.csv">耗时 CSV</a>
+          <a id="logLink" target="_blank" rel="noopener">服务日志</a>
+        </div>
+        <div id="resultEmpty">
+          <strong>等待开始检测</strong>
+          <p>导入图像并配置流程节点，或直接点击左侧「载入样本」快速体验。</p>
+        </div>
+        <iframe id="report" title="检测结果交互报告" hidden></iframe>
+      </section>
+    </article>
+  </main>
+
+  <script src="/pairing.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
