@@ -27,7 +27,8 @@ class PitchTrigger:
     board_id: str
     piece_id: int
     image_path: str
-    depth: Future
+    depth_key: tuple
+    depth: Future | None
     ready: Callable[[float], None]
     dispatch: Callable[[PreparedPiece], None]
     fail: Callable[[str], None]
@@ -54,10 +55,12 @@ class PitchPreparations:
     def profile(segmentation, settings):
         return segmentation, json.dumps(settings, sort_keys=True)
 
-    def piece(self, board_id, path, segmentation, settings, piece_id):
+    def key(self, path, segmentation, settings):
         path = Path(path)
         stat = path.stat()
-        key = (path, stat.st_size, stat.st_mtime_ns, *self.profile(segmentation, settings))
+        return path, stat.st_size, stat.st_mtime_ns, *self.profile(segmentation, settings)
+
+    def start(self, board_id, key, segmentation, settings):
         now = time.monotonic()
         with self._lock:
             if self._closed:
@@ -67,19 +70,32 @@ class PitchPreparations:
             for board in expired:
                 self._boards.pop(board)
             scan = self._boards.get(board_id)
+            if scan is not None and scan.key == key and any(not future.done() for future in scan.pieces.values()):
+                scan.touched = now
+                return scan.pieces, True
+            if scan is None and len(self._boards) >= 4:
+                idle = [(item.touched, board) for board, item in self._boards.items()
+                        if all(future.done() for future in item.pieces.values())]
+                if not idle:
+                    raise RuntimeError("已有四块板正在准备深度")
+                self._boards.pop(min(idle)[1])
+            if scan is not None:
+                scan.cancelled.set()
+            scan = _Board(key, {pid: Future() for pid in range(1, segmentation.expected_piece_count + 1)},
+                          threading.Event(), now)
+            self._boards[board_id] = scan
+            self._pool.submit(self._prepare, scan, key[0], segmentation, settings)
+            return scan.pieces, False
+
+    def piece(self, board_id, key, piece_id):
+        with self._lock:
+            scan = self._boards.get(board_id)
             if scan is None or scan.key != key:
-                if scan is None and len(self._boards) >= 4:
-                    idle = [(scan.touched, board) for board, scan in self._boards.items()
-                            if all(future.done() for future in scan.pieces.values())]
-                    if not idle:
-                        raise RuntimeError("已有四块板正在准备深度")
-                    self._boards.pop(min(idle)[1])
-                if scan is not None:
-                    scan.cancelled.set()
-                scan = _Board(key, {pid: Future() for pid in range(1, segmentation.expected_piece_count + 1)},
-                              threading.Event(), now)
-                self._boards[board_id] = scan
-                self._pool.submit(self._prepare, scan, path, segmentation, settings)
+                return None
+            now = time.monotonic()
+            if now - scan.touched > 90 and all(future.done() for future in scan.pieces.values()):
+                self._boards.pop(board_id)
+                return None
             scan.touched = now
             return scan.pieces[piece_id]
 

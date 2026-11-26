@@ -3,9 +3,10 @@ const $=id=>document.getElementById(id);
 let files=[],config=null,busy=false,uploading=false,revision=0;
 const workflow=[];
 const pitchMode='pitch_piece_3d';
+const pitchStart='pitch_start';
 const detectionTypes={manual_2d:'单片 2D',manual_piece_3d:'单片 3D',[pitchMode]:'Pitch 就绪送检 3D'};
-const actions={...detectionTypes,delay:'延时触发'};
-const palette=[['addDetection','manual_2d'],['addDelay','delay']];
+const actions={...detectionTypes,[pitchStart]:'启动 Pitch',delay:'延时触发'};
+const palette=[['addDetection','manual_2d'],['addPitch',pitchStart],['addDelay','delay']];
 const savedWorkflowKey='validation-lab.workflow-templates.v1';
 const workflowFileFormat='validation-lab-workflow';
 const workflowVersion=2;
@@ -127,7 +128,8 @@ async function runValidation(request){
 async function runExclusive(work,kind=null){
  if(busy||uploading||!config)return;
  busy=true;
- activeRun=kind?{kind,stopped:false,runIds:[],pitchIds:[],results:[]}:null;
+ activeRun=kind?{kind,stopped:false,runIds:[],pitchIds:[],results:[],
+  pitchStartBoards:new Set(),startedPitchBoards:new Set()}:null;
  renderFiles();
  try{return await work(activeRun);}
  finally{activeRun=null;busy=false;renderFiles();}
@@ -144,6 +146,7 @@ $('run').onclick=async()=>{
 
 function target(mode){
  if(mode==='delay')return {mode,delay_ms:'1000'};
+ if(mode===pitchStart)return {mode,board_id:''};
  return {mode,board_id:'',piece_spec:'1'};
 }
 function nodeBoardId(node){
@@ -156,6 +159,7 @@ function nodeCheck(node){
   return text!==''&&Number.isFinite(ms)&&ms>=0&&ms<=max
    ?{ok:true,message:''}:{ok:false,message:'等待时间须为0～'+max+'毫秒的有限数值'};
  }
+ if(node.mode===pitchStart)return Pairing.checkPitch(files,nodeBoardId(node));
  const count=config?.piece_count||0;
  const pieces=Pairing.pieceNumbers(node.piece_spec,count);
  if(!pieces.length)return {ok:false,message:'请填写 1～'+count+' 的片号，支持用逗号和范围'};
@@ -170,7 +174,7 @@ function delayCheck(node,index){
  const duration=nodeCheck(node);
  if(!duration.ok)return duration;
  const next=workflow[index+1];
- if(!next||next.mode==='delay')return {ok:false,message:'请将延时节点放在要触发的检测节点前'};
+ if(!next||next.mode==='delay')return {ok:false,message:'请将延时节点放在要触发的节点前'};
  return nodeCheck(next);
 }
 function addNode(node,index=workflow.length){
@@ -202,7 +206,10 @@ async function runDetection(node,run){
   const snapshot=files.filter(row=>Pairing.board(row.board_id)===board_id&&
    (row.kind==='3d'?mode!=='manual_2d':row.piece_id===piece_id));
   try{
-   const accepted=await post('/api/run',{mode,board_id,piece_id,files:structuredClone(snapshot)});
+   const request={mode,board_id,piece_id,files:structuredClone(snapshot)};
+   if(mode===pitchMode&&run.pitchStartBoards.has(board_id)&&!run.startedPitchBoards.has(board_id))
+    request.wait_for_pitch_start=true;
+   const accepted=await post('/api/run',request);
    ids.push(accepted.id);run.runIds.push(accepted.id);
    if(mode===pitchMode){run.pitchIds.push(accepted.id);pendingPitchRuns.add(run);}
    timing.submittedAt=accepted.submitted_at;
@@ -286,7 +293,7 @@ async function runSingleNode(node,index){
  const check=isDelay?delayCheck(node,index):nodeCheck(node);
  if(!check.ok){status(check.message,true);return;}
  const run=await runExclusive(async run=>{
-  if(!isDelay||await waitDelay(node,next))await runDetection(next,run);
+  if(!isDelay||await waitDelay(node,next))await executeNode(next,run);
   if(run.stopped)status(isDelay&&!run.runIds.length?'计时已取消。':'后续请求已停止。');
   return run;
  },isDelay?'delay':'detection');
@@ -302,6 +309,27 @@ async function runSingleNode(node,index){
  }
  try{await history();if(!busy&&result.id)$('history').value=result.id;}
  catch(error){console.warn('历史验证记录刷新失败',error);}
+}
+async function startPitch(node,run){
+ const board_id=nodeBoardId(node);
+ const snapshots=files.filter(row=>row.kind==='3d'&&Pairing.board(row.board_id)===board_id);
+ node.runBoardId=board_id;
+ node.status='正在提交启动请求';node.outcome='running';updateWorkflow();
+ try{
+  const started=await post('/api/pitch/start',{board_id,files:structuredClone(snapshots)});
+  run.startedPitchBoards.add(board_id);
+  node.status=started.reused?'本板正在矫正':`已启动 · ${requestClock.format(started.started_at*1000)}`;
+  node.outcome='done';
+  status(node.status);
+ }catch(error){
+  node.status='启动失败';node.outcome='failed';node.message=error.message;
+  status(error.message,true);
+ }
+ updateWorkflow();
+ return node.outcome==='done'&&!run.stopped;
+}
+function executeNode(node,run){
+ return node.mode===pitchStart?startPitch(node,run):runDetection(node,run);
 }
 function workflowIssue(){
  for(const [index,node] of workflow.entries()){
@@ -319,9 +347,9 @@ $('startWorkflow').onclick=async()=>{
  if(!workflow.length||workflow.some(node=>node.outcome==='running'))return;
  const submission=await runExclusive(async run=>{
   for(const node of workflow){node.outcome='';node.status='待执行';node.message='';node.requestTimes=[];}
+  run.pitchStartBoards=new Set(workflow.filter(node=>node.mode===pitchStart).map(nodeBoardId));
   let error='';
-  // Arm the automatic requests before starting 2D. An adjacent delay still
-  // controls when its following trigger is armed.
+  // Pre-arm 3D without starting Pitch. An adjacent delay still controls registration.
   const armed=new Set();
   for(const [index,node] of workflow.entries()){
    if(run.stopped||error)break;
@@ -332,7 +360,7 @@ $('startWorkflow').onclick=async()=>{
   for(const [index,node] of workflow.entries()){
    if(run.stopped||error)break;
    if(armed.has(node.id))continue;
-   const finished=node.mode==='delay'?await waitDelay(node,workflow[index+1]):await runDetection(node,run);
+   const finished=node.mode==='delay'?await waitDelay(node,workflow[index+1]):await executeNode(node,run);
    if(!finished){
     if(!run.stopped)error=`流程停在节点 ${index+1}：${node.message||'检测请求失败'}`;
     break;
@@ -346,6 +374,10 @@ $('startWorkflow').onclick=async()=>{
  },'workflow');
  if(!submission)return;
  const {run}=submission;
+ if(!run.runIds.length){
+  status(submission.error||(run.stopped?'流程已停止。':'流程动作已提交。'),!!submission.error);
+  return;
+ }
  if(!busy)status(submission.error||(run.stopped?'后续提交已停止，等待已提交的检测结果…':'请求已提交，等待检测结果…'),!!submission.error);
  const results=await Promise.all(run.results);
  pendingPitchRuns.delete(run);refreshWorkflowControls();
@@ -391,6 +423,7 @@ function appendOption(select,value,text){
  const option=document.createElement('option');option.value=value;option.textContent=text;select.append(option);
 }
 function nodeSetup({mode,board_id,piece_spec,delay_ms}){
+ if(mode===pitchStart)return {mode,board_id};
  if(mode==='manual_board_3d'){
   const count=config?.piece_count||1;
   return {mode:'manual_piece_3d',board_id,piece_spec:count>1?'1-'+count:'1'};
@@ -402,7 +435,7 @@ function workflowSetup(){
 }
 function validWorkflow(entry){
  const validNode=node=>node&&(node.mode==='delay'?typeof node.delay_ms==='string':
-   typeof node.board_id==='string'&&(node.mode==='manual_board_3d'||
+    typeof node.board_id==='string'&&(node.mode===pitchStart||node.mode==='manual_board_3d'||
     Object.hasOwn(detectionTypes,node.mode)&&typeof node.piece_spec==='string'));
  return entry&&(entry.version===undefined||entry.version===1||entry.version===workflowVersion)&&
   typeof entry.name==='string'&&entry.name.trim()&&
@@ -509,24 +542,27 @@ function editNode(node,changes){
  Object.assign(node,changes,{status:'待执行',outcome:'',message:'',requestTimes:[]});
  refreshWorkflowControls();
 }
-function detectionFields(node,boards,locked){
- const fields=document.createElement('div');fields.className='node-fields';
- const type=document.createElement('select');type.disabled=locked;
- for(const [value,title] of Object.entries(detectionTypes))appendOption(type,value,title);
- type.value=node.mode;
- addField(fields,'检测类型',type);
+function boardSelector(node,boards,locked){
  const board=document.createElement('select');board.disabled=locked;
  const currentBoard=$('board').value;
  appendOption(board,'',currentBoard?'自动 · 板 '+currentBoard:'自动 · 等待载入文件');
  for(const id of boards)appendOption(board,id,'板 '+id);
  if(node.board_id&&!boards.includes(node.board_id))appendOption(board,node.board_id,'板 '+node.board_id+'（未载入）');
  board.value=node.board_id;
- addField(fields,'板号',board);
+ board.onchange=()=>editNode(node,{board_id:board.value});
+ return board;
+}
+function detectionFields(node,boards,locked){
+ const fields=document.createElement('div');fields.className='node-fields';
+ const type=document.createElement('select');type.disabled=locked;
+ for(const [value,title] of Object.entries(detectionTypes))appendOption(type,value,title);
+ type.value=node.mode;
+ addField(fields,'检测类型',type);
+ addField(fields,'板号',boardSelector(node,boards,locked));
  const pieces=document.createElement('input');pieces.type='text';pieces.value=node.piece_spec;
  pieces.placeholder='如 1 或 1,3-5';pieces.disabled=locked;
   addField(fields,'片号',pieces);
   type.onchange=()=>editNode(node,{mode:type.value});
- board.onchange=()=>editNode(node,{board_id:board.value});
  pieces.oninput=()=>editNode(node,{piece_spec:pieces.value});
  return fields;
 }
@@ -563,7 +599,7 @@ function updateWorkflow(){
  refreshCards=[];
  $('flowNodes').replaceChildren();
  for(const [index,node] of workflow.entries()){
-  const isDelay=node.mode==='delay';
+  const isDelay=node.mode==='delay',isPitchStart=node.mode===pitchStart;
   const card=document.createElement('li');card.className=isDelay?'flow-node delay-node':'flow-node';card.dataset.flowId=String(node.id);
   const grip=document.createElement('div');grip.className='flow-grip';grip.draggable=!locked;grip.tabIndex=0;
   grip.title='拖动排序，也可用方向键移动';
@@ -574,7 +610,7 @@ function updateWorkflow(){
    event.preventDefault();moveNode(node.id,Math.max(0,Math.min(workflow.length-1,index+offset)));
   };
   const footer=document.createElement('div');footer.className='flow-footer';
-  const times=isDelay?null:document.createElement('table');
+  const times=isDelay||isPitchStart?null:document.createElement('table');
   if(times){times.className='node-request-times';times.setAttribute('aria-label','各片请求时间');}
   const state=document.createElement('span');
   const execute=document.createElement('button');
@@ -583,7 +619,7 @@ function updateWorkflow(){
     const otherBoard=!isDelay&&node.outcome&&node.runBoardId&&node.runBoardId!==nodeBoardId(node);
     state.className='flow-status '+(node.outcome||'');
     state.textContent=otherBoard?'板 '+node.runBoardId+' · '+node.status:node.status;state.title=node.message||'';
-   execute.textContent=isDelay?'开始计时':node.outcome==='done'?'重跑':'执行';
+   execute.textContent=isDelay?'开始计时':isPitchStart?'启动':node.outcome==='done'?'重跑':'执行';
    const check=isDelay?delayCheck(node,index):nodeCheck(node);
     execute.disabled=locked||node.outcome==='running'||!check.ok;execute.title=check.message;
    if(times){
@@ -602,7 +638,10 @@ function updateWorkflow(){
    input.setAttribute('aria-label','节点 '+(index+1)+' 等待时间（毫秒）');
    input.oninput=()=>editNode(node,{delay_ms:input.value});
    description.append(input);
-   }else description=detectionFields(node,boards,locked||node.outcome==='running');
+  }else if(isPitchStart){
+   description=document.createElement('div');description.className='node-fields';
+   addField(description,'板号',boardSelector(node,boards,locked));
+  }else description=detectionFields(node,boards,locked||node.outcome==='running');
   refreshCards.push(refresh);
   execute.onclick=()=>runSingleNode(node,index);
   const remove=document.createElement('button');remove.textContent='×';remove.title='移除节点';remove.disabled=locked;

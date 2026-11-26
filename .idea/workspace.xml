@@ -6,6 +6,10 @@
   <component name="ChangeListManager">
     <list default="true" id="f45a9d93-da79-4d4c-b621-f1da0bf4d833" name="更改" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/visualization/validation_lab/app.js" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/validation_lab/app.js" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/visualization/validation_lab/index.html" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/validation_lab/index.html" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/visualization/validation_lab/pairing.js" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/validation_lab/pairing.js" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/visualization/validation_lab/pitch_stream.py" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/validation_lab/pitch_stream.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/visualization/validation_lab/server.py" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/validation_lab/server.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />

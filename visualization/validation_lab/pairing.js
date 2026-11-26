@@ -25,6 +25,12 @@
    return {ok:false,message:'单片3D需要一张整板深度图'};
   return {ok:true,message:''};
  }
+ function checkPitch(files,id){
+  if(!id)return {ok:false,message:'请选择验证板号'};
+  if(files.filter(row=>row.kind==='3d'&&board(row.board_id)===id).length!==1)
+   return {ok:false,message:'启动 Pitch 需要一张整板深度图'};
+  return {ok:true,message:''};
+ }
  function pieceNumbers(value,count){
   const ids=new Set();
   for(const part of String(value??'').trim().split(/[,，]/)){
@@ -36,5 +42,5 @@
   }
   return [...ids];
  }
- const api={board,boards,check,checkManual,pieceNumbers};if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.Pairing=api;
+ const api={board,boards,check,checkManual,checkPitch,pieceNumbers};if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.Pairing=api;
 })(typeof globalThis!=='undefined'?globalThis:this);

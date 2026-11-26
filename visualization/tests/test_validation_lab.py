@@ -142,6 +142,9 @@ class ValidationTests(unittest.TestCase):
         self.addCleanup(runner.stop)
         folder = self.root / "bad-depth"
         folder.mkdir()
+        with self.assertRaisesRegex(ValueError, "请先执行"):
+            runner.run_manual(self.rows, "2", "manual_piece_3d", 1, 2, folder, lambda _: None)
+        runner.start_pitch("2", self.rows[2])
         with self.assertRaisesRegex(ValueError, "16位"):
             runner.run_manual(self.rows, "2", "manual_piece_3d", 1, 2, folder, lambda _: None)
         self.assertFalse(any(q["cmd"].startswith("detect_") for q in clients[0].requests))
@@ -161,6 +164,7 @@ class ValidationTests(unittest.TestCase):
 
         two_d=click(1,'manual_2d',2)
         self.assertEqual(two_d['ready_piece_ids'],[2])
+        runner.start_pitch("2", self.rows[2])
         single=click(2,'manual_piece_3d',2)
         self.assertTrue(single['product_is_ok'])
         self.assertEqual(single['ready_piece_ids'],[])
@@ -364,14 +368,20 @@ class ValidationTests(unittest.TestCase):
         self.addCleanup(allow_second.set)
         base = f"http://127.0.0.1:{server.server_port}"
 
-        def submit(mode, piece_id):
-            payload = dict(files=self.rows, board_id="2", mode=mode, piece_id=piece_id)
+        def submit(mode, piece_id, **options):
+            payload = dict(files=self.rows, board_id="2", mode=mode, piece_id=piece_id, **options)
             request = Request(base+"/api/run", data=json.dumps(payload).encode(),
                               headers={"Content-Type": "application/json"})
             with urlopen(request, timeout=3) as response:
                 message = json.load(response)
             self.assertNotEqual(message.get("submitted"), False, message)
             return message["id"]
+
+        def start_pitch():
+            request = Request(base+"/api/pitch/start",
+                              data=json.dumps(dict(files=self.rows, board_id="2")).encode())
+            with urlopen(request, timeout=3) as response:
+                self.assertEqual(response.status, 202)
 
         def completed(key):
             deadline = time.monotonic() + 3
@@ -392,6 +402,9 @@ class ValidationTests(unittest.TestCase):
              patch.object(pitch_stream, "DepthPreprocessor", side_effect=GatedPitch) as correction:
             first, second = (submit(lab.PITCH_3D, pid) for pid in (1, 2))
             try:
+                self.assertFalse(second_started.wait(.1), "arming 3D started Pitch")
+                correction.assert_not_called()
+                start_pitch()
                 self.assertTrue(second_started.wait(3))
                 self.assertFalse(first_3d_sent.is_set())
                 first_2d, second_2d = (submit("manual_2d", pid) for pid in (1, 2))
@@ -407,7 +420,10 @@ class ValidationTests(unittest.TestCase):
                 completed(key)
             self.assertEqual(len(prepared), 2)
             correction.assert_called_once()
-            waiting = submit(lab.PITCH_3D, 1)
+            waiting = submit(lab.PITCH_3D, 1, wait_for_pitch_start=True)
+            completed(submit("manual_2d", 1))
+            with urlopen(base+"/api/jobs/"+waiting, timeout=3) as response:
+                self.assertNotIn("pitch_ready_at", json.load(response))
             finish = Request(base+"/api/pitch/finish",
                              data=json.dumps(dict(run_ids=[waiting], stopped=False)).encode())
             with urlopen(finish, timeout=3) as response:
@@ -416,6 +432,7 @@ class ValidationTests(unittest.TestCase):
                 unsent = json.load(response)
             self.assertEqual(unsent["status"], "failed")
             self.assertNotIn("submitted_at", unsent)
+            self.assertIn("尚未启动 Pitch", unsent["error"])
 
     def test_http_workflow_publishes_one_history_entry_and_combined_report(self):
         server=lab.Server(0,self.root/'workflow-api')

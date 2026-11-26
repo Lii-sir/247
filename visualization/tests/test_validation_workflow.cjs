@@ -5,7 +5,7 @@ function browserStorage(){
  return {getItem:key=>values.get(key)??null,setItem:(key,value)=>values.set(key,value)};
 }
 async function boot(latency=null,timers={},failRequest=()=>false,browser={},hooks={}){
- const nodes=new Map(),requests=[],history=[],groups=[];
+ const nodes=new Map(),requests=[],history=[],groups=[],pitchStarts=[];
  class Node{
   constructor(){this.value='';this.textContent='';this.hidden=false;this.disabled=false;this.children=[];this.dataset={};}
   set id(v){this._id=v;nodes.set(v,this);}get id(){return this._id;}
@@ -28,6 +28,10 @@ async function boot(latency=null,timers={},failRequest=()=>false,browser={},hook
     const timing=hooks.timing?.(q)??{};
     Object.assign(history[0],timing);
     data=q.mode==='pitch_piece_3d'?{id,pitch_waiting:true}:{id,submitted,submitted_at:timing.submitted_at,error:submitted?null:'synthetic request failure'};}
+   else if(url==='/api/pitch/start'){
+    pitchStarts.push(JSON.parse(opt.body));
+    data={started_at:new Date(2026,10,26,14,3,5).getTime()/1000,reused:false};
+   }
    else if(url==='/api/pitch/finish')data={};
    else if(url==='/api/workflows'){
     const q=JSON.parse(opt.body);groups.push(q);
@@ -43,7 +47,7 @@ async function boot(latency=null,timers={},failRequest=()=>false,browser={},hook
    return {ok:true,json:async()=>data};
   }});
  vm.runInContext(fs.readFileSync(path.join(dir,'pairing.js'),'utf8'),ctx);vm.runInContext(fs.readFileSync(path.join(dir,'app.js'),'utf8'),ctx);await new Promise(setImmediate);
- return {nodes,requests,config,groups};
+ return {nodes,requests,config,groups,pitchStarts};
 }
 const execute=card=>card.children[2].children[1];
 function setDetection(card,{mode,board,pieces}){
@@ -352,22 +356,31 @@ test('a multi-piece node displays each submission and updates the response times
  assert.deepEqual(rows(),[['1','14:03:05.250','14:03:08.500'],['2','14:03:06.250','14:03:07.750']]);
 });
 
-test('Pitch node is armed before 2D and shows ready, submitted, and returned times',async()=>{
+test('Pitch begins only at the explicit start node after the configured delay',async()=>{
  const base=new Date(2026,10,26,14,3,5).getTime()/1000;
- const {nodes,requests}=await boot(null,{},()=>false,{},{
+ const {timers,pending}=deferredTimers();
+ const {nodes,requests,pitchStarts}=await boot(null,timers,()=>false,{},{
   timing:q=>q.mode==='pitch_piece_3d'?{pitch_ready_at:base,submitted_at:base+.25,received_at:base+.75}:{},
  });
  nodes.get('demo').onclick();
  nodes.get('addDetection').onclick();
+ nodes.get('addDelay').onclick();
+ nodes.get('addPitch').onclick();
  nodes.get('addDetection').onclick();
  const cards=nodes.get('flowNodes');
  setDetection(cards.children[0],{pieces:'1-2'});
- setDetection(cards.children[1],{mode:'pitch_piece_3d',pieces:'1-2'});
- await nodes.get('startWorkflow').onclick();
+ setDetection(cards.children[3],{mode:'pitch_piece_3d',pieces:'1-2'});
+ const run=nodes.get('startWorkflow').onclick();
+ for(let n=0;!pending.size&&n<10;n++)await new Promise(setImmediate);
+ assert.equal(pitchStarts.length,0);
  assert.deepEqual(requests.map(q=>[q.mode,q.piece_id]),[
   ['pitch_piece_3d',1],['pitch_piece_3d',2],['manual_2d',1],['manual_2d',2],
  ]);
- const table=cards.children[1].children[3];
+ assert.ok(requests.filter(q=>q.mode==='pitch_piece_3d').every(q=>q.wait_for_pitch_start===true));
+ pending.values().next().value();
+ await run;
+ assert.deepEqual(pitchStarts.map(q=>[q.board_id,q.files[0].name]),[['2','2.png']]);
+ const table=cards.children[3].children[3];
  assert.deepEqual(table.children[0].children[0].children.map(cell=>cell.textContent),
   ['片号','Pitch 就绪','3D 提交','3D 返回']);
  assert.deepEqual(table.children[1].children[0].children.map(cell=>cell.textContent),
