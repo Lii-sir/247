@@ -4,7 +4,22 @@
     <option name="autoReloadType" value="ALL" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="f45a9d93-da79-4d4c-b621-f1da0bf4d833" name="更改" comment="" />
+    <list default="true" id="f45a9d93-da79-4d4c-b621-f1da0bf4d833" name="更改" comment="">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/config/2D/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/config/2D/README.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/config/2D/config.json" beforeDir="false" afterPath="$PROJECT_DIR$/config/2D/config.json" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/python/algorithm/application/board/detect_board.py" beforeDir="false" afterPath="$PROJECT_DIR$/python/algorithm/application/board/detect_board.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/python/algorithm/application/standalone/detect_2D.py" beforeDir="false" afterPath="$PROJECT_DIR$/python/algorithm/application/standalone/detect_2D.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/python/algorithm/vision2d/defect_geometry.py" beforeDir="false" afterPath="$PROJECT_DIR$/python/algorithm/vision2d/defect_geometry.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/python/algorithm/vision2d/instance_geometry.py" beforeDir="false" afterPath="$PROJECT_DIR$/python/algorithm/vision2d/instance_geometry.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/python/algorithm/vision2d/silver_inspection.py" beforeDir="false" afterPath="$PROJECT_DIR$/python/algorithm/vision2d/silver_inspection.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/python/algorithm/vision3d/measurement/joint_geometry.py" beforeDir="false" afterPath="$PROJECT_DIR$/python/algorithm/vision3d/measurement/joint_geometry.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/test_postprocess_equivalence.py" beforeDir="false" afterPath="$PROJECT_DIR$/tests/test_postprocess_equivalence.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/test_registration.py" beforeDir="false" afterPath="$PROJECT_DIR$/tests/test_registration.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/visualization/build_detection_flow.py" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/build_detection_flow.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/visualization/detection-flow.html" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/detection-flow.html" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/visualization/detection_flow_data.py" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/detection_flow_data.py" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -176,7 +191,7 @@
       <workItem from="1794126520608" duration="3501000" />
       <workItem from="1794196452229" duration="30292000" />
       <workItem from="1794911765751" duration="14201000" />
-      <workItem from="1795598537364" duration="20947000" />
+      <workItem from="1795598537364" duration="22536000" />
     </task>
     <servers />
   </component>

@@ -116,7 +116,7 @@ def make_document():
         ['2D','cpu_prepare_phase_ms','读图、圆/crop、平台掩码整个准备阶段','包含其子计时'],
         ['2D','gpu_phase_ms','借资源、YOLO、掩码提取、EfficientAD和流收尾','包含reported和预测器外工作'],
         ['2D','yolo_predict_wall_ms','完整model.predict调用','首次设置、预热等可不在reported三段内'],
-        ['2D','mask_extract_to_cpu_ms','批量阈值化/转换/传输及实例组装','不是mask_postprocess_ms'],
+        ['2D','mask_extract_to_cpu_ms','按类合并、批量传回、连通区域拆分','包含部件组装'],
         ['2D','efficientad_total_ms','逐chip外观检测总工作','forward_enqueue不是纯GPU内核时间'],
         ['2D','geometry_phase_ms','弯曲、缺线、旋转、灰度准备','完成后发布joint_entry'],
         ['2D','cpu_postprocess_phase_ms','2D子进程计算＋父finalize执行墙钟之和','不含中间队列，端到端看cpu_postprocess_pipeline_ms'],

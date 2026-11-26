@@ -14,7 +14,6 @@ from typing import Any, Dict, Sequence
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as torch_functional
 
 from algorithm.runtime.config import (
     DEFAULT_ALGORITHM_PARAMETERS,
@@ -60,6 +59,7 @@ from algorithm.execution.instance_tasks import InstanceTasks
 from algorithm.vision3d.measurement.joint_geometry import JointGeometry
 from algorithm.application.board.board_results import join_piece_diagnostics
 from algorithm.application.defect_checks import silver_check, wire_bending_result
+from algorithm.vision2d.segmentation_instances import extract_instances
 from algorithm.runtime.defect_plan import (
     CHECKS_2D, defect_orders, evaluate_in_order, failed_check, require_configured_checks, unrun_checks,
 )
@@ -1029,55 +1029,10 @@ class DetectBoard(JointGeometry):
             torch.cuda.synchronize(device)
 
     def _extract_instances(self, result: Any, crop_shape: tuple[int, int]):
-        masks_object = getattr(result, "masks", None)
-        boxes = getattr(result, "boxes", None)
-        if masks_object is None or boxes is None:
-            return []
-        masks = masks_object.data
-        if masks.shape[-2:] != crop_shape:
-            masks = torch_functional.interpolate(
-                masks.unsqueeze(1), size=crop_shape, mode="nearest"
-            ).squeeze(1)
-        masks = masks > 0.5
-        # Convert all masks from this image together and perform one mask D2H
-        # transfer. Conversion allocates new storage, so mul_ never modifies
-        # the prediction tensor. NumPy slices below share disjoint CPU regions.
-        masks_cpu = masks.to(torch.uint8).mul_(255).cpu().numpy()
-        classes = boxes.cls.detach().cpu().numpy()
-        confidences = boxes.conf.detach().cpu().numpy()
-        names = getattr(result, "names", {}) or {}
-        instances = []
-        for index, mask in enumerate(masks_cpu):
-            if int(np.count_nonzero(mask)) < self.min_component_area:
-                continue
-            class_id = int(classes[index]) if index < len(classes) else -1
-            class_name = (
-                names.get(class_id, names.get(str(class_id), class_id))
-                if isinstance(names, dict)
-                else class_id
-            )
-            instances.append(
-                {
-                    "instance_id": len(instances) + 1,
-                    "class_id": class_id,
-                    "class_name": str(class_name),
-                    "confidence": float(confidences[index]) if index < len(confidences) else 1.0,
-                    "mask": mask,
-                    "_mask_binary_255": True,
-                    "rectangle": None,
-                    "rectangle_ratio": 1.0,
-                    "is_ok": True,
-                }
-            )
-        return instances
+        return extract_instances(result, crop_shape, self.min_component_area)
 
     def _measure_2d_wire_instances(self, instances, roi_boxes, crop_box):
-        """Compute bending for both ``wire`` and ``thin`` masks.
-
-        The check is deliberately performed per YOLO instance so the result
-        can be returned immediately with the single-piece response.  The 3D
-        board path still builds connected wire regions for height alignment.
-        """
+        """Check each connected wire or thin component for bending."""
         output = []
         offset = np.asarray(crop_box[:2], dtype=np.int32)
         for instance in instances:
@@ -1086,7 +1041,7 @@ class DetectBoard(JointGeometry):
                 continue
             mask = np.asarray(instance.get("mask"), dtype=np.uint8)
             cleaned, mask_offset = _geometry.clean_mask_crop(
-                mask, min_area=self.min_component_area, kernel_size=5
+                mask, min_area=self.min_component_area, kernel_size=5, bounds=instance.get("_mask_bbox")
             )
             bending = _geometry.measure_wire_bending(
                 cleaned, roi_boxes, min_ratio=self.rectangle_ratio_threshold,

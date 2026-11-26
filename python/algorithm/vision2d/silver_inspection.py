@@ -465,10 +465,15 @@ def _union_masks(
         candidate = item.get("mask")
         if not isinstance(candidate, np.ndarray):
             continue
-        candidate = np.asarray(candidate) > 0
         if candidate.shape != shape:
             raise ValueError("YOLO mask shape does not match the 2D crop")
-        mask |= candidate
+        bounds = item.get("_mask_bbox")
+        if bounds is None:
+            mask |= candidate > 0
+        else:
+            x, y, width, height = bounds
+            region = np.s_[y:y+height, x:x+width]
+            mask[region] |= candidate[region] > 0
         count += 1
     return mask, count
 

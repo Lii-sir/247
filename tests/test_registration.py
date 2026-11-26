@@ -65,6 +65,67 @@ class MaskMappingInputTests(unittest.TestCase):
         finally:
             owner.close()
 
+    def test_class_unions_keep_components_separate_and_use_local_confidence(self):
+        import torch
+        from algorithm.vision2d.segmentation_instances import extract_instances
+
+        masks = np.zeros((4, 24, 30), np.uint8)
+        masks[0, 2:6, 2:6] = 1
+        masks[0, 2:4, 24:26] = 1
+        masks[1, 5:10, 5:10] = 1
+        masks[2, 14:19, 20:25] = 1
+        masks[2, 22, 0] = 1  # Below min_area after connected-component labeling.
+        masks[3, 5:9, 5:9] = 1  # Overlaps wire but belongs to silver.
+        result = SimpleNamespace(masks=SimpleNamespace(data=torch.from_numpy(masks)),
+            boxes=SimpleNamespace(cls=torch.tensor([1, 1, 1, 2]), conf=torch.tensor([.65, .9, .35, .8])),
+            names={1: "wire", 2: "silver"})
+        instances = extract_instances(result, masks.shape[1:], 4)
+        self.assertEqual([1, 2, 3, 4], [item["instance_id"] for item in instances])
+        self.assertEqual(["wire", "wire", "wire", "silver"], [item["class_name"] for item in instances])
+        np.testing.assert_allclose([.65, .9, .35, .8], [item["confidence"] for item in instances])
+        self.assertEqual([(24, 2, 2, 2), (2, 2, 8, 8), (20, 14, 5, 5), (5, 5, 4, 4)],
+                         [item["_mask_bbox"] for item in instances])
+        self.assertEqual([4, 40, 25, 16], [item["_mask_area_px"] for item in instances])
+        self.assertEqual(255, instances[1]["mask"][5, 5])
+        self.assertEqual(255, instances[3]["mask"][5, 5])
+        np.testing.assert_array_equal(masks, result.masks.data.numpy())
+        result.orig_shape = masks.shape[1:]
+        result.boxes.xyxy = torch.tensor([[1.5, 1.5, 26., 6.], [5., 5., 10., 10.],
+                                           [0., 14., 25., 23.], [5., 5., 9., 9.]])
+        cropped = extract_instances(result, masks.shape[1:], 4)
+        self.assertEqual(len(instances), len(cropped))
+        for original, packed in zip(instances, cropped):
+            np.testing.assert_array_equal(original["mask"], packed["mask"])
+            self.assertEqual(original["confidence"], packed["confidence"])
+
+    def test_non_native_masks_exclude_letterbox_padding(self):
+        import torch
+        from algorithm.vision2d.segmentation_instances import extract_instances
+
+        masks = torch.zeros((1, 8, 8))
+        masks[0, :2, :] = 1
+        masks[0, 3:5, 4:6] = 1
+        result = SimpleNamespace(masks=SimpleNamespace(data=masks),
+            boxes=SimpleNamespace(cls=torch.tensor([1]), conf=torch.tensor([.9])), names={1: "wire"})
+        instance, = extract_instances(result, (4, 8), 1)
+        self.assertEqual((4, 1, 2, 2), instance["_mask_bbox"])
+        self.assertEqual(4, instance["_mask_area_px"])
+
+    def test_diagonally_adjacent_crops_are_joined_before_area_filtering(self):
+        import torch
+        from algorithm.vision2d.segmentation_instances import extract_instances
+
+        masks = torch.zeros((2, 10, 10), dtype=torch.uint8)
+        masks[0, 2, 2] = 1
+        masks[1, 3, 3] = 1
+        result = SimpleNamespace(masks=SimpleNamespace(data=masks), orig_shape=(10, 10),
+            boxes=SimpleNamespace(cls=torch.tensor([1, 1]), conf=torch.tensor([.7, .8]),
+                                  xyxy=torch.tensor([[2, 2, 3, 3], [3, 3, 4, 4]])), names={1: "wire"})
+        instance, = extract_instances(result, (10, 10), 2)
+        self.assertEqual((2, 2, 2, 2), instance["_mask_bbox"])
+        self.assertEqual(2, instance["_mask_area_px"])
+        self.assertAlmostEqual(.8, instance["confidence"])
+
 
 class AffineScoreTests(unittest.TestCase):
     def test_only_selected_regions_contribute_to_objective(self):

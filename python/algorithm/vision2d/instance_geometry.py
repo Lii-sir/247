@@ -14,6 +14,8 @@ def share_instances(instances, inputs, *, arrays=None, cache_keys=None, cache_pr
         record = dict(fields={key: instance[key] for key in PUBLIC_INSTANCE_FIELDS if key in instance})
         if instance.get("_mask_binary_255") is True:
             record["fields"]["_mask_binary_255"] = True
+        if "_mask_bbox" in instance:
+            record["fields"]["_mask_bbox"] = instance["_mask_bbox"]
         mask = instance.get("mask")
         if isinstance(mask, np.ndarray):
             if mask.size:
@@ -49,15 +51,13 @@ def mask_geometry(mask, offset, epsilon):
 
 
 def public_instance(instance, crop_box, *, geometry=mask_geometry):
-    mask = instance.get("mask")
     offset = tuple(crop_box)[:2]
     return {
         "instance_id": int(instance.get("instance_id", 0)),
         "class_id": int(instance.get("class_id", -1)),
         "class_name": str(instance.get("class_name", "")),
         "confidence": float(instance.get("confidence", 0.0)),
-        "mask_2d": geometry(mask, offset=offset, epsilon=1.0) if isinstance(mask, np.ndarray)
-                   else geometry(np.zeros((1, 1), dtype=np.uint8), (0, 0), 1.0),
+        "mask_2d": component_geometry(instance, offset, epsilon=1.0, geometry=geometry),
         "rectangle": instance.get("rectangle"),
         "rectangle_ratio": float(instance.get("rectangle_ratio", 0.0)),
         "bending_2d": instance.get("bending_2d"),
@@ -65,3 +65,15 @@ def public_instance(instance, crop_box, *, geometry=mask_geometry):
         "chip_anomaly_2d": instance.get("chip_anomaly_2d"),
         "is_ok": bool(instance.get("is_ok", True)),
     }
+
+
+def component_geometry(instance, offset, *, epsilon, geometry=mask_geometry):
+    mask = instance.get("mask")
+    if not isinstance(mask, np.ndarray):
+        mask, offset = np.zeros((1, 1), dtype=np.uint8), (0, 0)
+    bounds = instance.get("_mask_bbox")
+    if bounds is not None:
+        x, y, width, height = bounds
+        mask = mask[y:y+height, x:x+width]
+        offset = (int(offset[0])+x, int(offset[1])+y)
+    return geometry(mask, offset=offset, epsilon=epsilon)

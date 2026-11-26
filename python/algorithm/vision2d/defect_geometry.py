@@ -89,11 +89,11 @@ def clean_mask(mask: np.ndarray, min_area: int = 500, kernel_size: int = 5) -> n
 
 
 def clean_mask_crop(mask: np.ndarray, min_area: int = 500,
-                    kernel_size: int = 5) -> tuple[np.ndarray, tuple[int, int]]:
+                    kernel_size: int = 5, *, bounds=None) -> tuple[np.ndarray, tuple[int, int]]:
     """Clean the entire instance within its bounds, retaining its crop offset."""
     source = np.asarray(mask)
     binary = source if source.dtype == np.uint8 else (source > 0).astype(np.uint8)
-    x, y, width, height = cv2.boundingRect(binary)
+    x, y, width, height = cv2.boundingRect(binary) if bounds is None else bounds
     if width == 0 or height == 0:
         return np.zeros((1, 1), dtype=bool), (0, 0)
     # Closing followed by opening has four primitive operations. Keep enough

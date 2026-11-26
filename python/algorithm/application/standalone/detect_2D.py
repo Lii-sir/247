@@ -25,6 +25,8 @@ from algorithm.runtime.defect_plan import (
 )
 from algorithm.vision2d import chip_alignment, chip_anomaly, circle_roi, silver_inspection, wire_roi_presence
 from algorithm.vision2d import defect_geometry as geometry
+from algorithm.vision2d.instance_geometry import component_geometry, mask_geometry
+from algorithm.vision2d.segmentation_instances import extract_instances
 from transport.shared_memory import read_shared_memory
 
 class Detect2D:
@@ -132,13 +134,11 @@ class Detect2D:
         mask = common.get("mask") or {}
         if not isinstance(mask, dict):
             raise ValueError("mask must be an object")
-        self.mask_config = {"merge_iou": float(mask.get("merge_iou", 0.2)),
-                            "min_component_area": int(mask.get("min_component_area", 500)),
+        self.mask_config = {"min_component_area": int(mask.get("min_component_area", 500)),
                             "rectangle_ratio_threshold": float(
                                 wire_block.get("rectangle_ratio_threshold",
-                                                mask.get("rectangle_ratio_threshold", 0.75))),
-                            "crop_padding": int(mask.get("crop_padding", 5))}
-        if not 0 <= self.mask_config["merge_iou"] <= 1 or self.mask_config["min_component_area"] < 1:
+                                                 mask.get("rectangle_ratio_threshold", 0.75)))}
+        if self.mask_config["min_component_area"] < 1:
             raise ValueError("invalid mask configuration")
         if not 0 <= self.mask_config["rectangle_ratio_threshold"] <= 1:
             raise ValueError("rectangle_ratio_threshold must be in [0,1]")
@@ -352,66 +352,30 @@ class Detect2D:
         output = []
         ox, oy = box[:2]
         for result in predictions or []:
-            masks_obj = getattr(result, "masks", None)
+            if getattr(result, "masks", None) is not None:
+                for instance in extract_instances(result, roi.shape[:2], self.mask_config["min_component_area"]):
+                    x, y, width, height = instance["_mask_bbox"]
+                    instance.update(instance_id=len(output) + 1,
+                        x1=float(x + ox), y1=float(y + oy),
+                        x2=float(x + width + ox), y2=float(y + height + oy),
+                        mask_area_px=instance["_mask_area_px"])
+                    output.append(instance)
+                continue
+
             boxes = getattr(result, "boxes", None)
+            if boxes is None:
+                continue
+            # Retain the box-only contract for checkpoints without segmentation.
             names = getattr(result, "names", {}) or {}
-            coords = boxes.xyxy.cpu().numpy() if boxes is not None else []
-            confs = boxes.conf.cpu().numpy() if boxes is not None else []
-            classes = boxes.cls.cpu().numpy() if boxes is not None else []
-            if masks_obj is None and len(coords):
-                # Compatibility with detection-only checkpoints: retain the
-                # original box contract when no segmentation head is present.
-                for index, xy in enumerate(coords):
-                    cid = int(classes[index]); score = float(confs[index])
-                    name = names.get(cid, names.get(str(cid), cid)) if isinstance(names, dict) else cid
-                    output.append({"instance_id": len(output) + 1,
-                                   "class_id": cid, "class_name": str(name), "confidence": score,
-                                   "x1": float(xy[0] + ox), "y1": float(xy[1] + oy),
-                                   "x2": float(xy[2] + ox), "y2": float(xy[3] + oy),
-                                   "mask_area_px": 0, "rectangle_ratio": 0.0,
-                                   "rectangle": None, "is_ok": False})
-                continue
-            if masks_obj is None:
-                continue
-            # Retain complete instances through morphology. ROI assignment
-            # and clipping belong to the shared bending measurement below.
-            masks_data = masks_obj.data
-            if not masks_data.is_cuda:
-                raise RuntimeError("2D mask post-processing requires a CUDA tensor")
-            if masks_data.shape[-2:] != roi.shape[:2]:
-                masks_data = torch.nn.functional.interpolate(
-                    masks_data.unsqueeze(1), size=roi.shape[:2], mode="nearest"
-                ).squeeze(1)
-            for index, mask_tensor in enumerate(masks_data):
-                cid = int(classes[index]) if index < len(classes) else -1
-                score = float(confs[index]) if index < len(confs) else 1.0
-                name = names.get(cid, names.get(str(cid), cid)) if isinstance(names, dict) else cid
-                class_name = str(name)
-                mask_tensor = mask_tensor > 0.5
-                transferred = geometry.transfer_mask_crops(
-                    mask_tensor.unsqueeze(0), [0], self.mask_config["crop_padding"]
-                )
-                if not transferred:
-                    continue
-                _, mask, mask_offset = transferred[0]
-                if cv2.countNonZero(mask) < self.mask_config["min_component_area"]:
-                    continue
-                if class_name.casefold() not in {"wire", "thin"}:
-                    mask = geometry.clean_mask(mask, self.mask_config["min_component_area"])
-                    if not np.any(mask):
-                        continue
-                # Wire instances are cleaned once by the measurement stage;
-                # retain rejected instances so their failure can be diagnosed.
-                ys, xs = np.where(mask)
-                mask_x, mask_y = mask_offset
-                full_mask = np.zeros(roi.shape[:2], dtype=np.uint8)
-                full_mask[mask_y:mask_y + mask.shape[0], mask_x:mask_x + mask.shape[1]] = mask
-                output.append({"instance_id": len(output) + 1,
-                               "class_id": cid, "class_name": class_name, "confidence": score,
-                               "x1": float(xs.min() + mask_x + ox), "y1": float(ys.min() + mask_y + oy),
-                               "x2": float(xs.max() + 1 + mask_x + ox), "y2": float(ys.max() + 1 + mask_y + oy),
-                               "mask_area_px": int(np.count_nonzero(mask)), "rectangle_ratio": 1.0,
-                               "rectangle": None, "is_ok": True, "mask": full_mask})
+            coords = boxes.xyxy.cpu().numpy()
+            confidences, classes = boxes.conf.cpu().numpy(), boxes.cls.cpu().numpy()
+            for index, xy in enumerate(coords):
+                class_id = int(classes[index])
+                name = names.get(class_id, names.get(str(class_id), class_id)) if isinstance(names, dict) else class_id
+                output.append(dict(instance_id=len(output) + 1, class_id=class_id, class_name=str(name),
+                    confidence=float(confidences[index]), x1=float(xy[0] + ox), y1=float(xy[1] + oy),
+                    x2=float(xy[2] + ox), y2=float(xy[3] + oy), mask_area_px=0,
+                    rectangle_ratio=0., rectangle=None, is_ok=False))
         return output
 
     def _measure_2d_wire_regions(self, instances, roi_boxes, crop_box):
@@ -424,11 +388,12 @@ class Detect2D:
             if not isinstance(instance.get("mask"), np.ndarray):
                 continue
             mask = np.asarray(instance["mask"], dtype=np.uint8)
-            cleaned = geometry.clean_mask(
-                mask, min_area=self.mask_config["min_component_area"], kernel_size=5)
+            cleaned, mask_offset = geometry.clean_mask_crop(
+                mask, min_area=self.mask_config["min_component_area"], kernel_size=5,
+                bounds=instance.get("_mask_bbox"))
             bending = geometry.measure_wire_bending(
                 cleaned, roi_boxes, self.mask_config["rectangle_ratio_threshold"],
-                output_offset=offset,
+                mask_offset=mask_offset, output_offset=offset,
             )
             instance["bending_2d"] = bending
             instance["is_ok"] = bool(bending["is_ok"])
@@ -438,7 +403,7 @@ class Detect2D:
                 "region_id": len(output) + 1,
                 "class_name": str(instance["class_name"]),
                 "instance_id": int(instance["instance_id"]),
-                "mask_2d": _mask_geometry(cleaned, crop_box[:2]),
+                "mask_2d": mask_geometry(cleaned, offset + mask_offset, epsilon=1.0),
                 "bending_2d": bending,
             })
         return output
@@ -453,7 +418,7 @@ class Detect2D:
                 key = "chip_rotation_2d"
             public[key] = value
         if "mask_2d" not in public and isinstance(instance.get("mask"), np.ndarray):
-            public["mask_2d"] = _mask_geometry(instance["mask"], offset)
+            public["mask_2d"] = component_geometry(instance, offset, epsilon=1.0)
         return public
 
     @staticmethod
@@ -492,29 +457,3 @@ class Detect2D:
     @staticmethod
     def elapsed_ms(start):
         return (time.perf_counter() - start) * 1000.0
-
-
-def _mask_geometry(mask: np.ndarray, offset=(0, 0)) -> Dict[str, Any]:
-    """Serialize a crop-local mask without copying pixel data to JSON."""
-    binary = (np.asarray(mask) > 0).astype(np.uint8) * 255
-    area = int(np.count_nonzero(binary))
-    if area == 0:
-        return {"area_px": 0, "bounding_box": [], "contours": []}
-    ys, xs = np.nonzero(binary)
-    ox, oy = int(offset[0]), int(offset[1])
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    serialized = []
-    for contour in contours:
-        points = cv2.approxPolyDP(contour, 1.0, closed=True).reshape(-1, 2)
-        if len(points) >= 3:
-            serialized.append([[int(point[0]) + ox, int(point[1]) + oy] for point in points])
-    return {
-        "area_px": area,
-        "bounding_box": [
-            int(xs.min()) + ox,
-            int(ys.min()) + oy,
-            int(xs.max()) + 1 + ox,
-            int(ys.max()) + 1 + oy,
-        ],
-        "contours": serialized,
-    }

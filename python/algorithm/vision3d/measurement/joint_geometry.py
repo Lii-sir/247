@@ -16,7 +16,7 @@ from algorithm.runtime.defect_plan import (
 )
 from algorithm.runtime.timing import timed_call
 from algorithm.vision2d import defect_geometry as _geometry
-from algorithm.vision2d.instance_geometry import mask_geometry as _mask_geometry
+from algorithm.vision2d.instance_geometry import component_geometry, mask_geometry as _mask_geometry
 
 
 class JointGeometry:
@@ -97,7 +97,7 @@ class JointGeometry:
         )
         return {
             **instance,
-            "mask_2d": self._joint_ops._mask_geometry(crop_mask, offset=crop_box[:2], epsilon=2.0),
+            "mask_2d": component_geometry(instance, crop_box[:2], epsilon=2.0, geometry=self._joint_ops._mask_geometry),
             "mask_3d_local": self._joint_ops._mask_geometry(aligned, offset=(0, 0), epsilon=1.0),
             "_mask_2d_array": crop_mask,
             "_mask_3d_array": aligned,

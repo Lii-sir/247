@@ -51,9 +51,7 @@
         "platform_threshold": 50
       },
       "mask": {
-        "merge_iou": 0.2,
-        "min_component_area": 1,
-        "crop_padding": 5
+        "min_component_area": 1
       },
       "yolo": {
         "imgsz": 640,

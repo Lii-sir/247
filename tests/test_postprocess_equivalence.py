@@ -74,7 +74,7 @@ class PostprocessEquivalenceTests(unittest.TestCase):
         detector.min_component_area = 5
         roi_boxes = [(0, 0, 75, 99), (45, 0, 139, 99)]
 
-        def clean_full(mask, min_area, kernel_size):
+        def clean_full(mask, min_area, kernel_size, *, bounds=None):
             return geometry.clean_mask(mask, min_area, kernel_size), (0, 0)
 
         for index, mask in enumerate(self.masks()):

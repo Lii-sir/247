@@ -122,8 +122,8 @@ def build_flows():
       '从可用资源队列借出独立模型副本|记录槽位等待与锁等待|进入该资源CUDA流|同资源内保持YOLO、掩码提取和外观检测顺序',pool='gpu',kind='parallel',src=(B,'infer_2d_piece'),times=('gpu_model_slot_wait_ms','model_lock_wait_ms'))
     n('d-yolo','YOLO分割预测','一次调用，不等待凑满多张',0,5,
       '以当前单片crop调用model.predict，retina_masks=True|应用imgsz/conf/iou/max_det/device等配置|首次调用可能设置predictor并预热|返回实例掩码、类别与置信度|记录predict墙钟和模型reported三段耗时，口径不同',pool='gpu',src=(B,'_predict_batch'),params=('common_2d.parameters.yolo',),times=('yolo_predict_wall_ms','yolo_reported_inference_ms'))
-    n('d-masks','整片掩码批量转换至CPU','GPU阈值化 / uint8 / 一次传输',0,6,
-      '要求掩码为CUDA张量|尺寸不匹配时用nearest插值到crop大小|全部实例一起执行>0.5，再转uint8并乘255|一次cpu().numpy()传回本片所有掩码|读取classes/confidences并按min_component_area过滤|实例编号连续，CPU掩码切片保留各自区域',pool='gpu',src=(B,'_extract_instances'),params=('common_2d.parameters.mask.min_component_area',),times=('mask_extract_to_cpu_ms',))
+    n('d-masks','同类掩码合并与拆分','批量回传检测框内像素',0,6,
+      '原尺寸掩码只回传检测框内的像素，低分辨率掩码先去填边并还原|同类、可能相连的掩码在局部区域合并|不同类的重叠像素保留|按8邻域拆分并过滤小部件|复用部件边界',pool='gpu',src=('python/algorithm/vision2d/segmentation_instances.py','extract_instances'),params=('common_2d.parameters.mask.min_component_area',),times=('mask_extract_to_cpu_ms',))
     n('d-anomaly','芯片外观检测','每个chip顺序进入EfficientAD',0,7,
       '按chip掩码提取轮廓和最小外接矩形|从原始彩色图拉正芯片局部crop|按长宽比选择模型，超范围是接口错误|逐chip前向、分数校准和异常区域映射|结果写入chip_anomaly_2d',pool='gpu',src=(A,'inspect'),params=('chip_anomaly_2d.parameters',),times=('efficientad_total_ms',))
     n('d-gpudone','GPU资源归还','prepared.instances可供CPU消费',0,8,
