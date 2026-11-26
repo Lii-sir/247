@@ -54,7 +54,12 @@ class FakeClient:
 
 
 def init_request(*args):
-    return dict(cmd='init_algorithm',config_text=json.dumps({'common_3d':{'parameters':{'input':{'piece_count':2}}},'height_measurement_3d':{'description':'synthetic height settings','parameters':{}}}))
+    return dict(cmd='init_algorithm', config_text=json.dumps({
+        'common_3d': {'parameters': {'input': {'piece_count': 2}}},
+        'height_measurement_3d': {'description': 'synthetic height settings', 'parameters': {}},
+        'segmentation_3d': {'description': 'synthetic windows', 'parameters': {
+            'mode': 'fixed', 'expected_piece_count': 2, 'fixed_rois': [[0,0,4,2],[0,2,4,4]]}},
+    }))
 
 
 class ValidationTests(unittest.TestCase):
@@ -134,7 +139,7 @@ class ValidationTests(unittest.TestCase):
     def test_manual_piece_rejects_invalid_depth_without_submitting_detection(self):
         Image.new("RGB", (4, 4)).save(self.rows[2]["path"])
         runner, clients = self.make_runner()
-        self.addCleanup(runner.close)
+        self.addCleanup(runner.stop)
         folder = self.root / "bad-depth"
         folder.mkdir()
         with self.assertRaisesRegex(ValueError, "16位"):
@@ -142,7 +147,7 @@ class ValidationTests(unittest.TestCase):
         self.assertFalse(any(q["cmd"].startswith("detect_") for q in clients[0].requests))
 
     def test_manual_clicks_keep_pairing_and_send_one_protocol_request(self):
-        runner,clients=self.make_runner();self.addCleanup(runner.close)
+        runner,clients=self.make_runner();self.addCleanup(runner.stop)
         cfg=json.loads(init_request()['config_text'])
         cfg['segmentation_3d']={'description':'synthetic windows','parameters':{
             'mode':'fixed','expected_piece_count':2,'fixed_rois':[[0,0,4,2],[0,2,4,4]]}}
@@ -315,6 +320,102 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(['detect_2d_piece'], [row['cmd'] for row in result_2d['timeline']])
         self.assertEqual(['detect_3d_piece'], [row['cmd'] for row in result_3d['timeline']])
         self.assertNotIn('2', runner._manual_boards)
+
+    def test_pitch_dispatches_first_piece_while_second_is_still_correcting(self):
+        from validation_lab import pitch_stream
+
+        allow_second = threading.Event()
+        second_started = threading.Event()
+        first_3d_sent = threading.Event()
+        prepared = []
+
+        class GatedPitch:
+            def __init__(self, settings):
+                self.settings = settings
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def prepare(self, pixels):
+                prepared.append(pixels.copy())
+                if len(prepared) == 2:
+                    second_started.set()
+                    if not allow_second.wait(5):
+                        raise TimeoutError("second piece was not released")
+                return pixels.copy(), {"applied": False}
+
+        class TrackedClient(FakeClient):
+            def request(self, q, timeout, *, on_sent=None):
+                reply = super().request(q, timeout, on_sent=on_sent)
+                if q["cmd"] == "detect_3d_piece" and q["piece_id"] == 1:
+                    first_3d_sent.set()
+                return reply
+
+        server = lab.Server(0, self.root/"pitch-api")
+        runner, _ = self.make_runner()
+        runner.client_factory = TrackedClient
+        server.runner = runner
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(allow_second.set)
+        base = f"http://127.0.0.1:{server.server_port}"
+
+        def submit(mode, piece_id):
+            payload = dict(files=self.rows, board_id="2", mode=mode, piece_id=piece_id)
+            request = Request(base+"/api/run", data=json.dumps(payload).encode(),
+                              headers={"Content-Type": "application/json"})
+            with urlopen(request, timeout=3) as response:
+                message = json.load(response)
+            self.assertNotEqual(message.get("submitted"), False, message)
+            return message["id"]
+
+        def completed(key):
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                with urlopen(base+"/api/jobs/"+key, timeout=3) as response:
+                    job = json.load(response)
+                if job["status"] != "running":
+                    self.assertEqual(job["status"], "done", job)
+                    return job
+                time.sleep(.01)
+            self.fail("request did not finish")
+
+        def mapping(stack, pixels, piece_id, metadata):
+            return dict(piece_id=piece_id, shm_name=f"depth-{piece_id}", pitch_correction=metadata)
+
+        with patch.object(lab, "defaults", return_value=dict(piece_count=2)), \
+             patch.object(lab, "mapped_depth_piece", side_effect=mapping), \
+             patch.object(pitch_stream, "DepthPreprocessor", side_effect=GatedPitch) as correction:
+            first, second = (submit(lab.PITCH_3D, pid) for pid in (1, 2))
+            try:
+                self.assertTrue(second_started.wait(3))
+                self.assertFalse(first_3d_sent.is_set())
+                first_2d, second_2d = (submit("manual_2d", pid) for pid in (1, 2))
+                self.assertTrue(first_3d_sent.wait(3), "3D waited for the whole board")
+                job = completed(first)
+                self.assertLessEqual(job["pitch_ready_at"], job["submitted_at"])
+                self.assertLessEqual(job["submitted_at"], job["received_at"])
+                with urlopen(base+"/api/jobs/"+second, timeout=3) as response:
+                    self.assertNotIn("submitted_at", json.load(response))
+            finally:
+                allow_second.set()
+            for key in (second, first_2d, second_2d):
+                completed(key)
+            self.assertEqual(len(prepared), 2)
+            correction.assert_called_once()
+            waiting = submit(lab.PITCH_3D, 1)
+            finish = Request(base+"/api/pitch/finish",
+                             data=json.dumps(dict(run_ids=[waiting], stopped=False)).encode())
+            with urlopen(finish, timeout=3) as response:
+                self.assertEqual(response.status, 200)
+            with urlopen(base+"/api/jobs/"+waiting, timeout=3) as response:
+                unsent = json.load(response)
+            self.assertEqual(unsent["status"], "failed")
+            self.assertNotIn("submitted_at", unsent)
 
     def test_http_workflow_publishes_one_history_entry_and_combined_report(self):
         server=lab.Server(0,self.root/'workflow-api')

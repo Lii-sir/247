@@ -36,6 +36,24 @@ ushort[] corrected = corrector.Correct(input, width, height);
 
 ## 逐片切分和矫正
 
+整板采集完成后，可调用一次 `CorrectPieces`，把原始深度和带片号的行范围传入 DLL。每片完成时，回调立刻收到该片的 `PieceId`、深度、宽高、原始起始行和矫正元数据。下例由上位机发起请求，适用于对应片 2D 已提交的情况。
+
+```csharp
+var ranges = new[] {
+    new DepthPieceRange(1, firstStartRow, firstEndRow),
+    new DepthPieceRange(2, secondStartRow, secondEndRow),
+};
+var requests = new List<Task<DetectResponse>>();
+await Task.Run(() => corrector.CorrectPieces(rawDepth, width, height, ranges, piece =>
+{
+    requests.Add(bridge.ThreeD.DetectPieceAsync(
+        boardId, piece.PieceId, piece.Depth, piece.Width, piece.Height, piece.PitchCorrection));
+}));
+var results = await Task.WhenAll(requests);
+```
+
+DLL 按传入顺序调用回调。上位机可在回调中按片筛选并提交，并持有原始输入直到整次 `CorrectPieces` 返回。
+
 `CorrectPiece` 接收原始深度数组与本片的行范围。下例在上位机代码中执行。
 
 ```csharp

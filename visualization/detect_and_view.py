@@ -263,6 +263,13 @@ def _map_bytes(stack, raw):
     return name
 
 
+def mapped_depth_piece(stack, depth, piece_id, correction):
+    height, width = depth.shape
+    raw = depth.astype("<u2", copy=False).tobytes(order="C")
+    return dict(piece_id=piece_id, shm_name=_map_bytes(stack, raw), data_format="uint16",
+                data_size=len(raw), image_width=width, image_height=height, pitch_correction=correction)
+
+
 def split_depth_sample(path, config, preprocessor):
     """Prepare a sample scan on the calling side before sending per-piece requests."""
     import numpy as np
@@ -343,12 +350,9 @@ def detect_batch(client: ProtocolClient, args, paths: list[Path], depth: Path,
             piece = geometry[piece_id]
             start, end = piece["y1"], piece["y2"]
             pixels = corrected[start:end, :]
-            height, width = pixels.shape
-            raw = pixels.astype("<u2", copy=False).tobytes(order="C")
             with ExitStack() as stack:
-                three_d = client.request(dict(cmd="detect_3d_piece", board_id=board_id, piece_id=piece_id,
-                    shm_name=_map_bytes(stack, raw), data_format="uint16", data_size=len(raw),
-                    image_width=width, image_height=height, pitch_correction=correction), args.timeout)
+                descriptor = mapped_depth_piece(stack, pixels, piece_id, correction)
+                three_d = client.request(dict(cmd="detect_3d_piece", board_id=board_id, **descriptor), args.timeout)
             return two_d, three_d
 
         started = time.perf_counter()

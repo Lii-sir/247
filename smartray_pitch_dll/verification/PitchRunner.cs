@@ -119,6 +119,29 @@ internal static class PitchRunner
         Reject(delegate { corrector.CorrectPiece(raw, 2, 3, 1, 1); });
         Reject(delegate { corrector.CorrectPiece(raw, 2, 3, 1, 4); });
         Reject(delegate { corrector.CorrectPiece(raw, 2, 4, 1, 2); });
+        var ranges = new[] { new DepthPieceRange(7, 0, 1), new DepthPieceRange(2, 1, 3) };
+        var ids = new System.Collections.Generic.List<int>();
+        corrector.CorrectPieces(raw, 2, 3, ranges, delegate(CorrectedDepthPiece piece)
+        {
+            ids.Add(piece.PieceId);
+            var expected = piece.PieceId == 7 ? corrector.CorrectPiece(raw, 2, 3, 0, 1) : corrector.CorrectPiece(raw, 2, 3, 1, 3);
+            Require(piece.Depth.SequenceEqual(expected.Depth));
+        });
+        Require(ids.SequenceEqual(new[] { 7, 2 }));
+        using (var stop = new System.Threading.CancellationTokenSource())
+        {
+            int callbacks = 0;
+            try
+            {
+                corrector.CorrectPieces(raw, 2, 3, ranges, delegate
+                {
+                    ++callbacks;
+                    stop.Cancel();
+                }, stop.Token);
+                throw new Exception("Expected cancellation between pieces.");
+            }
+            catch (OperationCanceledException) { Require(callbacks == 1); }
+        }
         Console.WriteLine("Per-piece slicing, metadata isolation, bypass and invalid ranges passed.");
     }
 }

@@ -27,7 +27,8 @@ async function boot(latency=null,timers={},failRequest=()=>false,browser={},hook
     else history.unshift({id,board_id:q.board_id,status:'done',result:{ok:true,product_is_ok:false,board_id:q.board_id,pieces:2,total_wall_ms:1000,output_dir:'/output',model_reused:false,submission_mode:q.submission_mode,request_interval_ms:q.request_interval_ms,two_d_latency:latency}});
     const timing=hooks.timing?.(q)??{};
     Object.assign(history[0],timing);
-    data={id,submitted,submitted_at:timing.submitted_at,error:submitted?null:'synthetic request failure'};}
+    data=q.mode==='pitch_piece_3d'?{id,pitch_waiting:true}:{id,submitted,submitted_at:timing.submitted_at,error:submitted?null:'synthetic request failure'};}
+   else if(url==='/api/pitch/finish')data={};
    else if(url==='/api/workflows'){
     const q=JSON.parse(opt.body);groups.push(q);
     data={id:'a'.repeat(32),kind:'workflow',title:'流程 '+groups.length,status:q.outcome,boards:2,runs:q.run_ids.length,error:q.error,total_wall_ms:1750};
@@ -349,6 +350,28 @@ test('a multi-piece node displays each submission and updates the response times
  release.get(1)();
  await run;
  assert.deepEqual(rows(),[['1','14:03:05.250','14:03:08.500'],['2','14:03:06.250','14:03:07.750']]);
+});
+
+test('Pitch node is armed before 2D and shows ready, submitted, and returned times',async()=>{
+ const base=new Date(2026,10,26,14,3,5).getTime()/1000;
+ const {nodes,requests}=await boot(null,{},()=>false,{},{
+  timing:q=>q.mode==='pitch_piece_3d'?{pitch_ready_at:base,submitted_at:base+.25,received_at:base+.75}:{},
+ });
+ nodes.get('demo').onclick();
+ nodes.get('addDetection').onclick();
+ nodes.get('addDetection').onclick();
+ const cards=nodes.get('flowNodes');
+ setDetection(cards.children[0],{pieces:'1-2'});
+ setDetection(cards.children[1],{mode:'pitch_piece_3d',pieces:'1-2'});
+ await nodes.get('startWorkflow').onclick();
+ assert.deepEqual(requests.map(q=>[q.mode,q.piece_id]),[
+  ['pitch_piece_3d',1],['pitch_piece_3d',2],['manual_2d',1],['manual_2d',2],
+ ]);
+ const table=cards.children[1].children[3];
+ assert.deepEqual(table.children[0].children[0].children.map(cell=>cell.textContent),
+  ['片号','Pitch 就绪','3D 提交','3D 返回']);
+ assert.deepEqual(table.children[1].children[0].children.map(cell=>cell.textContent),
+  ['1','14:03:05.000','14:03:05.250','14:03:05.750']);
 });
 
 test('a named setup survives reload, restores its node parameters and sends no requests',async()=>{

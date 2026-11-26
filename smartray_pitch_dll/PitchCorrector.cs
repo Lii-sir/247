@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;
 using System.Reflection;
+using System.Threading;
 
 [assembly: AssemblyTitle("SmartRay Pitch Correction")]
 [assembly: AssemblyVersion("1.0.0.0")]
@@ -34,8 +35,24 @@ namespace SmartRay.PitchCorrection
         }
     }
 
+    public sealed class DepthPieceRange
+    {
+        public int PieceId { get; private set; }
+        public int StartRow { get; private set; }
+        public int EndRow { get; private set; }
+
+        public DepthPieceRange(int pieceId, int startRow, int endRow)
+        {
+            if (pieceId <= 0) throw new ArgumentOutOfRangeException("pieceId");
+            PieceId = pieceId;
+            StartRow = startRow;
+            EndRow = endRow;
+        }
+    }
+
     public sealed class CorrectedDepthPiece
     {
+        public int PieceId { get; private set; }
         public ushort[] Depth { get; private set; }
         public int Width { get; private set; }
         public int Height { get; private set; }
@@ -43,8 +60,9 @@ namespace SmartRay.PitchCorrection
         public Dictionary<string, object> PitchCorrection { get; private set; }
 
         internal CorrectedDepthPiece(ushort[] depth, int width, int height, int startRow,
-            Dictionary<string, object> pitchCorrection)
+            Dictionary<string, object> pitchCorrection, int pieceId = 0)
         {
+            PieceId = pieceId;
             Depth = depth;
             Width = width;
             Height = height;
@@ -150,14 +168,46 @@ namespace SmartRay.PitchCorrection
         public CorrectedDepthPiece CorrectPiece(ushort[] input, int width, int height, int startRow, int endRow)
         {
             CheckInput(input, width, height);
+            CheckRows(startRow, endRow, height);
+            return ProjectPiece(input, width, startRow, endRow, 0);
+        }
+
+        /// <summary>Correct each configured raw row range and publish it immediately in input order.</summary>
+        public void CorrectPieces(ushort[] input, int width, int height, IEnumerable<DepthPieceRange> pieces,
+            Action<CorrectedDepthPiece> onPieceReady, CancellationToken cancellationToken = default(CancellationToken))
+        {
+            CheckInput(input, width, height);
+            if (pieces == null) throw new ArgumentNullException("pieces");
+            if (onPieceReady == null) throw new ArgumentNullException("onPieceReady");
+            var ranges = new List<DepthPieceRange>();
+            var ids = new HashSet<int>();
+            foreach (DepthPieceRange piece in pieces)
+            {
+                if (piece == null || !ids.Add(piece.PieceId))
+                    throw new ArgumentException("Every piece must have a unique ID.", "pieces");
+                CheckRows(piece.StartRow, piece.EndRow, height);
+                ranges.Add(piece);
+            }
+            foreach (DepthPieceRange piece in ranges)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                onPieceReady(ProjectPiece(input, width, piece.StartRow, piece.EndRow, piece.PieceId));
+            }
+        }
+
+        private static void CheckRows(int startRow, int endRow, int height)
+        {
             if (startRow < 0 || startRow >= height) throw new ArgumentOutOfRangeException("startRow");
             if (endRow <= startRow || endRow > height) throw new ArgumentOutOfRangeException("endRow");
+        }
 
+        private CorrectedDepthPiece ProjectPiece(ushort[] input, int width, int startRow, int endRow, int pieceId)
+        {
             int pieceHeight = endRow - startRow;
             var corrected = new ushort[width * pieceHeight];
             Project(input, corrected, width, pieceHeight, false, startRow * width);
             return new CorrectedDepthPiece(corrected, width, pieceHeight, startRow,
-                new Dictionary<string, object>(correctionMetadata));
+                new Dictionary<string, object>(correctionMetadata), pieceId);
         }
 
         /// <summary>Output must be a distinct packed array of width*height values.</summary>

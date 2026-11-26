@@ -25,12 +25,16 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 SERVICE_NAME = "detection-validation-lab"
 MAX_REQUEST_INTERVAL_MS = 3600000
-MANUAL_MODES = {"manual_2d", "manual_piece_3d"}
+PITCH_3D = "pitch_piece_3d"
+MANUAL_MODES = {"manual_2d", "manual_piece_3d", PITCH_3D}
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(ROOT / "python"))
-from detect_and_view import ProtocolClient, algorithm_request, mapped_file, save_timing_csv, split_depth_sample, summarize_2d_latency
+from detect_and_view import ProtocolClient, algorithm_request, mapped_depth_piece, mapped_file, save_timing_csv, summarize_2d_latency
 from generate_report import render_report
-from algorithm.vision3d.depth.depth_preprocessing import preprocessing_parameters, DepthPreprocessor
+from algorithm.runtime.config import feature_parameters
+from algorithm.vision3d.depth.depth_preprocessing import preprocessing_parameters
+from algorithm.vision3d.depth.segment import SegmentationConfig
+from validation_lab.pitch_stream import PitchPreparations, PitchTrigger
 
 
 def board_number(value):
@@ -61,7 +65,7 @@ def submission_options(submission_mode="concurrent", request_interval_ms=0):
 def board_inputs(rows, board_id, mode, count, *, piece_id=None):
     if not isinstance(mode, str) or mode not in {"2d", *MANUAL_MODES}:
         raise ValueError("未知验证方式")
-    if mode in {"manual_2d", "manual_piece_3d"} and (type(piece_id) is not int or not 1 <= piece_id <= count):
+    if mode in MANUAL_MODES and (type(piece_id) is not int or not 1 <= piece_id <= count):
         raise ValueError(f"片号须为1～{count}的整数")
     board_id = board_number(board_id)
     if not isinstance(rows, list) or len(rows) > 1000:
@@ -83,7 +87,7 @@ def board_inputs(rows, board_id, mode, count, *, piece_id=None):
             raise ValueError("未知图像类型")
         if mode in {"2d", "manual_2d"} and kind == "3d":
             continue
-        if mode in {"manual_2d", "manual_piece_3d"} and kind == "2d" and row.get("piece_id") != piece_id:
+        if mode in MANUAL_MODES and kind == "2d" and row.get("piece_id") != piece_id:
             continue
         path = Path(str(row.get("path", ""))).expanduser().resolve()
         if not path.is_file() or path.stat().st_size == 0:
@@ -99,9 +103,9 @@ def board_inputs(rows, board_id, mode, count, *, piece_id=None):
             if piece in images:
                 raise ValueError(f"板{board_id}的第{piece}片重复，请移除或修改编号")
             images[piece] = {**row, "path": str(path), "piece_id": piece}
-    if not images and mode != "manual_piece_3d":
+    needs_depth = mode in {"manual_piece_3d", PITCH_3D}
+    if not images and not needs_depth:
         raise ValueError(f"板{board_id}没有2D片图")
-    needs_depth = mode == "manual_piece_3d"
     if needs_depth and len(depths) != 1:
         raise ValueError(f"每板需要恰好一张3D整板图，目前{len(depths)}张")
     return board_id, [images[p] for p in sorted(images)], depths[0] if needs_depth else None
@@ -141,8 +145,8 @@ class Runner:
         self.client = None
         self.fingerprint = None
         self._startup_threading = None
-        self._depth_preprocessor = None
-        self._depth_settings_key = None
+        self._pitch = PitchPreparations()
+        self._pitch_triggers = {}
         self._state_lock = threading.RLock()
         self._submission_lock = threading.Lock()
         self._stopping = threading.Event()
@@ -162,28 +166,15 @@ class Runner:
                 self.fingerprint = None
                 self._startup_threading = None
                 self._manual_boards.clear()
-                if self._depth_preprocessor is not None:
-                    self._depth_preprocessor.close()
-                    self._depth_preprocessor = None
-                    self._depth_settings_key = None
-
-    def _depth_runtime(self, settings):
-        key = json.dumps(settings, sort_keys=True)
-        with self._state_lock:
-            if self._stopping.is_set():
-                raise RuntimeError('验证台正在停止')
-            if self._depth_preprocessor is not None and key != self._depth_settings_key:
-                self._depth_preprocessor.close()
-                self._depth_preprocessor = None
-            if self._depth_preprocessor is None:
-                self._depth_preprocessor = DepthPreprocessor(settings)
-                self._depth_settings_key = key
-            return self._depth_preprocessor
 
     def stop(self):
         with self._state_lock:
             self._stopping.set()
             self.close(force=True)
+            keys = list(self._pitch_triggers)
+        for key in keys:
+            self._fail_pitch_trigger(key, "验证台正在停止")
+        self._pitch.close()
 
     def _ensure(self, request, progress, *, board_timeout_seconds=None):
         stamps = {p: [Path(p).stat().st_mtime_ns, Path(p).stat().st_size]
@@ -216,17 +207,84 @@ class Runner:
         return dict(model_reused=False, process_pid=client.process.pid,
                     threading=self._startup_threading)
 
-    def _manual_piece_depth(self, path, piece_id, config, settings, folder):
-        corrected, pieces, metadata = split_depth_sample(path, config, self._depth_runtime(settings))
-        piece = pieces.get(piece_id)
-        if piece is None:
-            raise ValueError(f"整板深度图中未找到第{piece_id}片")
+    def _pitch_piece(self, board_id, path, piece_id, config, settings):
+        segmentation = SegmentationConfig.from_dict(feature_parameters(config, "segmentation_3d"))
+        return self._pitch.piece(board_id, path, segmentation, settings, piece_id)
+
+    def register_pitch_trigger(self, key, board_id, piece_id, images, depth, ready, dispatch, fail):
+        if not images:
+            raise ValueError("Pitch 就绪送检需要对应片的 2D 文件")
+        config = json.loads(self.init_builder(None, None)["config_text"])
+        future = self._pitch_piece(board_id, depth["path"], piece_id, config, preprocessing_parameters(config))
+        timeout = float(os.environ.get("BRIDGE_BOARD_TIMEOUT_SECONDS", "90"))
+        timer = threading.Timer(timeout, self._fail_pitch_trigger, args=(key, "等待单片深度或 2D 提交超时"))
+        timer.daemon = True
+        image_path = images[0]["path"]
+        with self._state_lock:
+            if self._stopping.is_set():
+                raise RuntimeError("验证台正在停止")
+            state = self._manual_boards.get(board_id)
+            available = state and (state["active"] or time.monotonic() - state["touched"] < timeout)
+            record = state["images"].get(piece_id) if available else None
+            already_sent = bool(record and record["sent"] and record["path"] == image_path)
+            self._pitch_triggers[key] = PitchTrigger(
+                board_id, piece_id, image_path, future, ready, dispatch, fail, timer, already_sent)
+            timer.start()
+        future.add_done_callback(lambda _: self._advance_pitch_trigger(key))
+
+    def _piece_2d_sent(self, board_id, piece_id, record):
+        with self._state_lock:
+            record["sent"] = True
+            keys = [key for key, trigger in self._pitch_triggers.items()
+                    if (trigger.board_id, trigger.piece_id, trigger.image_path) ==
+                    (board_id, piece_id, record["path"])]
+            for key in keys:
+                self._pitch_triggers[key].two_d_sent = True
+        for key in keys:
+            self._advance_pitch_trigger(key)
+
+    def _advance_pitch_trigger(self, key):
+        with self._state_lock:
+            trigger = self._pitch_triggers.get(key)
+            if trigger is None or not trigger.depth.done():
+                return
+            error = trigger.depth.exception()
+            can_dispatch = trigger.two_d_sent and error is None
+            if error is not None or can_dispatch:
+                self._pitch_triggers.pop(key)
+                trigger.timer.cancel()
+        if error is not None:
+            trigger.fail(str(error))
+            return
+        piece = trigger.depth.result()
+        trigger.ready(piece.ready_at)
+        if can_dispatch:
+            trigger.dispatch(piece)
+
+    def _fail_pitch_trigger(self, key, reason):
+        with self._state_lock:
+            trigger = self._pitch_triggers.pop(key, None)
+        if trigger is not None:
+            trigger.timer.cancel()
+            trigger.fail(reason)
+
+    def finish_pitch_submissions(self, keys, stopped):
+        with self._state_lock:
+            pending = [key for key in keys if key in self._pitch_triggers and
+                       (stopped or not self._pitch_triggers[key].two_d_sent)]
+            triggers = [self._pitch_triggers.pop(key) for key in pending]
+        for trigger in triggers:
+            trigger.timer.cancel()
+            trigger.fail("后续送检已停止" if stopped else "该片 2D 请求尚未提交")
+
+    def _manual_piece_depth(self, path, piece_id, config, settings, folder, board_id):
+        piece = self._pitch_piece(board_id, path, piece_id, config, settings).result()
         asset = folder / "piece-depth.png"
-        Image.fromarray(corrected[piece["y1"]:piece["y2"], :]).save(asset)
-        return asset, metadata
+        Image.fromarray(piece.pixels).save(asset)
+        return asset, piece.correction
 
     def run_manual(self, rows, board_id, mode, piece_id, count, folder, progress, *,
-                   on_sent=None, on_finished=None):
+                   on_sent=None, on_finished=None, prepared_piece=None):
         board_id, images, depth = board_inputs(rows, board_id, mode, count, piece_id=piece_id)
         if mode == "manual_2d":
             with Image.open(images[0]["path"]) as image:
@@ -236,13 +294,17 @@ class Runner:
         if int(config["common_3d"]["parameters"]["input"]["piece_count"]) != count:
             raise ValueError("配置片数已变，请刷新页面")
         settings = preprocessing_parameters(config) if depth else None
+        if prepared_piece is not None:
+            segmentation = SegmentationConfig.from_dict(feature_parameters(config, "segmentation_3d"))
+            if prepared_piece.profile != self._pitch.profile(segmentation, settings):
+                raise ValueError("Pitch 配置或分片范围已变更，请重新启动流程")
         affinity_note = fit_manual_affinity(config)
         config.pop("smartray_pitch_3d", None)
         init["config_text"] = json.dumps(config, ensure_ascii=True)
         idle_timeout = float(os.environ.get("BRIDGE_BOARD_TIMEOUT_SECONDS", "90"))
         chosen = {r["piece_id"]: r["path"] for r in images}
-        command = {"manual_2d": "detect_2d_piece", "manual_piece_3d": "detect_3d_piece"}[mode]
-        label = {"manual_2d": "2D", "manual_piece_3d": "单片3D"}[mode]
+        command = "detect_2d_piece" if mode == "manual_2d" else "detect_3d_piece"
+        label = "2D" if mode == "manual_2d" else "单片3D"
         title = f"板 {board_id} · 第{piece_id}片 · {label}"
         envelope = dict(viewer_version=1, mode="stream", board_id=board_id, title=title,
                         images_2d=images, responses_2d=[], warnings=[affinity_note] if affinity_note else [])
@@ -263,7 +325,7 @@ class Runner:
                 state = self._manual_boards.setdefault(board_id, dict(images={}, active=0, touched=now))
                 known = state["images"]
                 record = known.get(piece_id)
-                if mode == "manual_piece_3d" and record is not None and record["path"] != chosen.get(piece_id):
+                if mode != "manual_2d" and record is not None and record["path"] != chosen.get(piece_id):
                     raise ValueError("该片2D文件已变更，请重新提交对应2D")
                 if mode == "manual_2d":
                     record = None
@@ -290,8 +352,10 @@ class Runner:
             progress(f"准备{label}输入")
             if mode == "manual_2d":
                 descriptor = self.mapper(stack, Path(images[0]["path"]), "2d", piece_id)
+            elif prepared_piece is not None:
+                descriptor = mapped_depth_piece(stack, prepared_piece.pixels, piece_id, prepared_piece.correction)
             else:
-                asset, metadata = self._manual_piece_depth(Path(depth["path"]), piece_id, config, settings, folder)
+                asset, metadata = self._manual_piece_depth(Path(depth["path"]), piece_id, config, settings, folder, board_id)
                 descriptor = self.mapper(stack, asset, "3d", piece_id)
                 descriptor.update(piece_id=piece_id, pitch_correction=metadata)
                 envelope.update(image_3d=str(asset), image_3d_preprocessed=True)
@@ -299,11 +363,13 @@ class Runner:
                 raise RuntimeError("验证台正在停止")
             if mode == "manual_2d":
                 with self._state_lock:
-                    record = known[piece_id] = {"path": chosen[piece_id], "ready": False}
+                    record = known[piece_id] = {"path": chosen[piece_id], "ready": False, "sent": False}
 
             def sent(identifier, sent_at):
                 nonlocal request_id
                 request_id = identifier
+                if mode == "manual_2d":
+                    self._piece_2d_sent(board_id, piece_id, record)
                 submission.close()
                 if on_sent is not None:
                     on_sent(sent_at)
@@ -318,6 +384,10 @@ class Runner:
                 if request_id is not None and on_finished is not None:
                     on_finished(time.perf_counter(), received)
         elapsed = (time.perf_counter() - started) * 1000
+        if prepared_piece is not None:
+            asset = folder / "piece-depth.png"
+            Image.fromarray(prepared_piece.pixels).save(asset)
+            envelope.update(image_3d=str(asset), image_3d_preprocessed=True, pitch_ready_at=prepared_piece.ready_at)
         with self._state_lock:
             ready_pieces = sorted(pid for pid, source in known.items() if source["ready"])
         timeline = [row for row in client.timeline if row.get("request_id") == request_id]
@@ -338,7 +408,12 @@ class Runner:
                     output_dir=str(folder), model_reused=startup.get("model_reused", False))
 
     def release_manual(self, board_id):
-        self._manual_boards.pop(board_id, None)
+        self._pitch.release(board_id)
+        with self._state_lock:
+            self._manual_boards.pop(board_id, None)
+            keys = [key for key, trigger in self._pitch_triggers.items() if trigger.board_id == board_id]
+        for key in keys:
+            self._fail_pitch_trigger(key, "板缓存已释放")
         if self.client is not None and self.client.process.poll() is None:
             reply = self.client.request(dict(cmd="release_board", board_id=board_id), 15)
             if not reply.get("ok"):
@@ -715,19 +790,28 @@ class Handler(BaseHTTPRequestHandler):
                 # shutdown() must run outside the serve_forever thread.
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
-            if parsed.path not in {"/api/run", "/api/release-board", "/api/workflows"}:
+            if parsed.path not in {"/api/run", "/api/release-board", "/api/workflows", "/api/pitch/finish"}:
                 return self.send(404, {"error": "接口不存在"})
             request = json.loads(self.rfile.read(size))
             if not isinstance(request, dict):
                 raise ValueError("验证请求须为JSON对象")
             if parsed.path == "/api/workflows":
                 return self.send(201, self.server.finish_workflow(request))
+            if parsed.path == "/api/pitch/finish":
+                ids, stopped = request.get("run_ids"), request.get("stopped")
+                if not isinstance(ids, list) or type(stopped) is not bool or any(
+                    not isinstance(key, str) or not re.fullmatch(r"[a-f0-9]{32}", key) for key in ids
+                ):
+                    raise ValueError("无效的 Pitch 送检记录")
+                self.server.runner.finish_pitch_submissions(ids, stopped)
+                return self.send(200, {})
             if parsed.path == "/api/release-board":
                 board = board_number(request.get("board_id"))
                 with self.server.lock:
-                    if any(j["status"] == "running" for j in self.server.jobs.values()):
+                    if any(j["status"] == "running" and not j.get("pitch_waiting")
+                           for j in self.server.jobs.values()):
                         return self.send(409, {"error": "已有验证运行中，请等待完成"})
-                    self.server.runner.release_manual(board)
+                self.server.runner.release_manual(board)
                 return self.send(200, {"board_id": board})
             mode = request.get("mode")
             manual = isinstance(mode, str) and mode in MANUAL_MODES
@@ -740,13 +824,17 @@ class Handler(BaseHTTPRequestHandler):
                 running = [j for j in self.server.jobs.values() if j["status"] == "running"]
                 if running and (not manual or any(j.get("mode") not in MANUAL_MODES for j in running)):
                     return self.send(409, {"error": "批量验证须单独运行，请等待当前请求完成"})
-                if manual and any(j.get("board_id") == board and j.get("piece_id") == piece_id and
-                                  (j.get("mode") == mode or mode == "manual_2d") for j in running):
+                same_piece = [j for j in running if j.get("board_id") == board and j.get("piece_id") == piece_id]
+                conflict = any((not j.get("pitch_waiting") if mode == "manual_2d" else j.get("mode") != "manual_2d")
+                               for j in same_piece)
+                if manual and conflict:
                     return self.send(409, {"error": f"板 {board} 第 {piece_id} 片已有冲突请求正在处理"})
                 key = uuid.uuid4().hex
                 self.server.jobs[key] = dict(status="running", phase="准备验证", board_id=board, created=time.time())
                 if manual:
                     self.server.jobs[key].update(mode=mode, piece_id=piece_id)
+                if mode == PITCH_3D:
+                    self.server.jobs[key].update(pitch_waiting=True, phase="等待单片深度和同片 2D 提交")
             folder = self.server.folder / key;folder.mkdir()
             submitted = threading.Event()
             request_sent_at = submitted_at = None
@@ -765,18 +853,39 @@ class Handler(BaseHTTPRequestHandler):
             def update(**values):
                 with self.server.lock:
                     self.server.jobs[key].update(values)
-            def execute():
+            def execute(prepared_piece=None):
                 try:
                     progress = lambda phase: update(phase=phase)
                     if manual:
+                        prepared = {"prepared_piece": prepared_piece} if prepared_piece is not None else {}
                         result = self.server.runner.run_manual(
                             rows, board, mode, piece_id, count, folder, progress, on_sent=on_sent,
-                            on_finished=on_finished)
+                            on_finished=on_finished, **prepared)
                     else:
                         result = self.server.runner.run(rows, board, mode, count, folder, progress, **options)
                     update(status="done" if result["ok"] else "failed", result=result, error=result.get("error"))
                 except Exception as exc:
                     update(status="failed", error=str(exc))
+
+            if mode == PITCH_3D:
+                def fail(reason):
+                    update(status="failed", error=reason, pitch_waiting=False)
+
+                def dispatch(piece):
+                    update(pitch_waiting=False)
+                    try:
+                        self.server.pool.submit(execute, piece)
+                    except RuntimeError as exc:
+                        fail(str(exc))
+
+                try:
+                    self.server.runner.register_pitch_trigger(
+                        key, board, piece_id, images, depth,
+                        lambda ready_at: update(pitch_ready_at=ready_at), dispatch, fail)
+                except (OSError, RuntimeError, ValueError, KeyError) as exc:
+                    fail(str(exc))
+                    return self.send(202, dict(id=key, submitted=False, error=str(exc)))
+                return self.send(202, dict(id=key, pitch_waiting=True))
             future = self.server.pool.submit(execute)
             if manual:
                 future.add_done_callback(lambda _: submitted.set())

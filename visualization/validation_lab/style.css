@@ -369,6 +369,8 @@ td button:hover { color: var(--danger); }
 .node-request-times th, .node-request-times td { padding: 4px 6px; white-space: nowrap; }
 .node-request-times td { font-size: 10px; color: var(--text-muted); }
 .node-request-times tr:last-child td { border-bottom: 0; }
+.pitch-request-times th:first-child { width: 28px; }
+.pitch-request-times th, .pitch-request-times td { padding-inline: 2px; font-size: 9px; }
 
 /* Report Panel */
 .report-panel { padding: 18px; }

@@ -2,7 +2,8 @@
 const $=id=>document.getElementById(id);
 let files=[],config=null,busy=false,uploading=false,revision=0;
 const workflow=[];
-const detectionTypes={manual_2d:'单片 2D',manual_piece_3d:'单片 3D'};
+const pitchMode='pitch_piece_3d';
+const detectionTypes={manual_2d:'单片 2D',manual_piece_3d:'单片 3D',[pitchMode]:'Pitch 就绪送检 3D'};
 const actions={...detectionTypes,delay:'延时触发'};
 const palette=[['addDetection','manual_2d'],['addDelay','delay']];
 const savedWorkflowKey='validation-lab.workflow-templates.v1';
@@ -11,6 +12,7 @@ const workflowVersion=2;
 const requestClock=new Intl.DateTimeFormat('zh-CN',{hour:'2-digit',minute:'2-digit',second:'2-digit',
  fractionalSecondDigits:3,hourCycle:'h23'});
 let nodeID=0, activeRun=null, cancelCountdown=null, refreshCards=[];
+const pendingPitchRuns=new Set();
 async function api(url,options){const r=await fetch(url,options),d=await r.json();if(!r.ok)throw Error(d.error||'HTTP '+r.status);return d;}
 const post=(url,body)=>api(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
 function status(text,error=false){$('progress').textContent=text;$('progress').className=error?'error':'';}
@@ -125,7 +127,7 @@ async function runValidation(request){
 async function runExclusive(work,kind=null){
  if(busy||uploading||!config)return;
  busy=true;
- activeRun=kind?{kind,stopped:false,runIds:[],results:[]}:null;
+ activeRun=kind?{kind,stopped:false,runIds:[],pitchIds:[],results:[]}:null;
  renderFiles();
  try{return await work(activeRun);}
  finally{activeRun=null;busy=false;renderFiles();}
@@ -202,8 +204,9 @@ async function runDetection(node,run){
   try{
    const accepted=await post('/api/run',{mode,board_id,piece_id,files:structuredClone(snapshot)});
    ids.push(accepted.id);run.runIds.push(accepted.id);
+   if(mode===pitchMode){run.pitchIds.push(accepted.id);pendingPitchRuns.add(run);}
    timing.submittedAt=accepted.submitted_at;
-   timing.phase=accepted.submitted===false?'unsent':'pending';
+   timing.phase=accepted.submitted===false?'unsent':accepted.pitch_waiting?'pitch_pending':'pending';
    results.push(trackRequest(accepted.id,timing));
    refreshWorkflowControls();
    if(accepted.submitted===false){
@@ -218,7 +221,7 @@ async function runDetection(node,run){
  }
  node.message=error;
  node.outcome=ids.length?'running':error?'failed':'';
- node.status=ids.length?`已提交 ${ids.length}/${pieces.length} · 等待结果`:error?'请求失败':'已停止';
+ node.status=ids.length?`${mode===pitchMode?'已登记':'已提交'} ${ids.length}/${pieces.length} · 等待结果`:error?'请求失败':'已停止';
  updateWorkflow();
  run.results.push(collectNode(node,workflow.indexOf(node),ids,results,pieces.length,error));
  return !error&&!run.stopped;
@@ -226,17 +229,21 @@ async function runDetection(node,run){
 function trackRequest(id,timing){
  return waitForJob(id,job=>{
   const receivedAt=job.received_at??null;
+  const submittedAt=job.submitted_at??timing.submittedAt;
+  const pitchReadyAt=job.pitch_ready_at??null;
   let phase=timing.phase;
   if(Number.isFinite(receivedAt))phase='received';
   else if(phase!=='unsent'){
    if(job.status==='done')phase='unavailable';
-   else if(job.status!=='running'||job.request_finished_at!=null)phase='unreceived';
+   else if(job.status!=='running'||job.request_finished_at!=null)phase=Number.isFinite(submittedAt)?'unreceived':'unsent';
+   else if(Number.isFinite(submittedAt))phase='pending';
   }
-  if(timing.phase===phase&&timing.receivedAt===receivedAt)return;
-  timing.phase=phase;timing.receivedAt=receivedAt;
+  if(timing.phase===phase&&timing.receivedAt===receivedAt&&timing.submittedAt===submittedAt&&
+   timing.pitchReadyAt===pitchReadyAt)return;
+  Object.assign(timing,{phase,receivedAt,submittedAt,pitchReadyAt});
   refreshWorkflowControls();
  }).catch(error=>{
-  if(timing.phase==='pending')timing.phase='unreceived';
+  if(timing.phase==='pending'||timing.phase==='pitch_pending')timing.phase='unreceived';
   refreshWorkflowControls();
   return {status:'failed',error:error.message};
  });
@@ -284,7 +291,9 @@ async function runSingleNode(node,index){
   return run;
  },isDelay?'delay':'detection');
  if(!run)return;
+ if(run.stopped&&run.pitchIds.length)await finishPitchSubmissions(run).catch(err=>status(err.message,true));
  const [result]=await Promise.all(run.results);
+ pendingPitchRuns.delete(run);refreshWorkflowControls();
  if(!result)return;
  if(!busy){
   if(result.job?.result)showResult(result.id,result.job);
@@ -301,6 +310,9 @@ function workflowIssue(){
  }
  return '';
 }
+function finishPitchSubmissions(run){
+ return post('/api/pitch/finish',{run_ids:run.pitchIds,stopped:run.stopped});
+}
 $('startWorkflow').onclick=async()=>{
  const issue=workflowIssue();
  if(issue){status(issue,true);return;}
@@ -308,13 +320,27 @@ $('startWorkflow').onclick=async()=>{
  const submission=await runExclusive(async run=>{
   for(const node of workflow){node.outcome='';node.status='待执行';node.message='';node.requestTimes=[];}
   let error='';
+  // Arm the automatic requests before starting 2D. An adjacent delay still
+  // controls when its following trigger is armed.
+  const armed=new Set();
   for(const [index,node] of workflow.entries()){
-   if(run.stopped)break;
+   if(run.stopped||error)break;
+   if(node.mode!==pitchMode||workflow[index-1]?.mode==='delay')continue;
+   armed.add(node.id);
+   if(!await runDetection(node,run)&&!run.stopped)error=`流程停在节点 ${index+1}：${node.message||'登记失败'}`;
+  }
+  for(const [index,node] of workflow.entries()){
+   if(run.stopped||error)break;
+   if(armed.has(node.id))continue;
    const finished=node.mode==='delay'?await waitDelay(node,workflow[index+1]):await runDetection(node,run);
    if(!finished){
     if(!run.stopped)error=`流程停在节点 ${index+1}：${node.message||'检测请求失败'}`;
     break;
    }
+  }
+  if(run.pitchIds.length){
+   try{await finishPitchSubmissions(run);}
+   catch(err){error=error||err.message;}
   }
   return {run,error};
  },'workflow');
@@ -322,6 +348,7 @@ $('startWorkflow').onclick=async()=>{
  const {run}=submission;
  if(!busy)status(submission.error||(run.stopped?'后续提交已停止，等待已提交的检测结果…':'请求已提交，等待检测结果…'),!!submission.error);
  const results=await Promise.all(run.results);
+ pendingPitchRuns.delete(run);refreshWorkflowControls();
  const failure=results.find(result=>result.error);
  const error=submission.error||(failure?`节点 ${failure.index+1}：${failure.error}`:'');
  const outcome=run.stopped?'stopped':error?'failed':'done';
@@ -349,9 +376,10 @@ function refreshWorkflowControls(){
  $('saveWorkflowFile').disabled=locked||!workflow.length;
  $('openWorkflowFile').disabled=locked;
  $('workflowIssue').textContent=issue;$('workflowIssue').hidden=!issue||busy;
- $('stopWorkflow').hidden=!activeRun;
- $('stopWorkflow').disabled=activeRun?.stopped===true;
- $('stopWorkflow').textContent=activeRun?.kind==='workflow'?'停止流程':cancelCountdown?'取消计时':'停止后续请求';
+ const stoppable=activeRun||Array.from(pendingPitchRuns).at(-1);
+ $('stopWorkflow').hidden=!stoppable;
+ $('stopWorkflow').disabled=stoppable?.stopped===true;
+ $('stopWorkflow').textContent=stoppable?.kind==='workflow'?'停止流程':cancelCountdown?'取消计时':'停止后续请求';
  for(const refresh of refreshCards)refresh();
 }
 function addField(group,text,control){
@@ -502,12 +530,13 @@ function detectionFields(node,boards,locked){
  pieces.oninput=()=>editNode(node,{piece_spec:pieces.value});
  return fields;
 }
-function renderRequestTimes(table,timings){
+function renderRequestTimes(table,timings,pitch){
  table.hidden=!timings?.length;
  table.replaceChildren();
  if(table.hidden)return;
  const header=document.createElement('thead'),columns=document.createElement('tr');
- for(const name of ['片号','提交时间','收到结果']){
+ const names=pitch?['片号','Pitch 就绪','3D 提交','3D 返回']:['片号','提交时间','收到结果'];
+ for(const name of names){
   const cell=document.createElement('th');cell.scope='col';cell.textContent=name;columns.append(cell);
  }
  header.append(columns);
@@ -515,10 +544,13 @@ function renderRequestTimes(table,timings){
  for(const timing of timings){
   const row=document.createElement('tr');
   const submitted=Number.isFinite(timing.submittedAt)?requestClock.format(timing.submittedAt*1000):
-   timing.phase==='submitting'?'提交中':timing.phase==='unsent'?'未提交':'—';
+   timing.phase==='submitting'?'提交中':timing.phase==='unsent'?'未提交':timing.phase==='pitch_pending'?'等待中':'—';
   const received=Number.isFinite(timing.receivedAt)?requestClock.format(timing.receivedAt*1000):
    timing.phase==='pending'?'等待中':timing.phase==='unreceived'?'未收到':'—';
-  for(const value of [timing.piece_id,submitted,received]){
+  const values=[timing.piece_id];
+  if(pitch)values.push(Number.isFinite(timing.pitchReadyAt)?requestClock.format(timing.pitchReadyAt*1000):'—');
+  values.push(submitted,received);
+  for(const value of values){
    const cell=document.createElement('td');cell.textContent=String(value);row.append(cell);
   }
   body.append(row);
@@ -554,7 +586,11 @@ function updateWorkflow(){
    execute.textContent=isDelay?'开始计时':node.outcome==='done'?'重跑':'执行';
    const check=isDelay?delayCheck(node,index):nodeCheck(node);
     execute.disabled=locked||node.outcome==='running'||!check.ok;execute.title=check.message;
-   if(times)renderRequestTimes(times,node.requestTimes);
+   if(times){
+    const pitch=node.mode===pitchMode;
+    times.className=pitch?'node-request-times pitch-request-times':'node-request-times';
+    renderRequestTimes(times,node.requestTimes,pitch);
+   }
   };
   let description;
   if(isDelay){
@@ -595,8 +631,10 @@ $('flowCanvas').ondrop=event=>{
 };
 $('clearFlow').onclick=()=>{if(!busy&&!uploading){workflow.length=0;updateWorkflow();}};
 $('stopWorkflow').onclick=()=>{
- if(!activeRun||activeRun.stopped)return;
- activeRun.stopped=true;
+ const run=activeRun||Array.from(pendingPitchRuns).at(-1);
+ if(!run||run.stopped)return;
+ run.stopped=true;
+ if(run.pitchIds.length)finishPitchSubmissions(run).catch(err=>status(err.message,true));
  if(cancelCountdown)cancelCountdown();
  else{refreshWorkflowControls();status('已停止后续提交，已经发出的请求继续检测。');}
 };
