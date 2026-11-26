@@ -60,7 +60,7 @@ console.log('6 real-viewer coordinate checks passed');
 
 const done={status:'done',is_ok:true};
 const board=(board_id,pieces)=>({board_id,pieces,response:{ok:true},warnings:[]});
-const {nodes}=loadViewer({mode:'workflow',title:'Test flow',response:{mode:'workflow'},boards:[
+const {nodes}=loadViewer({mode:'workflow',title:'Test flow',response:{mode:'workflow',total_wall_ms:1750},boards:[
   board('A',[
     {piece_id:1,workflow_stages:{'2d':done,'3d':done}},
     {piece_id:2,workflow_stages:{'2d':done,'3d':{status:'skipped',reason:'2d_ng'}}},
@@ -69,6 +69,8 @@ const {nodes}=loadViewer({mode:'workflow',title:'Test flow',response:{mode:'work
 ]});
 assert.equal(nodes.get('panel-2d').hidden,false);
 assert.equal(nodes.get('panel-3d').hidden,false);
+assert.equal(nodes.get('elapsed-label').textContent,'流程总耗时');
+assert.equal(nodes.get('elapsed').textContent,'1.75 秒');
 nodes.get('pieces').children[1].handlers.click();
 assert.equal(nodes.get('panel-2d').hidden,false);
 assert.equal(nodes.get('panel-3d').hidden,true);
@@ -78,4 +80,5 @@ nodes.get('workflow-board').handlers.change();
 assert.equal(nodes.get('panel-2d').hidden,true);
 assert.equal(nodes.get('panel-3d').hidden,false);
 assert.equal(nodes.get('piece-stage-warnings').hidden,true);
+assert.equal(nodes.get('elapsed').textContent,'1.75 秒');
 console.log('Workflow board/piece switches and stage visibility passed');

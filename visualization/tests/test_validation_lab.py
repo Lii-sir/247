@@ -233,8 +233,9 @@ class ValidationTests(unittest.TestCase):
             return urlopen(Request(base+'/api/run',data=json.dumps(data).encode(),
                 headers={'Content-Type':'application/json'}))
         done=threading.Event()
-        def manual(*args):
-            args[-1]()
+        def manual(*args, on_sent, on_finished):
+            on_sent(10.0)
+            on_finished(10.6)
             done.set()
             return {'ok':True,'piece_id':2}
         with patch.object(server.runner,'run_manual',side_effect=manual) as exact, patch.object(server.runner,'run') as batch:
@@ -252,7 +253,10 @@ class ValidationTests(unittest.TestCase):
             self.assertEqual([row['name'] for row in args[0]],['2_2.png'])
             batch.assert_not_called()
         with urlopen(base+'/api/jobs/'+job_id) as response:
-            self.assertEqual(json.load(response)['piece_id'],2)
+            job = json.load(response)
+            self.assertEqual(job['piece_id'], 2)
+            self.assertEqual(job['request_sent_at'], 10.0)
+            self.assertEqual(job['request_finished_at'], 10.6)
 
     def test_http_submits_same_piece_3d_while_2d_result_is_pending(self):
         release_2d = threading.Event()
@@ -316,18 +320,20 @@ class ValidationTests(unittest.TestCase):
         self.addCleanup(server.server_close);self.addCleanup(server.shutdown)
         base=f'http://127.0.0.1:{server.server_port}'
         ids=['1'*32,'2'*32]
-        for key, mode, result in zip(ids,('manual_2d','manual_piece_3d'),(
-            {'results_2d':{'is_ok':True}}, {'results_piece':{'piece_id':1,'is_ok':True}})):
+        for key, mode, result, (sent, finished) in zip(ids, ('manual_2d', 'manual_piece_3d'), (
+            {'results_2d':{'is_ok':True}}, {'results_piece':{'piece_id':1,'is_ok':True}}), ((10.0, 11.5), (10.6, 11.0))):
             folder=server.folder/key;folder.mkdir()
             envelope=dict(board_id='2',response=dict(ok=True,board_id='2',piece_id=1,**result))
             (folder/'result.json').write_text(json.dumps(envelope),encoding='utf-8')
-            server.jobs[key]={'status':'done','board_id':'2','piece_id':1,'mode':mode}
+            server.jobs[key] = dict(status='done', board_id='2', piece_id=1, mode=mode,
+                                    request_sent_at=sent, request_finished_at=finished)
         body=json.dumps({'run_ids':ids,'outcome':'done'}).encode()
         request=Request(base+'/api/workflows',data=body, headers={'Content-Type':'application/json'})
         with urlopen(request) as response:
             self.assertEqual(response.status,201)
             group=json.load(response)
         self.assertEqual(group['runs'],2)
+        self.assertEqual(group['total_wall_ms'], 1500.0)
         with urlopen(base+'/api/history') as response:
             self.assertEqual(json.load(response),[group])
         with urlopen(base+'/runs/'+group['id']+'/report.html') as response:
@@ -335,6 +341,10 @@ class ValidationTests(unittest.TestCase):
         self.assertIn('workflow_stages',html)
         self.assertIn('流程 1',html)
         with urlopen(base+'/runs/'+group['id']+'/result.json') as response:
-            self.assertEqual([r['id'] for r in json.load(response)['runs']],ids)
+            document = json.load(response)
+            self.assertEqual([r['id'] for r in document['runs']], ids)
+            self.assertEqual(document['total_wall_ms'], 1500.0)
+        with urlopen(base+'/runs/'+group['id']+'/timings.csv') as response:
+            self.assertIn(',workflow,,total_wall_ms,1500.0', response.read().decode('utf-8-sig'))
 
 if __name__=='__main__':unittest.main()

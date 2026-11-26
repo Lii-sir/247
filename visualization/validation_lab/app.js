@@ -57,6 +57,7 @@ function showWorkflow(id,group){
  links(id,true);
  $('resultEmpty').hidden=true;$('report').hidden=false;$('report').src='/runs/'+id+'/report.html';
  $('summary').textContent=`${group.title} · ${workflowStatus[group.status]} · ${group.boards} 板 · ${group.runs} 个检测请求`+
+   (Number.isFinite(group.total_wall_ms)?` · 总耗时 ${(group.total_wall_ms/1000).toFixed(2)} 秒`:'')+
   (group.error?'\n'+group.error:'');
 }
 function showResult(id,job){

@@ -225,7 +225,8 @@ class Runner:
         Image.fromarray(corrected[piece["y1"]:piece["y2"], :]).save(asset)
         return asset, metadata
 
-    def run_manual(self, rows, board_id, mode, piece_id, count, folder, progress, on_sent=None):
+    def run_manual(self, rows, board_id, mode, piece_id, count, folder, progress, *,
+                   on_sent=None, on_finished=None):
         board_id, images, depth = board_inputs(rows, board_id, mode, count, piece_id=piece_id)
         if mode == "manual_2d":
             with Image.open(images[0]["path"]) as image:
@@ -300,16 +301,20 @@ class Runner:
                 with self._state_lock:
                     record = known[piece_id] = {"path": chosen[piece_id], "ready": False}
 
-            def sent(identifier, _):
+            def sent(identifier, sent_at):
                 nonlocal request_id
                 request_id = identifier
                 submission.close()
                 if on_sent is not None:
-                    on_sent()
+                    on_sent(sent_at)
 
             started = time.perf_counter()
             progress(f"等待{label}响应")
-            reply = client.request(dict(cmd=command, board_id=board_id, **descriptor), 900, on_sent=sent)
+            try:
+                reply = client.request(dict(cmd=command, board_id=board_id, **descriptor), 900, on_sent=sent)
+            finally:
+                if request_id is not None and on_finished is not None:
+                    on_finished(time.perf_counter())
         elapsed = (time.perf_counter() - started) * 1000
         with self._state_lock:
             ready_pieces = sorted(pid for pid, source in known.items() if source["ready"])
@@ -593,16 +598,25 @@ class Server(ThreadingHTTPServer):
             timings = child / "timings.csv"
             if timings.is_file():
                 timing_rows.extend(timings.read_text(encoding="utf-8-sig").splitlines()[1:])
+        timed_jobs = [job for job in jobs if "request_sent_at" in job and "request_finished_at" in job]
+        total_wall_ms = None
+        if timed_jobs:
+            begin = min(job["request_sent_at"] for job in timed_jobs)
+            end = max(job["request_finished_at"] for job in timed_jobs)
+            total_wall_ms = round((end - begin) * 1000, 2)
+            timing_rows.insert(0, f",workflow,,total_wall_ms,{total_wall_ms}")
         key = uuid.uuid4().hex
         folder = self.folder / key
         folder.mkdir()
-        document = dict(mode="workflow", title=title, outcome=outcome, error=error, runs=runs)
+        document = dict(mode="workflow", title=title, outcome=outcome, error=error, runs=runs,
+                        total_wall_ms=total_wall_ms)
         render_report(document, folder / "report.html", base_dir=folder)
         (folder / "result.json").write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8")
         (folder / "timings.csv").write_text("\n".join(
             ["board_id,phase,piece_id,stage,elapsed_ms", *timing_rows]) + "\n", encoding="utf-8-sig")
         entry = dict(kind="workflow", title=title, status=outcome, created=time.time(), runs=len(runs),
-                     boards=len({run["document"]["board_id"] for run in runs}), error=error)
+                     boards=len({run["document"]["board_id"] for run in runs}), error=error,
+                     total_wall_ms=total_wall_ms)
         with self.lock:
             self.workflows[key] = entry
         return dict(id=key, **entry)
@@ -735,8 +749,9 @@ class Handler(BaseHTTPRequestHandler):
             submitted = threading.Event()
             sent = False
 
-            def on_sent():
+            def on_sent(sent_at):
                 nonlocal sent
+                update(request_sent_at=sent_at)
                 sent = True
                 submitted.set()
 
@@ -747,7 +762,9 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     progress = lambda phase: update(phase=phase)
                     if manual:
-                        result = self.server.runner.run_manual(rows, board, mode, piece_id, count, folder, progress, on_sent)
+                        result = self.server.runner.run_manual(
+                            rows, board, mode, piece_id, count, folder, progress, on_sent=on_sent,
+                            on_finished=lambda ended: update(request_finished_at=ended))
                     else:
                         result = self.server.runner.run(rows, board, mode, count, folder, progress, **options)
                     update(status="done" if result["ok"] else "failed", result=result, error=result.get("error"))

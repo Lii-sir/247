@@ -154,7 +154,14 @@
       : pieces().length > 0 && pieces().every((item) => item.registration?.status === "disabled");
     setText("registration-status", registrationDisabled ? "未启用" : statusText(registration),
       statusClass(registrationDisabled ? null : registration));
-    setText("elapsed", response.elapsed_ms == null ? "—" : `${number(response.elapsed_ms, 1)} ms`);
+    if (workflow) {
+      setText("elapsed-label", "流程总耗时");
+      $("elapsed-label").title = "从该流程第一条检测请求发出到最后一条结束";
+      const elapsed = report.response?.total_wall_ms;
+      setText("elapsed", Number.isFinite(elapsed) ? `${number(elapsed / 1000, 2)} 秒` : "—");
+    } else {
+      setText("elapsed", response.elapsed_ms == null ? "—" : `${number(response.elapsed_ms, 1)} ms`);
+    }
     $("piece-count").textContent = `${pieces().length} 片 · 点击片号查看细节`;
     const warningText = [workflow && report.response?.error, ...(data.warnings || [])].filter(Boolean).join("\n");
     const notice = $("notice");

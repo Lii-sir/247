@@ -28,7 +28,7 @@ async function boot(latency=null,timers={},failRequest=()=>false,browser={},hook
     data={id,submitted,error:submitted?null:'synthetic request failure'};}
    else if(url==='/api/workflows'){
     const q=JSON.parse(opt.body);groups.push(q);
-    data={id:'a'.repeat(32),kind:'workflow',title:'流程 '+groups.length,status:q.outcome,boards:2,runs:q.run_ids.length,error:q.error};
+    data={id:'a'.repeat(32),kind:'workflow',title:'流程 '+groups.length,status:q.outcome,boards:2,runs:q.run_ids.length,error:q.error,total_wall_ms:1750};
     for(const id of q.run_ids){const index=history.findIndex(job=>job.id===id);if(index>=0)history.splice(index,1);}
     history.unshift(data);
    }
@@ -259,6 +259,7 @@ test('one click runs a configured range and delay, then opens one grouped workfl
  assert.equal(nodes.get('history').children.length,2);
  assert.equal(nodes.get('report').src,'/runs/'+'a'.repeat(32)+'/report.html');
  assert.match(nodes.get('summary').textContent,/流程 1.*3 个检测请求/);
+ assert.match(nodes.get('summary').textContent,/总耗时 1\.75 秒/);
  assert.match(nodes.get('progress').textContent,/流程执行完成/);
 });
 
