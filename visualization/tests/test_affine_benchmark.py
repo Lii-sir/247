@@ -91,11 +91,14 @@ class AffineBenchmarkTests(unittest.TestCase):
             depth = root / "2.png"
             cv2.imwrite(str(depth), np.tile(mask.astype(np.uint16)*33000, (2, 1)))
             config = {
-                "segmentation_3d": {"parameters": dict(expected_piece_count=2, mode="fixed",
+                "segmentation_3d": {"description": "Test segmentation", "thresholds": {},
+                    "parameters": dict(expected_piece_count=2, mode="fixed",
                     fixed_rois=[[0, 0, 128, 96], [0, 96, 128, 192]])},
-                "registration_3d": {"parameters": dict(scale=1, roi_3d=[2, 2, 30, 40],
+                "registration_3d": {"description": "Test registration", "thresholds": dict(threshold_2d=60),
+                    "parameters": dict(scale=1, roi_3d=[2, 2, 30, 40],
                     search_2d_scaled=[0, 0, 128, 96], morphology_kernel_size=1)},
-                "dynamic_affine_3d": {"parameters": dict(preview_scale=1, score_mode="full",
+                "dynamic_affine_3d": {"description": "Test affine refinement", "thresholds": dict(threshold_2d=75),
+                    "parameters": dict(preview_scale=1, score_mode="full",
                     morphology_kernel_size=1, rois=[[0, 0, 60, 96], [60, 0, 128, 96]],
                     maxiter=1, maxfev=12, translation_delta=[2, 2])}}
             config_path = root / "config.json"

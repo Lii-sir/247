@@ -20,6 +20,7 @@ from algorithm.runtime.config import (
     feature_parameters,
     inspection_parameters,
     load_runtime_config,
+    parse_config_text,
 )
 from algorithm.vision3d.measurement.height_measurement import (
     HeightConfig,
@@ -76,6 +77,7 @@ class DetectBoard(JointGeometry):
         self._gpu_worker_resources = []
         self._gpu_worker_slots = queue.Queue()
         self.config_path: str | None = None
+        self._stage_2d_dir: Path | None = None
         self.config: Dict[str, Any] = {}
         self.expected_piece_count = 10
         self.crop_roi = (1700, 0, 3900, 2700)
@@ -115,7 +117,8 @@ class DetectBoard(JointGeometry):
         self.model_paths = {str(name): str(path) for name, path in model_paths.items()}
         self.model_path = str(model_paths.get("YOLO") or "") or None
         try:
-            timed_call("init_config_ms", self._load_config, str(req.get("config_text") or ""))
+            timed_call("init_config_ms", self._load_config, str(req.get("config_text") or ""),
+                       config_3d_path=str(req.get("config_3d_path") or "") or None)
             if not self.model_path:
                 raise ValueError("model_path.YOLO is empty")
             timed_call("init_cuda_check_ms", self._validate_gpu_requirement)
@@ -248,8 +251,17 @@ class DetectBoard(JointGeometry):
         self._gpu_worker_slots = slots
         return timings
 
-    def _load_config(self, text: str) -> None:
-        config = load_runtime_config(text, self.config_path)
+    def _load_config(self, text: str, *, config_3d_path: str | None = None) -> None:
+        config = load_runtime_config(text, self.config_path, config_3d_path=config_3d_path)
+        self._stage_2d_dir = None
+        if self.config_path:
+            source = Path(self.config_path).resolve().parent
+            if config_3d_path:
+                self._stage_2d_dir = source
+            elif source.name.casefold() not in {"2d", "3d"}:
+                stage_2d = parse_config_text(text).get("config_2d")
+                if isinstance(stage_2d, str) and stage_2d:
+                    self._stage_2d_dir = (source / stage_2d).resolve().parent
         if not isinstance(config, dict):
             raise ValueError("board config must be an object")
         self.config = config
@@ -860,6 +872,8 @@ class DetectBoard(JointGeometry):
         return value
 
     def _silver_config_base_dir(self) -> Path | None:
+        if self._stage_2d_dir is not None:
+            return self._stage_2d_dir
         if not self.config_path:
             return None
         parent = Path(self.config_path).resolve().parent
@@ -1097,6 +1111,7 @@ class DetectBoard(JointGeometry):
         self.model_path = None
         self.model_paths = {}
         self.config_path = None
+        self._stage_2d_dir = None
         self.config = {}
         self.circle_crop_config = None
         self.silver_config = {}

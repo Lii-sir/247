@@ -31,7 +31,7 @@ import cv2
 import numpy as np
 import scipy
 import PIL
-from algorithm.runtime.config import load_runtime_config
+from algorithm.runtime.config import feature_parameters, load_runtime_config
 from algorithm.vision3d.alignment.registration import (
     RegistrationConfig, affine_coordinate_context, platform_mask_2d,
     platform_mask_3d, refine_affine_registration, register_platform_masks,
@@ -133,16 +133,16 @@ def select_inputs(directory, depth, pieces, expected, board_id=None):
 
 def prepare(config, inputs, depth_path):
     started = time.perf_counter()
-    height = config.get("height_measurement_3d", {}).get("parameters", {})
+    height = feature_parameters(config, "height_measurement_3d", required=False) or {}
     pitch = production_pitch_parameters(config, height.get("gray_offset", 32768.),
                                         height.get("vertical_resolution_mm", .00105))
     raw = cv2.imdecode(np.fromfile(str(depth_path), dtype=np.uint8), cv2.IMREAD_UNCHANGED)
     if raw is None or raw.ndim != 2 or raw.dtype != np.uint16:
         raise ValueError("depth sample must be an original single-channel uint16 image")
     depth, correction = correct_smartray_depth(raw, pitch)
-    segmentation = segment.SegmentationConfig.from_dict(config["segmentation_3d"]["parameters"])
+    segmentation = segment.SegmentationConfig.from_dict(feature_parameters(config, "segmentation_3d"))
     boxes = {box["piece_id"]: box for box in segment.segment_depth_image(depth, segmentation)}
-    registration = RegistrationConfig.from_dict(config["registration_3d"]["parameters"])
+    registration = RegistrationConfig.from_dict(feature_parameters(config, "registration_3d"))
     prepared, info = [], []
     depth.setflags(write=False)
     for pid, path in inputs:
@@ -360,14 +360,15 @@ def main(argv=None):
     config_path = args.config.resolve()
     config = load_runtime_config(config_path.read_text(encoding="utf-8-sig"), str(config_path))
     profile = json.loads(args.profile.read_text(encoding="utf-8-sig")) if args.profile else None
-    variants = {name: parameters(config["dynamic_affine_3d"]["parameters"], name, profile) for name in args.variants}
+    affine = feature_parameters(config, "dynamic_affine_3d")
+    variants = {name: parameters(affine, name, profile) for name in args.variants}
     if args.depth is None:
         candidates = list((ROOT / "demodatasets/3D").glob("*.png"))
         if len(candidates) != 1:
             parser.error("Specify --depth; the default 3D directory must contain exactly one PNG")
         args.depth = candidates[0]
     inputs = select_inputs(args.images_dir, args.depth, args.pieces,
-                           config["segmentation_3d"]["parameters"].get("expected_piece_count", 10), args.board_id)
+                           feature_parameters(config, "segmentation_3d").get("expected_piece_count", 10), args.board_id)
     cv2.setNumThreads(1)
     prepared, input_info = prepare(config, inputs, args.depth)
     folder = args.output_dir / ("run-"+datetime.now().strftime("%Y%m%d-%H%M%S-%f"))

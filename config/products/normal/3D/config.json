@@ -1,6 +1,7 @@
 {
   "common_3d": {
     "description": "3D板级输入公共参数",
+    "thresholds": {},
     "parameters": {
       "input": {
         "piece_count": 10
@@ -25,6 +26,7 @@
   },
   "segmentation_3d": {
     "description": "将一张整板深度图分割为十片",
+    "thresholds": {},
     "parameters": {
       "expected_piece_count": 10,
       "mode": "fixed",
@@ -94,9 +96,12 @@
   },
   "registration_3d": {
     "description": "2D掩码到每片3D深度图的初始尺度匹配",
+    "thresholds": {
+      "threshold_2d": 50,
+      "minimum_score": 0.7
+    },
     "parameters": {
       "scale": 0.306,
-      "threshold_2d": 50,
       "roi_3d": [
         120,
         50,
@@ -109,12 +114,14 @@
         950,
         900
       ],
-      "morphology_kernel_size": 5,
-      "minimum_score": 0.7
+      "morphology_kernel_size": 5
     }
   },
   "dynamic_affine_3d": {
     "description": "每片运行时动态拟合仿射变换",
+    "thresholds": {
+      "threshold_2d": 50
+    },
     "parameters": {
       "score_mode": "full",
       "cache_enabled": true,
@@ -134,7 +141,6 @@
       "maxfev": null,
       "total_maxfev": null,
       "preview_scale": 0.5,
-      "threshold_2d": 50,
       "morphology_kernel_size": 3,
       "scale_delta": 0.02,
       "shear_limit": 0.02,
@@ -150,6 +156,13 @@
   },
   "height_measurement_3d": {
     "description": "使用ROI工具标定的2D引脚平台区域，经每片透视矩阵映射到3D拟合平台面；检测焊脚和引线相对平台/芯片平面的高度差",
+    "thresholds": {
+      "plane_min_valid_points": 100,
+      "chip_min_valid_points": 100,
+      "max_wire_platform_height_mm": 0.8,
+      "max_solder_platform_height_mm": 0.8,
+      "max_solder_chip_height_mm": 0.8
+    },
     "parameters": {
       "platform_roi_offsets": [
         [
@@ -175,11 +188,6 @@
       "wire_measurement_erode_px": 2,
       "thin_measurement_erode_px": 1,
       "plane_percentile": 35.0,
-      "plane_min_valid_points": 100,
-      "chip_min_valid_points": 100,
-      "max_wire_platform_height_mm": 0.8,
-      "max_solder_platform_height_mm": 0.8,
-      "max_solder_chip_height_mm": 0.8,
       "thin_solder_end_ratio": 0.02,
       "thin_solder_search_dilation_px": 6,
       "bond_measurement_erode_px": 1,
@@ -190,6 +198,7 @@
   },
   "smartray_pitch_3d": {
     "description": "调用侧提交前的SmartRay Pitch预处理参数；检测算法不执行矫正、不计矫正耗时；SDK使用独立DLL先矫正再提交",
+    "thresholds": {},
     "parameters": {
       "enabled_3d": true,
       "projection_workers": 8,

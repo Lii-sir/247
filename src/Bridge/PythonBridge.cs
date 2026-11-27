@@ -97,12 +97,20 @@ public sealed class PythonBridge : IDisposable
 
     public BridgeBaseResponse InitAlgorithm(string stage)
     {
+        return InitAlgorithm(stage, _configPath);
+    }
+
+    /// <summary>Initialize the detector using the specified product configuration manifest.</summary>
+    public BridgeBaseResponse InitAlgorithm(string stage, string configPath)
+    {
+        if (string.IsNullOrWhiteSpace(configPath))
+            throw new ArgumentException("Product configuration path is empty.", nameof(configPath));
+
+        InitAlgorithmRequest req = CreateInitAlgorithmRequest(stage, Path.GetFullPath(configPath));
         if (!_initialized || _process == null || _process.HasExited)
         {
             Init();
         }
-
-        InitAlgorithmRequest req = CreateInitAlgorithmRequest(stage);
 
         using (EnterLifecycleOperation())
         {
@@ -618,7 +626,7 @@ public sealed class PythonBridge : IDisposable
     }
 
     // 初始化算法请求
-    private InitAlgorithmRequest CreateInitAlgorithmRequest(string stage)
+    private static InitAlgorithmRequest CreateInitAlgorithmRequest(string stage, string configPath)
     {
         if (string.IsNullOrWhiteSpace(stage))
         {
@@ -633,14 +641,13 @@ public sealed class PythonBridge : IDisposable
                 nameof(stage));
         }
 
-        if (!File.Exists(_configPath))
+        if (!File.Exists(configPath))
         {
             throw new FileNotFoundException(
-                "Bridge config manifest not found. Expected config/config.json.",
-                _configPath);
+                "Bridge config manifest not found.", configPath);
         }
 
-        string manifestText = File.ReadAllText(_configPath, Encoding.UTF8);
+        string manifestText = File.ReadAllText(configPath, Encoding.UTF8);
         using JsonDocument manifestDocument = JsonDocument.Parse(manifestText);
         JsonElement manifest = manifestDocument.RootElement;
         if (manifest.ValueKind != JsonValueKind.Object
@@ -650,11 +657,11 @@ public sealed class PythonBridge : IDisposable
             || config3DElement.ValueKind != JsonValueKind.String)
         {
             throw new InvalidDataException(
-                $"'config_2d' and 'config_3d' paths are required in {_configPath}.");
+                $"'config_2d' and 'config_3d' paths are required in {configPath}.");
         }
 
-        string config2DPath = ResolveConfigRelativePath(config2DElement.GetString()!);
-        string config3DPath = ResolveConfigRelativePath(config3DElement.GetString()!);
+        string config2DPath = ResolveConfigRelativePathFrom(config2DElement.GetString()!, configPath);
+        string config3DPath = ResolveConfigRelativePathFrom(config3DElement.GetString()!, configPath);
         if (!File.Exists(config2DPath) || !File.Exists(config3DPath))
         {
             throw new FileNotFoundException(
@@ -666,7 +673,7 @@ public sealed class PythonBridge : IDisposable
         {
             if (policyPath.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(policyPath.GetString()))
                 throw new InvalidDataException("'config_inspection' must be a non-empty path.");
-            inspectionPath = ResolveConfigRelativePath(policyPath.GetString()!);
+            inspectionPath = ResolveConfigRelativePathFrom(policyPath.GetString()!, configPath);
         }
         using JsonDocument? inspection = inspectionPath == null
             ? null
@@ -746,20 +753,9 @@ public sealed class PythonBridge : IDisposable
             Stage = normalizedStage,
             ModelPath = modelPaths,
             ConfigPath = config2DPath,
+            Config3DPath = normalizedStage == "board" ? config3DPath : null,
             ConfigText = configText
         };
-    }
-
-    private string ResolveConfigRelativePath(string path)
-    {
-        if (Path.IsPathRooted(path))
-        {
-            return Path.GetFullPath(path);
-        }
-
-        string baseDirectory = Path.GetDirectoryName(_configPath)
-            ?? Environment.CurrentDirectory;
-        return Path.GetFullPath(Path.Combine(baseDirectory, path));
     }
 
     private static string ResolveConfigRelativePathFrom(string path, string configPath)

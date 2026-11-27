@@ -1,21 +1,21 @@
 # 2D 配置
 
-每个 2D 功能块包含 `description` 和 `parameters`。项目启用与 3D 跳过规则参见[检测策略](../README.md#检测策略)。
+项目启用与 3D 跳过规则参见[检测策略](../../../README.md#检测策略)。
 
-- `common_2d.parameters`：圆搜索、检测裁剪、板级 2D 兜底裁剪/引线 ROI、
-  竖向分割、掩码和 YOLO 参数。
-- `wire_bending_2d.parameters`：引线/细线 ROI 和弯曲度阈值。
-
-- `silver_continuity_2d.parameters`：银浆断连/联通参数。
-- `silver_overflow_2d.parameters`：检测 ROI 四边内缩生成的银浆允许边界、容差和最小缺陷面积。
-- `chip_rotation_2d.parameters`：芯片外接矩形角度阈值。
-- `chip_anomaly_2d.parameters`：芯片外观异常和 EfficientAD 模型区间映射。
+| 模块 | `thresholds` | `parameters` |
+| --- | --- | --- |
+| `common_2d` | YOLO 置信度与 NMS IoU、最小连通域面积、分割灰度阈值 | 圆搜索、检测裁剪、固定 ROI、竖向分割位置、YOLO 尺寸与执行设置 |
+| `wire_bending_2d` | 最小合格覆盖率 | 引线和细线 ROI |
+| `silver_continuity_2d` | 扇区银浆像素数与覆盖率、扇区有效像素数、芯片面积、可见扇区比例下限 | 检测类别、外扩长度、扇区数和遮挡膨胀量 |
+| `silver_overflow_2d` | 越界容差和最小越界面积 | 允许边界和银浆类别 |
+| `chip_rotation_2d` | 芯片旋转角上限和最小面积 | `{}` |
+| `chip_anomaly_2d` | 各 EfficientAD 模型的分数阈值 | 模型选择、裁剪留边、矫正角上限和评分方式 |
 
 ## YOLO 掩码后处理
 
 板级和独立 2D 共用同一套掩码后处理。同类预测先合并，按 8 邻域拆成独立部件。不同类别的重叠像素保留。每个部件的置信度取实际覆盖该部件的预测中最高的一项。
 
-原尺寸预测只批量传回各检测框内的有效像素。CPU 将可能相连的同类掩码分组，在局部范围内合并和拆分，并把部件边界复用于几何输出、银浆检查和引线清理。`common_2d.parameters.mask.min_component_area` 按裁剪图中的部件面积过滤。
+原尺寸预测只批量传回各检测框内的有效像素。CPU 将可能相连的同类掩码分组，在局部范围内合并和拆分，并把部件边界复用于几何输出、银浆检查和引线清理。`common_2d.thresholds.mask.min_component_area` 按裁剪图中的部件面积过滤。
 
 芯片掩码轮廓不足三个点，或最小外接矩形短边不超过一像素时，跳过该掩码的 EfficientAD 检测。结果在 `chip_anomaly_2d.skipped_chips` 中记录跳过原因，外观结论根据其余有效芯片判定。全部跳过时，外观项返回 `status=skipped` 和 `is_ok=null`。
 
@@ -36,18 +36,22 @@
 会更新 `common_2d.parameters` 和对应功能块的 `parameters`。
 ## 银浆允许边界：复用检测 ROI，四边按像素内缩
 
-当前 `silver_overflow_2d.parameters` 为：
+当前 `silver_overflow_2d` 的参数分组如下。
 
 ```json
 {
-  "boundary": {
-    "mode": "roi_inset",
-    "inset_unit": "px",
-    "insets": {"left": 376, "top": 146, "right": 34, "bottom": 128}
+  "thresholds": {
+    "tolerance_px": 0.0,
+    "min_area_px": 1
   },
-  "silver_class": "silver",
-  "tolerance_px": 0.0,
-  "min_area_px": 1
+  "parameters": {
+    "boundary": {
+      "mode": "roi_inset",
+      "inset_unit": "px",
+      "insets": {"left": 376, "top": 146, "right": 34, "bottom": 128}
+    },
+    "silver_class": "silver"
+  }
 }
 ```
 
@@ -82,7 +86,7 @@ C# 调用和字段不变，`Boundary.Mode` 和 `Registration.Method` 均为 `roi
 
 运行 `scripts/roi_configurator.py` 可在同一张 2D 图片上标定 3D 引脚平台参考区：
 按 `F` 添加矩形，拖动框内移动、拖动角点拉伸，`V` 清空平台框，`U` 撤销，
-`S` 同时保存两份配置。平台框只写入 `config/3D/config.json` 的
+`S` 同时保存两份配置。平台框只写入同型号的 [3D 配置](../3D/config.json) 的
 `height_measurement_3d.parameters.platform_roi_offsets`，不混入 2D 参数。
 引线弧高仅使用 `wire_bending_2d.parameters.roi_offsets` 内的 wire/thin 掩码；
 ROI 外部分不参与测高，thin 焊脚仍从完整掩码的两端划分。

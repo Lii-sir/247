@@ -129,9 +129,10 @@ class ThresholdTests(unittest.TestCase):
 
     def test_cli_parameters_keep_scoring_config_and_send_threshold_per_request(self):
         request = client.algorithm_request("pool+top", 7)
-        parameters = json.loads(request["config_text"])["chip_anomaly_2d"]["parameters"]
-        self.assertNotIn("threshold", parameters)
-        self.assertEqual(parameters["score_mode"], "pool+top")
+        feature = json.loads(request["config_text"])["chip_anomaly_2d"]
+        self.assertEqual(set(feature["thresholds"]["threshold"]), {"chip_short", "chip_long"})
+        self.assertNotIn("threshold", feature["parameters"])
+        self.assertEqual(feature["parameters"]["score_mode"], "pool+top")
         threshold = {"chip_short": 0.4, "chip_long": 2.0}
         self.assertEqual(client.threshold_request(threshold), {"threshold": threshold})
         self.assertEqual(client.threshold_request(None), {})

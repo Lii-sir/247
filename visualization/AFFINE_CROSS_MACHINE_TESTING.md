@@ -1,6 +1,6 @@
 # Windows 仿射配准：跨机器完整测试流程
 
-当前正式实现已拆为三组常驻进程：配准、2D后处理、3D映射测高，均无thread回退。针对32物理核，默认三组各8核/8进程，主进程剩余8核；每个测高进程instance_workers默认1。旧4/2及主进程共享实例池20/64线程建议已不适用于当前执行方式。详见config/3D/README.md。
+当前正式实现已拆为三组常驻进程：配准、2D后处理、3D映射测高，均无thread回退。针对32物理核，默认三组各8核/8进程，主进程剩余8核；每个测高进程instance_workers默认1。旧4/2及主进程共享实例池20/64线程建议已不适用于当前执行方式。详见config/products/normal/3D/README.md。
 
 整板验收同时保存初始化registration_execution、cpu_2d_execution、joint_measurement_execution、最终main_cpu_ids，并记录全部片的三个worker诊断及queue/shared/phase/transfer/pipeline。增加保留核会减少主进程范围；仅按CPU总核数放大并发不能证明最优。benchmark_affine.py仍只直接测求解函数，不能证明完整进程隔离与整板收益。
 
@@ -63,7 +63,7 @@ if ($LASTEXITCODE -ne 0) { throw '输入或标定检查失败，先查看报错'
 自定义输入命令示例（后续每条实验命令都附加相同参数）：
 
 ```powershell
-& .\.venv-affine\Scripts\python.exe -B .\visualization\benchmark_affine.py --dry-run --images-dir D:\samples\board2\2D --depth D:\samples\board2\2.png --config .\config\3D\config.json
+& .\.venv-affine\Scripts\python.exe -B .\visualization\benchmark_affine.py --dry-run --images-dir D:\samples\board2\2D --depth D:\samples\board2\2.png --config .\config\products\normal\3D\config.json
 ```
 
 ## 4. 第一轮：只改变片并发数

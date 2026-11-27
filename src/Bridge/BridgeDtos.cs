@@ -25,6 +25,9 @@ public class InitAlgorithmRequest
     [JsonPropertyName("config_path")]
     public string? ConfigPath { get; set; }
 
+    [JsonPropertyName("config_3d_path")]
+    public string? Config3DPath { get; set; }
+
     [JsonPropertyName("config_text")]
     public string? ConfigText { get; set; }
 }

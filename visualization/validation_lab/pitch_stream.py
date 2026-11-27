@@ -129,10 +129,17 @@ class PitchPreparations:
             if scan is not None:
                 scan.cancelled.set()
 
+    def reset(self):
+        with self._lock:
+            self._cancel_boards()
+
+    def _cancel_boards(self):
+        for scan in self._boards.values():
+            scan.cancelled.set()
+        self._boards.clear()
+
     def close(self):
         with self._lock:
             self._closed = True
-            for scan in self._boards.values():
-                scan.cancelled.set()
-            self._boards.clear()
+            self._cancel_boards()
         self._pool.shutdown(wait=True)

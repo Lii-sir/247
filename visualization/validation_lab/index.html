@@ -18,6 +18,11 @@
   <main class="layout">
     <aside class="sidebar">
       <section class="card">
+        <div class="board-row">
+          <label>产品型号<select id="product" disabled></select></label>
+        </div>
+      </section>
+      <section class="card">
         <div class="section-head">
           <h2>输入图像</h2>
           <p id="counts" class="counts"></p>
@@ -78,7 +83,7 @@
         <summary>配置与说明</summary>
         <div class="fold-body">
           <p id="config" class="hint">加载中…</p>
-          <p class="hint">使用 <code>config</code> 下的正式参数与模型；结果保存至 <code>visualization/output/validation-lab</code>。</p>
+          <p class="hint">使用所选型号的参数与模型。结果保存至 <code>visualization/output/validation-lab</code>。</p>
         </div>
       </details>
 

@@ -88,7 +88,7 @@ def build_flows():
     n('i-init','init：协议就绪','轻量响应，不加载全部模型',1,0,
       '启动bridge_server并设置原生线程默认值|构造默认执行器与请求容量|init只返回协议状态和当前线程信息|日志走stderr，stdout仅协议JSON',src=(T,'handle_init'))
     n('i-config','合并配置与计算线程设置','config/config.json → 2D + 3D',1,1,
-      '读取manifest所指2D/3D文件|合并feature.description/parameters对象|解析线程预算和共享池关系|参数校验失败返回初始化错误',src=(T,'handle_init_algorithm'),params=('common_3d.parameters.threading','common_2d.parameters.threading'))
+      '读取manifest所指2D/3D文件|合并模块的thresholds与parameters|解析线程预算和共享池关系|参数校验失败返回初始化错误',src=(T,'handle_init_algorithm'),params=('common_3d.parameters.threading','common_2d.parameters.threading'))
     n('i-board','构造统一检测器与解析算法参数','stage=board',1,2,
       '设置GPU副本数量G|读取圆定位、YOLO、银胶、外观、配准和高度参数|要求分片数量与input.piece_count一致|配置独立instance与Pitch任务池',src=(B,'_load_config'))
     n('i-cuda','检查CUDA与主YOLO构造','模型未初始化时不接受实际推理',1,3,
@@ -115,25 +115,25 @@ def build_flows():
     n('d-crop','圆相对裁剪与2D诊断ROI','原图 → 检测crop',0,2,
       '使用圆心、半径和detection_roi_offsets生成检测crop|依据wire_bending_2d.roi_offsets生成弯曲/缺线框|将诊断框转换成crop相对坐标|crop.copy建立后续推理自有内存|缺少圆配置的兼容路径才使用固定crop_2d.roi',pool='cpu',src=(B,'_stream_crop'),params=('common_2d.parameters.crop.detection_roi_offsets','wire_bending_2d.parameters.roi_offsets','common_2d.parameters.crop_2d'),times=('roi_prepare_ms','roi_copy_ms'))
     n('d-platform','预备2D粗配准平台掩码','完整原图按scale缩放',0,3,
-      '完整原图转灰度|按registration_3d.scale缩小|按threshold_2d二值化并闭运算|与检测crop不同，保留原图坐标对应关系|prepared保存图像、crop、圆、ROI和平台掩码',pool='cpu',src=(R,'platform_mask_2d'),params=('registration_3d.parameters',),times=('platform_mask_2d_ms',))
+      '完整原图转灰度|按registration_3d.scale缩小|按threshold_2d二值化并闭运算|与检测crop不同，保留原图坐标对应关系|prepared保存图像、crop、圆、ROI和平台掩码',pool='cpu',src=(R,'platform_mask_2d'),params=('registration_3d.parameters','registration_3d.thresholds.threshold_2d'),times=('platform_mask_2d_ms',))
     n('d-boundary','并行：银胶边界准备','只依赖图像与crop',1,4,
       '在silver池执行prepare_silver_boundary|当前roi_inset模式无需等待分割|模板模式可借用同一灰度缓存锁|完成后写回prepared.silver_boundary',pool='silver',kind='parallel',src=(B,'prepare_silver_boundary'),times=('silver_prepare_phase_ms',))
     n('d-slot','并行：借用GPU模型资源','槽位 → 资源锁 → CUDA流',0,4,
       '从可用资源队列借出独立模型副本|记录槽位等待与锁等待|进入该资源CUDA流|同资源内保持YOLO、掩码提取和外观检测顺序',pool='gpu',kind='parallel',src=(B,'infer_2d_piece'),times=('gpu_model_slot_wait_ms','model_lock_wait_ms'))
     n('d-yolo','YOLO分割预测','一次调用，不等待凑满多张',0,5,
-      '以当前单片crop调用model.predict，retina_masks=True|应用imgsz/conf/iou/max_det/device等配置|首次调用可能设置predictor并预热|返回实例掩码、类别与置信度|记录predict墙钟和模型reported三段耗时，口径不同',pool='gpu',src=(B,'_predict_batch'),params=('common_2d.parameters.yolo',),times=('yolo_predict_wall_ms','yolo_reported_inference_ms'))
+      '以当前单片crop调用model.predict，retina_masks=True|应用imgsz/conf/iou/max_det/device等配置|首次调用可能设置predictor并预热|返回实例掩码、类别与置信度|记录predict墙钟和模型reported三段耗时，口径不同',pool='gpu',src=(B,'_predict_batch'),params=('common_2d.parameters.yolo','common_2d.thresholds.yolo'),times=('yolo_predict_wall_ms','yolo_reported_inference_ms'))
     n('d-masks','同类掩码合并与拆分','批量回传检测框内像素',0,6,
-      '原尺寸掩码只回传检测框内的像素，低分辨率掩码先去填边并还原|同类、可能相连的掩码在局部区域合并|不同类的重叠像素保留|按8邻域拆分并过滤小部件|复用部件边界',pool='gpu',src=('python/algorithm/vision2d/segmentation_instances.py','extract_instances'),params=('common_2d.parameters.mask.min_component_area',),times=('mask_extract_to_cpu_ms',))
+      '原尺寸掩码只回传检测框内的像素，低分辨率掩码先去填边并还原|同类、可能相连的掩码在局部区域合并|不同类的重叠像素保留|按8邻域拆分并过滤小部件|复用部件边界',pool='gpu',src=('python/algorithm/vision2d/segmentation_instances.py','extract_instances'),params=('common_2d.thresholds.mask.min_component_area',),times=('mask_extract_to_cpu_ms',))
     n('d-anomaly','芯片外观检测','每个chip顺序进入EfficientAD',0,7,
-      '按chip掩码提取轮廓和最小外接矩形|从原始彩色图拉正芯片局部crop|按长宽比选择模型，超范围是接口错误|逐chip前向、分数校准和异常区域映射|结果写入chip_anomaly_2d',pool='gpu',src=(A,'inspect'),params=('chip_anomaly_2d.parameters',),times=('efficientad_total_ms',))
+      '按chip掩码提取轮廓和最小外接矩形|从原始彩色图拉正芯片局部crop|按长宽比选择模型，超范围是接口错误|逐chip前向、分数校准和异常区域映射|结果写入chip_anomaly_2d',pool='gpu',src=(A,'inspect'),params=('chip_anomaly_2d.parameters','chip_anomaly_2d.thresholds'),times=('efficientad_total_ms',))
     n('d-gpudone','GPU资源归还','prepared.instances可供CPU消费',0,8,
       '保存实例、推理耗时和外观诊断|同步本资源流并归还槽位|GPU分支完成后投递geometry任务|原图owner仍保留，直到2D完整后处理结束',pool='gpu',src=(B,'infer_2d_piece'),times=('gpu_worker_stream_sync_ms',))
     n('d-bending','2D引线弯曲','wire / thin原始实例',0,9,
-      '局部清理实例并保留偏移|按最大交集选择一个2D诊断ROI|找ROI周界的两个连续接触段|四个端点凸包形成评估四边形|覆盖率=四边形覆盖前景/本实例ROI内前景|与rectangle_ratio_threshold比较，ROI外标记outside_rois',pool='cpu',src=(G,'measure_wire_bending'),params=('wire_bending_2d.parameters',),times=('wire_bending_ms',))
+      '局部清理实例并保留偏移|按最大交集选择一个2D诊断ROI|找ROI周界的两个连续接触段|四个端点凸包形成评估四边形|覆盖率=四边形覆盖前景/本实例ROI内前景|与rectangle_ratio_threshold比较，ROI外标记outside_rois',pool='cpu',src=(G,'measure_wire_bending'),params=('wire_bending_2d.parameters','wire_bending_2d.thresholds'),times=('wire_bending_ms',))
     n('d-presence','2D缺线与ROI存在性','每个配置框独立给诊断',0,10,
       '使用已清理的弯曲结果选择ROI归属|缺少候选引线时给wire_missing|掩码被清理拒绝时给bending_unavailable|返回ROI框、关联实例和OK/NG|此ROI不限制后续3D测高目标',pool='cpu',src=('python/algorithm/vision2d/wire_roi_presence.py','check_wire_roi_presence'),times=('wire_roi_presence_ms',))
     n('d-rotation','芯片旋转 + 灰度缓存','geometry支路顺序收尾',0,11,
-      '各chip轮廓求最小面积矩形|长边角度折算到最近坐标轴偏差[-45,45)|abs偏差与max_angle_deg比较|原图灰度通过gray_lock只转换一次|构建joint_entry并对实例字典做浅拷贝',pool='cpu',src=(B,'prepare_joint_piece'),params=('chip_rotation_2d.parameters',),times=('chip_rotation_ms','cache_gray_image_ms'))
+      '各chip轮廓求最小面积矩形|长边角度折算到最近坐标轴偏差[-45,45)|abs偏差与max_angle_deg比较|原图灰度通过gray_lock只转换一次|构建joint_entry并对实例字典做浅拷贝',pool='cpu',src=(B,'prepare_joint_piece'),params=('chip_rotation_2d.thresholds',),times=('chip_rotation_ms','cache_gray_image_ms'))
     n('d-ready','准备本片联合输入','等待完整 2D 诊断',0,12,
       '保存灰度和掩码|组装本片几何诊断|后处理结束后再发布缓存',kind='data',src=(P,'submit_2d'))
     n('d-join','边界 + geometry汇合','两支都成功才进入2D最终处理',1,13,
@@ -160,7 +160,7 @@ def build_flows():
     n('s-union','本次检查共享联合掩码','silver / chip / occlusion',0,1,
       '按归一化类别名称建立union缓存|同一类组合只阈值化合并一次|溢胶与断连共享silver/chip联合掩码|缓存仅属于本次图像，不跨图沿用|缺少掩码与尺寸不匹配有独立错误状态',pool='postprocess',src=(S,'_MaskUnionCache'),times=('silver_mask_union_ms',))
     n('s-overflow','银浆溢出测量','前景点到允许边界的距离',0,2,
-      '枚举silver前景像素|分块计算到边界的signed_distance|大于容差的点成为候选|8连通域统计面积并按min_area_px筛选|输出缺陷面积、框、轮廓及最大越界距离|缺陷面积非零时is_ok=False',pool='postprocess',src=(S,'measure_overflow'),params=('silver_overflow_2d.parameters',),times=('silver_overflow_measure_ms',))
+      '枚举silver前景像素|分块计算到边界的signed_distance|大于容差的点成为候选|8连通域统计面积并按min_area_px筛选|输出缺陷面积、框、轮廓及最大越界距离|缺陷面积非零时is_ok=False',pool='postprocess',src=(S,'measure_overflow'),params=('silver_overflow_2d.thresholds',),times=('silver_overflow_measure_ms',))
     n('s-labels','断连：芯片分量与外扩环','保持全局2×2扫描对齐',0,3,
       '复用chip联合掩码及连通域结果|在有效包围框内做连通域，原点向偶数对齐|每个达面积阈值的chip分量只在自身bbox比较标签|构造轴对齐外扩矩形，去掉芯片矩形与其它chip掩码|线/焊脚遮挡掩码可按配置膨胀',pool='postprocess',src=(S,'measure_continuity'),params=('silver_continuity_2d.parameters',))
     n('s-sectors','断连：环形区域角度分区','每个chip独立统计扇区',0,4,
@@ -176,7 +176,7 @@ def build_flows():
     n('a-infer','外观：预处理和前向','缩放归一化 → 张量 → 模型',2,3,
       '缩放到模型自身image_size并规范化|进入预测器锁和torch.inference_mode|执行模型得到anomaly_map|forward_enqueue为主机调用耗时，不能直接等同CUDA执行时间|后续取分数/响应图可能等待设备结果',pool='gpu',src=(A,'predict'),times=('efficientad_preprocess_ms','efficientad_forward_enqueue_ms'))
     n('a-score','外观：分数、校准和阈值','当前pool+top；严格大于阈值为NG',2,4,
-      '按模型校准及配置选择评分方法|pool+top先池化并做高响应分数聚合|应用对应模型阈值：运行时覆盖优先于配置和checkpoint|score > threshold为NG，等于阈值为OK|仅在异常分数触发时生成二值定位响应',pool='gpu',src=(A,'_scores_and_response'),params=('chip_anomaly_2d.parameters.score_mode','chip_anomaly_2d.parameters.score_pool_kernel','chip_anomaly_2d.parameters.threshold'),times=('efficientad_score_and_response_ms',))
+      '按模型校准及配置选择评分方法|pool+top先池化并做高响应分数聚合|应用对应模型阈值：运行时覆盖优先于配置和checkpoint|score > threshold为NG，等于阈值为OK|仅在异常分数触发时生成二值定位响应',pool='gpu',src=(A,'_scores_and_response'),params=('chip_anomaly_2d.parameters.score_mode','chip_anomaly_2d.parameters.score_pool_kernel','chip_anomaly_2d.thresholds.threshold'),times=('efficientad_score_and_response_ms',))
     n('a-boxes','外观：异常区域返回','形态学 / 连通域 / 坐标映射',2,5,
       '对异常二值图开闭运算|按最小面积筛选连通域框|响应图坐标换算到拉正crop|用逆透视矩阵映射到原始2D图|写入实例外观诊断并汇总所有chip结论',pool='gpu',src=(A,'_component_boxes'),times=('efficientad_component_boxes_ms','efficientad_total_ms'))
     for node in current['nodes']:
@@ -210,9 +210,9 @@ def build_flows():
     n('r-platform','构造3D平台掩码','depth_piece > 0并闭运算',1,1,
       '对片深度的非零像素二值化|按registration_3d.morphology_kernel_size闭运算|2D平台掩码此前已在准备阶段生成|两幅掩码进入固定尺度模板匹配',pool='joint_measurement_process',src=(R,'platform_mask_3d'),times=('platform_mask_3d_ms',))
     n('r-coarse','粗配准模板匹配','TM_CCOEFF_NORMED',1,2,
-      '从3D掩码裁roi_3d作模板，底部保留安全边界|从缩放2D掩码裁search_2d_scaled作搜索区|matchTemplate取最高相关位置|结合模板与搜索框偏移得到tx/ty|构造原始2D→片局部矩阵：scale对角项+平移|粗分数与minimum_score给粗有效标记',pool='joint_measurement_process',src=(R,'register_platform_masks'),params=('registration_3d.parameters',),times=('coarse_registration_ms',))
+      '从3D掩码裁roi_3d作模板，底部保留安全边界|从缩放2D掩码裁search_2d_scaled作搜索区|matchTemplate取最高相关位置|结合模板与搜索框偏移得到tx/ty|构造原始2D→片局部矩阵：scale对角项+平移|粗分数与minimum_score给粗有效标记',pool='joint_measurement_process',src=(R,'register_platform_masks'),params=('registration_3d.parameters','registration_3d.thresholds.minimum_score'),times=('coarse_registration_ms',))
     n('r-source','仿射评分准备','灰度阈值化；源2D再按preview_scale缩放',1,3,
-      '原2D灰度>threshold_2d后变为0/1|源掩码按preview_scale做nearest缩放|目标depth>0保持原始3D分片画幅|两侧按仿射morphology_kernel_size闭运算|裁出所选R1/R2/R3目标掩码供评分复用',pool='joint_measurement_process',src=(R,'refine_affine_registration'),params=('dynamic_affine_3d.parameters',))
+      '原2D灰度>threshold_2d后变为0/1|源掩码按preview_scale做nearest缩放|目标depth>0保持原始3D分片画幅|两侧按仿射morphology_kernel_size闭运算|裁出所选R1/R2/R3目标掩码供评分复用',pool='joint_measurement_process',src=(R,'refine_affine_registration'),params=('dynamic_affine_3d.parameters','dynamic_affine_3d.thresholds.threshold_2d'))
     n('r-initial','粗矩阵换算6参数初值','sx sy kxy kyx cx cy',1,4,
       '矩阵线性项除preview_scale得到内部sx/sy/交叉项|内部参考点固定为缩小2D中的(1000,400)|cx/ cy是该参考点映到3D后的坐标|默认使用粗配准；可选标定profile只复用线性四项，保留本片中心位置|始终保留原粗配准的scale/shear/translation边界，候选须在范围内且完整评分改善',pool='joint_measurement_process',src=(R,'_affine_parameters_from_matrix'),params=('dynamic_affine_3d.parameters.scale_delta','dynamic_affine_3d.parameters.shear_limit','dynamic_affine_3d.parameters.translation_delta'))
     n('r-score','单次评分','原生warpAffine → 区域差异 → 惩罚',1,5,
@@ -249,11 +249,11 @@ def build_flows():
     n('h-platformroi','映射引脚平台采样ROI','2D圆相对标定 → 深度片',1,1,
       '圆心/半径结合platform_roi_offsets生成原图矩形|使用当前片仿射矩阵映射多边形|采样区域减去完整语义排除掩码|排除invalid_values深度|没有标定、圆或有效配准时平台面标记invalid',pool='joint_measurement_process',src=(H,'map_platform_rois'),params=('height_measurement_3d.parameters.platform_roi_offsets','height_measurement_3d.parameters.invalid_values'))
     n('h-platformfit','拟合全局引脚平台面','平面z=a·x+b·y+c',1,2,
-      '提取有效平台采样点|按stride=max(1,N//30000)降采样，非严格3万点上限|先保留plane_percentile对应的较低深度点|最多5轮最小二乘和残差MAD剔除|残差阈值取max(50灰度,4.4478×MAD)|点数不足时标记无效，不伪造平面',pool='joint_measurement_process',src=(H,'_fit_plane_points'),params=('height_measurement_3d.parameters.plane_percentile','height_measurement_3d.parameters.plane_min_valid_points'),times=('height_fit_platform_plane_ms',))
+      '提取有效平台采样点|按stride=max(1,N//30000)降采样，非严格3万点上限|先保留plane_percentile对应的较低深度点|最多5轮最小二乘和残差MAD剔除|残差阈值取max(50灰度,4.4478×MAD)|点数不足时标记无效，不伪造平面',pool='joint_measurement_process',src=(H,'_fit_plane_points'),params=('height_measurement_3d.parameters.plane_percentile','height_measurement_3d.thresholds.plane_min_valid_points'),times=('height_fit_platform_plane_ms',))
     n('h-chipcache','准备芯片归属缓存','父线程统一构造，只读共享',1,3,
       '对各chip的原2D掩码取填充外部区域|填充芯片轮廓内孔洞供归属判断|缓存区域面积|后续焊脚工作线程只读，不懒写共享缓存|此缓存不作为芯片平面实际采样掩码',pool='joint_measurement_process',src=(J, '_prepare_chip_regions'),times=('height_prepare_chip_regions_ms',))
     n('h-chipfit','逐chip拟合芯片参考面','保留本chip，排除其它实例',1,4,
-      '为当前chip重建“除它以外”的语义union|不能在全局union上清空chip区域，否则会恢复重叠焊点|chip掩码内排除其它语义和无效深度|检查chip_min_valid_points|采用同一稳健平面拟合，但不先做低百分位筛选|失败则该chip平面None，不悄悄替换参考',pool='joint_measurement_process',src=(H,'fit_chip_plane'),params=('height_measurement_3d.parameters.chip_min_valid_points',),times=('height_fit_chip_plane_ms',))
+      '为当前chip重建“除它以外”的语义union|不能在全局union上清空chip区域，否则会恢复重叠焊点|chip掩码内排除其它语义和无效深度|检查chip_min_valid_points|采用同一稳健平面拟合，但不先做低百分位筛选|失败则该chip平面None，不悄悄替换参考',pool='joint_measurement_process',src=(H,'fit_chip_plane'),params=('height_measurement_3d.thresholds.chip_min_valid_points',),times=('height_fit_chip_plane_ms',))
     n('h-thin','thin一次分段准备','主轴SVD：两端 + 中段',1,5,
       '在原2D thin掩码前景坐标上做主轴SVD|按投影长度划分start/end端部|中间部分作为引线，端部分别作为焊脚|父线程保存本次分段结果供两个阶段复用|不使用2D引线ROI裁剪这些区域',pool='joint_measurement_process',src=(J, '_prepare_thin_parts'),params=('height_measurement_3d.parameters.thin_solder_end_ratio',),times=('height_prepare_thin_ms',))
     n('h-wirejobs','全部wire/thin逐根并行','ROI外目标也必须返回记录',1,6,
@@ -261,7 +261,7 @@ def build_flows():
     n('h-wiremask','每根：映射、内缩与有效点','3D像素半径定义',1,7,
       '将局部清理偏移合入crop到原图变换|映射得到独立引线测高掩码|按wire或thin_measurement_erode_px内缩|只修改自有测量掩码，不修改语义掩码|空/无有效深度或无平台面时保留无效记录',pool='instance',src=(J, '_measure_wire_region'),params=('height_measurement_3d.parameters.wire_measurement_erode_px','height_measurement_3d.parameters.thin_measurement_erode_px'))
     n('h-wirepoint','每根：P95点与平台高度差','原始灰度分位 → 最近实际像素',1,8,
-      '枚举测量掩码内有效深度|计算height_percentile分位值|选与该分位值最接近的实际像素，按行序处理平局|在同一个(x,y)计算参考平面深度|高度差=(点灰度−平面灰度)×vertical_resolution_mm|严格小于max_wire_platform_height_mm才OK',pool='instance',src=(H,'measure_mask_height'),params=('height_measurement_3d.parameters.height_percentile','height_measurement_3d.parameters.max_wire_platform_height_mm'))
+      '枚举测量掩码内有效深度|计算height_percentile分位值|选与该分位值最接近的实际像素，按行序处理平局|在同一个(x,y)计算参考平面深度|高度差=(点灰度−平面灰度)×vertical_resolution_mm|严格小于max_wire_platform_height_mm才OK',pool='instance',src=(H,'measure_mask_height'),params=('height_measurement_3d.parameters.height_percentile','height_measurement_3d.thresholds.max_wire_platform_height_mm'))
     n('h-wirejoin','引线结果有序汇合','等待该片全部引线任务',1,9,
       '按原输入顺序连续分配region_id|每个wire/thin有独立height_3d记录|高度有效性与2D弯曲结论分开|准备焊脚任务列表',kind='gate',src=(J, '_measure_wire_regions'))
     n('h-solderjobs','全部bond与thin端点并行','每个端点独立任务',1,10,
@@ -273,7 +273,7 @@ def build_flows():
     n('h-chipplane','芯片焊脚：使用既有芯片面','不另拟合局部平台',2,12,
       '从chip_planes取归属芯片平面|reference=chip，保存reference_instance_id|使用max_solder_chip_height_mm|缺少有效芯片平面时保留无效height_3d',pool='instance',src=(J, '_measure_solder'))
     n('h-solderpoint','每焊脚：内缩、P95与高度差','归属先确定；测量再内缩',1,13,
-      '按bond或thin_solder_measurement_erode_px内缩独立bbox|不修改共享完整实例掩码|使用与引线相同的实际P95代表点方法|按芯片/平台对应阈值判定高度|记录reference/location/measurement_id及2D/3D测量区域',pool='instance',src=(J, '_measure_solder'),params=('height_measurement_3d.parameters.bond_measurement_erode_px','height_measurement_3d.parameters.thin_solder_measurement_erode_px','height_measurement_3d.parameters.max_solder_chip_height_mm','height_measurement_3d.parameters.max_solder_platform_height_mm'),times=('height_solder_ms',))
+      '按bond或thin_solder_measurement_erode_px内缩独立bbox|不修改共享完整实例掩码|使用与引线相同的实际P95代表点方法|按芯片/平台对应阈值判定高度|记录reference/location/measurement_id及2D/3D测量区域',pool='instance',src=(J, '_measure_solder'),params=('height_measurement_3d.parameters.bond_measurement_erode_px','height_measurement_3d.parameters.thin_solder_measurement_erode_px','height_measurement_3d.thresholds.max_solder_chip_height_mm','height_measurement_3d.thresholds.max_solder_platform_height_mm'),times=('height_solder_ms',))
     n('h-merge','父线程汇总高度与实例字段','所有子任务结束后再写回',1,14,
       '将引线结果按instance_id关联|将bond高度和芯片归属写回实例|chip保存plane_3d，非测高类别height_3d=None|高度组件is_ok只看高度，不再AND弯曲|整体联合结论仍会合并2D ROI与诊断|失败任务先取消未运行任务、等待运行中的兄弟任务再抛错',pool='joint_measurement_process',src=(J, '_measure_piece'),times=('height_measurement_ms',))
     chain=['h-union','h-platformroi','h-platformfit','h-chipcache','h-chipfit','h-thin','h-wirejobs','h-wiremask','h-wirepoint','h-wirejoin','h-solderjobs','h-ownership']

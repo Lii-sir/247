@@ -29,10 +29,12 @@ def source_ref(path, symbol):
 
 
 def make_document():
-    two = load_json(ROOT / 'config/2D/config.json')
-    three = load_json(ROOT / 'config/3D/config.json')
+    config_dir = ROOT / 'config'
+    manifest = load_json(config_dir / 'config.json')
+    two = load_json(config_dir / manifest['config_2d'])
+    three = load_json(config_dir / manifest['config_3d'])
     config = {**two, **{key:value for key,value in three.items() if key != 'model_path'},
-              'inspection': load_json(ROOT / 'config/inspection.json')}
+              'inspection': load_json(config_dir / manifest['config_inspection'])}
     scenes = build_flows()
     seen = set()
     for scene in scenes:

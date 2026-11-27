@@ -76,6 +76,7 @@ class AlgorithmServer:
             config = load_runtime_config(
                 str(req.get("config_text") or ""),
                 str(req.get("config_path") or "") or None,
+                config_3d_path=str(req.get("config_3d_path") or "") or None,
             )
             settings = self._thread_settings(config)
             if self.pipeline is not None and self.pipeline.has_pending:

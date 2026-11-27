@@ -18,7 +18,7 @@ python/
     └── runtime/               配置读取、运行计时
 ```
 
-- 调整 2D 检测顺序或首项 NG 的规则，查看 [defect_checks.py](algorithm/application/defect_checks.py) 和 [2D 配置](../config/2D/README.md)。
+- 调整 2D 检测顺序或首项 NG 的规则，查看 [defect_checks.py](algorithm/application/defect_checks.py) 和 [2D 配置](../config/products/normal/2D/README.md)。
 - 调整整板或单片 3D 输入，查看 [board_depth.py](algorithm/application/board/board_depth.py)。两种入口在 [board_pipeline.py](algorithm/application/board/board_pipeline.py) 共用配准和测高调度。
 - 调整跳过原因、片级结论或整板汇总字段，查看 [board_results.py](algorithm/application/board/board_results.py) 和 [上位机返回参数](../process/OUTPUT_PARAMETERS.md)。
 

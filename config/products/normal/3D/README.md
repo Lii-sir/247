@@ -1,10 +1,13 @@
 # 3D 配置
 
-- `common_3d` 保存每板的片号范围和工作进程参数。
-- `registration_3d`、`dynamic_affine_3d` 保存配准参数。
-- `height_measurement_3d` 保存参考面、焊脚和引线高度阈值。
-- `segmentation_3d` 和 `smartray_pitch_3d` 供验证台在提交前处理整板样本。产线由上位机调用矫正 DLL 准备单片深度。
-- 项目选择和 2D NG 跳过规则统一在 [inspection.json](../inspection.json)。
+| 模块 | `thresholds` | `parameters` |
+| --- | --- | --- |
+| `registration_3d` | `threshold_2d` 灰度阈值、`minimum_score` 配准最低分数 | 初始尺度、模板与搜索 ROI、形态学核 |
+| `dynamic_affine_3d` | `threshold_2d` 灰度阈值 | 仿射搜索范围、迭代与收敛设置、标定初值和缓存 |
+| `height_measurement_3d` | 平台面与芯片面最少有效点数、引线及两类焊脚高度上限 | 深度标定、平台 ROI、采样分位数和掩码处理参数 |
+| `common_3d`、`segmentation_3d`、`smartray_pitch_3d` | `{}` | 片数、并发、调用端分片与 Pitch 矫正 |
+
+验证台在提交前按配置分片和矫正。产线由上位机调用矫正 DLL 准备单片深度。项目选择和 2D NG 跳过规则统一在 [inspection.json](../inspection.json)。
 
 ## 单片原始深度输入
 
@@ -33,7 +36,7 @@ result = await bridge.ThreeD.DetectPieceSharedMemoryAsync(
     boardId, pieceId, shmName, checked(width * height * 2), width, height, pitchCorrection);
 ```
 
-返回对象 `ResultsPiece` 的测高点使用单片坐标。下文的整板时序或统计是历史基准，当前检测入口按片工作。线上接口和缓存语义详见[接口说明](../../process/OUTPUT_PARAMETERS.md)。
+返回对象 `ResultsPiece` 的测高点使用单片坐标。下文的整板时序或统计是历史基准，当前检测入口按片工作。线上接口和缓存语义详见[接口说明](../../../../process/OUTPUT_PARAMETERS.md)。
 
 ## 联合测高的引线边缘剔除
 
@@ -217,7 +220,7 @@ C# 方法和字段不增加。`SolderMeasurements[].Mask3DLocal` 是实际内缩
 
 单片处理用 `corrector.CorrectPiece(rawDepth, width, height, startRow, endRow)`。返回后由上位机决定是否提交
 `ThreeD.DetectPieceAsync`，已补偿的检测点标为 `pitch_corrected_piece_3d`。
-行范围使用原始深度图坐标，矫正的投影边界以该片为准。 [单片调用示例](../../smartray_pitch_dll/README.md#逐片切分和矫正)
+行范围使用原始深度图坐标，矫正的投影边界以该片为准。 [单片调用示例](../../../../smartray_pitch_dll/README.md#逐片切分和矫正)
 
 C#数组/共享内存/文件辅助接口末尾可传可选`Dictionary<string, object> correction`。C#文件辅助方法只读取像素，默认认为文件已由调用方准备，不再自动执行矫正。Python验证台/CLI文件适配器会按预处理配置先矫正，再发送像素和元数据。
 
@@ -279,7 +282,7 @@ C# DTO新增元数据属性，现有测高点/掩码字段保持；源码已构�
 
 实图测试由使用者执行：同一套10片输入、同配置和并发，分别cache_enabled=false/true，比较每片最终矩阵、最终损失、各区损失、真实变换次数及`affine_registration_ms`。命中率不设30%硬门槛，以墙钟和输出一致性判断。重新初始化后参数生效。
 
-`calibration.enabled`默认false；可以把完整profile内嵌到`calibration.profile`，也可以只保留`calibration.profile_path`，路径相对于`config/3D/config.json`所在目录，例如`calibration/affine_initializer.json`。启用时校验原始2D尺寸、深度宽度、坐标来源及Pitch几何设置后，仅复用线性4项，当前片粗配准参考点位置不变，不复用历史平移和分片行偏移。候选必须位于原粗配准搜索边界内，完整分辨率损失严格更低才作为起点；不匹配、非法或不改善均保留粗配准，并在`affine_initialization.reason`说明原因。片高和分片模式可不同，因为未复用历史平移。仅支持独立2D相机坐标。
+`calibration.enabled`默认false；可以把完整profile内嵌到`calibration.profile`，也可以只保留`calibration.profile_path`，路径相对于`config/products/normal/3D/config.json`所在目录，例如`calibration/affine_initializer.json`。启用时校验原始2D尺寸、深度宽度、坐标来源及Pitch几何设置后，仅复用线性4项，当前片粗配准参考点位置不变，不复用历史平移和分片行偏移。候选必须位于原粗配准搜索边界内，完整分辨率损失严格更低才作为起点；不匹配、非法或不改善均保留粗配准，并在`affine_initialization.reason`说明原因。片高和分片模式可不同，因为未复用历史平移。仅支持独立2D相机坐标。
 
 还支持 `format="affine_initializer_profile"`、`version=1`、`mode="coarse_relative"` 的统计初始化文件，其 `matrix` 为粗配准到最终仿射的相对修正 `R`：`M_start = R @ M_coarse_current`。训练使用各片 `M_final @ inverse(M_coarse)` 的均值，线性项和平移都随当前片粗配准合成；不会直接套用某片的历史平移。它同样受上述上下文、原始搜索边界和完整评分保护约束，通过时 `affine_initialization.source` 为 `calibration_coarse_relative`。旧的配准台矩阵格式仍保持只复用线性四项的行为。
 
@@ -295,7 +298,7 @@ C# DTO新增元数据属性，现有测高点/掩码字段保持；源码已构�
 
 精修窗口半径为原搜索半径乘`refine_window_ratio`（默认0.25），且截在原边界内。完整评分退化、超过阈值、碰到新窗口边界或阶段异常时，回退原粗配准起点和原边界的完整搜索。保留实际完整评分候选中较好的解，不能据此保证等同原优化器的最优解。`affine_stages`逐级记录nfev、尺寸、边界、耗时、停止状态，顶层nfev/optimizer_ms为各级之和；`affine_multiscale`说明回退与最终解来源。完整阶段墙钟仍看timings中的affine_registration_ms；新增affine_optimization_pipeline_ms还覆盖级间准备和验证。实际速度和质量须由实图验证，默认不启用。
 
-`maxfev`为每次Powell调用的评估上限；多尺度`search_maxfev/refine_maxfev`为null时继承它。`total_maxfev`限制本次配准所有优化阶段的调用总数（含回退）；均默认null，非null须为正整数。缓存命中也消耗优化器评估预算，初始/候选/最终验收等额外检查不消耗该预算但计入实际耗时。每阶段保存已评估最佳有限参数的副本，仅在预算截断时优先取它，避免未完成线搜索丢掉更好试探点。`affine_budget`与`affine_stages`标记预算消耗、skipped及used_best_observed；总预算耗尽导致回退未运行时有fallback_not_run标记。停止状态与最终质量独立。实图分组步骤见[仿射验收说明](../../visualization/AFFINE_OPTIMIZATION_TESTING.md)。
+`maxfev`为每次Powell调用的评估上限；多尺度`search_maxfev/refine_maxfev`为null时继承它。`total_maxfev`限制本次配准所有优化阶段的调用总数（含回退）；均默认null，非null须为正整数。缓存命中也消耗优化器评估预算，初始/候选/最终验收等额外检查不消耗该预算但计入实际耗时。每阶段保存已评估最佳有限参数的副本，仅在预算截断时优先取它，避免未完成线搜索丢掉更好试探点。`affine_budget`与`affine_stages`标记预算消耗、skipped及used_best_observed；总预算耗尽导致回退未运行时有fallback_not_run标记。停止状态与最终质量独立。实图分组步骤见[仿射验收说明](../../../../visualization/AFFINE_OPTIMIZATION_TESTING.md)。
 
 ## Pitch条带并行
 

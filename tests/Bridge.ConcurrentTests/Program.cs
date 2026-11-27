@@ -1,5 +1,6 @@
 using Bridge;
 using System.IO.MemoryMappedFiles;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -26,6 +27,7 @@ static class Program
                 Check(bridge.ThreeD.DetectPieceFile("sample", 1, args[3]).ResultsPiece?.PieceId == 1, "Sample 3D input failed.");
                 return 0;
             }
+            CheckProductConfiguration(bridge, root);
 
             ThreadPool.SetMinThreads(16, 16);
             ushort[] values = Enumerable.Range(0, 30).Select(i => (ushort)(33000 + i)).ToArray();
@@ -102,6 +104,32 @@ static class Program
     static void Check(bool condition, string message)
     {
         if (!condition) throw new InvalidOperationException(message);
+    }
+
+    static void CheckProductConfiguration(PythonBridge bridge, string root)
+    {
+        var fixture = Directory.CreateDirectory(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
+            "bridge-product-" + Guid.NewGuid().ToString("N")));
+        try
+        {
+            string config = Path.Combine(root, "config", "products", "normal");
+            File.WriteAllText(Path.Combine(fixture.FullName, "inspection.json"),
+                "{\"defect_sequence\":[\"wire_height_3d\"],\"skip_3d_on_2d_ng\":true}");
+            string manifest = Path.Combine(fixture.FullName, "config.json");
+            File.WriteAllText(manifest, JsonSerializer.Serialize(new {
+                config_2d = Path.Combine(config, "2D", "config.json"),
+                config_3d = Path.Combine(config, "3D", "config.json"),
+                config_inspection = "inspection.json"
+            }));
+            Check(bridge.InitAlgorithm("board", manifest).Message == "selected product",
+                "Product-specific inspection settings were not loaded.");
+            Check(bridge.InitAlgorithm("board").Message == "default product",
+                "The default manifest did not return after using an explicit one.");
+        }
+        finally
+        {
+            fixture.Delete(recursive: true);
+        }
     }
 
     static TestMapping Mapping(byte[] bytes) => new(bytes);

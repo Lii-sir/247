@@ -186,15 +186,16 @@ def parse_threshold(value: str) -> float | dict[str, float]:
 
 
 def algorithm_request(score_mode: str | None, score_pool_kernel: int | None,
-                      silver_calibration: Path | None = None) -> dict:
-    manifest = json.loads((ROOT / "config/config.json").read_text(encoding="utf-8-sig"))
-    first_path = (ROOT / "config" / manifest["config_2d"]).resolve()
-    second_path = (ROOT / "config" / manifest["config_3d"]).resolve()
+                      silver_calibration: Path | None = None, *, config_path: Path | None = None) -> dict:
+    manifest_path = (config_path or ROOT / "config/config.json").resolve()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    first_path = (manifest_path.parent / manifest["config_2d"]).resolve()
+    second_path = (manifest_path.parent / manifest["config_3d"]).resolve()
     first = json.loads(first_path.read_text(encoding="utf-8-sig"))
     second = json.loads(second_path.read_text(encoding="utf-8-sig"))
     combined = {**first, **{k: v for k, v in second.items() if k != "model_path"}}
     if "config_inspection" in manifest:
-        settings_path = (ROOT / "config" / manifest["config_inspection"]).resolve()
+        settings_path = (manifest_path.parent / manifest["config_inspection"]).resolve()
         combined["inspection"] = json.loads(settings_path.read_text(encoding="utf-8-sig"))
     chip_config = combined.get("chip_anomaly_2d", {}).get("parameters", {})
     if silver_calibration is not None:
@@ -216,7 +217,8 @@ def algorithm_request(score_mode: str | None, score_pool_kernel: int | None,
         if not Path(path).is_file():
             raise FileNotFoundError(path)
     return {"cmd": "init_algorithm", "stage": "board", "config_path": str(first_path),
-            "config_text": json.dumps(combined, ensure_ascii=True), "model_path": models}
+            "config_3d_path": str(second_path), "config_text": json.dumps(combined, ensure_ascii=True),
+            "model_path": models}
 
 
 def threshold_request(threshold: float | dict[str, float] | None) -> dict:

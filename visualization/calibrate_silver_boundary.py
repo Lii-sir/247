@@ -14,15 +14,14 @@ from pathlib import Path
 from generate_report import render_report
 
 ROOT = Path(__file__).resolve().parents[1]
-CONFIG = ROOT / "config/2D/config.json"
-CALIBRATION = ROOT / "config/2D/calibration/silver_boundary.json"
+sys.path.insert(0, str(ROOT / "python"))
+from algorithm.runtime.config import default_stage_config_path, feature_parameters
 
 
 def validate_calibration(document: dict, image: Path) -> dict:
     """Validate the downloaded points against the original image, not its preview."""
     from importlib import import_module
     from PIL import Image
-    sys.path.insert(0, str(ROOT / "python"))
     silver = import_module("algorithm.vision2d.silver_inspection")
     if not isinstance(document, dict) or document.get("mode") != "polygon":
         raise ValueError("标定 JSON 必须为 mode=polygon 的对象")
@@ -70,6 +69,7 @@ def apply_calibration(document: dict, image: Path, config_path: Path) -> Path:
     """Explicitly install validated calibration, preserving backups of existing files."""
     saved = validate_calibration(document, image)
     config = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    feature_parameters(config, "silver_overflow_2d")
     parameters = config["silver_overflow_2d"]["parameters"]
     folder = config_path.parent / "calibration"
     folder.mkdir(parents=True, exist_ok=True)
@@ -109,7 +109,7 @@ def main() -> int:
                         help="Optional new directory for the standalone preview report")
     parser.add_argument("--apply", type=Path,
                         help="Install the downloaded silver_boundary.json using the matching original --image")
-    parser.add_argument("--config", type=Path, default=CONFIG,
+    parser.add_argument("--config", type=Path, default=default_stage_config_path("config_2d"),
                         help="Stage configuration to update when --apply is used")
     parser.add_argument("--open", action="store_true", help="Open the report after generating it")
     args = parser.parse_args()
@@ -151,8 +151,8 @@ def main() -> int:
                 "template_source": str(image),
                 "template_size": [width, height],
                 "template_sha256": digest,
-                "target_config": str(CONFIG),
-                "target_calibration": str(CALIBRATION),
+                "target_config": str(args.config.resolve()),
+                "target_calibration": str(args.config.resolve().parent / "calibration/silver_boundary.json"),
                 "template_points": [],
             },
             "warnings": [

@@ -89,31 +89,33 @@ def compose_panels(panels, titles, subtitles, top, bottom):
 def main():
     parser = argparse.ArgumentParser(description="Visualize the actual silver overflow boundary on a sample image.")
     parser.add_argument("--image", type=Path, default=ROOT / "demodatasets/2D/001.png")
-    parser.add_argument("--config", type=Path, default=ROOT / "config/2D/config.json")
+    parser.add_argument("--config", type=Path)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--open", action="store_true")
     args = parser.parse_args()
-    config_path = args.config.resolve()
-    config = json.loads(config_path.read_text(encoding="utf-8-sig"))
-    overflow_config = config["silver_overflow_2d"]["parameters"]
-    boundary_config = overflow_config["boundary"]
-    mode = str(boundary_config.get("mode", "polygon")).casefold()
-
     sys.path.insert(0, str(ROOT / "python"))
     from algorithm.application.board.detect_board import DetectBoard, _mask_geometry
+    from algorithm.runtime.config import default_stage_config_path, feature_parameters
     from ultralytics import YOLO
     silver = import_module("algorithm.vision2d.silver_inspection")
+    config_path = (args.config or default_stage_config_path("config_2d")).resolve()
+    config = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    common = feature_parameters(config, "common_2d")
+    wire_config = feature_parameters(config, "wire_bending_2d")
+    overflow_config = feature_parameters(config, "silver_overflow_2d")
+    boundary_config = overflow_config["boundary"]
+    mode = str(boundary_config.get("mode", "polygon")).casefold()
 
     image = cv2.imdecode(np.fromfile(str(args.image.resolve()), dtype=np.uint8), cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError(f"Cannot decode image: {args.image}")
     # Use the board detector's actual crop and instance extraction, but skip unrelated AD scoring.
     detector = DetectBoard(lambda message: print(message, file=sys.stderr))
-    detector.min_component_area = int(config["common_2d"]["parameters"].get("mask", {}).get("min_component_area", 100))
-    crop_config = dict(config["common_2d"]["parameters"]["crop"])
-    crop_config["rectangle_roi_offsets"] = config["wire_bending_2d"]["parameters"].get("roi_offsets", [])
+    detector.min_component_area = int(common.get("mask", {}).get("min_component_area", 100))
+    crop_config = dict(common["crop"])
+    crop_config["rectangle_roi_offsets"] = wire_config.get("roi_offsets", [])
     detector.circle_crop_config = detector._parse_circle_crop_config(crop_config)
-    detector.yolo_parameters = {k: v for k, v in config["common_2d"]["parameters"]["yolo"].items()
+    detector.yolo_parameters = {k: v for k, v in common["yolo"].items()
                                 if k in {"imgsz", "conf", "iou", "max_det", "device", "half", "end2end"}}
     detector._validate_gpu_requirement()
     detector.model = YOLO(str((config_path.parent / config["model_path"]["YOLO"]).resolve()))

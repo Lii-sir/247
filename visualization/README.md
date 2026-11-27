@@ -50,13 +50,13 @@ Bridge DTO 说明通用响应、2D/联合3D结果、银浆回退、测高坐标�
 四边 `insets.left/top/right/bottom` 独立设置。复用圆定位后的检测 ROI，无模板特征匹配。
 图上黄色边界标注“ROI 内缩边界”，检查卡显示“银浆边界生成”；失败时显示不确定/边界失败，
 不回退模板坐标。修改后重新初始化并检测，新报告才会使用新边界。
-参数、初值来源和坐标约定见 [2D 配置说明](../config/2D/README.md)。
+参数、初值来源和坐标约定见 [2D 配置说明](../config/products/normal/2D/README.md)。
 
 以下模板标定说明仅适用于主动切回 `polygon + calibration_path` 的旧模板模式。
 
 ## 银浆允许边界：模板标定 → SIFT 映射 → 查看黄色边界
 
-银浆溢出现在使用 `config/2D/calibration/silver_boundary.json` 中的预标定多边形。
+银浆溢出现在使用 `config/products/normal/2D/calibration/silver_boundary.json` 中的预标定多边形。
 SIFT 匹配的是模板与当前图像的特征点，得到 Homography 后映射人工标定的边界顶点；
 不会从当前银浆 mask 或芯片框自动生成允许边界。初始标定点为空，未安装真实标定时
 诊断为 `not_configured / is_ok=null`，不会回退为芯片外扩或判 OK。
@@ -81,7 +81,7 @@ SIFT 匹配的是模板与当前图像的特征点，得到 Homography 后映射
   --apply "$env:USERPROFILE\Downloads\silver_boundary.json"
 ```
 
-脚本校验点序、边界面积、原图尺寸和哈希；复制原图为 `config/2D/calibration/` 下的模板，
+脚本校验点序、边界面积、原图尺寸和哈希；复制原图为 `config/products/normal/2D/calibration/` 下的模板，
 保存标定并备份旧 JSON/配置为带时间戳的 `.bak` 文件。仅更新银浆 `boundary` 配置，
 不修改其它检测阈值。安装后重启服务或重新初始化算法。
 
@@ -172,12 +172,12 @@ GPU 每个工作槽使用独立 YOLO 与 EfficientAD 模型副本；两个新增
 
 | 配置项 / 环境变量 | 当前配置 / 缺省规则 | 用途 |
 | --- | --- | --- |
-| 配置 `config/3D/config.json` 的 `common_3d.parameters.threading.worker_budget` | 50 | 当前配置的工作线程池总预算；最小为 2，代码不设硬编码上限 |
+| 配置 `config/products/normal/3D/config.json` 的 `common_3d.parameters.threading.worker_budget` | 50 | 当前配置的工作线程池总预算；最小为 2，代码不设硬编码上限 |
 | `common_3d.parameters.threading.cpu_workers`（3D 配置） | 5 | `bridge-cpu`：2D 输入读取/解码/ROI 准备、推理后联合几何准备、整板深度读取/分片 |
 | `common_3d.parameters.threading.joint_workers`（3D 配置，新增） | 5 | `bridge-joint`：单片粗配准、仿射/透视配准、掩码映射、测高 |
 | `common_2d.parameters.threading.postprocess_workers`（2D 配置） | 5 | `bridge-postprocess`：完整 2D 诊断、银浆溢出/连续性判断、结果整理；不含提前计算的边界配准 |
 | `common_2d.parameters.threading.silver_workers`（2D 配置，新增） | 5 | `bridge-silver`：银浆边界 SIFT 特征提取、匹配、RANSAC、模板点映射/回退 |
-| 配置 `config/2D/config.json` 的 `common_2d.parameters.threading.gpu_workers` | 3 | GPU 推理工作线程数；统一板级检测中每个线程使用独立模型副本 |
+| 配置 `config/products/normal/2D/config.json` 的 `common_2d.parameters.threading.gpu_workers` | 3 | GPU 推理工作线程数；统一板级检测中每个线程使用独立模型副本 |
 | `BRIDGE_MAX_WORKERS` / `BRIDGE_CPU_WORKERS` / `BRIDGE_POSTPROCESS_WORKERS` / `BRIDGE_GPU_WORKERS` | 对应配置缺省时回退 | JSON 配置优先，环境变量不覆盖已有 JSON 值 |
 | `BRIDGE_SILVER_WORKERS` / `BRIDGE_JOINT_WORKERS`（新增） | 对应配置缺省时回退 | 显式设置会启用独立银浆/联合 3D 池，并计入线程预算 |
 | `BRIDGE_NATIVE_THREADS` | `1` | 服务启动、导入数值库之前，为 OpenBLAS/OpenMP/MKL 设置默认线程数 |
@@ -339,7 +339,7 @@ EfficientAD 评分可以在启动时显式传参：
 
 `--threshold` 会随每张 2D 推理请求传递，不是算法初始化参数。优先级是：本次请求中对应模型的阈值 → 初始化配置中对应模型的阈值 → 该模型 checkpoint 自己的校准阈值。`pool+top` 优先使用各自 checkpoint 的 `pool_top_threshold`；没有该字段时兼容回退到该模型原始 `threshold`。运行覆盖只影响判定和异常框，不改权重或 checkpoint，响应的每个芯片都返回实际 `threshold` 和 `threshold_source`。Python 协议也支持在单片 `detect_2d_piece` 请求的 `threshold` 字段中传数值或每模型字典；C# `DetectPieceFile` 同样接受单个 `double` 或 `Dictionary<string,double>`。只指定一个模型的阈值时，另一个模型沿用其配置/自身 checkpoint 阈值。
 
-配置形式：在 `config/2D/config.json` 的 `chip_anomaly_2d.parameters` 中添加：
+在 `config/products/normal/2D/config.json` 的 `chip_anomaly_2d.thresholds` 中设置分数阈值。
 
 ```json
 "threshold": {"chip_short": 0.4, "chip_long": 2.0}

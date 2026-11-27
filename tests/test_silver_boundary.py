@@ -384,8 +384,10 @@ class SilverBoundaryTests(unittest.TestCase):
     def test_installer_keeps_thresholds_backs_up_and_resolves_template(self):
         self.enable_fallback()
         config_file = self.root / "config.json"
-        config = dict(silver_overflow_2d=dict(parameters=dict(
-            boundary=dict(mode="chip_expansion"), tolerance_px=2.5, min_area_px=5)),
+        config = dict(silver_overflow_2d=dict(
+            description="银浆溢出检测",
+            thresholds=dict(tolerance_px=2.5, min_area_px=5),
+            parameters=dict(boundary=dict(mode="chip_expansion"))),
             unrelated_feature={"threshold": 9})
         config_file.write_text(json.dumps(config), encoding="utf-8")
         old_file = self.root / "calibration/silver_boundary.json"
@@ -399,7 +401,7 @@ class SilverBoundaryTests(unittest.TestCase):
         self.assertTrue((target.parent / saved["template_path"]).is_file())
         after = json.loads(config_file.read_text(encoding="utf-8"))
         self.assertEqual(after["unrelated_feature"], config["unrelated_feature"])
-        self.assertEqual(after["silver_overflow_2d"]["parameters"]["tolerance_px"], 2.5)
+        self.assertEqual(after["silver_overflow_2d"]["thresholds"], config["silver_overflow_2d"]["thresholds"])
         self.assertTrue(list(self.root.glob("config.json.*.bak")))
         self.assertTrue(list(target.parent.glob("silver_boundary.json.*.bak")))
         boundary = self.build(config=after["silver_overflow_2d"]["parameters"])

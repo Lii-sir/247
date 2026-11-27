@@ -166,4 +166,4 @@ public static class SilverBoundaryDrawing
 - 若上位机存在上述字符串分支、枚举或显示逻辑，则需要修改并重新构建上位机程序。不能把“无需更新 DTO”理解为“所有上位机逻辑都无需调整”。
 - 此结论针对本次银浆 ROI 内缩模式切换；此前引线弯曲新增 DTO 属性对应的 DLL 更新要求仍按原说明执行。
 
-参考：[完整返回参数说明](OUTPUT_PARAMETERS.md)、[ROI 内缩配置说明](../config/2D/README.md)。
+参考：[完整返回参数说明](OUTPUT_PARAMETERS.md)、[ROI 内缩配置说明](../config/products/normal/2D/README.md)。

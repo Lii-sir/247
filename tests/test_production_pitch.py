@@ -11,6 +11,7 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT/'python'),str(ROOT/'tests')]
 from algorithm.application.board import detect_board as board_module
 from algorithm.application.board.board_pipeline import BoardPipeline
+from algorithm.runtime.config import default_stage_config_path
 from algorithm.vision3d.depth.depth_preprocessing import prepare_depth_for_detection, preprocessing_parameters
 from algorithm.vision3d.depth.tilt_correction import correct_smartray_depth
 from transport.depth_input import input_depth_correction
@@ -36,7 +37,7 @@ class ProductionPitchTests(unittest.TestCase):
         self.detector.expected_piece_count=1
 
     def test_external_parameters_validate_calibration_and_keep_switch(self):
-        config=json.loads((ROOT/'config/3D/config.json').read_text(encoding='utf-8-sig'))
+        config=json.loads(default_stage_config_path('config_3d').read_text(encoding='utf-8-sig'))
         config['smartray_pitch_3d']['parameters'].update(enabled_3d=False)
         self.assertFalse(preprocessing_parameters(config)['enabled_3d'])
         for bad in ({'scan_pitch_mm':0},{'enabled_2d':True},{'z_step_mm':.002}):

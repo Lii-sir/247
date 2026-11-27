@@ -14,6 +14,7 @@ CSV、日志、时间线或可视化专用字段。JSON 名称与 C# 属性名�
 | ---------------------------------------------------------------------------------------------------------------- | ------------------------ | ---------------------------------------------------- |
 | `bridge.Init()`                                                                                                | `BridgeBaseResponse`   | 通信初始化状态                                       |
 | `bridge.InitAlgorithm()` / `InitAlgorithm(stage)`                                                            | `BridgeBaseResponse`   | 算法初始化状态、模型加载耗时                         |
+| `bridge.InitAlgorithm(stage, configPath)` | `BridgeBaseResponse` | 从指定型号的配置入口初始化，返回初始化状态与模型加载耗时 |
 | `bridge.TwoD.DetectPieceFile(...)` / `DetectPieceSharedMemory(...)` / `DetectPieceSharedMemoryLayout(...)` | `DetectResponse`       | 指定板号、片号的 2D 结果及缓存状态                   |
 | 上述单片接口的`...Async(...)` 版本                                                                             | `Task<DetectResponse>` | `await` 后得到同样的返回对象                       |
 | `bridge.ThreeD.DetectPiece(...)` / `DetectPieceFile(...)` / `DetectPieceSharedMemory(...)` | `DetectResponse` | 按板号、片号提交已分好的 3D 深度图，返回 `ResultsPiece` |
@@ -75,7 +76,7 @@ CSV、日志、时间线或可视化专用字段。JSON 名称与 C# 属性名�
 启用优先级时，`Results2D.FirstNgCheck` 和因该检查跳过 3D 的 `BoardPieceResult.FirstNgCheck`
 提供首项 NG 的检测名称。
 
-在 `config/inspection.json` 中设置检测清单时，联合单片结果还提供
+在 `config/products/normal/inspection.json` 中设置检测清单时，联合单片结果还提供
 `BoardPieceResult.DefectChecks3D`（JSON `defect_checks_3d`），按检测名称返回
 `Status`（`ok`、`ng`、`skipped` 或 `disabled`）和 `IsOk`。
 3D 项首个 NG 也写入 `BoardPieceResult.FirstNgCheck`。只启用 2D 且通过时，联合请求
@@ -350,7 +351,7 @@ ROI 汇总复用实例测量的 ROI 分配与像素数；若掩码清理失败�
 `thin_measurement_erode_px` 控制 thin 中间段。单位为 3D 像素半径，0 关闭。
 `WireMeasurements[].Mask3DLocal` 返回收缩后的实际采样区域，`Height3D.Point` 从该区域内选择；
 收缩后无有效深度时 `IsValid=false/IsOk=false/Point=null`。C# 字段不变，平台参考面不变，该引线参数不控制焊脚流程。
-详见 [3D 配置说明](../config/3D/README.md)。
+详见 [3D 配置说明](../config/products/normal/3D/README.md)。
 
 焊点/焊脚也支持独立内缩参数：`bond_measurement_erode_px` 控制 bond，
 `thin_solder_measurement_erode_px` 控制 thin 两端，均位于 `height_measurement_3d.parameters`。
@@ -712,4 +713,4 @@ screen_y = image_y * zoom + pan_y
 
 正式联合配准现为粗配准+仿射，不执行透视求解。`results_board`、`results_3d`及联合单片包含`pitch_correction`元数据与`depth_coordinate_space`。默认关闭，`board_3d`表示本次输入板栅格；补偿实际执行时标签为`pitch_corrected_board_3d`。对应的`height_point_coordinate_space`与`Height3D.point_coordinate_space`同样标记补偿栅格，点已加本片在补偿后整板中的起始行，勿重复偏移。掩码与参考面仍为补偿后分片局部坐标。
 
-补偿后的点不能直接叠加到未补偿的原始深度PNG。C# DTO新增`PitchCorrection`（原始JSON字段字典）和`DepthCoordinateSpace`；需使用更新的Bridge构建产物才能按类型读取这些新增字段。模型公式、标定及开关详见config/3D/README.md。
+补偿后的点不能直接叠加到未补偿的原始深度PNG。C# DTO新增`PitchCorrection`（原始JSON字段字典）和`DepthCoordinateSpace`；需使用更新的Bridge构建产物才能按类型读取这些新增字段。模型公式、标定及开关详见config/products/normal/3D/README.md。

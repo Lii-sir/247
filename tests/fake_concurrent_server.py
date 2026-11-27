@@ -34,10 +34,12 @@ class RawDepthDetector(FakeDetector):
 
 class FixtureServer(AlgorithmServer):
     def handle_init_algorithm(self, req):
-        config = load_runtime_config(req["config_text"], req["config_path"])
+        config = load_runtime_config(req["config_text"], req["config_path"],
+                                     config_3d_path=req.get("config_3d_path"))
         if not isinstance(config.get("inspection"), dict):
             return dict(ok=False, error="Independent inspection configuration was not sent")
-        return dict(ok=True, cmd="init_algorithm")
+        product = config["inspection"].get("defect_sequence") == ["wire_height_3d"]
+        return dict(ok=True, cmd="init_algorithm", message="selected product" if product else "default product")
 
 
 server = FixtureServer()

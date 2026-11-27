@@ -172,6 +172,7 @@ class Cpu2DProcessTests(unittest.TestCase):
                 self.cpu_2d_process = service
                 self.silver_config = settings
                 self.config_path = None
+                self._stage_2d_dir = None
                 self.log = lambda message: None
 
             def prepare_2d_piece(self, req):

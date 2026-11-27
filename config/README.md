@@ -1,9 +1,19 @@
 # Bridge 配置
 
+默认入口 [`config.json`](config.json) 指向 [`normal`](products/normal/config.json) 型号。
+每个型号目录包含以下配置。
+
 - `2D/config.json` 保存圆定位、ROI、YOLO 和各项 2D 算法的参数。
-- `3D/config.json` 保存单片 3D 配准和测高参数，以及验证台在调用端分片和矫正所需的参数。
+- `3D/config.json` 保存配准、测高、调用端分片和矫正参数。
 - `inspection.json` 保存检测项选择、报告优先级和跳过规则。
-- `config.json` 引用以上文件。模型路径相对 2D 配置文件解析。
+
+型号入口引用以上文件。各型号的模型路径相对该型号的 2D 配置文件解析，公共模型存放于 `models/`。 [型号目录说明](products/README.md)
+
+## 阈值与算法参数
+
+2D 和 3D 的每个算法模块都包含 `description`、`thresholds` 和 `parameters`。
+`thresholds` 保存候选筛选、数据有效性和缺陷判定门槛。`parameters` 保存 ROI、模型配置、采样与几何处理方式以及并发设置。
+某一组没有字段时使用 `{}`。同一字段只填一次，加载时会合并两组配置。修改后重新初始化算法。
 
 ## 检测策略
 
@@ -36,4 +46,4 @@
 
 ## 上位机提交
 
-使用 `InitAlgorithm("board")` 初始化联合检测。上位机按相同板号、片号分别提交 `detect_2d_piece` 和 `detect_3d_piece`，深度图在调用端完成切片和矫正。C# 和测高结果字段参见[接口说明](../process/OUTPUT_PARAMETERS.md)。
+使用 `InitAlgorithm("board")` 加载默认配置，或用 `InitAlgorithm("board", configPath)` 加载指定型号的配置。上位机按相同板号、片号分别提交 `detect_2d_piece` 和 `detect_3d_piece`，深度图在调用端完成切片和矫正。C# 和测高结果字段参见[接口说明](../process/OUTPUT_PARAMETERS.md)。

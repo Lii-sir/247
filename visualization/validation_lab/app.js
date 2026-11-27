@@ -21,6 +21,9 @@ async function api(url,options){
  throw Object.assign(Error(detail?.error||'HTTP '+response.status),{httpStatus:response.status});
 }
 const post=(url,body)=>api(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+function productFields(){
+ return config?.product?{product_id:config.product.id,product_version:config.product.version}:{};
+}
 function status(text,error=false){$('progress').textContent=text;$('progress').className=error?'error':'';}
 function assess(){
  const d=Pairing.check(files,$('board').value,config?.piece_count||0);
@@ -88,6 +91,7 @@ function showResult(id,job){
    (r.error?'\n'+r.error:'')+'\n用时 '+(r.total_wall_ms/1000).toFixed(2)+'秒';
   if(r.note)$('summary').textContent+='\n'+r.note;
  }
+ if(job.product)$('summary').textContent+='\n型号 '+job.product.label+' · 配置 '+job.product.version.slice(0,12);
  const latency=r?.two_d_latency;
  if(latency&&Number.isFinite(latency.max_ms))$('summary').textContent+='\n2D请求≤'+latency.target_ms+'ms：'+(latency.meets_target?'达标':'未达标')+' · 最大 '+latency.max_ms.toFixed(1)+'ms'+(latency.over_target_piece_ids?.length?' · 超标片号 '+latency.over_target_piece_ids.join(', '):'');
  const warnings=Object.values(artifactErrors);
@@ -136,7 +140,7 @@ async function runValidation(request){
  const snapshot=revision;
  status('正在提交验证…');
  try{
-  const {id}=await post('/api/run',request);
+  const {id}=await post('/api/run',{...request,...productFields()});
   const job=await waitForJob(id,job=>{if(job.status==='running')status(job.phase);});
   if(job.result)showResult(id,job);else showJobError(job);
   try{await history();$('history').value=id;}catch(error){console.warn('历史验证记录刷新失败',error);}
@@ -227,7 +231,7 @@ async function runDetection(node,run){
   const snapshot=files.filter(row=>Pairing.board(row.board_id)===board_id&&
    (row.kind==='3d'?mode!=='manual_2d':row.piece_id===piece_id));
   try{
-   const request={mode,board_id,piece_id,files:structuredClone(snapshot)};
+   const request={mode,board_id,piece_id,files:structuredClone(snapshot),...productFields()};
    if(mode===pitchMode&&run.pitchStartBoards.has(board_id)&&!run.startedPitchBoards.has(board_id))
     request.wait_for_pitch_start=true;
    const accepted=await post('/api/run',request);
@@ -349,7 +353,7 @@ async function startPitch(node,run){
  node.runBoardId=board_id;
  node.status='正在提交启动请求';node.outcome='running';updateWorkflow();
  try{
-  const started=await post('/api/pitch/start',{board_id,files:structuredClone(snapshots)});
+  const started=await post('/api/pitch/start',{board_id,files:structuredClone(snapshots),...productFields()});
   run.startedPitchBoards.add(board_id);
   node.status=started.reused?'本板正在矫正':`已启动 · ${requestClock.format(started.started_at*1000)}`;
   node.outcome='done';
@@ -429,6 +433,7 @@ $('startWorkflow').onclick=async()=>{
 };
 function refreshWorkflowControls(){
  const locked=busy||uploading||!config;
+ $('product').disabled=locked||workflow.some(node=>node.outcome==='running');
  for(const [id] of palette)$(id).disabled=locked;
  const issue=config&&workflow.length?workflowIssue():'';
  $('flowEmpty').hidden=workflow.length>0;
@@ -714,12 +719,29 @@ $('stopWorkflow').onclick=()=>{
 $('releaseBoard').onclick=async()=>{
  if(busy||uploading||!$('board').value)return;
  const board_id=$('board').value;busy=true;assess();
- try{await post('/api/release-board',{board_id});status('板 '+board_id+' 的检测缓存已释放。');}
+ try{await post('/api/release-board',{board_id,...productFields()});status('板 '+board_id+' 的检测缓存已释放。');}
  catch(error){status(error.message,true);}finally{busy=false;assess();}
 };
-api('/api/defaults').then(d=>{
+function showConfig(d){
  config=d;
- const p=d.pitch;$('config').textContent='每板 '+d.piece_count+'片 · 粗配准 + 仿射 · Pitch '+(p.enabled_3d?'启用，'+p.angle_deg+'°，步距'+p.scan_pitch_mm+' mm/profile':'关闭');
+ const select=$('product');select.replaceChildren();
+ for(const product of d.products||[])appendOption(select,product.id,product.label);
+ select.value=d.product?.id||'';
+ const p=d.pitch;$('config').textContent='每板 '+d.piece_count+'片 · 粗配准 + 仿射 · Pitch '+(p.enabled_3d?'启用，'+p.angle_deg+'°，步距'+p.scan_pitch_mm+' mm/profile':'关闭')+(d.product?' · 配置 '+d.product.version.slice(0,12):'');
+}
+$('product').onchange=async()=>{
+ if($('product').disabled)return;
+ const product_id=$('product').value;
+ busy=true;assess();
+ try{
+  showConfig(await post('/api/product',{product_id}));
+  for(const node of workflow){node.outcome='';node.status='待执行';node.message='';node.requestTimes=[];}
+  status('已选择 '+config.product.label+'。');
+ }catch(e){$('product').value=config.product?.id||'';status(e.message,true);}
+ finally{busy=false;renderFiles();}
+};
+api('/api/defaults').then(d=>{
+ showConfig(d);
  renderFiles();status('就绪，请添加文件或载入项目样本。');
  try{showSavedWorkflows(readSavedWorkflows());}catch(error){status('读取已保存流程失败：'+error.message,true);}
  return history();

@@ -56,8 +56,8 @@ class FakeClient:
 def init_request(*args):
     return dict(cmd='init_algorithm', config_text=json.dumps({
         'common_3d': {'parameters': {'input': {'piece_count': 2}}},
-        'height_measurement_3d': {'description': 'synthetic height settings', 'parameters': {}},
-        'segmentation_3d': {'description': 'synthetic windows', 'parameters': {
+        'height_measurement_3d': {'description': 'synthetic height settings', 'thresholds': {}, 'parameters': {}},
+        'segmentation_3d': {'description': 'synthetic windows', 'thresholds': {}, 'parameters': {
             'mode': 'fixed', 'expected_piece_count': 2, 'fixed_rois': [[0,0,4,2],[0,2,4,4]]}},
     }))
 
@@ -151,10 +151,6 @@ class ValidationTests(unittest.TestCase):
 
     def test_manual_clicks_keep_pairing_and_send_one_protocol_request(self):
         runner,clients=self.make_runner();self.addCleanup(runner.stop)
-        cfg=json.loads(init_request()['config_text'])
-        cfg['segmentation_3d']={'description':'synthetic windows','parameters':{
-            'mode':'fixed','expected_piece_count':2,'fixed_rois':[[0,0,4,2],[0,2,4,4]]}}
-        runner.init_builder=lambda *args:dict(cmd='init_algorithm',config_text=json.dumps(cfg))
         pixels=np.arange(16,dtype=np.uint16).reshape(4,4)+33000
         Image.fromarray(pixels).save(self.rows[2]['path'])
 
@@ -214,7 +210,7 @@ class ValidationTests(unittest.TestCase):
     def test_two_d_mode_does_not_mutate_or_require_depth_calibration(self):
         runner,clients=self.make_runner();self.addCleanup(runner.close)
         cfg=json.loads(init_request()['config_text'])
-        cfg['smartray_pitch_3d']={'description':'test','parameters':{'enabled_3d':True,'scan_pitch_mm':0}}
+        cfg['smartray_pitch_3d']={'description':'test','thresholds':{},'parameters':{'enabled_3d':True,'scan_pitch_mm':0}}
         cfg['common_3d']['parameters']['threading']={'registration_affinity':{'enabled':True,'physical_cores':8},'joint_affinity':{'enabled':True,'physical_cores':8}}
         runner.init_builder=lambda *args:dict(cmd='init_algorithm',config_text=json.dumps(cfg))
         folder=self.root/'two-only';folder.mkdir()
@@ -245,6 +241,76 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(error.exception.code,400);self.assertIsNone(server.runner.client)
         key='a'*32;folder=server.folder/key;folder.mkdir();(folder/'result.json').write_text('{"ok":true}')
         with urlopen(base+'/runs/'+key+'/result.json') as r:self.assertEqual(json.load(r),{'ok':True})
+
+    def test_product_selection_binds_pitch_and_detection_and_records_version(self):
+        project = self.root / 'project'
+        config_dir = project / 'config'
+        source = ROOT / 'config/products/normal'
+        product_dir = config_dir / 'products' / 'A100'
+        product_dir.mkdir(parents=True)
+        default = dict(config_2d=str(source / '2D/config.json'), config_3d=str(source / '3D/config.json'),
+                       config_inspection=str(source / 'inspection.json'))
+        normal_dir = config_dir / 'products' / 'normal'
+        normal_dir.mkdir()
+        (normal_dir / 'config.json').write_text(json.dumps(default), encoding='utf-8')
+        three = json.loads((source / '3D/config.json').read_text(encoding='utf-8'))
+        three['common_3d']['parameters']['input']['piece_count'] = 2
+        three['segmentation_3d']['parameters'].update(expected_piece_count=2, fixed_rois=[[0, 0, 4, 2], [0, 2, 4, 4]])
+        three['smartray_pitch_3d']['parameters'].update(enabled_3d=False, angle_deg=11.0)
+        calibration = product_dir / 'calibration'
+        calibration.mkdir()
+        profile_path = calibration / 'affine_initializer.json'
+        profile = json.loads((source / '3D/calibration/affine_initializer.json').read_text(encoding='utf-8'))
+        profile['product_fixture'] = 'A100'
+        profile_path.write_text(json.dumps(profile), encoding='utf-8')
+        (product_dir / 'measure.json').write_text(json.dumps(three), encoding='utf-8')
+        (product_dir / 'config.json').write_text(json.dumps(dict(default, config_3d='measure.json')), encoding='utf-8')
+
+        server = lab.Server(0, self.root / 'product-api')
+        server.runner.stop()
+        server.runner, clients = self.make_runner()
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        base = f'http://127.0.0.1:{server.server_port}'
+
+        def post(route, **body):
+            request = Request(base + route, data=json.dumps(body).encode(), headers={'Content-Type': 'application/json'})
+            with urlopen(request) as response:
+                return json.load(response)
+
+        with patch.object(lab, 'ROOT', project):
+            with urlopen(base + '/api/defaults') as response:
+                options = json.load(response)
+            self.assertEqual([product['id'] for product in options['products']], ['A100', 'normal'])
+            self.assertEqual(options['product']['id'], 'normal')
+            profile_path.unlink()
+            with self.assertRaises(HTTPError):
+                post('/api/product', product_id='A100')
+            self.assertEqual(server.runner.product.id, 'normal')
+            profile_path.write_text(json.dumps(profile), encoding='utf-8')
+            selected = post('/api/product', product_id='A100')
+            self.assertEqual(selected['piece_count'], 2)
+            self.assertEqual(selected['pitch']['angle_deg'], 11)
+            version = selected['product']['version']
+            scope = dict(product_id='A100', product_version=version)
+            post('/api/pitch/start', board_id='2', files=self.rows, **scope)
+            init_config = json.loads(server.runner.product.request['config_text'])
+            self.assertEqual(init_config['dynamic_affine_3d']['parameters']['calibration']['profile'], profile)
+            job = post('/api/run', board_id='2', mode='manual_2d', piece_id=1, files=self.rows, **scope)
+            result_file = server.folder / job['id'] / 'result.json'
+            deadline = time.monotonic() + 5
+            while server.jobs[job['id']]['status'] == 'running' and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertEqual(server.jobs[job['id']]['status'], 'done', server.jobs[job['id']])
+            self.assertEqual(json.loads(result_file.read_text(encoding='utf-8'))['product'], selected['product'])
+            group = post('/api/workflows', run_ids=[job['id']], outcome='done')
+            self.assertIn('A100', group['title'])
+
+            post('/api/product', product_id='normal')
+            self.assertTrue(clients[0].closed)
+            with self.assertRaises(HTTPError):
+                post('/api/pitch/start', board_id='2', files=self.rows, **scope)
 
     def test_http_manual_action_preserves_exact_piece_and_dispatches_without_batch(self):
         server=lab.Server(0,self.root/'manual-api')

@@ -1,0 +1,6 @@
+{
+  "config_2d": "2D/config.json",
+  "config_3d": "3D/config.json",
+  "config_inspection": "inspection.json",
+  "model_directory": "../../models"
+}

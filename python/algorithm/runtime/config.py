@@ -12,6 +12,24 @@ DEFAULT_ALGORITHM_PARAMETERS: Dict[str, Any] = {
 }
 
 
+def default_stage_config_path(stage: str) -> Path:
+    manifest = json.loads((_PROJECT_CONFIG_DIR / "config.json").read_text(encoding="utf-8-sig"))
+    return (_PROJECT_CONFIG_DIR / manifest[stage]).resolve()
+
+
+def _combine_feature_settings(parameters: Dict[str, Any], thresholds: Dict[str, Any],
+                              path: str) -> Dict[str, Any]:
+    combined = dict(parameters)
+    for key, value in thresholds.items():
+        if key in combined:
+            setting_path = f"{path}.{key}"
+            if not isinstance(combined[key], dict) or not isinstance(value, dict):
+                raise ValueError(f"{setting_path} is defined in both parameters and thresholds")
+            value = _combine_feature_settings(combined[key], value, setting_path)
+        combined[key] = value
+    return combined
+
+
 def feature_parameters(
         config: Dict[str, Any],
         name: str,
@@ -24,6 +42,7 @@ def feature_parameters(
 
         "feature_name": {
             "description": "...",
+            "thresholds": { ... },
             "parameters": { ... }
         }
 
@@ -41,18 +60,22 @@ def feature_parameters(
     description = block.get("description")
     if not isinstance(description, str) or not description.strip():
         raise ValueError(f"{name}.description must be a non-empty string")
+    thresholds = block.get("thresholds")
+    if not isinstance(thresholds, dict):
+        raise ValueError(f"{name}.thresholds must be an object")
     parameters = block.get("parameters")
     if not isinstance(parameters, dict):
         raise ValueError(f"{name}.parameters must be an object")
-    if "enabled" in block or "enabled" in parameters:
+    if "enabled" in block or "enabled" in parameters or "enabled" in thresholds:
         raise ValueError(
             f"{name} no longer accepts enabled; remove the feature block "
             "only in an optional integration"
         )
-    return dict(parameters)
+    return _combine_feature_settings(parameters, thresholds, name)
 
 
-def load_runtime_config(config_text: str, config_path: str | None = None) -> Dict[str, Any]:
+def load_runtime_config(config_text: str, config_path: str | None = None, *,
+                        config_3d_path: str | None = None) -> Dict[str, Any]:
     """Load either a stage file or the small project manifest.
 
     The manifest points at the algorithm parameters and the inspection policy.
@@ -64,7 +87,8 @@ def load_runtime_config(config_text: str, config_path: str | None = None) -> Dic
     path_2d = parsed.get("config_2d")
     path_3d = parsed.get("config_3d")
     if not isinstance(path_2d, str) or not isinstance(path_3d, str):
-        _load_affine_initializer_profile(parsed, config_path)
+        _load_affine_initializer_profile(parsed, config_3d_path or config_path,
+                                         stage_3d=bool(config_3d_path))
         return parsed
     base = (
         Path(config_path).expanduser().resolve().parent
@@ -82,7 +106,7 @@ def load_runtime_config(config_text: str, config_path: str | None = None) -> Dic
         if not isinstance(policy_path, str) or not policy_path.strip():
             raise ValueError("config_inspection must be a non-empty path")
         merged["inspection"] = json.loads((base / policy_path).resolve().read_text(encoding="utf-8-sig"))
-    _load_affine_initializer_profile(merged, str((base / path_3d).resolve()))
+    _load_affine_initializer_profile(merged, str((base / path_3d).resolve()), stage_3d=True)
     return merged
 
 
@@ -94,13 +118,13 @@ def inspection_parameters(config, legacy_2d):
     return settings
 
 
-def _load_affine_initializer_profile(config: Dict[str, Any], config_path: str | None) -> None:
+def _load_affine_initializer_profile(config: Dict[str, Any], config_path: str | None, *,
+                                     stage_3d: bool) -> None:
     """Resolve the optional coarse-relative affine profile from profile_path.
 
-    The production request carries a merged 2D+3D config, so ``config_path``
-    can point at the 2D stage file. In that case the sibling config/3D folder
-    is also searched. An inline ``profile`` remains supported for callers that
-    already materialize the JSON object themselves.
+    A known 3D config path fixes the base directory, including for product
+    manifests. Older inline requests carrying only a 2D path retain their
+    existing search paths.
     """
     dynamic = config.get("dynamic_affine_3d")
     if not isinstance(dynamic, dict):
@@ -125,9 +149,10 @@ def _load_affine_initializer_profile(config: Dict[str, Any], config_path: str | 
         if config_path:
             stage = Path(config_path).expanduser().resolve()
             candidates.append(stage.parent / raw)
-            if stage.parent.name.casefold() == "2d":
+            if not stage_3d and stage.parent.name.casefold() == "2d":
                 candidates.append(stage.parent.parent / "3D" / raw)
-        candidates.append(_PROJECT_CONFIG_DIR / "3D" / raw)
+        if not stage_3d:
+            candidates.append(default_stage_config_path("config_3d").parent / raw)
 
     selected = next((path.resolve() for path in candidates if path.is_file()), None)
     if selected is None:

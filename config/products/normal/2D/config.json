@@ -1,11 +1,23 @@
 {
   "model_path": {
-    "YOLO": "../models/yolo_2d.pt",
-    "chip_short": "../models/chip_short_v1.pt",
-    "chip_long": "../models/chip_long_v1.pt"
+    "YOLO": "../../../models/yolo_2d.pt",
+    "chip_short": "../../../models/chip_short_v1.pt",
+    "chip_long": "../../../models/chip_long_v1.pt"
   },
   "common_2d": {
     "description": "2D通用参数：圆定位、检测裁剪、YOLO推理和基础掩码处理",
+    "thresholds": {
+      "vertical_split": {
+        "platform_threshold": 50
+      },
+      "mask": {
+        "min_component_area": 300
+      },
+      "yolo": {
+        "conf": 0.25,
+        "iou": 0.7
+      }
+    },
     "parameters": {
       "crop": {
         "circle_search_roi": [
@@ -47,16 +59,10 @@
       },
       "vertical_split": {
         "offset_radius": -3.44464,
-        "offset_px": 0.0,
-        "platform_threshold": 50
-      },
-      "mask": {
-        "min_component_area": 1
+        "offset_px": 0.0
       },
       "yolo": {
         "imgsz": 640,
-        "conf": 0.25,
-        "iou": 0.7,
         "max_det": 300,
         "device": "0",
         "end2end": false
@@ -75,6 +81,9 @@
   },
   "wire_bending_2d": {
     "description": "引线/细线存在性和弯曲度检测；ROI为空或没有对应掩码时判定NG",
+    "thresholds": {
+      "rectangle_ratio_threshold": 0.75
+    },
     "parameters": {
       "roi_offsets": [
         [
@@ -89,12 +98,18 @@
           -2.7786,
           1.812
         ]
-      ],
-      "rectangle_ratio_threshold": 0.75
+      ]
     }
   },
   "silver_continuity_2d": {
     "description": "银浆断连/联通检测",
+    "thresholds": {
+      "min_sector_silver_px": 3,
+      "min_sector_coverage": 0.01,
+      "min_valid_sector_px": 1,
+      "min_chip_area_px": 100,
+      "min_visible_sector_ratio": 0.1
+    },
     "parameters": {
       "silver_class": "silver",
       "chip_class": "chip",
@@ -105,16 +120,15 @@
       ],
       "outward_length_px": 20,
       "sector_count": 72,
-      "min_sector_silver_px": 3,
-      "min_sector_coverage": 0.01,
-      "min_valid_sector_px": 1,
-      "occlusion_dilation_px": 0,
-      "min_chip_area_px": 100,
-      "min_visible_sector_ratio": 0.1
+      "occlusion_dilation_px": 0
     }
   },
   "silver_overflow_2d": {
     "description": "复用圆定位检测ROI，按四边像素内缩生成银浆允许矩形；边界无效不判OK",
+    "thresholds": {
+      "tolerance_px": 0.0,
+      "min_area_px": 1
+    },
     "parameters": {
       "boundary": {
         "mode": "roi_inset",
@@ -126,20 +140,25 @@
           "bottom": 128
         }
       },
-      "silver_class": "silver",
-      "tolerance_px": 0.0,
-      "min_area_px": 1
+      "silver_class": "silver"
     }
   },
   "chip_rotation_2d": {
     "description": "芯片掩码外接矩形旋转角度检测",
-    "parameters": {
+    "thresholds": {
       "max_angle_deg": 3.0,
       "min_area_px": 1
-    }
+    },
+    "parameters": {}
   },
   "chip_anomaly_2d": {
     "description": "YOLO芯片掩码外接矩形透视矫正后，按长宽比区间选择EfficientAD模型检测外观异常",
+    "thresholds": {
+      "threshold": {
+        "chip_short": 0.89511,
+        "chip_long": 10.2000
+      }
+    },
     "parameters": {
       "chip_class": "chip",
       "device": "0",
@@ -162,11 +181,7 @@
       "padding_ratio": 0.02,
       "max_rotation_deg": 5.0,
       "score_mode": "pool+top",
-      "score_pool_kernel": 7,
-      "threshold": {
-        "chip_short": 0.89511,
-        "chip_long": 10.2000
-        }
+      "score_pool_kernel": 7
     }
   }
 }

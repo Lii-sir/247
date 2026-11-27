@@ -18,7 +18,8 @@ async function boot(latency=null,timers={},failRequest=()=>false,browser={},hook
   window:{localStorage:browserStorage(),confirm:()=>true,...browser},document:{getElementById:id=>{if(!nodes.has(id))throw Error(id);return nodes.get(id);},createElement:()=>new Node()},
   fetch:async(url,opt)=>{
    let data;
-   if(url==='/api/defaults')data=config;
+   if(url==='/api/defaults')data={...config,...hooks.initialConfig};
+   else if(url==='/api/product')data={...config,...hooks.selectProduct(JSON.parse(opt.body))};
    else if(url==='/api/history')data=history;
    else if(url.startsWith('/api/upload?')){const kind=new URL(url,'http://local').searchParams.get('kind'),name=opt.body.name,m=name.match(/^(.+)_(\d+)\./);data={kind,name,path:'/uploads/'+name,board_id:kind==='3d'?name.split('.')[0]:m?.[1]||'',piece_id:kind==='2d'&&m?Number(m[2]):null};}
    else if(url==='/api/run'){const q=JSON.parse(opt.body);requests.push(q);const id=String(requests.length).padStart(32,'0');
@@ -63,6 +64,25 @@ test('demo -> validation passes exact board/piece manifest and opens interactive
  assert.equal(requests[0].board_id,'2');assert.deepEqual(requests[0].files.filter(f=>f.kind==='2d').map(f=>f.piece_id),[1,2]);
  assert.equal(nodes.get('report').hidden,false);assert.match(nodes.get('report').src,/report.html$/);assert.match(nodes.get('summary').textContent,/NG/);
  assert.match(nodes.get('jsonLink').href,/result.json$/);
+});
+
+test('product selection updates piece count and scopes Pitch and detection requests',async()=>{
+ const initial={id:'normal',label:'normal',version:'d'.repeat(64)};
+ const product={id:'A100',label:'A100',version:'a'.repeat(64)};
+ const products=[initial,product];
+ const {nodes,requests,pitchStarts}=await boot(null,{},undefined,{}, {
+  initialConfig:{product:initial,products},
+  selectProduct:(request)=>{assert.equal(request.product_id,'A100');return {product,products,piece_count:3};},
+ });
+ nodes.get('demo').onclick();
+ const select=nodes.get('product');assert.equal(select.value,'normal');
+ select.value='A100';await select.onchange();
+ assert.match(nodes.get('config').textContent,/每板 3片/);
+ nodes.get('addPitch').onclick();await execute(nodes.get('flowNodes').children[0]).onclick();
+ await nodes.get('run').onclick();
+ for(const request of [pitchStarts[0],requests[0]]){
+  assert.equal(request.product_id,product.id);assert.equal(request.product_version,product.version);
+ }
 });
 
 test('2D latency violation is visible without changing product NG',async()=>{

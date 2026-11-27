@@ -36,6 +36,7 @@ from algorithm.runtime.config import feature_parameters
 from algorithm.vision3d.depth.depth_preprocessing import preprocessing_parameters
 from algorithm.vision3d.depth.segment import SegmentationConfig
 from validation_lab.pitch_stream import PitchPreparations, PitchTrigger
+from validation_lab.product_config import DEFAULT_PRODUCT, load_product, product_manifests
 
 
 def board_number(value):
@@ -145,6 +146,7 @@ class Runner:
         self.folder = Path(folder)
         self.client_factory, self.init_builder = client_factory, init_builder
         self.mapper, self.reporter = mapper, reporter
+        self.product = None
         self.client = None
         self.fingerprint = None
         self._startup_threading = None
@@ -155,6 +157,24 @@ class Runner:
         self._stopping = threading.Event()
         self._manual_boards = {}
         self._manual_active = 0
+
+    def select_product(self, product):
+        with self._state_lock:
+            if self.product == product:
+                return
+            if self._stopping.is_set() or self._manual_active or self._pitch_triggers:
+                raise RuntimeError("请等待当前检测请求结束后再切换型号")
+            self.close()
+            self._pitch.reset()
+            self.product = product
+
+    def _init_request(self):
+        return dict(self.product.request) if self.product else self.init_builder(None, None)
+
+    def _add_product_to_report(self, envelope):
+        if self.product:
+            envelope["product"] = self.product.metadata
+            envelope["title"] += f" · {self.product.id} · {self.product.version[:12]}"
 
     def close(self, *, force=False):
         with self._state_lock:
@@ -193,10 +213,10 @@ class Runner:
             if self._manual_active:
                 raise RuntimeError("检测配置已变更或进程已退出，请等已提交的请求结束后重试")
             self.close()
-            progress("初始化模型（首次需要加载CUDA模型）")
             args = (Path(sys.executable), ROOT / "python/transport/bridge_server.py", self.folder / "python.log")
             self.client = self.client_factory(*args, **({"env_overrides": overrides} if overrides else {}))
             client = self.client
+        progress("初始化模型（首次需要加载CUDA模型）")
         for req in ({"cmd": "init"}, request):
             reply = client.request(req, 900)
             if not reply.get("ok"):
@@ -215,7 +235,7 @@ class Runner:
         return segmentation, self._pitch.key(path, segmentation, settings)
 
     def start_pitch(self, board_id, depth):
-        config = json.loads(self.init_builder(None, None)["config_text"])
+        config = json.loads(self._init_request()["config_text"])
         settings = preprocessing_parameters(config)
         segmentation, depth_key = self._pitch_input(depth["path"], config, settings)
         with self._state_lock:
@@ -238,7 +258,7 @@ class Runner:
                                wait_for_pitch_start=False):
         if not images:
             raise ValueError("Pitch 就绪送检需要对应片的 2D 文件")
-        config = json.loads(self.init_builder(None, None)["config_text"])
+        config = json.loads(self._init_request()["config_text"])
         _, depth_key = self._pitch_input(depth["path"], config, preprocessing_parameters(config))
         timeout = float(os.environ.get("BRIDGE_BOARD_TIMEOUT_SECONDS", "90"))
         timer = threading.Timer(timeout, self._fail_pitch_trigger, args=(key, "等待单片深度或 2D 提交超时"))
@@ -328,7 +348,7 @@ class Runner:
         if mode == "manual_2d":
             with Image.open(images[0]["path"]) as image:
                 image.verify()
-        init = self.init_builder(None, None)
+        init = self._init_request()
         config = json.loads(init["config_text"])
         if int(config["common_3d"]["parameters"]["input"]["piece_count"]) != count:
             raise ValueError("配置片数已变，请刷新页面")
@@ -347,6 +367,7 @@ class Runner:
         title = f"板 {board_id} · 第{piece_id}片 · {label}"
         envelope = dict(viewer_version=1, mode="stream", board_id=board_id, title=title,
                         images_2d=images, responses_2d=[], warnings=[affinity_note] if affinity_note else [])
+        self._add_product_to_report(envelope)
         reply, request_id = {}, None
         with ExitStack() as submission, ExitStack() as stack:
             # Serialize input preparation and pipe writes only. Response waits
@@ -486,6 +507,7 @@ class Runner:
                                     "interval_basis": "minimum_start_to_start_no_response_wait"})
         envelope["title"] += (f" · 按间隔提交 {options['request_interval_ms']:g}ms"
                               if options["submission_mode"] == "paced" else " · 并发提交")
+        self._add_product_to_report(envelope)
         started, startup, client, timeline_start, release_sent = None, {}, None, 0, False
         first_error = None
         try:
@@ -495,7 +517,7 @@ class Runner:
             for row in images:
                 with Image.open(row["path"]) as image:
                     image.verify()
-            init = self.init_builder(None, None)
+            init = self._init_request()
             config = json.loads(init["config_text"])
             actual_count = int(config["common_3d"]["parameters"]["input"]["piece_count"])
             if actual_count != count:
@@ -685,7 +707,14 @@ class Server(ThreadingHTTPServer):
         self.workflows, self.grouped_runs = {}, set()
         self.workflow_number = 0
         # Match the bridge's bound of 26 protocol requests in flight.
-        self.pool, self.lock = ThreadPoolExecutor(26), threading.Lock()
+        self.pool, self.lock = ThreadPoolExecutor(26), threading.RLock()
+
+    def check_product(self, request):
+        selected = self.runner.product
+        selected_id = selected.id if selected else DEFAULT_PRODUCT
+        if (request.get("product_id", DEFAULT_PRODUCT) != selected_id or
+                selected and request.get("product_version", selected.version) != selected.version):
+            raise ValueError("验证台的产品配置已切换，请刷新页面或重新选择型号")
 
     def finish_workflow(self, request):
         ids, outcome = request.get("run_ids"), request.get("outcome")
@@ -701,17 +730,22 @@ class Server(ThreadingHTTPServer):
             jobs = [dict(self.jobs.get(key, {})) for key in ids]
             if any(job.get("status") == "running" for job in jobs):
                 raise ValueError("流程仍有请求正在处理")
+            product = jobs[0].get("product") if jobs else None
+            if any(job.get("product") != product for job in jobs):
+                raise ValueError("同一流程的检测记录须使用同一份产品配置")
             self.workflow_number += 1
             title = f"流程 {self.workflow_number}"
+            if product:
+                title += f" · {product['label']} · {product['version'][:12]}"
             self.grouped_runs.update(ids)
         try:
-            return self._write_workflow(ids, jobs, title, outcome, str(request.get("error") or ""))
+            return self._write_workflow(ids, jobs, title, outcome, str(request.get("error") or ""), product)
         except Exception:
             with self.lock:
                 self.grouped_runs.difference_update(ids)
             raise
 
-    def _write_workflow(self, ids, jobs, title, outcome, error):
+    def _write_workflow(self, ids, jobs, title, outcome, error, product):
         runs, timing_rows = [], []
         for key, job in zip(ids, jobs):
             child = self.folder / key
@@ -744,6 +778,8 @@ class Server(ThreadingHTTPServer):
         folder.mkdir()
         document = dict(mode="workflow", title=title, outcome=outcome, error=error, runs=runs,
                         total_wall_ms=total_wall_ms)
+        if product:
+            document["product"] = product
         render_report(document, folder / "report.html", base_dir=folder)
         (folder / "result.json").write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8")
         (folder / "timings.csv").write_text("\n".join(
@@ -765,15 +801,15 @@ class Server(ThreadingHTTPServer):
             self.pool.shutdown(wait=True, cancel_futures=True)
 
 
-def defaults():
-    request = algorithm_request(None, None)
-    cfg = json.loads(request["config_text"])
-    count = int(cfg["common_3d"]["parameters"]["input"]["piece_count"])
+def defaults(product=None):
+    product = product or load_product(ROOT / "config", DEFAULT_PRODUCT)
     samples = [dict(kind="2d", name=p.name, path=str(p), board_id="demo", piece_id=i)
                for i, p in enumerate(sorted((ROOT / "demodatasets/2D").glob("*.png")), 1)]
     samples += [dict(kind="3d", name=p.name, path=str(p), board_id="demo", piece_id=None)
                 for p in sorted((ROOT / "demodatasets/3D").glob("*.png"))]
-    return dict(piece_count=count, samples=samples, pitch=cfg.get("smartray_pitch_3d", {}).get("parameters", {}),
+    products = [dict(id=key, label=key) for key in product_manifests(ROOT / "config")]
+    return dict(piece_count=product.piece_count, samples=samples, pitch=product.pitch,
+                product=product.metadata, products=products,
                 max_request_interval_ms=MAX_REQUEST_INTERVAL_MS)
 
 
@@ -798,7 +834,12 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         try:
             if path == "/api/defaults":
-                return self.send(200, defaults())
+                with self.server.lock:
+                    if (self.server.runner.product is None and
+                            not any(job["status"] == "running" for job in self.server.jobs.values())):
+                        self.server.runner.select_product(load_product(ROOT / "config", DEFAULT_PRODUCT))
+                    config = defaults(self.server.runner.product)
+                return self.send(200, config)
             if path == "/api/health":
                 return self.send(200, dict(service=SERVICE_NAME))
             if path == "/api/history":
@@ -822,7 +863,7 @@ class Handler(BaseHTTPRequestHandler):
             if asset:
                 return self.send(200, self.server.assets[asset], {".html":"text/html", ".js":"text/javascript", ".css":"text/css"}[Path(asset).suffix]+"; charset=utf-8")
             self.send(404, {"error": "文件不存在"})
-        except (OSError, ValueError) as exc:
+        except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
             self.send(400, {"error": str(exc)})
 
     def do_POST(self):
@@ -847,16 +888,27 @@ class Handler(BaseHTTPRequestHandler):
                 # shutdown() must run outside the serve_forever thread.
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
-            if parsed.path not in {"/api/run", "/api/release-board", "/api/workflows", "/api/pitch/start", "/api/pitch/finish"}:
+            if parsed.path not in {"/api/run", "/api/release-board", "/api/workflows", "/api/pitch/start", "/api/pitch/finish", "/api/product"}:
                 return self.send(404, {"error": "接口不存在"})
             request = json.loads(self.rfile.read(size))
             if not isinstance(request, dict):
                 raise ValueError("验证请求须为JSON对象")
             if parsed.path == "/api/workflows":
                 return self.send(201, self.server.finish_workflow(request))
+            if parsed.path == "/api/product":
+                with self.server.lock:
+                    if any(job["status"] == "running" for job in self.server.jobs.values()):
+                        return self.send(409, {"error": "请等待当前检测请求结束后再切换型号"})
+                    product = load_product(ROOT / "config", request.get("product_id"))
+                    self.server.runner.select_product(product)
+                    config = defaults(product)
+                return self.send(200, config)
             if parsed.path == "/api/pitch/start":
                 board, _, depth = board_inputs(request.get("files"), request.get("board_id"), PITCH_START, 0)
-                return self.send(202, self.server.runner.start_pitch(board, depth))
+                with self.server.lock:
+                    self.server.check_product(request)
+                    started = self.server.runner.start_pitch(board, depth)
+                return self.send(202, started)
             if parsed.path == "/api/pitch/finish":
                 ids, stopped = request.get("run_ids"), request.get("stopped")
                 if not isinstance(ids, list) or type(stopped) is not bool or any(
@@ -868,10 +920,11 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/release-board":
                 board = board_number(request.get("board_id"))
                 with self.server.lock:
+                    self.server.check_product(request)
                     if any(j["status"] == "running" and not j.get("pitch_waiting")
                            for j in self.server.jobs.values()):
                         return self.send(409, {"error": "已有验证运行中，请等待完成"})
-                self.server.runner.release_manual(board)
+                    self.server.runner.release_manual(board)
                 return self.send(200, {"board_id": board})
             mode = request.get("mode")
             manual = isinstance(mode, str) and mode in MANUAL_MODES
@@ -880,10 +933,12 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("无效的 Pitch 启动等待设置")
             piece_id = request.get("piece_id") if manual else None
             options = {} if manual else submission_options(request.get("submission_mode", "concurrent"), request.get("request_interval_ms", 0))
-            count = defaults()["piece_count"]
-            board, images, depth = board_inputs(request.get("files"), request.get("board_id"), mode, count, piece_id=piece_id)
-            rows = images + ([depth] if depth else [])
             with self.server.lock:
+                self.server.check_product(request)
+                product = self.server.runner.product
+                count = product.piece_count if product else defaults()["piece_count"]
+                board, images, depth = board_inputs(request.get("files"), request.get("board_id"), mode, count, piece_id=piece_id)
+                rows = images + ([depth] if depth else [])
                 running = [j for j in self.server.jobs.values() if j["status"] == "running"]
                 if running and (not manual or any(j.get("mode") not in MANUAL_MODES for j in running)):
                     return self.send(409, {"error": "批量验证须单独运行，请等待当前请求完成"})
@@ -894,6 +949,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(409, {"error": f"板 {board} 第 {piece_id} 片已有冲突请求正在处理"})
                 key = uuid.uuid4().hex
                 self.server.jobs[key] = dict(status="running", phase="准备验证", board_id=board, created=time.time())
+                if product:
+                    self.server.jobs[key]["product"] = product.metadata
                 if manual:
                     self.server.jobs[key].update(mode=mode, piece_id=piece_id)
                 if mode == PITCH_3D:
