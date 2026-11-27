@@ -10,6 +10,7 @@ import numpy as np
 from scipy.optimize import minimize, OptimizeResult
 
 from algorithm.runtime.timing import timed_call
+from algorithm.vision3d.alignment._affine_native import make_scorer
 
 
 @dataclass(frozen=True)
@@ -614,8 +615,11 @@ class _AffineScore:
         # overwrite each other's warp or comparison output.
         self._warp_buffer = np.empty(target.shape, dtype=source.dtype) if score_mode == "full" else None
         self._difference_buffers = [np.empty(item.shape, dtype=np.bool_) for item in self.targets]
+        self._native_score = make_scorer(source, target, rois) if score_mode == "full" else None
+        self._native_validated = False
         self.cache = {}
         self.calls = self.hits = self.misses = self.warps = 0
+        self.native_calls = 0
         self.seconds = self.compute_seconds = 0.
 
     def __call__(self, parameters, details=False):
@@ -635,14 +639,7 @@ class _AffineScore:
                 matrix[:,1] /= sy
                 matrix[0,:] *= tx
                 matrix[1,:] *= ty
-            if self.score_mode == "roi":
-                patches = _warp_affine_rois(self.source, matrix, self.rois, self.grids, self.target.shape[1])
-            else:
-                warped = cv2.warpAffine(self.source, matrix, (self.target.shape[1],self.target.shape[0]),
-                    dst=self._warp_buffer, flags=cv2.INTER_NEAREST,borderMode=cv2.BORDER_CONSTANT,borderValue=0)
-                patches = (warped[y0:y1,x0:x1] for x0,y0,x1,y1 in self.rois)
-            zones = tuple(float(np.count_nonzero(np.not_equal(patch, target, out=difference)) / target.size)
-                          for patch,target,difference in zip(patches,self.targets,self._difference_buffers))
+            zones = self._score_zones(matrix)
             penalty = self.penalty_weight * ((parameters[2]/max(self.shear_limit,1e-6))**2
                                             +(parameters[3]/max(self.shear_limit,1e-6))**2)
             value = float(np.mean(zones)+penalty)
@@ -653,10 +650,32 @@ class _AffineScore:
         self.seconds += time.perf_counter()-started
         return (value,list(zones)) if details else value
 
+    def _score_zones(self, matrix):
+        native_zones = self._native_score(matrix) if self._native_score is not None else None
+        if native_zones is not None and self._native_validated:
+            self.native_calls += 1
+            return native_zones
+
+        if self.score_mode == "roi":
+            patches = _warp_affine_rois(self.source, matrix, self.rois, self.grids, self.target.shape[1])
+        else:
+            warped = cv2.warpAffine(self.source, matrix, (self.target.shape[1],self.target.shape[0]),
+                dst=self._warp_buffer, flags=cv2.INTER_NEAREST,borderMode=cv2.BORDER_CONSTANT,borderValue=0)
+            patches = (warped[y0:y1,x0:x1] for x0,y0,x1,y1 in self.rois)
+        zones = tuple(float(np.count_nonzero(np.not_equal(patch, target, out=difference)) / target.size)
+                      for patch,target,difference in zip(patches,self.targets,self._difference_buffers))
+        if native_zones is not None:
+            # Validate the initial transform on the exact OpenCV runtime used by this worker.
+            self._native_validated = native_zones == zones
+            if not self._native_validated:
+                self._native_score = None
+        return zones
+
     def diagnostics(self):
         return dict(affine_cache_enabled=self.cache_enabled,affine_cache_hits=self.hits,
             affine_cache_misses=self.misses,affine_cache_hit_rate=self.hits/max(1,self.calls),
             affine_warp_evaluations=self.warps,affine_score_calls=self.calls,
+            affine_rust_score_calls=self.native_calls,
             affine_score_total_ms=self.seconds*1000,affine_score_mean_ms=self.seconds*1000/max(1,self.calls),
             affine_score_compute_ms=self.compute_seconds*1000,
             affine_score_compute_mean_ms=self.compute_seconds*1000/max(1,self.misses))
@@ -686,6 +705,7 @@ def _score_diagnostics(objectives):
     totals = {key:sum(row[key] for row in rows) for key in (
         "affine_cache_hits","affine_cache_misses","affine_warp_evaluations","affine_score_calls",
         "affine_score_total_ms","affine_score_compute_ms")}
+    totals["affine_rust_score_calls"] = sum(row["affine_rust_score_calls"] for row in rows)
     totals.update(affine_cache_enabled=all(row["affine_cache_enabled"] for row in rows),
         affine_cache_hit_rate=totals["affine_cache_hits"]/max(1,totals["affine_score_calls"]),
         affine_score_mean_ms=totals["affine_score_total_ms"]/max(1,totals["affine_score_calls"]),

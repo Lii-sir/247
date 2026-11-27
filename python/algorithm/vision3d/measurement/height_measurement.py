@@ -180,17 +180,24 @@ def fit_chip_plane(
     exclude_mask: np.ndarray | None = None,
 ) -> Dict[str, Any] | None:
     """Fit the chip top plane from the aligned chip segmentation mask."""
-    valid = _valid_depth(depth, config)
-    mask = (np.asarray(chip_mask) > 0) & valid
+    source = np.broadcast_to(chip_mask, depth.shape)
+    binary = source if source.dtype == np.uint8 else (source > 0).astype(np.uint8)
+    exclusion = None
     if exclude_mask is not None:
         exclusion = np.asarray(exclude_mask)
         if exclusion.shape != depth.shape:
             raise ValueError("exclude_mask must have the same shape as depth")
-        mask &= exclusion == 0
+    x, y, width, height = cv2.boundingRect(binary)
+    if width * height < config.chip_min_valid_points:
+        return None
+    region = np.s_[y:y + height, x:x + width]
+    mask = (binary[region] > 0) & _valid_depth(depth[region], config)
+    if exclusion is not None:
+        mask &= exclusion[region] == 0
     ys, xs = np.nonzero(mask)
     if len(xs) < config.chip_min_valid_points:
         return None
-    return _fit_plane_points(depth, xs, ys, config, "chip", use_low_percentile=False)
+    return _fit_plane_points(depth, xs + x, ys + y, config, "chip", use_low_percentile=False)
 
 
 def fit_local_platform_plane(
@@ -205,7 +212,8 @@ def fit_local_platform_plane(
     wire or chip on the same platform cannot become the reference surface.
     """
     depth = np.asarray(depth)
-    target = (np.asarray(target_mask) > 0).astype(np.uint8)
+    source = np.asarray(target_mask)
+    target = source if source.dtype == np.uint8 else (source > 0).astype(np.uint8)
     if target.shape != depth.shape:
         raise ValueError("target_mask must have the same shape as depth")
     exclusion = np.asarray(exclude_mask)

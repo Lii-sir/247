@@ -109,6 +109,19 @@ class AffineBufferTests(unittest.TestCase):
                     'affine_zone_losses', 'affine_matrix_2d_to_3d', 'affine_valid', 'affine_stop_reason'):
             self.assertEqual(expected[key], actual[key], key)
 
+    def test_built_rust_kernel_matches_opencv_scores_at_borders_and_ties(self):
+        cv_rng = np.random.default_rng(342)
+        source = cv_rng.integers(0, 2, (251, 270), dtype=np.uint8)
+        target = cv_rng.integers(0, 2, (261, 257), dtype=np.uint8)
+        rois = [(0, 0, 134, 261), (103, 7, 257, 255), (254, 23, 257, 200)]
+        scorer = reg._AffineScore(source, target, rois, .005, .02)
+        if scorer._native_score is None:
+            self.skipTest("Rust DLL or supported OpenCV/CPU unavailable")
+        for parameters in self.parameters():
+            with self.subTest(parameters=parameters):
+                self.assertEqual(legacy_score(scorer, parameters, True), scorer(parameters, True))
+        self.assertGreater(scorer.native_calls, 0)
+
 
 if __name__ == '__main__':
     unittest.main()

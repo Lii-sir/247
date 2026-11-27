@@ -296,7 +296,14 @@ class JointGeometry:
                 continue
             mask = np.asarray(item.get("_mask_3d_array"), dtype=np.uint8)
             if mask.shape == shape:
-                union = np.maximum(union, mask)
+                # Reuse bounds computed from this aligned mask for the response.
+                bounds = (item.get("mask_3d_local") or {}).get("bounding_box")
+                if bounds is None:
+                    np.maximum(union, mask, out=union)
+                elif bounds:
+                    left, top, right, bottom = bounds
+                    region = np.s_[top:bottom, left:right]
+                    np.maximum(union[region], mask[region], out=union[region])
         return self._joint_ops.dilate_mask(union, self.height_config.semantic_exclusion_dilation_px)
 
     @staticmethod
@@ -470,12 +477,17 @@ class JointGeometry:
         chips: list[Dict[str, Any]],
         *, fill=None,
     ) -> tuple[Dict[str, Any] | None, bool]:
-        bond_mask = bond["_mask_2d_array"] > 0
-        ys, xs = np.nonzero(bond_mask)
-        if len(xs) == 0 or not chips:
+        if not chips:
             return None, False
-        center_x = int(round(float(xs.mean())))
-        center_y = int(round(float(ys.mean())))
+        source = np.asarray(bond["_mask_2d_array"])
+        bond_mask = source if source.dtype == np.uint8 else (source > 0).astype(np.uint8)
+        x, y, width, height = cv2.boundingRect(bond_mask)
+        if width == 0:
+            return None, False
+        moments = cv2.moments(bond_mask[y:y + height, x:x + width], binaryImage=True)
+        area = moments["m00"]
+        center_x = round((moments["m10"] + x * area) / area)
+        center_y = round((moments["m01"] + y * area) / area)
         best_chip = None
         best_area = None
         for chip in chips:
@@ -502,7 +514,8 @@ class JointGeometry:
 
 
 def _filled_external_region(mask: np.ndarray) -> np.ndarray:
-    binary = (np.asarray(mask) > 0).astype(np.uint8) * 255
+    source = np.asarray(mask)
+    binary = source if source.dtype == np.uint8 else (source > 0).astype(np.uint8)
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     filled = np.zeros_like(binary)
     if contours:
