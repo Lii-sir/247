@@ -128,26 +128,6 @@ class ProcessRegistrationTests(unittest.TestCase):
         self.assertFalse(first["registration_worker"]["torch_loaded"])
         self.assertEqual(1, first["registration_worker"]["opencv_threads"])
 
-    def test_direct_mode_uses_piece_profile_without_publishing_a_coarse_mask(self):
-        from algorithm.vision3d.alignment.registration import affine_coordinate_context
-
-        entry = dict(gray_image=self.entry["gray_image"], circle=(50, 40, 10))
-        context = affine_coordinate_context(entry["gray_image"].shape, self.depth.shape)
-        profile = dict(format="registration_direct_seeds", version=1, context=context,
-                       pieces={"1": dict(linear=[[1., 0.], [0., 1.]], depth_anchor_xy=[50., 40.], depth_height=96)})
-        options = dict(self.values, initialization_mode="direct", calibration={"profile": profile})
-        timings = {}
-        result = self.submit(entry=entry, affine_config=options, timings=timings).result(20)
-        self.assertEqual("direct_circle", result["affine_initialization"]["source"])
-        self.assertTrue(result["affine_valid"])
-        self.assertIsNone(result["affine_coarse_parameters"])
-        self.assertIn("affine_direct_seed_ms", timings)
-        self.assertNotIn("coarse_registration_ms", timings)
-        self.assertNotIn("platform_mask_3d_ms", timings)
-        self.assertEqual({"depth", (1, "gray")}, set(self.inputs._blocks))
-        with self.assertRaisesRegex(RuntimeError, "no seed for piece 2"):
-            self.submit(piece_id=2, entry=entry, affine_config=options).result(20)
-
     def test_process_queue_and_board_relative_timeline_are_separate_from_preparation(self):
         from algorithm.runtime.timing import PipelineTimings
         timeline={}

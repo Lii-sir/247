@@ -274,14 +274,9 @@ def refine_affine_registration(
         raise ValueError("dynamic_affine.calibration must contain a boolean enabled")
     start = p0.copy()
     initial_score = before
-    direct = values.get("initialization_mode") == "direct"
-    if direct:
-        initialization = dict(enabled=True, source="direct_circle", reason="piece_profile",
-                              coarse_score=None, candidate_score=before, profile_valid=True)
-    else:
-        initialization = dict(enabled=calibration.get("enabled", False), source="coarse", reason="disabled",
-                              coarse_score=before, candidate_score=None, profile_valid=False)
-    if not direct and initialization["enabled"]:
+    initialization = dict(enabled=calibration.get("enabled", False), source="coarse", reason="disabled",
+                          coarse_score=before, candidate_score=None, profile_valid=False)
+    if initialization["enabled"]:
         try:
             candidate = _calibration_seed(calibration.get("profile"), context, p0, preview_scale, lower, upper)
         except ValueError as exc:
@@ -297,7 +292,7 @@ def refine_affine_registration(
             else:
                 initialization["reason"] = "candidate_did_not_improve_full_score"
     result.update(affine_initialization=initialization, affine_initial_parameters=start.tolist(),
-                  affine_initial_score=float(initial_score), affine_coarse_parameters=None if direct else p0.tolist())
+                  affine_initial_score=float(initial_score), affine_coarse_parameters=p0.tolist())
     optimizer_calls_before = score.calls
     optimizer_started = time.perf_counter()
     stages, objectives = [], [score]
@@ -416,51 +411,18 @@ def affine_coordinate_context(image_shape, depth_shape, correction=None, image_r
                 depth_size=[int(depth_shape[1]), int(depth_shape[0])], preprocessing=prep)
 
 
-def register_arrays(gray, mask_2d, depth_piece, registration_config, affine_config, correction,
-                    *, operations=None, piece_id=None, circle=None):
-    """Fit a piece from template matching or from an absolute per-piece seed."""
+def register_arrays(gray, mask_2d, depth_piece, registration_config, affine_config, correction, *, operations=None):
+    """Run coarse registration and affine refinement on one depth piece."""
     make_mask, coarse_registration, refine = (
         (platform_mask_3d, register_platform_masks, refine_affine_registration)
         if operations is None else operations
     )
+    if isinstance(registration_config, dict):
+        registration_config = RegistrationConfig.from_dict(registration_config)
+    mask = timed_call("platform_mask_3d_ms", make_mask, depth_piece, registration_config)
+    coarse = timed_call("coarse_registration_ms", coarse_registration, mask_2d, mask, registration_config)
     context = affine_coordinate_context(gray.shape, depth_piece.shape, correction)
-    if (affine_config or {}).get("initialization_mode") == "direct":
-        calibration = affine_config.get("calibration") or {}
-        seed = timed_call("affine_direct_seed_ms", _direct_affine_seed,
-                          calibration.get("profile"), context, piece_id, circle)
-    else:
-        if isinstance(registration_config, dict):
-            registration_config = RegistrationConfig.from_dict(registration_config)
-        mask = timed_call("platform_mask_3d_ms", make_mask, depth_piece, registration_config)
-        seed = timed_call("coarse_registration_ms", coarse_registration, mask_2d, mask, registration_config)
-    return timed_call("affine_registration_ms", refine, gray, depth_piece, seed, affine_config, context=context)
-
-
-def _direct_affine_seed(profile, context, piece_id, circle):
-    if (not isinstance(profile, dict) or profile.get("format") != "registration_direct_seeds"
-            or type(profile.get("version")) is not int or profile["version"] != 1):
-        raise ValueError("direct affine requires an absolute per-piece calibration profile")
-    saved = profile.get("context")
-    depth_size = saved.get("depth_size") if isinstance(saved, dict) else None
-    if (not isinstance(saved, dict)
-            or any(saved.get(key) != context[key] for key in ("source_space", "target_space", "image_size", "preprocessing"))
-            or not isinstance(depth_size, list) or len(depth_size) != 2 or depth_size[0] != context["depth_size"][0]):
-        raise ValueError("direct affine calibration geometry or Pitch settings do not match the input")
-    pieces = profile.get("pieces")
-    item = pieces.get(str(piece_id)) if isinstance(pieces, dict) else None
-    if not isinstance(item, dict):
-        raise ValueError(f"direct affine calibration has no seed for piece {piece_id}")
-    if item.get("depth_height") != context["depth_size"][1]:
-        raise ValueError(f"direct affine calibration depth height does not match piece {piece_id}")
-    if circle is None or len(circle) != 3 or not np.isfinite(circle).all() or circle[2] <= 0:
-        raise ValueError("direct affine requires the detected 2D circle")
-    linear = np.asarray(item.get("linear"), dtype=np.float64)
-    anchor = np.asarray(item.get("depth_anchor_xy"), dtype=np.float64)
-    if (linear.shape != (2, 2) or anchor.shape != (2,) or not np.isfinite(linear).all()
-            or not np.isfinite(anchor).all() or np.linalg.det(linear) <= 0 or np.any(linear.diagonal() <= 0)):
-        raise ValueError(f"invalid direct affine seed for piece {piece_id}")
-    translation = anchor - linear @ np.asarray(circle[:2], dtype=np.float64)
-    return {"homography_2d_to_3d": np.vstack((np.column_stack((linear, translation)), [0., 0., 1.])).tolist()}
+    return timed_call("affine_registration_ms", refine, gray, depth_piece, coarse, affine_config, context=context)
 
 
 def _calibration_seed(profile, context, coarse, preview_scale, lower, upper):

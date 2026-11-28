@@ -66,10 +66,8 @@ class SharedBoardInputs:
             raise RuntimeError("registration shared-memory cleanup failed: "+str(errors[0]))
 
     def prepare(self, piece_id, gray, mask, depth):
-        arrays = dict(depth=depth, gray=gray)
-        if mask is not None:
-            arrays["mask"] = mask
-        return self.prepare_named(arrays, dict(gray=(piece_id, "gray"), mask=(piece_id, "mask")), kinds="ui")
+        return self.prepare_named(dict(depth=depth, gray=gray, mask=mask),
+                                  dict(depth="depth", gray=(piece_id, "gray"), mask=(piece_id, "mask")), kinds="ui")
 
     def prepare_named(self, arrays, cache_keys=None, *, kinds="buif"):
         """Publish CPU arrays without pickling their pixel buffers."""
@@ -238,10 +236,10 @@ class RegistrationProcesses:
     def submit(self, preparation_pool, inputs, piece_id, entry, depth, piece, correction,
                registration_config, affine_config, timings, metadata, is_current, log=None):
         def make_payload():
-            arrays = inputs.prepare(piece_id, entry["gray_image"], entry.get("registration_mask"), depth)
+            arrays = inputs.prepare(piece_id, entry["gray_image"], entry["registration_mask"], depth)
             return dict(arrays=arrays, rows=[int(piece["y1"]), int(piece["y2"])],
                         registration_config=asdict(registration_config), affine_config=affine_config,
-                        correction=correction, metadata=metadata, piece_id=piece_id, circle=entry.get("circle"))
+                        correction=correction, metadata=metadata)
         return self.submit_task(preparation_pool, inputs, make_payload, timings, metadata, is_current, log)
 
     def submit_task(self, preparation_pool, inputs, make_payload, timings, metadata, is_current,
