@@ -81,8 +81,9 @@ def run(payload):
                 if not 0 <= y1 < y2 <= arrays["depth"].shape[0]:
                     raise ValueError("registration piece row bounds exceed shared depth")
                 local = arrays["depth"][y1:y2, :]
-                registration = register_arrays(arrays["gray"], arrays["mask"], local,
-                    payload["registration_config"], payload["affine_config"], payload["correction"])
+                registration = register_arrays(arrays["gray"], arrays.get("mask"), local,
+                    payload["registration_config"], payload["affine_config"], payload["correction"],
+                    piece_id=payload.get("piece_id"), circle=payload.get("circle"))
         return dict(ok=True, result=registration, timings=timings, logs=logs,
                     worker=_startup, started=started, finished=time.perf_counter())
     except Exception as error:

@@ -362,6 +362,14 @@ class DetectBoard(JointGeometry):
         self.dynamic_affine_config = dict(
             feature_parameters(config, "dynamic_affine_3d") or {}
         )
+        initialization_mode = self.dynamic_affine_config.get("initialization_mode", "coarse")
+        if initialization_mode not in ("coarse", "direct"):
+            raise ValueError("dynamic_affine_3d.initialization_mode must be coarse or direct")
+        if initialization_mode == "direct":
+            calibration = self.dynamic_affine_config.get("calibration")
+            profile = calibration.get("profile") if isinstance(calibration, dict) else None
+            if not isinstance(profile, dict) or profile.get("format") != "registration_direct_seeds":
+                raise ValueError("direct affine requires an absolute per-piece calibration profile")
         threading_values = _dict(common_3d.get("threading", {}), "common_3d.parameters.threading")
         self._instance_tasks.configure(threading_values.get("instance_workers", 16))
 
@@ -411,7 +419,7 @@ class DetectBoard(JointGeometry):
             crop = timed_call("roi_copy_ms", crop.copy)
             circle_crop_ms = self.elapsed_ms(circle_start)
             registration_mask = None
-            if self.height_order != ():
+            if self.height_order != () and self.dynamic_affine_config.get("initialization_mode") != "direct":
                 registration_mask = timed_call("platform_mask_2d_ms", platform_mask_2d, image, self.registration_config)
         except Exception:
             image = None
@@ -793,10 +801,11 @@ class DetectBoard(JointGeometry):
                                depth: np.ndarray, piece: Dict[str, Any],
                                pitch_correction: Dict[str, Any] | None = None) -> Dict[str, Any]:
         """Fit one piece's matrix without waiting for mapping or height work."""
-        return register_arrays(entry["gray_image"], entry["registration_mask"],
+        return register_arrays(entry["gray_image"], entry.get("registration_mask"),
             depth[int(piece["y1"]):int(piece["y2"])], self.registration_config,
             self.dynamic_affine_config, pitch_correction,
-            operations=(platform_mask_3d, register_platform_masks, refine_affine_registration))
+            operations=(platform_mask_3d, register_platform_masks, refine_affine_registration),
+            piece_id=piece_id, circle=entry.get("circle"))
 
     def submit_registration(self, preparation_pool, inputs, piece_id, entry, depth, piece,
                             correction, timings, metadata, is_current):

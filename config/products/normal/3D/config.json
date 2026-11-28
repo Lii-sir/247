@@ -123,6 +123,7 @@
       "threshold_2d": 50
     },
     "parameters": {
+      "initialization_mode": "coarse",
       "score_mode": "full",
       "cache_enabled": true,
       "calibration": {
