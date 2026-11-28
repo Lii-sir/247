@@ -7,8 +7,9 @@ import cv2
 import numpy as np
 from algorithm.vision3d.measurement.height_measurement import (HeightConfig, dilate_mask, erode_wire_mask_in_place,
     erode_measurement_mask_crop, fit_chip_plane, fit_local_platform_plane, fit_platform_plane,
-    height_points_to_board, map_platform_rois, measure_mask_height, split_thin_mask)
-from algorithm.vision3d.measurement.height_references import chip_region, platform_region, reference_chips
+    height_points_to_board, map_platform_rois, measure_mask_height, measure_mask_heights, split_thin_mask)
+from algorithm.vision3d.measurement.height_references import (chip_region, platform_region, reference_chips,
+                                                            resolve_references)
 from algorithm.vision3d.alignment.registration import align_crop_mask_to_depth
 from transport.depth_input import depth_coordinate_space
 from algorithm.execution.instance_tasks import InstanceTasks
@@ -198,18 +199,21 @@ class JointGeometry:
                 except ValueError as exc:
                     platform_diagnostics.update(status="invalid", error=str(exc))
 
+        references = None if routes is None else resolve_references(routes, platform_plane, chip_planes)
+
         def measure_wires():
             prepare_thin()
-            options = {} if routes is None else {"references": (routes, chip_planes)}
+            options = {} if references is None else {"references": references}
             return timed_call("height_wire_regions_ms", self._measure_wire_regions,
                 depth, instances, registration, platform_plane, crop_box=crop_box, prepare_thin=False, **options)
 
         def measure_solders(jobs):
-            options = {} if routes is None else {"references": (routes, chip_planes)}
-            return timed_call("height_solder_wall_ms", self._instance_tasks.map,
+            options = {} if references is None else {"references": references}
+            return timed_call("height_solder_wall_ms", self._map_height_jobs,
                 lambda job: self._measure_solder_task(job, depth, registration, chips, chip_planes,
                     platform_plane, semantic_exclusion, crop_box, **options),
-                jobs, timing_stage="height_solder_work_ms")
+                jobs, depth=depth, instance_and_part=lambda job: job[:2], references=references,
+                timing_stage="height_solder_work_ms")
 
         @cache
         def solder_groups():
@@ -410,11 +414,11 @@ class JointGeometry:
             height = self._joint_ops.measure_mask_height(depth, measurement_mask, plane, self.height_config,
                 reference=reference, max_height_mm=max_height, mask_offset=measurement_offset)
         else:
-            height, reference_instance_id, plane = self._measure_references(
-                depth, measurement_mask, measurement_offset, platform_plane, instance["instance_id"], endpoint, references)
-            location = height["reference"]
-            inside = len(references[0][instance["instance_id"], endpoint] or ()) == 1
-        return {
+            selected = references[instance["instance_id"], endpoint]
+            location, reference_instance_id, plane = selected.name, selected.chip_id, selected.plane
+            inside = selected.chip_id is not None and selected.fixed_height_mm is None
+            height = None
+        result = {
             "measurement_id": int(instance.get("instance_id", 0)) * 3 + {
                 "bond": 0,
                 "start": 1,
@@ -431,6 +435,7 @@ class JointGeometry:
             "mask_3d_local": self._joint_ops._mask_geometry(measurement_mask, offset=measurement_offset, epsilon=1.0),
             "height_3d": height,
         }
+        return result if references is None else (result, measurement_mask, measurement_offset)
 
     def _prepare_thin_parts(self, wires):
         # Owned by this piece; children only read these arrays. Rebuild once
@@ -458,13 +463,51 @@ class JointGeometry:
         if prepare_thin:
             timed_call("height_prepare_thin_ms", self._prepare_thin_parts, wires)
         options = {} if references is None else {"references": references}
-        results = self._instance_tasks.map(
+        results = self._map_height_jobs(
             lambda wire: self._measure_wire_region(depth, wire, registration,
                                                    platform_plane, crop_box, **options),
-            wires, timing_stage="height_wire_work_ms",
+            wires, depth=depth, instance_and_part=lambda wire: (wire, "wire"), references=references,
+            timing_stage="height_wire_work_ms",
         )
         for region_id, item in enumerate(results, 1):
             item["region_id"] = region_id
+        return results
+
+    def _map_height_jobs(self, function, jobs, *, depth, instance_and_part, references, timing_stage):
+        if references is None:
+            return self._instance_tasks.map(function, jobs, timing_stage=timing_stage)
+        groups = {}
+        for index, job in enumerate(jobs):
+            instance, part = instance_and_part(job)
+            reference = references[instance["instance_id"], part]
+            key = (reference.name, reference.chip_id, reference.fixed_height_mm, instance["class_name"].lower())
+            groups.setdefault(key, []).append((index, job))
+
+        def measure_group(group):
+            indices, batch = zip(*group)
+            instance, part = instance_and_part(batch[0])
+            reference = references[instance["instance_id"], part]
+            prepared = [function(job) for job in batch]
+            regions = [(mask, offset) for _, mask, offset in prepared]
+            settings = self.height_config
+            if part == "wire":
+                limit = settings.max_wire_platform_height_mm
+            else:
+                limit = settings.max_solder_chip_height_mm if reference.name == "chip" else settings.max_solder_platform_height_mm
+            heights = timed_call("height_batch_ms", measure_mask_heights,
+                depth, regions, reference.plane, settings, reference.name, limit,
+                reference_height_mm=reference.fixed_height_mm)
+            for (result, _, _), height in zip(prepared, heights):
+                if reference.chip_id is not None:
+                    height["reference_instance_id"] = reference.chip_id
+                result["height_3d"] = height
+            return indices, [result for result, _, _ in prepared]
+
+        results = [None] * sum(map(len, groups.values()))
+        measured = self._instance_tasks.map(measure_group, groups.values(), timing_stage=timing_stage)
+        for indices, batch in measured:
+            for index, result in zip(indices, batch):
+                results[index] = result
         return results
 
     def _measure_wire_region(self, depth, wire, registration, platform_plane, crop_box, *, references=None):
@@ -481,16 +524,17 @@ class JointGeometry:
             bending = {"is_valid": False, "is_ok": False, "status": "not_evaluated"}
         if not np.any(cleaned):
             empty = np.zeros((1, 1), dtype=np.uint8)
-            height_result = self._joint_ops.measure_mask_height(
-                depth, empty, platform_plane, self.height_config, reference="wire_platform",
-                max_height_mm=self.height_config.max_wire_platform_height_mm)
-            height_result["is_ok"] = False
-            return dict(instance_id=int(wire.get("instance_id", 0)),
+            result = dict(instance_id=int(wire.get("instance_id", 0)),
                 class_name=str(wire.get("class_name", "")),
                 mask_2d=self._joint_ops._mask_geometry(cleaned, offset=full_offset, epsilon=1.0),
                 mask_3d_local=self._joint_ops._mask_geometry(empty, offset=(0, 0), epsilon=1.0),
                 bending_2d=bending,
-                height_3d=height_result)
+                height_3d=None)
+            if references is not None:
+                return result, empty, (0, 0)
+            result["height_3d"] = self._joint_ops.measure_mask_height(depth, empty, platform_plane, self.height_config,
+                reference="wire_platform", max_height_mm=self.height_config.max_wire_platform_height_mm)
+            return result
         local_crop = (int(full_offset[0]), int(full_offset[1]),
                       int(full_offset[0] + cleaned.shape[1]), int(full_offset[1] + cleaned.shape[0]))
         aligned = self._joint_ops.align_crop_mask_to_depth(cleaned.astype(np.uint8) * 255,
@@ -499,46 +543,20 @@ class JointGeometry:
                     else self.height_config.wire_measurement_erode_px)
         if erode_px:
             self._joint_ops.erode_wire_mask_in_place(aligned, erode_px)
-        if references is None:
-            height_result = self._joint_ops.measure_mask_height(depth, aligned, platform_plane, self.height_config,
-                reference="wire_platform", max_height_mm=self.height_config.max_wire_platform_height_mm)
-        else:
-            height_result, _, _ = self._measure_references(depth, aligned, (0, 0), platform_plane,
-                                                           wire["instance_id"], "wire", references)
-        return dict(instance_id=int(wire.get("instance_id", 0)),
+        result = dict(instance_id=int(wire.get("instance_id", 0)),
             class_name=str(wire.get("class_name", "")),
             mask_2d=self._joint_ops._mask_geometry(cleaned, offset=full_offset, epsilon=2.0),
             mask_3d_local=self._joint_ops._mask_geometry(aligned, offset=(0, 0), epsilon=1.0),
-            bending_2d=bending, height_3d=height_result)
-
-    def _measure_references(self, depth, mask, offset, platform_plane, instance_id, part, references):
-        routes, planes = references
-        ids = routes[instance_id, part]
-        settings = self.height_config
-
-        def measure(plane, reference, chip_id=None, *, reference_height_mm=None):
-            if part == "wire":
-                limit = settings.max_wire_platform_height_mm
-            else:
-                limit = settings.max_solder_chip_height_mm if reference == "chip" else settings.max_solder_platform_height_mm
-            height = self._joint_ops.measure_mask_height(depth, mask, plane, settings,
-                reference=reference, max_height_mm=limit, mask_offset=offset, reference_height_mm=reference_height_mm)
-            if chip_id is not None:
-                height["reference_instance_id"] = chip_id
-            return height, chip_id, plane
-
-        if ids is None:
-            return measure(None, "unclassified")
-        if not ids:
-            return measure(platform_plane, "wire_platform")
-        if len(ids) == 1:
-            chip_id = ids[0]
-            return measure(planes[chip_id], "chip", chip_id)
-        candidates = [(chip_id, planes[chip_id]) for chip_id in ids]
-        if any(plane is None for _, plane in candidates):
-            return measure(None, "chip")
-        chip_id, plane = max(candidates, key=lambda item: item[1]["representative_height_mm"])
-        return measure(plane, "chip", chip_id, reference_height_mm=plane["representative_height_mm"])
+            bending_2d=bending, height_3d=None)
+        if references is not None:
+            box = result["mask_3d_local"]["bounding_box"]
+            if box:
+                left, top, right, bottom = box
+                return result, aligned[top:bottom, left:right].copy(), (left, top)
+            return result, np.zeros((1, 1), dtype=np.uint8), (0, 0)
+        result["height_3d"] = self._joint_ops.measure_mask_height(depth, aligned, platform_plane, self.height_config,
+            reference="wire_platform", max_height_mm=self.height_config.max_wire_platform_height_mm)
+        return result
 
     @staticmethod
     def _matching_chip(

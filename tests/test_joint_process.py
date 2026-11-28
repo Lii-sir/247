@@ -18,6 +18,8 @@ sys.path.insert(0, str(ROOT/'tests'))
 import cv2
 import numpy as np
 from algorithm.vision3d.measurement.height_measurement import HeightConfig
+from algorithm.vision3d.measurement.height_references import resolve_references
+from algorithm.vision3d.measurement.joint_geometry import JointGeometry
 from algorithm.execution.processes.joint_process import JointMeasurementProcesses
 from algorithm.execution.processes.registration_process import SharedBoardInputs
 from algorithm.runtime.defect_plan import CHIP_SOLDER_HEIGHT, PLATFORM_SOLDER_HEIGHT, WIRE_HEIGHT
@@ -80,6 +82,33 @@ class JointProcessTests(unittest.TestCase):
                       metadata=dict(board_id='A',piece_id=1,request_id='joint'), is_current=lambda: True)
         params.update(overrides)
         return self.service.submit_piece(**params)
+
+    def test_height_groups_submit_one_batch_per_class_and_reference(self):
+        geometry = JointGeometry(instance_workers=2)
+        self.addCleanup(geometry._instance_tasks.close)
+        classes = ['bond', 'bond', 'thin', 'bond', 'bond', 'bond']
+        jobs = [(dict(instance_id=i, class_name=kind), 'bond') for i, kind in enumerate(classes, 1)]
+        routes = {(i, 'bond'): ids for i, ids in enumerate([(), (10,), (), (), (20,), (10, 20)], 1)}
+        platform = {'coefficients': [0, 0, 33000]}
+        refs = resolve_references(routes, platform, {10: {**platform, 'representative_height_mm': 1.5},
+                                                      20: {**platform, 'representative_height_mm': 1.4}})
+        original_map = geometry._instance_tasks.map
+        batches = []
+        def record(fn, groups, **options):
+            groups = list(groups)
+            batches.append([[job[0]['instance_id'] for _, job in group] for group in groups])
+            return original_map(fn, groups, **options)
+
+        def measure(job):
+            instance_id = job[0]['instance_id']
+            return dict(instance_id=instance_id), np.ones((1, 1), np.uint8), (instance_id - 1, 0)
+
+        depth = np.arange(33000, 33006, dtype=np.uint16)[None, :]
+        with patch.object(geometry._instance_tasks, 'map', side_effect=record):
+            result = geometry._map_height_jobs(measure, jobs, instance_and_part=lambda job: job,
+                                               references=refs, depth=depth, timing_stage='height_solder_work_ms')
+        self.assertEqual([[[1, 4], [2], [3], [5], [6]]], batches)
+        self.assertEqual(list(range(1, 7)), [row['instance_id'] for row in result])
 
     def test_overlap_references_use_platform_first_and_highest_chip_center(self):
         shape = (96, 160)

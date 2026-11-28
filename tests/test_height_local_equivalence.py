@@ -74,6 +74,21 @@ class LocalHeightTests(unittest.TestCase):
         self.assertAlmostEqual((33000 + 3 * cx + 2 * cy - config.gray_offset) * config.vertical_resolution_mm,
                                plane["representative_height_mm"])
 
+    def test_batch_heights_match_scalar_with_offsets_invalid_depth_and_ties(self):
+        depth = np.array([[33000, 33002, 65535, 33004], [33002, 33000, 0, 33004],
+                          [33010, 33000, 33001, 33001]], dtype=np.uint16)
+        regions = [(np.ones((2, 4), np.uint8), (0, 0)), (np.zeros((2, 1), bool), (2, 0)),
+                   (np.ones((2, 2), bool), (2, 0)), (np.ones((1, 3), np.uint8), (1, 2))]
+        plane = {"coefficients": [1.25, -.4, 32900.5]}
+        for percentile in (5., 50., 75., 95., 100.):
+            config = replace(self.config, height_percentile=percentile)
+            for fixed in (None, 0.0, 0.14):
+                with self.subTest(percentile=percentile, fixed=fixed):
+                    expected = [height.measure_mask_height(depth, mask, plane, config, "chip", .8,
+                        mask_offset=offset, reference_height_mm=fixed) for mask, offset in regions]
+                    self.assertEqual(expected, height.measure_mask_heights(
+                        depth, regions, plane, config, "chip", .8, reference_height_mm=fixed))
+
     def test_local_planes_match_full_frame_at_edges_and_for_disjoint_targets(self):
         for radius, inner in [(12, 3), (2, 8), (0, 3)]:
             config = replace(self.config, platform_local_ring_px=radius,

@@ -320,18 +320,7 @@ def erode_measurement_mask_crop(mask: np.ndarray, radius_px: int) -> tuple[np.nd
     return eroded, (x, y)
 
 
-def measure_mask_height(
-    depth: np.ndarray,
-    mask: np.ndarray,
-    plane: Dict[str, Any] | None,
-    config: HeightConfig,
-    reference: str,
-    max_height_mm: float | None = None,
-    *,
-    mask_offset: tuple[int, int] = (0, 0),
-    reference_height_mm: float | None = None,
-) -> Dict[str, Any]:
-    """Measure a percentile relative to a plane or a fixed reference height."""
+def _mask_points(mask, mask_offset):
     source = np.asarray(mask)
     if source.dtype == np.uint8:
         # Warp output is uint8. Find its bounds in OpenCV, then enumerate only
@@ -345,17 +334,31 @@ def measure_mask_height(
     ox, oy = mask_offset
     if ox or oy:
         xs, ys = xs + ox, ys + oy
+    return ys, xs
+
+
+def _invalid_height(reference):
+    return dict(reference=reference, is_valid=False, is_ok=False,
+                height_mm=None, height_diff_mm=None, point=None)
+
+
+def measure_mask_height(
+    depth: np.ndarray,
+    mask: np.ndarray,
+    plane: Dict[str, Any] | None,
+    config: HeightConfig,
+    reference: str,
+    max_height_mm: float | None = None,
+    *,
+    mask_offset: tuple[int, int] = (0, 0),
+    reference_height_mm: float | None = None,
+) -> Dict[str, Any]:
+    """Measure a percentile relative to a plane or a fixed reference height."""
+    ys, xs = _mask_points(mask, mask_offset)
     valid = _valid_depth(depth[ys, xs], config)
     ys, xs = ys[valid], xs[valid]
     if len(xs) == 0 or (plane is None and reference_height_mm is None):
-        return {
-            "reference": reference,
-            "is_valid": False,
-            "is_ok": False,
-            "height_mm": None,
-            "height_diff_mm": None,
-            "point": None,
-        }
+        return _invalid_height(reference)
     values = depth[ys, xs].astype(np.float64)
     index = int(np.argmin(np.abs(values - np.percentile(values, config.height_percentile))))
     x, y, value = int(xs[index]), int(ys[index]), float(values[index])
@@ -372,6 +375,56 @@ def measure_mask_height(
         "height_diff_mm": float(difference_mm),
         "point": {"x": x, "y": y},
     }
+
+
+def measure_mask_heights(depth, regions, plane, config, reference, max_height_mm, *, reference_height_mm=None):
+    """Gather and reduce one sparse set of samples with a separate P95 for each mask."""
+    results = [_invalid_height(reference) for _ in regions]
+    if not regions or (plane is None and reference_height_mm is None):
+        return results
+
+    points = [_mask_points(mask, offset) for mask, offset in regions]
+    rows = np.repeat(np.arange(len(regions)), [len(xs) for _, xs in points])
+    ys = np.concatenate([ys for ys, _ in points])
+    xs = np.concatenate([xs for _, xs in points])
+    raw = depth[ys, xs]
+    valid = _valid_depth(raw, config)
+    rows, ys, xs, raw = rows[valid], ys[valid], xs[valid], raw[valid]
+    counts = np.bincount(rows, minlength=len(regions))
+    active = np.flatnonzero(counts)
+    if not active.size:
+        return results
+
+    # A single sort by instance and depth gives contiguous per-instance segments.
+    # Keep the original row-major order separately for stable nearest-point selection.
+    starts = np.cumsum(counts)[active] - counts[active]
+    ordered = raw[np.lexsort((raw, rows))]
+    rank = (counts[active] - 1) * (config.height_percentile / 100.0)
+    low = rank.astype(np.intp)
+    fraction = rank - low
+    a = ordered[starts + low].astype(np.float64)
+    b = ordered[starts + np.minimum(low + 1, counts[active] - 1)].astype(np.float64)
+    delta = b - a
+    percentiles = np.zeros(len(regions), dtype=np.float64)
+    # Match NumPy's linear percentile interpolation on both sides of the midpoint.
+    percentiles[active] = np.where(fraction < .5, a + delta * fraction, b - delta * (1.0 - fraction))
+    distance = np.abs(raw - percentiles[rows])
+    nearest = np.empty(len(regions))
+    nearest[active] = np.minimum.reduceat(distance, starts)
+    matches = np.flatnonzero(distance == nearest[rows])
+    matched_rows = rows[matches]
+    points = matches[np.r_[True, matched_rows[1:] != matched_rows[:-1]]]
+    x, y = xs[points], ys[points]
+    heights = (raw[points].astype(np.float64) - config.gray_offset) * config.vertical_resolution_mm
+    if reference_height_mm is None:
+        a, b, c = plane["coefficients"]
+        reference_height_mm = (a * x + b * y + c - config.gray_offset) * config.vertical_resolution_mm
+    differences = heights - reference_height_mm
+    for row, cx, cy, value, diff in zip(active, x, y, heights, differences):
+        results[row] = dict(reference=reference, is_valid=True,
+            is_ok=None if max_height_mm is None else bool(diff < max_height_mm),
+            height_mm=float(value), height_diff_mm=float(diff), point={"x": int(cx), "y": int(cy)})
+    return results
 
 
 def height_points_to_board(piece: Dict[str, Any]) -> Dict[str, Any]:
