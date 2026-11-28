@@ -36,6 +36,10 @@
 会更新 `common_2d.parameters` 和对应功能块的 `parameters`。
 ## 银浆允许边界：复用检测 ROI，四边按像素内缩
 
+Windows x64 可通过 `silver_scan.dll` 加速 `roi_inset` 矩形的银浆像素扫描。
+距离、容差和连通域处理仍使用现有算法。DLL 缺失时使用 NumPy 路径。
+如需对照，设置 `YINXKJ_DISABLE_RUST_SILVER=1` 后重启检测进程。重建使用 `python/algorithm/vision2d/native/build.ps1`。
+
 当前 `silver_overflow_2d` 的参数分组如下。
 
 ```json

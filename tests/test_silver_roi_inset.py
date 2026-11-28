@@ -1,6 +1,7 @@
 """ROI-derived silver boundary, fast distances, and template-free integration."""
 import copy
 import importlib
+import os
 from pathlib import Path
 import sys
 import unittest
@@ -23,6 +24,27 @@ def config(**overrides):
 class SilverRoiInsetTests(unittest.TestCase):
     def build(self, values=None, crop=(100, 200, 200, 280), shape=(80, 100), circle=None):
         return silver.build_boundary(values or config(), crop_box=crop, circle=circle, image_shape=shape)
+
+    def test_rust_scan_preserves_rectangle_results_and_cutoffs(self):
+        rng = np.random.default_rng(19)
+        mask = rng.random((257, 263)) < .3
+        with patch.dict(os.environ, YINXKJ_DISABLE_RUST_SILVER="0"):
+            if silver.rectangle_pixels(mask, (1., 1., 256., 250.)) is None:
+                self.skipTest("Silver scan DLL unavailable")
+        for left, top, right, bottom in ((0., 0., 263., 257.), (3.25, 4.5, 242., 211.75),
+                                         (120., 120., 120.25, 120.25), (-5., -5., -2., -1.)):
+            boundary = silver.Boundary(((left, top), (right, top), (right, bottom), (left, bottom)), "roi_inset")
+            corner = float(boundary.signed_distance([(0, 0)])[0])
+            for tolerance in (0., max(corner - silver.EPSILON, 0.), 3.2):
+                with self.subTest(bounds=boundary.points, tolerance=tolerance):
+                    settings = silver.OverflowSettings(tolerance_px=tolerance, min_area_px=3)
+                    with patch.dict(os.environ, YINXKJ_DISABLE_RUST_SILVER="1"):
+                        expected = silver.measure_overflow(mask, boundary, settings)
+                    with patch.dict(os.environ, YINXKJ_DISABLE_RUST_SILVER="0"):
+                        actual = silver.measure_overflow(mask, boundary, settings)
+                    self.assertEqual(expected.summary(), actual.summary())
+                    for field in ("silver_mask", "outside_mask", "defect_mask"):
+                        np.testing.assert_array_equal(getattr(expected, field), getattr(actual, field))
 
     def test_pixel_insets_are_independent_and_use_existing_crop(self):
         boundary = self.build(circle=(20, 40, 560))

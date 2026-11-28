@@ -21,6 +21,7 @@ from typing import Any, Iterable, Mapping, Sequence
 import cv2
 import numpy as np
 from algorithm.runtime.timing import timed_call, note
+from algorithm.vision2d._silver_native import rectangle_pixels
 
 
 EPSILON = 1e-6
@@ -293,7 +294,13 @@ def measure_overflow(
         raise ValueError("silver mask must be a 2D boolean array")
     # The allowed polygon may extend beyond the detection ROI. Evaluate the
     # observed mask pixels against the full polygon without clipping its edges.
-    ys, xs = np.nonzero(mask)
+    rectangle = boundary._rectangle_bounds
+    scanned = rectangle_pixels(mask, rectangle) if rectangle is not None else None
+    if scanned is None:
+        ys, xs = np.nonzero(mask)
+        silver_area = len(xs)
+    else:
+        silver_area, ys, xs = scanned
     distances = np.empty(len(xs), dtype=np.float64)
     for offset in range(0, len(xs), 100_000):
         stop = offset + 100_000
@@ -323,7 +330,7 @@ def measure_overflow(
             )
     defects = accepted[labels]
     return OverflowMeasurement(
-        int(len(xs)),
+        int(silver_area),
         int(outside.sum()),
         int(candidates.sum()),
         int(defects.sum()),
