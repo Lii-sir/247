@@ -43,7 +43,9 @@ pub unsafe extern "C" fn affine_roi_mismatches(
     let byte_mask = _mm256_set1_epi32(255);
     let column_scale_x = _mm256_set1_ps(a);
     let column_scale_y = _mm256_set1_ps(d);
-    let lanes = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let lanes = _mm256_setr_ps(0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0);
+    let first_columns = _mm256_add_ps(_mm256_set1_ps(left as f32), lanes);
+    let step = _mm256_set1_ps(8.0);
     let mut total = 0;
     for y in top..bottom {
         let row_x = (y as f32) * b;
@@ -52,8 +54,8 @@ pub unsafe extern "C" fn affine_roi_mismatches(
         let offset_y = _mm256_set1_ps(row_y + f);
         let row = target.add((y as usize) * target_width as usize);
         let mut x = left;
+        let mut columns = first_columns;
         while x + 8 <= vector_right {
-            let columns = _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_set1_epi32(x), lanes));
             let sx = round_coordinates(_mm256_fmadd_ps(columns, column_scale_x, offset_x));
             let sy = round_coordinates(_mm256_fmadd_ps(columns, column_scale_y, offset_y));
             let valid_x = _mm256_and_si256(
@@ -72,6 +74,7 @@ pub unsafe extern "C" fn affine_roi_mismatches(
             let equal = _mm256_castsi256_ps(_mm256_cmpeq_epi32(samples, expected));
             total += 8 - (_mm256_movemask_ps(equal) as u32).count_ones();
             x += 8;
+            columns = _mm256_add_ps(columns, step);
         }
         while x < right {
             let column = _mm_set_ss(x as f32);
@@ -99,6 +102,38 @@ pub unsafe extern "C" fn affine_roi_mismatches(
         }
     }
     total
+}
+
+/// Score all configured regions for one candidate transform.
+///
+/// # Safety
+/// The single-region requirements apply to each box. `rois` points to
+/// `count` boxes of four i32 values. `output` holds `count` writable u32s.
+#[no_mangle]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe extern "C" fn affine_rois_mismatches(
+    source: *const u8,
+    source_width: i32,
+    source_height: i32,
+    target: *const u8,
+    target_width: i32,
+    inverse: *const f32,
+    rois: *const i32,
+    count: usize,
+    output: *mut u32,
+) {
+    for index in 0..count {
+        // SAFETY: the caller supplies complete rectangle and output arrays.
+        output.add(index).write(affine_roi_mismatches(
+            source,
+            source_width,
+            source_height,
+            target,
+            target_width,
+            inverse,
+            rois.add(index * 4),
+        ));
+    }
 }
 
 #[inline]

@@ -13,13 +13,18 @@ $library = Join-Path $buildDir 'affine_score.dll'
 try {
     & $rustc --target $target --crate-type=lib --edition=2021 --emit=obj -C opt-level=3 -C panic=abort -o $object (Join-Path $PSScriptRoot 'affine_score.rs')
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    & $linker -flavor link /dll /noentry /nodefaultlib /export:affine_has_fma /export:affine_roi_mismatches "/out:$library" $object
+    & $linker -flavor link /dll /noentry /nodefaultlib /export:affine_has_fma /export:affine_roi_mismatches /export:affine_rois_mismatches "/out:$library" $object
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     $destination = Join-Path $PSScriptRoot 'affine_score.dll'
-    [IO.File]::Move($library, $destination, $true)
+    $previous = Join-Path $buildDir 'previous.dll'
+    if (Test-Path -LiteralPath $destination) {
+        [IO.File]::Replace($library, $destination, $previous)
+    } else {
+        [IO.File]::Move($library, $destination)
+    }
     Write-Output $destination
 } finally {
-    foreach ($file in @($object, $library, (Join-Path $buildDir 'affine_score.lib'))) {
+    foreach ($file in @($object, $library, (Join-Path $buildDir 'previous.dll'), (Join-Path $buildDir 'affine_score.lib'))) {
         if (Test-Path -LiteralPath $file) { Remove-Item -LiteralPath $file }
     }
     Remove-Item -LiteralPath $buildDir

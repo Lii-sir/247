@@ -1,5 +1,5 @@
 """Windows x64 Rust backend for OpenCV 5 nearest-neighbor scoring."""
-from ctypes import CDLL, c_bool, c_int32, c_uint32, c_void_p
+from ctypes import CDLL, c_bool, c_int32, c_size_t, c_uint32, c_void_p
 from functools import lru_cache
 import os
 from pathlib import Path
@@ -18,7 +18,14 @@ def _load_library():
         kernel = library.affine_roi_mismatches
         kernel.argtypes = (c_void_p, c_int32, c_int32, c_void_p, c_int32, c_void_p, c_void_p)
         kernel.restype = c_uint32
-        return kernel if library.affine_has_fma() else None
+        if not library.affine_has_fma():
+            return None
+        batch = getattr(library, "affine_rois_mismatches", None)
+        if batch is not None:
+            batch.argtypes = (c_void_p, c_int32, c_int32, c_void_p, c_int32,
+                              c_void_p, c_void_p, c_size_t, c_void_p)
+            batch.restype = None
+        return kernel, batch
     except (AttributeError, OSError):
         return None
 
@@ -36,9 +43,10 @@ def make_scorer(source, target, rois):
     if not all(0 <= x0 < x1 <= target_width and 0 <= y0 < y1 <= target_height
                for x0, y0, x1, y1 in rois):
         return None
-    kernel = _load_library()
-    if kernel is None:
+    library = _load_library()
+    if library is None:
         return None
+    kernel, batch = library
 
     source_height, source_width = source.shape
     source_buffer = np.empty(source.size + 3, dtype=np.uint8)
@@ -49,12 +57,19 @@ def make_scorer(source, target, rois):
     source_ptr, target_ptr = source_buffer.ctypes.data, target_buffer.ctypes.data
     regions = [(box.ctypes.data, (x1 - x0) * (y1 - y0))
                for box, (x0, y0, x1, y1) in zip(roi_buffer, rois)]
-    buffers = source_buffer, target_buffer, roi_buffer
+    areas = [area for _, area in regions]
+    out_buffer = np.empty(len(rois), dtype=np.uint32)
+    roi_ptr, out_ptr = roi_buffer.ctypes.data, out_buffer.ctypes.data
+    buffers = source_buffer, target_buffer, roi_buffer, out_buffer
     def score(matrix, _buffers=buffers):
         inverse = cv2.invertAffineTransform(matrix).astype(np.float32)
         if not np.all(np.abs(inverse) <= 8192):
             return None
         inverse_ptr = inverse.ctypes.data
+        if batch is not None:
+            batch(source_ptr, source_width, source_height, target_ptr, target_width,
+                  inverse_ptr, roi_ptr, len(areas), out_ptr)
+            return tuple(int(count) / area for count, area in zip(out_buffer, areas))
         return tuple(kernel(source_ptr, source_width, source_height, target_ptr, target_width,
                             inverse_ptr, box_ptr) / area for box_ptr, area in regions)
 

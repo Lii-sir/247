@@ -286,6 +286,8 @@ C# DTO新增元数据属性，现有测高点/掩码字段保持；源码已构�
 
 ## 仿射优化开关与测试
 
+支持的 Windows x64 工控机上，仿射评分可用 Rust DLL 在一次调用里计算同一候选矩阵的所有 ROI 错配数，再按原 ROI 顺序归一化。使用旧版 DLL 时仍可逐 ROI 调用。`YINXKJ_DISABLE_RUST_AFFINE=1` 可切回 OpenCV 评分。
+
 `dynamic_affine_3d.parameters.cache_enabled`当前配置为true，省略时false。缓存仅属于本片/本次优化的固定评分分辨率，以完全相同的6参数作键；不量化参数、不保存变换图、不跨片复用。开关不会改变目标函数或Powell评估序列。
 
 新增`affine_cache_hits/misses/hit_rate`、`affine_warp_evaluations`和`affine_score_compute_ms/compute_mean_ms`。`affine_function_evaluations`仍是SciPy调用目标函数的次数，缓存命中也计入；`affine_score_calls`还包含优化外检查；`affine_warp_evaluations`才是真正执行评分变换的次数。`affine_score_total_ms/mean_ms`包含缓存查询，compute两项只统计实际计算。均在每片`registration`中。
