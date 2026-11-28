@@ -8,6 +8,7 @@ import numpy as np
 from algorithm.vision3d.measurement.height_measurement import (HeightConfig, dilate_mask, erode_wire_mask_in_place,
     erode_measurement_mask_crop, fit_chip_plane, fit_local_platform_plane, fit_platform_plane,
     height_points_to_board, map_platform_rois, measure_mask_height, split_thin_mask)
+from algorithm.vision3d.measurement.height_references import chip_region, platform_region, reference_chips
 from algorithm.vision3d.alignment.registration import align_crop_mask_to_depth
 from transport.depth_input import depth_coordinate_space
 from algorithm.execution.instance_tasks import InstanceTasks
@@ -124,6 +125,7 @@ class JointGeometry:
         crop_box = tuple(crop_box or self.crop_roi)
         semantic_exclusion = timed_call("height_semantic_exclusion_ms", self._semantic_exclusion_mask, instances, depth.shape)
         platform_plane = None
+        roi_mask = None
         platform_diagnostics: Dict[str, Any] = {
             "status": "not_configured", "error": "platform_roi_offsets is empty",
             "boxes_2d": [], "polygons_3d_local": [],
@@ -153,10 +155,6 @@ class JointGeometry:
                         sampling_mask, offset=(0, 0), epsilon=0.0
                     ),
                 )
-                platform_plane = timed_call("height_fit_platform_plane_ms", self._joint_ops.fit_platform_plane,
-                    depth, self.height_config, roi_mask, exclude_mask=semantic_exclusion
-                )
-                platform_diagnostics.update(status="ok", error=None)
         except ValueError as exc:
             platform_diagnostics.update(status="invalid", error=str(exc))
         chips = [item for item in instances if item["class_name"].lower() == "chip"]
@@ -166,31 +164,75 @@ class JointGeometry:
         def prepare_thin():
             timed_call("height_prepare_thin_ms", self._prepare_thin_parts, instances)
 
+        routes = None
+        if self.height_config.reference_mode == "roi_overlap" and instances:
+            prepare_thin()
+            region = platform_region(crop_box, platform_diagnostics["boxes_2d"])
+            chip_regions = {chip["instance_id"]: chip_region(chip["_mask_2d_array"], chip.get("_mask_bbox"))
+                            for chip in chips}
+            routes = {}
+            if height_order is None or WIRE_HEIGHT in height_order:
+                for item in instances:
+                    kind = item["class_name"].lower()
+                    if kind in {"wire", "thin"}:
+                        key = "_thin_wire_mask_2d" if kind == "thin" else "_mask_2d_array"
+                        routes[item["instance_id"], "wire"] = reference_chips(item[key], region, chip_regions,
+                                                                             item.get("_mask_bbox"))
+            if height_order is None or any(check in height_order for check in (CHIP_SOLDER_HEIGHT, PLATFORM_SOLDER_HEIGHT)):
+                for item, endpoint, mask in self._solder_jobs(instances):
+                    ids = reference_chips(mask, region, chip_regions, item.get("_mask_bbox"))
+                    check = CHIP_SOLDER_HEIGHT if ids else PLATFORM_SOLDER_HEIGHT
+                    if height_order is None or check in height_order:
+                        routes[item["instance_id"], endpoint] = ids
+            needed = {chip_id for ids in routes.values() for chip_id in (ids or ())}
+            chip_planes.update(self._fit_chip_planes(depth, [c for c in chips if c["instance_id"] in needed], instances))
+
+        if roi_mask is not None:
+            if routes is not None and () not in routes.values():
+                platform_diagnostics.update(status="not_required", error=None)
+            else:
+                try:
+                    platform_plane = timed_call("height_fit_platform_plane_ms", self._joint_ops.fit_platform_plane,
+                        depth, self.height_config, roi_mask, exclude_mask=semantic_exclusion)
+                    platform_diagnostics.update(status="ok", error=None)
+                except ValueError as exc:
+                    platform_diagnostics.update(status="invalid", error=str(exc))
+
         def measure_wires():
             prepare_thin()
+            options = {} if routes is None else {"references": (routes, chip_planes)}
             return timed_call("height_wire_regions_ms", self._measure_wire_regions,
-                depth, instances, registration, platform_plane, crop_box=crop_box, prepare_thin=False)
+                depth, instances, registration, platform_plane, crop_box=crop_box, prepare_thin=False, **options)
 
         def measure_solders(jobs):
+            options = {} if routes is None else {"references": (routes, chip_planes)}
             return timed_call("height_solder_wall_ms", self._instance_tasks.map,
                 lambda job: self._measure_solder_task(job, depth, registration, chips, chip_planes,
-                    platform_plane, semantic_exclusion, crop_box),
+                    platform_plane, semantic_exclusion, crop_box, **options),
                 jobs, timing_stage="height_solder_work_ms")
 
         @cache
         def solder_groups():
             prepare_thin()
-            timed_call("height_prepare_chip_regions_ms", self._prepare_chip_regions, chips)
+            if routes is None:
+                timed_call("height_prepare_chip_regions_ms", self._prepare_chip_regions, chips)
             groups = {CHIP_SOLDER_HEIGHT: [], PLATFORM_SOLDER_HEIGHT: []}
             for job in self._solder_jobs(instances):
-                _, inside = self._matching_chip({"_mask_2d_array": job[2]}, chips)
+                if routes is None:
+                    _, inside = self._matching_chip({"_mask_2d_array": job[2]}, chips)
+                else:
+                    key = (job[0]["instance_id"], job[1])
+                    if key not in routes:
+                        continue
+                    inside = bool(routes[key])
                 groups[CHIP_SOLDER_HEIGHT if inside else PLATFORM_SOLDER_HEIGHT].append(job)
             return groups
 
         summary = {}
         if height_order is None:
-            timed_call("height_prepare_chip_regions_ms", self._prepare_chip_regions, chips)
-            chip_planes.update(self._fit_chip_planes(depth, chips, instances))
+            if routes is None:
+                timed_call("height_prepare_chip_regions_ms", self._prepare_chip_regions, chips)
+                chip_planes.update(self._fit_chip_planes(depth, chips, instances))
             wire_measurements = measure_wires()
             solder_measurements = measure_solders(self._solder_jobs(instances))
             measurements = wire_measurements + solder_measurements
@@ -203,7 +245,7 @@ class JointGeometry:
                     measured = measure_wires()
                 else:
                     jobs = solder_groups()[name]
-                    if name == CHIP_SOLDER_HEIGHT and jobs:
+                    if routes is None and name == CHIP_SOLDER_HEIGHT and jobs:
                         chip_planes.update(self._fit_chip_planes(depth, chips, instances))
                     measured = measure_solders(jobs)
                 if name == WIRE_HEIGHT:
@@ -315,7 +357,7 @@ class JointGeometry:
             chip["_filled_chip_area_2d"] = int(np.count_nonzero(region))
 
     def _measure_solder_task(self, job, depth, registration, chips, chip_planes,
-                             platform_plane, semantic_exclusion, crop_box):
+                             platform_plane, semantic_exclusion, crop_box, *, references=None):
         instance, endpoint, mask_2d = job
         if endpoint == "bond":
             mask_3d = instance["_mask_3d_array"]
@@ -325,9 +367,10 @@ class JointGeometry:
                 mask_2d, crop_box, depth.shape, registration, binary_255=True)
             # Expand after mapping: this radius is measured in depth pixels.
             mask_3d = self._joint_ops.dilate_mask(mask_3d, self.height_config.thin_solder_search_dilation_px)
+        options = {} if references is None else {"references": references}
         return timed_call("height_solder_ms", self._measure_solder,
             depth, mask_2d, mask_3d, instance, endpoint, chips, chip_planes,
-            platform_plane, semantic_exclusion, crop_box)
+            platform_plane, semantic_exclusion, crop_box, **options)
 
     def _measure_solder(
         self,
@@ -341,44 +384,36 @@ class JointGeometry:
         platform_plane: Dict[str, Any] | None,
         semantic_exclusion: np.ndarray,
         crop_box: Sequence[int],
+        *, references=None,
     ) -> Dict[str, Any]:
-        chip, inside = self._matching_chip(
-            {"_mask_2d_array": mask_2d}, chips
-        )
-        on_chip = chip is not None and inside
-        if on_chip:
-            plane = chip_planes.get(chip["instance_id"])
-            reference = "chip"
-            location = "chip"
-            reference_instance_id = chip["instance_id"]
-            max_height = self.height_config.max_solder_chip_height_mm
-        else:
-            try:
-                plane = self._joint_ops.fit_local_platform_plane(
-                    depth, mask_3d, semantic_exclusion, self.height_config
-                )
-            except ValueError:
-                plane = None
-            reference = "local_wire_platform" if plane is not None else "wire_platform"
-            location = "wire_platform"
-            reference_instance_id = None
-            if plane is None:
-                plane = platform_plane
-            max_height = self.height_config.max_solder_platform_height_mm
-        # Select reference/chip ownership using the original region above.
         # Solder masks may alias instance masks: erode only an independent bbox.
         erode_px = (self.height_config.bond_measurement_erode_px
                     if endpoint == "bond" else self.height_config.thin_solder_measurement_erode_px)
         measurement_mask, measurement_offset = self._joint_ops.erode_measurement_mask_crop(mask_3d, erode_px)
-        height = self._joint_ops.measure_mask_height(
-            depth,
-            measurement_mask,
-            plane,
-            self.height_config,
-            reference=reference,
-            max_height_mm=max_height,
-            mask_offset=measurement_offset,
-        )
+        if references is None:
+            chip, inside = self._matching_chip({"_mask_2d_array": mask_2d}, chips)
+            if chip is not None and inside:
+                reference_instance_id = chip["instance_id"]
+                plane = chip_planes.get(reference_instance_id)
+                reference = location = "chip"
+                max_height = self.height_config.max_solder_chip_height_mm
+            else:
+                try:
+                    plane = self._joint_ops.fit_local_platform_plane(depth, mask_3d, semantic_exclusion, self.height_config)
+                except ValueError:
+                    plane = None
+                location, reference_instance_id = "wire_platform", None
+                reference = "local_wire_platform" if plane is not None else "wire_platform"
+                if plane is None:
+                    plane = platform_plane
+                max_height = self.height_config.max_solder_platform_height_mm
+            height = self._joint_ops.measure_mask_height(depth, measurement_mask, plane, self.height_config,
+                reference=reference, max_height_mm=max_height, mask_offset=measurement_offset)
+        else:
+            height, reference_instance_id, plane = self._measure_references(
+                depth, measurement_mask, measurement_offset, platform_plane, instance["instance_id"], endpoint, references)
+            location = height["reference"]
+            inside = len(references[0][instance["instance_id"], endpoint] or ()) == 1
         return {
             "measurement_id": int(instance.get("instance_id", 0)) * 3 + {
                 "bond": 0,
@@ -414,7 +449,7 @@ class JointGeometry:
         registration: Dict[str, Any],
         platform_plane: Dict[str, Any] | None,
         crop_box: Sequence[int] | None = None,
-        *, prepare_thin: bool = True,
+        *, prepare_thin: bool = True, references=None,
     ) -> list[Dict[str, Any]]:
         crop_box = tuple(crop_box or self.crop_roi)
         wires = [item for item in instances if item["class_name"].lower() in {"wire", "thin"}]
@@ -422,16 +457,17 @@ class JointGeometry:
             return []
         if prepare_thin:
             timed_call("height_prepare_thin_ms", self._prepare_thin_parts, wires)
+        options = {} if references is None else {"references": references}
         results = self._instance_tasks.map(
             lambda wire: self._measure_wire_region(depth, wire, registration,
-                                                   platform_plane, crop_box),
+                                                   platform_plane, crop_box, **options),
             wires, timing_stage="height_wire_work_ms",
         )
         for region_id, item in enumerate(results, 1):
             item["region_id"] = region_id
         return results
 
-    def _measure_wire_region(self, depth, wire, registration, platform_plane, crop_box):
+    def _measure_wire_region(self, depth, wire, registration, platform_plane, crop_box, *, references=None):
         class_name = wire["class_name"].lower()
         source_mask = np.asarray(wire["_thin_wire_mask_2d"] if class_name == "thin"
                                  else wire["_mask_2d_array"], dtype=np.uint8)
@@ -463,13 +499,46 @@ class JointGeometry:
                     else self.height_config.wire_measurement_erode_px)
         if erode_px:
             self._joint_ops.erode_wire_mask_in_place(aligned, erode_px)
-        height_result = self._joint_ops.measure_mask_height(depth, aligned, platform_plane, self.height_config,
-            reference="wire_platform", max_height_mm=self.height_config.max_wire_platform_height_mm)
+        if references is None:
+            height_result = self._joint_ops.measure_mask_height(depth, aligned, platform_plane, self.height_config,
+                reference="wire_platform", max_height_mm=self.height_config.max_wire_platform_height_mm)
+        else:
+            height_result, _, _ = self._measure_references(depth, aligned, (0, 0), platform_plane,
+                                                           wire["instance_id"], "wire", references)
         return dict(instance_id=int(wire.get("instance_id", 0)),
             class_name=str(wire.get("class_name", "")),
             mask_2d=self._joint_ops._mask_geometry(cleaned, offset=full_offset, epsilon=2.0),
             mask_3d_local=self._joint_ops._mask_geometry(aligned, offset=(0, 0), epsilon=1.0),
             bending_2d=bending, height_3d=height_result)
+
+    def _measure_references(self, depth, mask, offset, platform_plane, instance_id, part, references):
+        routes, planes = references
+        ids = routes[instance_id, part]
+        settings = self.height_config
+
+        def measure(plane, reference, chip_id=None, *, reference_height_mm=None):
+            if part == "wire":
+                limit = settings.max_wire_platform_height_mm
+            else:
+                limit = settings.max_solder_chip_height_mm if reference == "chip" else settings.max_solder_platform_height_mm
+            height = self._joint_ops.measure_mask_height(depth, mask, plane, settings,
+                reference=reference, max_height_mm=limit, mask_offset=offset, reference_height_mm=reference_height_mm)
+            if chip_id is not None:
+                height["reference_instance_id"] = chip_id
+            return height, chip_id, plane
+
+        if ids is None:
+            return measure(None, "unclassified")
+        if not ids:
+            return measure(platform_plane, "wire_platform")
+        if len(ids) == 1:
+            chip_id = ids[0]
+            return measure(planes[chip_id], "chip", chip_id)
+        candidates = [(chip_id, planes[chip_id]) for chip_id in ids]
+        if any(plane is None for _, plane in candidates):
+            return measure(None, "chip")
+        chip_id, plane = max(candidates, key=lambda item: item[1]["representative_height_mm"])
+        return measure(plane, "chip", chip_id, reference_height_mm=plane["representative_height_mm"])
 
     @staticmethod
     def _matching_chip(

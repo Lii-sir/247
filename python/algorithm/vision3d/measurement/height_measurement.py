@@ -30,6 +30,7 @@ class HeightConfig:
     thin_measurement_erode_px: int = 0
     bond_measurement_erode_px: int = 0
     thin_solder_measurement_erode_px: int = 0
+    reference_mode: str = "legacy"
 
     @classmethod
     def from_dict(cls, values: Dict[str, Any] | None) -> "HeightConfig":
@@ -40,6 +41,7 @@ class HeightConfig:
         aois = tuple(_box(item, "height_3d.platform_roi_offsets") for item in raw_aois)
         raw_invalid = values.get("invalid_values", cls.invalid_values)
         config = cls(
+            reference_mode=values.get("reference_mode", cls.reference_mode),
             platform_roi_offsets=aois,
             invalid_values=tuple(int(item) for item in raw_invalid),
             gray_offset=float(values.get("gray_offset", cls.gray_offset)),
@@ -88,6 +90,8 @@ class HeightConfig:
         return config
 
     def validate(self) -> None:
+        if self.reference_mode not in ("legacy", "roi_overlap"):
+            raise ValueError("height_measurement_3d.reference_mode must be legacy or roi_overlap")
         for name in ("wire_measurement_erode_px", "thin_measurement_erode_px",
                      "bond_measurement_erode_px", "thin_solder_measurement_erode_px"):
             value = getattr(self, name)
@@ -325,8 +329,9 @@ def measure_mask_height(
     max_height_mm: float | None = None,
     *,
     mask_offset: tuple[int, int] = (0, 0),
+    reference_height_mm: float | None = None,
 ) -> Dict[str, Any]:
-    """Measure a depth-percentile point; optional bbox masks retain piece coordinates."""
+    """Measure a percentile relative to a plane or a fixed reference height."""
     source = np.asarray(mask)
     if source.dtype == np.uint8:
         # Warp output is uint8. Find its bounds in OpenCV, then enumerate only
@@ -342,16 +347,7 @@ def measure_mask_height(
         xs, ys = xs + ox, ys + oy
     valid = _valid_depth(depth[ys, xs], config)
     ys, xs = ys[valid], xs[valid]
-    if len(xs) == 0:
-        return {
-            "reference": reference,
-            "is_valid": False,
-            "is_ok": False,
-            "height_mm": None,
-            "height_diff_mm": None,
-            "point": None,
-        }
-    if plane is None:
+    if len(xs) == 0 or (plane is None and reference_height_mm is None):
         return {
             "reference": reference,
             "is_valid": False,
@@ -363,10 +359,11 @@ def measure_mask_height(
     values = depth[ys, xs].astype(np.float64)
     index = int(np.argmin(np.abs(values - np.percentile(values, config.height_percentile))))
     x, y, value = int(xs[index]), int(ys[index]), float(values[index])
-    plane_value = _evaluate_plane(plane, x, y)
     height_mm = (value - config.gray_offset) * config.vertical_resolution_mm
-    reference_mm = (plane_value - config.gray_offset) * config.vertical_resolution_mm
-    difference_mm = height_mm - reference_mm
+    if reference_height_mm is None:
+        plane_value = _evaluate_plane(plane, x, y)
+        reference_height_mm = (plane_value - config.gray_offset) * config.vertical_resolution_mm
+    difference_mm = height_mm - reference_height_mm
     return {
         "reference": reference,
         "is_valid": True,
@@ -441,14 +438,20 @@ def _fit_plane_points(
         keep = np.abs(residual - median) <= max(50.0, 4.4478 * mad)
     if np.count_nonzero(keep) < config.plane_min_valid_points:
         raise ValueError(f"{name} plane fit retained too few pixels")
-    return {
+    plane = {
         "name": name,
         "coefficients": [float(value) for value in coefficients],
         "valid_points": int(np.count_nonzero(keep)),
     }
+    if name == "chip" and config.reference_mode == "roi_overlap":
+        # The last design matrix contains the points that produced the returned plane.
+        cx, cy = map(float, design[:, :2].mean(axis=0))
+        plane["fit_center_3d_local"] = {"x": cx, "y": cy}
+        plane["representative_height_mm"] = (_evaluate_plane(plane, cx, cy) - config.gray_offset) * config.vertical_resolution_mm
+    return plane
 
 
-def _evaluate_plane(plane: Dict[str, Any], x: int, y: int) -> float:
+def _evaluate_plane(plane: Dict[str, Any], x: float, y: float) -> float:
     a, b, c = plane["coefficients"]
     return float(a * x + b * y + c)
 

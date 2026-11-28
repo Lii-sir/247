@@ -81,6 +81,53 @@ class JointProcessTests(unittest.TestCase):
         params.update(overrides)
         return self.service.submit_piece(**params)
 
+    def test_overlap_references_use_platform_first_and_highest_chip_center(self):
+        shape = (96, 160)
+        depth = np.full(shape, 33000, np.uint16)
+        instances = []
+
+        def add(kind, box, level):
+            left, top, right, bottom = box
+            mask = np.zeros(shape, np.uint8)
+            mask[top:bottom, left:right] = 255
+            depth[mask != 0] = level
+            instances.append(dict(instance_id=len(instances) + 1, class_name=kind, mask=mask))
+
+        add('chip', (44, 10, 85, 84), 33300)
+        add('chip', (90, 10, 145, 84), 33600)
+        # Chip 2 is higher at its own center, but lower if extended to the weld's P95 point.
+        depth[10:84, 90:145] = 32000 + 15 * np.arange(90, 145)
+        add('bond', (6, 17, 16, 23), 33800)
+        depth[18, 7] = 34100  # Platform-contained instances still use P95.
+        add('bond', (28, 30, 61, 37), 33800)
+        add('bond', (55, 44, 62, 52), 33900)
+        add('bond', (77, 56, 102, 62), 34200)
+        depth[58, 87] = 34400  # Sparse peak must not replace P95.
+        depth[59, 88] = 65535  # Invalid depth must never win.
+        add('wire', (100, 69, 133, 75), 34100)
+        add('bond', (39, 66, 49, 73), 33800)
+        config = replace(self.config, reference_mode='roi_overlap', platform_roi_offsets=((3, 4, 33, 91),))
+        entry = dict(instances=instances, crop_box=(0, 0, 160, 96), image_shape=[160, 96], circle=(0, 0, 1))
+        piece = dict(piece_id=1, x1=0, x2=160, y1=0, y2=96)
+        result = self.submit(depth=depth, piece=piece, entry=entry, height_config=config).result(20)
+        solders = {item['source_instance_id']: item for item in result['solder_measurements']}
+        for sid in (3, 4):
+            self.assertEqual('wire_platform', solders[sid]['location'])
+            self.assertEqual(result['reference_planes']['wire_platform'], solders[sid]['reference_plane'])
+        self.assertAlmostEqual((33800 - 33000) * config.vertical_resolution_mm,
+                               solders[3]['height_3d']['height_diff_mm'])
+        self.assertEqual(1, solders[5]['reference_instance_id'])
+        self.assertEqual(2, solders[6]['reference_instance_id'])
+        self.assertFalse(solders[6]['chip_inside'])
+        self.assertEqual({'x': 77, 'y': 56}, solders[6]['height_3d']['point'])
+        selected_plane = solders[6]['reference_plane']
+        center = selected_plane['fit_center_3d_local']
+        expected = (34200 - (32000 + 15 * center['x'])) * config.vertical_resolution_mm
+        self.assertAlmostEqual(expected, solders[6]['height_3d']['height_diff_mm'])
+        self.assertEqual(2, result['wire_measurements'][0]['height_3d']['reference_instance_id'])
+        self.assertEqual('unclassified', solders[8]['height_3d']['reference'])
+        self.assertFalse(solders[8]['height_3d']['is_valid'])
+
     def test_complete_result_matches_direct_and_preserves_input_masks(self):
         from algorithm.application.board.detect_board import DetectBoard
         detector = DetectBoard(lambda _: None)

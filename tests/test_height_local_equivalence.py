@@ -56,6 +56,24 @@ class LocalHeightTests(unittest.TestCase):
         self.config = height.HeightConfig(plane_min_valid_points=10, chip_min_valid_points=10,
                                           platform_local_ring_px=12)
 
+    def test_chip_representative_height_uses_filtered_fit_points(self):
+        ys, xs = np.indices((10, 12))
+        depth = (33000 + 3 * xs + 2 * ys).astype(np.uint16)
+        mask = np.ones(depth.shape, dtype=np.uint8)
+        exclusion = xs < 3
+        depth[exclusion] = 41000
+        depth[0, 10] = 0
+        depth[9, 10] = 65535
+        depth[9, 11] = 43000
+        used = ~exclusion & height._valid_depth(depth, self.config)
+        used[9, 11] = False
+        config = replace(self.config, reference_mode="roi_overlap")
+        plane = height.fit_chip_plane(depth, mask, config, exclude_mask=exclusion)
+        cx, cy = float(xs[used].mean()), float(ys[used].mean())
+        self.assertEqual({"x": cx, "y": cy}, plane["fit_center_3d_local"])
+        self.assertAlmostEqual((33000 + 3 * cx + 2 * cy - config.gray_offset) * config.vertical_resolution_mm,
+                               plane["representative_height_mm"])
+
     def test_local_planes_match_full_frame_at_edges_and_for_disjoint_targets(self):
         for radius, inner in [(12, 3), (2, 8), (0, 3)]:
             config = replace(self.config, platform_local_ring_px=radius,

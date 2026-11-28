@@ -164,6 +164,7 @@
       "max_solder_chip_height_mm": 0.8
     },
     "parameters": {
+      "reference_mode": "roi_overlap",
       "platform_roi_offsets": [
         [
           -4.0369,
