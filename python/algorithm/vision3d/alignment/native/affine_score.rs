@@ -2,6 +2,8 @@
 
 use core::arch::x86_64::*;
 
+mod affine_blocks;
+
 // MSVC marks objects that use floating point. This DLL has no CRT dependency.
 #[no_mangle]
 static _fltused: i32 = 0;
@@ -36,11 +38,8 @@ pub unsafe extern "C" fn affine_roi_mismatches(
     let [left, top, right, bottom] = roi.cast::<[i32; 4]>().read();
     let vector_end = target_width / 16 * 16;
     let vector_right = right.min(vector_end);
-    let zero = _mm256_setzero_si256();
-    let invalid_low = _mm256_set1_epi32(-1);
     let width = _mm256_set1_epi32(source_width);
     let height = _mm256_set1_epi32(source_height);
-    let byte_mask = _mm256_set1_epi32(255);
     let column_scale_x = _mm256_set1_ps(a);
     let column_scale_y = _mm256_set1_ps(d);
     let lanes = _mm256_setr_ps(0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0);
@@ -58,21 +57,7 @@ pub unsafe extern "C" fn affine_roi_mismatches(
         while x + 8 <= vector_right {
             let sx = round_coordinates(_mm256_fmadd_ps(columns, column_scale_x, offset_x));
             let sy = round_coordinates(_mm256_fmadd_ps(columns, column_scale_y, offset_y));
-            let valid_x = _mm256_and_si256(
-                _mm256_cmpgt_epi32(sx, invalid_low),
-                _mm256_cmpgt_epi32(width, sx),
-            );
-            let valid_y = _mm256_and_si256(
-                _mm256_cmpgt_epi32(sy, invalid_low),
-                _mm256_cmpgt_epi32(height, sy),
-            );
-            let valid = _mm256_and_si256(valid_x, valid_y);
-            let indices = _mm256_add_epi32(_mm256_mullo_epi32(sy, width), sx);
-            let samples = _mm256_mask_i32gather_epi32::<1>(zero, source.cast(), indices, valid);
-            let samples = _mm256_and_si256(samples, byte_mask);
-            let expected = _mm256_cvtepu8_epi32(_mm_loadl_epi64(row.add(x as usize).cast()));
-            let equal = _mm256_castsi256_ps(_mm256_cmpeq_epi32(samples, expected));
-            total += 8 - (_mm256_movemask_ps(equal) as u32).count_ones();
+            total += mismatch8(source, row.add(x as usize), sx, sy, width, height);
             x += 8;
             columns = _mm256_add_ps(columns, step);
         }
@@ -91,17 +76,51 @@ pub unsafe extern "C" fn affine_roi_mismatches(
             };
             let sx = round_coordinate(sx);
             let sy = round_coordinate(sy);
-            let sample = if (sx as u32) < source_width as u32 && (sy as u32) < source_height as u32
-            {
-                *source.add((sy * source_width + sx) as usize)
-            } else {
-                0
-            };
-            total += u32::from(sample != *row.add(x as usize));
+            total += pixel_loss(
+                source,
+                source_width,
+                source_height,
+                sx,
+                sy,
+                *row.add(x as usize),
+            );
             x += 1;
         }
     }
     total
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn mismatch8(
+    source: *const u8,
+    target: *const u8,
+    sx: __m256i,
+    sy: __m256i,
+    width: __m256i,
+    height: __m256i,
+) -> u32 {
+    let low = _mm256_set1_epi32(-1);
+    let valid_x = _mm256_and_si256(_mm256_cmpgt_epi32(sx, low), _mm256_cmpgt_epi32(width, sx));
+    let valid_y = _mm256_and_si256(_mm256_cmpgt_epi32(sy, low), _mm256_cmpgt_epi32(height, sy));
+    let valid = _mm256_and_si256(valid_x, valid_y);
+    let indices = _mm256_add_epi32(_mm256_mullo_epi32(sy, width), sx);
+    let samples =
+        _mm256_mask_i32gather_epi32::<1>(_mm256_setzero_si256(), source.cast(), indices, valid);
+    let samples = _mm256_and_si256(samples, _mm256_set1_epi32(255));
+    let expected = _mm256_cvtepu8_epi32(_mm_loadl_epi64(target.cast()));
+    let equal = _mm256_castsi256_ps(_mm256_cmpeq_epi32(samples, expected));
+    8 - (_mm256_movemask_ps(equal) as u32).count_ones()
+}
+
+#[inline]
+unsafe fn pixel_loss(source: *const u8, sw: i32, sh: i32, sx: i32, sy: i32, target: u8) -> u32 {
+    let value = if (sx as u32) < sw as u32 && (sy as u32) < sh as u32 {
+        *source.add((sy * sw + sx) as usize)
+    } else {
+        0
+    };
+    u32::from(value != target)
 }
 
 /// Score all configured regions for one candidate transform.

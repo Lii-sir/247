@@ -25,7 +25,18 @@ def _load_library():
             batch.argtypes = (c_void_p, c_int32, c_int32, c_void_p, c_int32,
                               c_void_p, c_void_p, c_size_t, c_void_p)
             batch.restype = None
-        return kernel, batch
+        build_blocks = getattr(library, "build_affine_blocks", None)
+        score_blocks = getattr(library, "score_affine_blocks", None)
+        blocks = None
+        if build_blocks is not None and score_blocks is not None:
+            build_blocks.argtypes = (c_void_p, c_size_t, c_size_t, c_void_p, c_size_t, c_size_t,
+                                     c_void_p, c_void_p)
+            build_blocks.restype = c_bool
+            score_blocks.argtypes = (c_void_p, c_int32, c_int32, c_void_p, c_int32, c_void_p,
+                                     c_void_p, c_void_p, c_void_p, c_size_t, c_void_p)
+            score_blocks.restype = None
+            blocks = build_blocks, score_blocks
+        return kernel, batch, blocks
     except (AttributeError, OSError):
         return None
 
@@ -46,7 +57,7 @@ def make_scorer(source, target, rois):
     library = _load_library()
     if library is None:
         return None
-    kernel, batch = library
+    kernel, batch, blocks = library
 
     source_height, source_width = source.shape
     source_buffer = np.empty(source.size + 3, dtype=np.uint8)
@@ -61,11 +72,26 @@ def make_scorer(source, target, rois):
     out_buffer = np.empty(len(rois), dtype=np.uint32)
     roi_ptr, out_ptr = roi_buffer.ctypes.data, out_buffer.ctypes.data
     buffers = source_buffer, target_buffer, roi_buffer, out_buffer
+    score_blocks = None
+    if blocks is not None and os.environ.get("YINXKJ_DISABLE_RUST_AFFINE_BLOCKS") != "1":
+        build_blocks, score_blocks_candidate = blocks
+        tiles = np.empty(((source_height + 3) // 4 + 1, (source_width + 7) // 8 + 1), np.uint64)
+        prefix = np.empty((target_height, target_width + 1), np.uint16)
+        tiles_ptr, prefix_ptr = tiles.ctypes.data, prefix.ctypes.data
+        if build_blocks(source_ptr, source_width, source_height, target_ptr, target_width,
+                        target_height, tiles_ptr, prefix_ptr):
+            score_blocks = score_blocks_candidate
+            buffers += tiles, prefix
+
     def score(matrix, _buffers=buffers):
         inverse = cv2.invertAffineTransform(matrix).astype(np.float32)
         if not np.all(np.abs(inverse) <= 8192):
             return None
         inverse_ptr = inverse.ctypes.data
+        if score_blocks is not None:
+            score_blocks(source_ptr, source_width, source_height, target_ptr, target_width, tiles_ptr,
+                         prefix_ptr, inverse_ptr, roi_ptr, len(areas), out_ptr)
+            return tuple(int(count) / area for count, area in zip(out_buffer, areas))
         if batch is not None:
             batch(source_ptr, source_width, source_height, target_ptr, target_width,
                   inverse_ptr, roi_ptr, len(areas), out_ptr)

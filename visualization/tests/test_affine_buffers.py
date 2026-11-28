@@ -2,13 +2,14 @@
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import cv2
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'python'))
+from algorithm.vision3d.alignment import _affine_native
 from algorithm.vision3d.alignment import registration as reg
 
 
@@ -121,6 +122,35 @@ class AffineBufferTests(unittest.TestCase):
             with self.subTest(parameters=parameters):
                 self.assertEqual(legacy_score(scorer, parameters, True), scorer(parameters, True))
         self.assertGreater(scorer.native_calls, 0)
+
+    def test_binary_blocks_match_dense_scoring_and_nonbinary_uses_dense_path(self):
+        source = np.zeros((251, 270), dtype=np.uint8)
+        source[13:146, 12:242] = 1
+        source[70:133, 102:130] = 0
+        target = np.zeros((261, 257), dtype=np.uint8)
+        target[23:156, 16:248] = 1
+        rois = [(0, 0, 257, 261), (3, 7, 244, 96), (254, 5, 257, 100)]
+        library = _affine_native._load_library()
+        if library is None or library[1] is None or library[2] is None:
+            self.skipTest("Rust DLL with block scorer or supported CPU unavailable")
+        kernel, batch, (build, blocks) = library
+        counting_blocks = Mock(wraps=blocks)
+        with patch.dict('os.environ', {'YINXKJ_DISABLE_RUST_AFFINE_BLOCKS': '0'}):
+            with patch.object(_affine_native, '_load_library', return_value=(kernel, batch, None)):
+                dense = _affine_native.make_scorer(source, target, rois)
+            if dense is None:
+                self.skipTest("Supported OpenCV/CPU unavailable")
+            with patch.object(_affine_native, '_load_library', return_value=(
+                    kernel, batch, (build, counting_blocks))):
+                scorer = _affine_native.make_scorer(source, target, rois)
+                nonbinary = _affine_native.make_scorer(source * 255, target * 255, rois)
+            matrices = [reg._scaled_affine(parameters) for parameters in self.parameters()]
+            matrices += [np.array([[-1., .02, 240.5], [.04, 1., -5.5]])]
+            for matrix in matrices:
+                with self.subTest(matrix=matrix):
+                    self.assertEqual(dense(matrix), scorer(matrix))
+                    self.assertEqual(dense(matrix), nonbinary(matrix))
+            self.assertEqual(counting_blocks.call_count, sum(dense(m) is not None for m in matrices))
 
 
 if __name__ == '__main__':

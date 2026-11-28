@@ -13,7 +13,7 @@ $library = Join-Path $buildDir 'affine_score.dll'
 try {
     & $rustc --target $target --crate-type=lib --edition=2021 --emit=obj -C opt-level=3 -C panic=abort -o $object (Join-Path $PSScriptRoot 'affine_score.rs')
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    & $linker -flavor link /dll /noentry /nodefaultlib /export:affine_has_fma /export:affine_roi_mismatches /export:affine_rois_mismatches "/out:$library" $object
+    & $linker -flavor link /dll /noentry /nodefaultlib /export:affine_has_fma /export:affine_roi_mismatches /export:affine_rois_mismatches /export:build_affine_blocks /export:score_affine_blocks "/out:$library" $object
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     $destination = Join-Path $PSScriptRoot 'affine_score.dll'
     $previous = Join-Path $buildDir 'previous.dll'
