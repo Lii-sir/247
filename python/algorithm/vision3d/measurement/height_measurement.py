@@ -7,6 +7,7 @@ from typing import Any, Dict, Sequence
 
 import numpy as np
 import cv2
+from algorithm.vision3d.measurement.height_percentile import pick_height_samples
 
 
 @dataclass(frozen=True)
@@ -395,25 +396,7 @@ def measure_mask_heights(depth, regions, plane, config, reference, max_height_mm
     if not active.size:
         return results
 
-    # A single sort by instance and depth gives contiguous per-instance segments.
-    # Keep the original row-major order separately for stable nearest-point selection.
-    starts = np.cumsum(counts)[active] - counts[active]
-    ordered = raw[np.lexsort((raw, rows))]
-    rank = (counts[active] - 1) * (config.height_percentile / 100.0)
-    low = rank.astype(np.intp)
-    fraction = rank - low
-    a = ordered[starts + low].astype(np.float64)
-    b = ordered[starts + np.minimum(low + 1, counts[active] - 1)].astype(np.float64)
-    delta = b - a
-    percentiles = np.zeros(len(regions), dtype=np.float64)
-    # Match NumPy's linear percentile interpolation on both sides of the midpoint.
-    percentiles[active] = np.where(fraction < .5, a + delta * fraction, b - delta * (1.0 - fraction))
-    distance = np.abs(raw - percentiles[rows])
-    nearest = np.empty(len(regions))
-    nearest[active] = np.minimum.reduceat(distance, starts)
-    matches = np.flatnonzero(distance == nearest[rows])
-    matched_rows = rows[matches]
-    points = matches[np.r_[True, matched_rows[1:] != matched_rows[:-1]]]
+    points = np.asarray(pick_height_samples(raw, counts, config.height_percentile), dtype=np.intp)[active]
     x, y = xs[points], ys[points]
     heights = (raw[points].astype(np.float64) - config.gray_offset) * config.vertical_resolution_mm
     if reference_height_mm is None:
