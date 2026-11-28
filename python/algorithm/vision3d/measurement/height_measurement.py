@@ -7,6 +7,7 @@ from typing import Any, Dict, Sequence
 
 import numpy as np
 import cv2
+from algorithm.vision3d.measurement._height_percentile_native import select_depth_samples
 from algorithm.vision3d.measurement.height_percentile import pick_height_samples
 
 
@@ -396,7 +397,10 @@ def measure_mask_heights(depth, regions, plane, config, reference, max_height_mm
     if not active.size:
         return results
 
-    points = np.asarray(pick_height_samples(raw, counts, config.height_percentile), dtype=np.intp)[active]
+    selected = select_depth_samples(raw, counts, config.height_percentile)
+    if selected is None:
+        selected = np.asarray(pick_height_samples(raw, counts, config.height_percentile), dtype=np.intp)
+    points = selected[active]
     x, y = xs[points], ys[points]
     heights = (raw[points].astype(np.float64) - config.gray_offset) * config.vertical_resolution_mm
     if reference_height_mm is None:

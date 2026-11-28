@@ -15,6 +15,8 @@
 
 拟合完成后，每个测量阶段按实例类别和实际使用的参考面或固定基准分批。组内将各实例的有效深度坐标打包，一次读取深度并批量计算各实例的 P95、测量点和高度差。`instance_workers` 控制可以并行准备和处理的组数，测量结果按原实例顺序返回。
 
+Windows x64 下，`height_percentile.dll` 可对成组的 `uint16` 深度批量选择测量点。DLL 缺失、数据不满足本地接口要求，或设置 `YINXKJ_DISABLE_RUST_HEIGHT_PERCENTILE=1` 时，改用 NumPy。用 `cargo build --release --manifest-path python/algorithm/vision3d/measurement/native/Cargo.toml` 构建 DLL，并部署到同目录。
+
 取样框可能只覆盖平台的一部分。与平台 ROI 和芯片均无交集时，延用平台归属并使用共用面。只与一颗芯片部分重合且未接触平台 ROI 时，标记 `unclassified`，该实例的高度无效。每片只拟合被使用的平台和芯片参考面。`legacy` 可以恢复原有的参考面选择规则。
 
 ## 单片原始深度输入

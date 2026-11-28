@@ -10,6 +10,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 from algorithm.vision3d.measurement import height_measurement as height
+from algorithm.vision3d.measurement._height_percentile_native import select_depth_samples
+from algorithm.vision3d.measurement.height_percentile import pick_height_samples
 
 
 def reference_local_plane(depth, target_mask, exclude_mask, config):
@@ -55,6 +57,17 @@ class LocalHeightTests(unittest.TestCase):
         self.excluded = (self.rng.random(xx.shape) < 0.08).astype(np.uint8) * 255
         self.config = height.HeightConfig(plane_min_valid_points=10, chip_min_valid_points=10,
                                           platform_local_ring_px=12)
+
+    def test_rust_percentile_matches_numpy_for_ragged_groups_and_ties(self):
+        counts = np.array([0, 100, 1, 2, 12000, 0, 128], dtype=np.int64)
+        raw = self.rng.integers(33000, 33160, size=counts.sum(), dtype=np.uint16)
+        raw[101:103] = [33002, 33000]
+        if select_depth_samples(raw, counts, 95.) is None:
+            self.skipTest("Rust percentile DLL unavailable")
+        for percentile in (0., 5., 25., 50., 66.7, 95., 99.999, 100.):
+            with self.subTest(percentile=percentile):
+                np.testing.assert_array_equal(select_depth_samples(raw, counts, percentile),
+                                              pick_height_samples(raw, counts, percentile))
 
     def test_chip_representative_height_uses_filtered_fit_points(self):
         ys, xs = np.indices((10, 12))
