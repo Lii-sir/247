@@ -129,7 +129,8 @@ class AffineBufferTests(unittest.TestCase):
         source[70:133, 102:130] = 0
         target = np.zeros((261, 257), dtype=np.uint8)
         target[23:156, 16:248] = 1
-        rois = [(0, 0, 257, 261), (3, 7, 244, 96), (254, 5, 257, 100)]
+        rois = [(0, 0, 257, 261), (3, 7, 244, 96), (254, 5, 257, 100),
+                (256, 0, 257, 261)]
         library = _affine_native._load_library()
         if library is None or library[1] is None or library[2] is None:
             self.skipTest("Rust DLL with block scorer or supported CPU unavailable")

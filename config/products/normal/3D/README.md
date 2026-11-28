@@ -286,7 +286,7 @@ C# DTO新增元数据属性，现有测高点/掩码字段保持；源码已构�
 
 ## 仿射优化开关与测试
 
-支持的 Windows x64 工控机上，仿射评分可用 Rust DLL 在一次调用里计算同一候选矩阵的所有 ROI 错配数，再按原 ROI 顺序归一化。对二值掩码，DLL 用每段的逆变换端点限定源像素范围。若该范围可判定为全前景或全背景，直接用目标行的前缀和计算错配数。其余像素计算原有的最近邻错配。设 `YINXKJ_DISABLE_RUST_AFFINE_BLOCKS=1` 可对照原 Rust 评分，设 `YINXKJ_DISABLE_RUST_AFFINE=1` 可对照 OpenCV 评分。
+支持的 Windows x64 工控机上，仿射评分可用 Rust DLL 在一次调用里计算同一候选矩阵的所有 ROI 错配数，再按原 ROI 顺序归一化。对二值掩码，每片预先为各 ROI 的每行每个评分块（最多 64 像素）计算一次目标前景像素数。DLL 用每块的逆变换端点限定源像素范围。若源范围可判定为全前景或全背景，直接用预计算的目标前景数得到错配数。其余像素按原最近邻规则逐个比较。设 `YINXKJ_DISABLE_RUST_AFFINE_BLOCKS=1` 可对照逐像素 Rust 评分，设 `YINXKJ_DISABLE_RUST_AFFINE=1` 可对照 OpenCV 评分。
 
 `dynamic_affine_3d.parameters.cache_enabled`当前配置为true，省略时false。缓存仅属于本片/本次优化的固定评分分辨率，以完全相同的6参数作键；不量化参数、不保存变换图、不跨片复用。开关不会改变目标函数或Powell评估序列。
 

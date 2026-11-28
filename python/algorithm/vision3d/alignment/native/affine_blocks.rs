@@ -14,18 +14,21 @@ const TILE_X: usize = 8;
 const TILE_Y: usize = 4;
 
 /// # Safety
-/// The caller provides both masks and room for (ceil(sw/8)+1) by
-/// (ceil(sh/4)+1) packed prefixes and (tw+1) by th target prefixes.
+/// Mask sizes and ROI bounds must be valid. The caller provides room for
+/// (ceil(sw/8)+1) by (ceil(sh/4)+1) packed prefixes. `target_ones` has room
+/// for `block_count` counts, in ROI, row and block order.
 #[no_mangle]
-pub unsafe extern "C" fn build_affine_blocks(
+pub unsafe extern "C" fn build_affine_block_counts(
     source: *const u8,
     sw: usize,
     sh: usize,
     target: *const u8,
     tw: usize,
-    th: usize,
+    rois: *const i32,
+    count: usize,
     tiles: *mut u64,
-    prefix: *mut u16,
+    target_ones: *mut u8,
+    block_count: usize,
 ) -> bool {
     let cols = sw.div_ceil(TILE_X);
     let rows = sh.div_ceil(TILE_Y);
@@ -58,20 +61,34 @@ pub unsafe extern "C" fn build_affine_blocks(
             row.add(x + 1).write(accum + *previous.add(x + 1));
         }
     }
-    for y in 0..th {
-        let row = prefix.add(y * (tw + 1));
-        row.write(0);
-        let mut count = 0u16;
-        for x in 0..tw {
-            let value = *target.add(y * tw + x);
-            if value > 1 {
-                return false;
+    let mut block_index = 0;
+    let vector_end = tw as i32 / 16 * 16;
+    for index in 0..count {
+        let [left, top, right, bottom] = rois.add(index * 4).cast::<[i32; 4]>().read();
+        let vector_right = right.min(vector_end);
+        for y in top..bottom {
+            let row = target.add(y as usize * tw);
+            let mut x = left;
+            while x < vector_right {
+                if block_index == block_count {
+                    return false;
+                }
+                let end = (x + BLOCK_WIDTH).min(vector_right);
+                let mut ones = 0u8;
+                for column in x..end {
+                    let pixel = *row.add(column as usize);
+                    if pixel > 1 {
+                        return false;
+                    }
+                    ones += pixel;
+                }
+                target_ones.add(block_index).write(ones);
+                block_index += 1;
+                x = end;
             }
-            count += value as u16;
-            row.add(x + 1).write(count);
         }
     }
-    true
+    block_index == block_count
 }
 
 #[inline]
@@ -117,17 +134,18 @@ unsafe fn classify_block(
 /// # Safety
 /// CPU supports AVX2/FMA and dimensions are below 32767; projected coordinates fit i32.
 /// All ROI and output arrays have the declared lengths and rectangles lie inside target.
-/// Source includes three gather padding bytes. Tables are from build_affine_blocks.
+/// Source includes three gather padding bytes. Tables are from build_affine_block_counts
+/// with the same ROI bounds and order.
 #[no_mangle]
 #[target_feature(enable = "avx2,fma")]
-pub unsafe extern "C" fn score_affine_blocks(
+pub unsafe extern "C" fn score_affine_block_counts(
     source: *const u8,
     sw: i32,
     sh: i32,
     target: *const u8,
     tw: i32,
     tiles: *const u64,
-    prefix: *const u16,
+    target_ones: *const u8,
     inverse: *const f32,
     rois: *const i32,
     count: usize,
@@ -144,12 +162,12 @@ pub unsafe extern "C" fn score_affine_blocks(
     let lanes = _mm256_setr_ps(0., 1., 2., 3., 4., 5., 6., 7.);
     let step = _mm256_set1_ps(8.);
     let vector_end = tw / 16 * 16;
+    let mut block_index = 0;
     for index in 0..count {
         let [left, top, right, bottom] = rois.add(index * 4).cast::<[i32; 4]>().read();
         let vector_right = right.min(vector_end);
         let mut total = 0u32;
         for y in top..bottom {
-            let px = prefix.add(y as usize * (tw as usize + 1));
             let row = target.add((y * tw) as usize);
             let row_x = y as f32 * b;
             let row_y = y as f32 * e;
@@ -160,6 +178,8 @@ pub unsafe extern "C" fn score_affine_blocks(
             let mut x = left;
             while x < vector_right {
                 let end = (x + BLOCK_WIDTH).min(vector_right);
+                let ones = *target_ones.add(block_index) as u32;
+                block_index += 1;
                 // Inverse coordinates on one destination row are monotone.
                 // Their endpoints bound all source pixels sampled by this block.
                 let sx0 = coordinate(x, ax, bx);
@@ -167,7 +187,6 @@ pub unsafe extern "C" fn score_affine_blocks(
                 let sy0 = coordinate(x, ay, by);
                 let sy1 = coordinate(end - 1, ay, by);
                 if let Some(value) = classify_block(tiles, sw, sh, stride, sx0, sx1, sy0, sy1) {
-                    let ones = (*px.add(end as usize) - *px.add(x as usize)) as u32;
                     total += if value == 0 {
                         ones
                     } else {

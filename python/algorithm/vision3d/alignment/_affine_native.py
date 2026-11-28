@@ -25,12 +25,12 @@ def _load_library():
             batch.argtypes = (c_void_p, c_int32, c_int32, c_void_p, c_int32,
                               c_void_p, c_void_p, c_size_t, c_void_p)
             batch.restype = None
-        build_blocks = getattr(library, "build_affine_blocks", None)
-        score_blocks = getattr(library, "score_affine_blocks", None)
+        build_blocks = getattr(library, "build_affine_block_counts", None)
+        score_blocks = getattr(library, "score_affine_block_counts", None)
         blocks = None
         if build_blocks is not None and score_blocks is not None:
-            build_blocks.argtypes = (c_void_p, c_size_t, c_size_t, c_void_p, c_size_t, c_size_t,
-                                     c_void_p, c_void_p)
+            build_blocks.argtypes = (c_void_p, c_size_t, c_size_t, c_void_p, c_size_t, c_void_p,
+                                     c_size_t, c_void_p, c_void_p, c_size_t)
             build_blocks.restype = c_bool
             score_blocks.argtypes = (c_void_p, c_int32, c_int32, c_void_p, c_int32, c_void_p,
                                      c_void_p, c_void_p, c_void_p, c_size_t, c_void_p)
@@ -76,12 +76,16 @@ def make_scorer(source, target, rois):
     if blocks is not None and os.environ.get("YINXKJ_DISABLE_RUST_AFFINE_BLOCKS") != "1":
         build_blocks, score_blocks_candidate = blocks
         tiles = np.empty(((source_height + 3) // 4 + 1, (source_width + 7) // 8 + 1), np.uint64)
-        prefix = np.empty((target_height, target_width + 1), np.uint16)
-        tiles_ptr, prefix_ptr = tiles.ctypes.data, prefix.ctypes.data
+        # Match the DLL's 64-pixel blocks and keep OpenCV's scalar tail out of the table.
+        vector_end = target_width // 16 * 16
+        block_count = sum((y1 - y0) * ((max(0, min(x1, vector_end) - x0) + 63) // 64)
+                          for x0, y0, x1, y1 in rois)
+        target_ones = np.empty(block_count, np.uint8)
+        tiles_ptr, ones_ptr = tiles.ctypes.data, target_ones.ctypes.data
         if build_blocks(source_ptr, source_width, source_height, target_ptr, target_width,
-                        target_height, tiles_ptr, prefix_ptr):
+                        roi_ptr, len(areas), tiles_ptr, ones_ptr, block_count):
             score_blocks = score_blocks_candidate
-            buffers += tiles, prefix
+            buffers += tiles, target_ones
 
     def score(matrix, _buffers=buffers):
         inverse = cv2.invertAffineTransform(matrix).astype(np.float32)
@@ -90,7 +94,7 @@ def make_scorer(source, target, rois):
         inverse_ptr = inverse.ctypes.data
         if score_blocks is not None:
             score_blocks(source_ptr, source_width, source_height, target_ptr, target_width, tiles_ptr,
-                         prefix_ptr, inverse_ptr, roi_ptr, len(areas), out_ptr)
+                         ones_ptr, inverse_ptr, roi_ptr, len(areas), out_ptr)
             return tuple(int(count) / area for count, area in zip(out_buffer, areas))
         if batch is not None:
             batch(source_ptr, source_width, source_height, target_ptr, target_width,
